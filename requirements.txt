@@ -1,0 +1,40 @@
+# Core libraries
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+joblib>=1.3
+dask[complete]>=2024.1
+
+# Forecasting libraries
+statsforecast>=1.6
+neuralforecast>=1.7
+xgboost>=2.0
+pytimetk>=0.1.5
+lightgbm >= 4.6
+
+# Plotting (optional, interactive)
+matplotlib>=3.8
+plotly>=5.20
+
+# Web scraping tools
+beautifulsoup4>=4.12
+selenium>=4.20
+webdriver-manager>=4.0
+
+# Environment management
+python-dotenv>=1.0
+
+# Optional data cleaning
+unifier
+
+# API clients
+fredapi>=0.5
+
+# Torch for neuralforecast
+torch>=2.2
+
+# Logging
+loguru>=0.7  # Optional enhancement for logging
+
+# Optional: For classical seasonal adjustment
+#x13as-sandbox  # Only if needed; otherwise remove or manage with system path

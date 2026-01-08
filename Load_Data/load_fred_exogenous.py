@@ -23,7 +23,6 @@ FRED_SERIES = {
     "JOLTS_Quits": "JTSQUR",
     "JOLTS_Layoffs": "JTSLDL",
     # Weekly Jobless Claims (ICSA and IURSA dropped due to multicollinearity)
-    # NOTE: These are aggregated monthly based on NFP release boundaries to ensure
     # only data available before each NFP report is included in that month's features
     # "ICSA": "ICSA",  # DROPPED - Initial Claims Seasonally Adjusted
     "CCSA": "CCSA",  # Continued Claims Seasonally Adjusted (KEPT)

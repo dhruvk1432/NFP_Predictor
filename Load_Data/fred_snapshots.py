@@ -16,6 +16,7 @@ from settings import (
     REFRESH_CACHE, TEMP_DIR, NBEATSX_MODEL_TYPE, setup_logger
 )
 from pipeline_helpers import build_hierarchy_structure
+from Load_Data.scrape_bls_schedule import get_future_nfp_dates, fill_missing_with_first_friday
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -650,6 +651,155 @@ def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp
     return df
 
 # ----------------------------------------
+# FUTURE DATE EXTENSION HELPERS
+# ----------------------------------------
+
+def extend_target_with_complete_date_range(
+    target_df: pd.DataFrame,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    end_date_setting: pd.Timestamp,
+    is_univariate: bool = True
+) -> pd.DataFrame:
+    """
+    Ensure target file has a complete date range from window_start to END_DATE month.
+
+    This function:
+    1. Identifies all missing months in the range
+    2. Scrapes BLS website for future release dates (after last existing data)
+    3. Uses first Friday fallback for any missing dates
+    4. Adds rows with NaN values for missing months
+    5. Removes any future rows that are now past END_DATE (if it was reduced)
+
+    Args:
+        target_df: Existing target data with columns [ds, y, release_date]
+        window_start: First month that should exist in target
+        window_end: Last month with actual published data
+        end_date_setting: END_DATE from settings (determines final month to include)
+        is_univariate: True for single column (y), False for multivariate
+
+    Returns:
+        Extended DataFrame with complete date range
+    """
+    # Determine the final month we want in the target (based on END_DATE setting)
+    final_month = pd.Timestamp(end_date_setting).to_period('M').to_timestamp()
+
+    # Generate complete range of months we should have
+    all_months = pd.date_range(
+        start=window_start,
+        end=final_month,
+        freq='MS'  # Month start
+    )
+
+    if target_df.empty:
+        existing_months = set()
+        last_data_month = window_start
+    else:
+        existing_months = set(target_df['ds'].dt.to_period('M'))
+        last_data_month = target_df['ds'].max()
+
+    # Identify missing months
+    missing_months = [m for m in all_months if m.to_period('M') not in existing_months]
+
+    if not missing_months:
+        logger.info("No missing months found in target date range")
+        # Still need to check for future rows to remove
+        if not target_df.empty:
+            target_df = target_df[target_df['ds'] <= final_month].copy()
+        return target_df
+
+    logger.info(f"Found {len(missing_months)} missing months in target range")
+
+    # Separate missing months into: past/present (backfill) vs future (scrape)
+    past_missing = [m for m in missing_months if m <= last_data_month]
+    future_missing = [m for m in missing_months if m > last_data_month]
+
+    new_rows = []
+
+    # Handle past missing months (backfill with first Friday)
+    if past_missing:
+        logger.info(f"Backfilling {len(past_missing)} past missing months with first Friday rule")
+        for month in past_missing:
+            next_month = month + pd.DateOffset(months=1)
+            release_date = get_first_friday_of_month(next_month)
+
+            row = {
+                'ds': month,
+                'y': float('nan'),
+                'release_date': release_date
+            }
+
+            new_rows.append(row)
+            logger.warning(
+                f"Backfilled missing month {month.strftime('%Y-%m')} "
+                f"with first Friday: {release_date.strftime('%Y-%m-%d')}"
+            )
+
+    # Handle future missing months (scrape BLS)
+    if future_missing:
+        logger.info(f"Scraping BLS for {len(future_missing)} future months")
+
+        try:
+            # Scrape BLS for future dates
+            future_start = future_missing[0]
+            future_end = future_missing[-1]
+
+            scraped_df = get_future_nfp_dates(future_start, future_end)
+
+            # Fill in any gaps with first Friday fallback
+            complete_future_df = fill_missing_with_first_friday(
+                future_start,
+                future_end,
+                scraped_df
+            )
+
+            # Convert to target format
+            for _, row in complete_future_df.iterrows():
+                new_row = {
+                    'ds': row['observation_month'],
+                    'y': float('nan'),
+                    'release_date': row['release_date']
+                }
+                new_rows.append(new_row)
+
+        except Exception as e:
+            logger.error(
+                f"BLS scraping failed: {e}. "
+                f"Using first Friday fallback for all {len(future_missing)} future months"
+            )
+            # Fallback: use first Friday for all future months
+            for month in future_missing:
+                next_month = month + pd.DateOffset(months=1)
+                release_date = get_first_friday_of_month(next_month)
+
+                row = {
+                    'ds': month,
+                    'y': float('nan'),
+                    'release_date': release_date
+                }
+
+                new_rows.append(row)
+
+    # Combine with existing data
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        result_df = pd.concat([target_df, new_df], ignore_index=True)
+        result_df = result_df.sort_values('ds').reset_index(drop=True)
+        logger.info(f"Added {len(new_rows)} new rows to target")
+    else:
+        result_df = target_df.copy()
+
+    # Remove any rows beyond final_month (in case END_DATE was reduced)
+    rows_before = len(result_df)
+    result_df = result_df[result_df['ds'] <= final_month].copy()
+    rows_removed = rows_before - len(result_df)
+
+    if rows_removed > 0:
+        logger.info(f"Removed {rows_removed} future rows that are now past END_DATE")
+
+    return result_df
+
+# ----------------------------------------
 
 def save_report(report: Dict[str, Any]) -> None:
     _ensure_dir(FRED_ROOT)
@@ -973,6 +1123,9 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
         "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",
     }
 
+    # Parse END_DATE setting to determine final month to include
+    end_date_setting = pd.to_datetime(END_DATE)
+
     for key, df in targets.items():
         df_sliced = _slice_to_window(df, window_start, window_end)
 
@@ -980,11 +1133,29 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
         if "first" in key:
             # SIMPLE logic for "first release" files (14 day threshold)
             df_imputed = impute_target_release_date_simple(df_sliced)
+
+            # EXTEND with complete date range including future months
+            # This adds missing/future months with NaN values and scraped/imputed release dates
+            df_extended = extend_target_with_complete_date_range(
+                target_df=df_imputed,
+                window_start=window_start,
+                window_end=window_end,
+                end_date_setting=end_date_setting,
+                is_univariate=(NBEATSX_MODEL_TYPE == "univariate")
+            )
+
+            _write_parquet(df_extended, paths[key])
+            logger.info(
+                f"Saved {key} with {len(df_extended)} rows "
+                f"(original: {len(df_sliced)}, extended: {len(df_extended) - len(df_sliced)})"
+            )
+
         else:  # "last" in key
             # COMPLEX logic for "last release" files (Options 1/2/3)
+            # DO NOT extend last release files (for now)
             df_imputed = impute_target_release_date_complex(df_sliced, snapshot_date)
-
-        _write_parquet(df_imputed, paths[key])
+            _write_parquet(df_imputed, paths[key])
+            logger.info(f"Saved {key} with {len(df_imputed)} rows (no extension)")
 
     return paths
 

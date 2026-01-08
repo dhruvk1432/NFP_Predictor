@@ -25,6 +25,7 @@ import warnings
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS
+from Train.backtest_results import generate_backtest_report
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -66,39 +67,128 @@ USE_PREPARED_FRED_DATA = True  # Set to False to use raw FRED data
 # --- Key Employment Series for Feature Engineering ---
 # These are the most predictive employment subsectors
 KEY_EMPLOYMENT_SERIES = {
-    # Level 0-1: Aggregates (exclude total since that's our target)
+    # Level 1: Major Divisions (NSA only)
     'aggregates': [
-        'total.private', 'total.government',
+        'total.private_nsa',
+        'total.government_nsa',
     ],
-    # Level 2: Goods vs Services
+
+    # Level 2: Private Sector Breakdown (NSA only)
     'goods_services': [
-        'total.private.goods', 'total.private.services',
+        'total.private.goods_nsa',
+        'total.private.services_nsa',
     ],
-    # Level 3: Major subsectors
-    'major_subsectors': [
-        'total.private.goods.construction',
-        'total.private.goods.manufacturing',
-        'total.private.services.trade_transportation_utilities',
-        'total.private.services.information',
-        'total.private.services.financial',
-        'total.private.services.professional_business',
-        'total.private.services.education_health',
-        'total.private.services.leisure_hospitality',
-        'total.private.services.other',
-        'total.government.federal',
-        'total.government.state',
-        'total.government.local',
+
+    # Level 3: Goods-Producing Industries (NSA only)
+    'goods_industries': [
+        'total.private.goods.mining_logging_nsa',
+        'total.private.goods.construction_nsa',
+        'total.private.goods.manufacturing_nsa',
     ],
-    # Level 4: Key detailed sectors (leading indicators)
-    'detailed_sectors': [
-        'total.private.goods.manufacturing.durable',
-        'total.private.goods.manufacturing.nondurable',
-        'total.private.services.trade_transportation_utilities.retail',
-        'total.private.services.trade_transportation_utilities.transportation_warehousing',
-        'total.private.services.professional_business.professional_technical',
-        'total.private.services.professional_business.admin_waste',
-        'total.private.services.education_health.health_social',
-        'total.private.services.leisure_hospitality.accommodation_food',
+
+    # Level 4: Mining and Logging Breakdown (NSA only)
+    'mining_logging_breakdown': [
+        'total.private.goods.mining_logging.logging_nsa',
+        'total.private.goods.mining_logging.mining_nsa',
+    ],
+
+    # Level 4: Construction Breakdown (NSA only)
+    'construction_breakdown': [
+        'total.private.goods.construction.buildings_nsa',
+        'total.private.goods.construction.heavy_civil_nsa',
+        'total.private.goods.construction.specialty_nsa',
+    ],
+
+    # Level 4: Manufacturing Breakdown (NSA only)
+    'manufacturing_breakdown': [
+        'total.private.goods.manufacturing.durable_nsa',
+        'total.private.goods.manufacturing.nondurable_nsa',
+    ],
+
+    # Level 3: Service-Providing Industries (NSA only)
+    'service_industries': [
+        'total.private.services.trade_transportation_utilities_nsa',
+        'total.private.services.information_nsa',
+        'total.private.services.financial_nsa',
+        'total.private.services.professional_business_nsa',
+        'total.private.services.education_health_nsa',
+        'total.private.services.leisure_hospitality_nsa',
+        'total.private.services.other_nsa',
+    ],
+
+    # Level 4: Trade, Transportation, and Utilities Breakdown (NSA only)
+    'trade_transport_utilities_breakdown': [
+        'total.private.services.trade_transportation_utilities.wholesale_nsa',
+        'total.private.services.trade_transportation_utilities.retail_nsa',
+        'total.private.services.trade_transportation_utilities.transportation_warehousing_nsa',
+        'total.private.services.trade_transportation_utilities.utilities_nsa',
+    ],
+
+    # Level 4: Information Breakdown (NSA only)
+    'information_breakdown': [
+        'total.private.services.information.motion_picture_nsa',
+        'total.private.services.information.publishing_nsa',
+        'total.private.services.information.broadcasting_nsa',
+        'total.private.services.information.telecommunications_nsa',
+        'total.private.services.information.data_processing_nsa',
+        'total.private.services.information.other_nsa',
+    ],
+
+    # Level 4: Financial Activities Breakdown (NSA only)
+    'financial_breakdown': [
+        'total.private.services.financial.finance_insurance_nsa',
+        'total.private.services.financial.real_estate_nsa',
+    ],
+
+    # Level 4: Professional and Business Services Breakdown (NSA only)
+    'professional_business_breakdown': [
+        'total.private.services.professional_business.professional_technical_nsa',
+        'total.private.services.professional_business.management_companies_nsa',
+        'total.private.services.professional_business.admin_waste_nsa',
+    ],
+
+    # Level 4: Education and Health Services Breakdown (NSA only)
+    'education_health_breakdown': [
+        'total.private.services.education_health.education_nsa',
+        'total.private.services.education_health.health_social_nsa',
+    ],
+
+    # Level 4: Leisure and Hospitality Breakdown (NSA only)
+    'leisure_hospitality_breakdown': [
+        'total.private.services.leisure_hospitality.arts_nsa',
+        'total.private.services.leisure_hospitality.accommodation_food_nsa',
+    ],
+
+    # Level 4: Other Services Breakdown (NSA only)
+    'other_services_breakdown': [
+        'total.private.services.other.repair_nsa',
+        'total.private.services.other.personal_nsa',
+        'total.private.services.other.religious_nsa',
+    ],
+
+    # Level 2: Government Breakdown (NSA only)
+    'government_breakdown': [
+        'total.government.federal_nsa',
+        'total.government.state_nsa',
+        'total.government.local_nsa',
+    ],
+
+    # Level 3: Federal Government Breakdown (NSA only)
+    'federal_government_breakdown': [
+        'total.government.federal.except_postal_nsa',
+        'total.government.federal.postal_nsa',
+    ],
+
+    # Level 3: State Government Breakdown (NSA only)
+    'state_government_breakdown': [
+        'total.government.state.education_nsa',
+        'total.government.state.excluding_education_nsa',
+    ],
+
+    # Level 3: Local Government Breakdown (NSA only)
+    'local_government_breakdown': [
+        'total.government.local.education_nsa',
+        'total.government.local.excluding_education_nsa',
     ],
 }
 
@@ -106,8 +196,22 @@ KEY_EMPLOYMENT_SERIES = {
 ALL_KEY_EMPLOYMENT_SERIES = (
     KEY_EMPLOYMENT_SERIES['aggregates'] +
     KEY_EMPLOYMENT_SERIES['goods_services'] +
-    KEY_EMPLOYMENT_SERIES['major_subsectors'] +
-    KEY_EMPLOYMENT_SERIES['detailed_sectors']
+    KEY_EMPLOYMENT_SERIES['goods_industries'] +
+    KEY_EMPLOYMENT_SERIES['mining_logging_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['construction_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['manufacturing_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['service_industries'] +
+    KEY_EMPLOYMENT_SERIES['trade_transport_utilities_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['information_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['financial_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['professional_business_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['education_health_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['leisure_hospitality_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['other_services_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['government_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['federal_government_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['state_government_breakdown'] +
+    KEY_EMPLOYMENT_SERIES['local_government_breakdown']
 )
 
 # --- Lag Configuration for Macroeconomic Data ---
@@ -1607,120 +1711,30 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
     importance_df.to_csv(importance_path, index=False)
     logger.info(f"Saved feature importance to {importance_path}")
 
-    # Generate visualizations
+    # Generate comprehensive backtest report using dedicated module
     logger.info("\n" + "=" * 60)
-    logger.info("Generating Backtest Visualizations")
+    logger.info("Generating Backtest Report")
     logger.info("=" * 60)
 
     try:
-        import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
+        # Prepare data for backtest report
+        report_df = backtest_results.copy()
+        report_df = report_df.rename(columns={
+            'ds': 'date',
+            'predicted': 'pred'
+        })
 
-        # Create prediction vs actual visualization
-        fig, ax = plt.subplots(figsize=(16, 8))
+        # Generate comprehensive report (visualizations, metrics, tables)
+        report_files = generate_backtest_report(
+            predictions_df=report_df,
+            selected_features=feature_cols,
+            output_dir=results_dir
+        )
 
-        # Plot actual values
-        ax.plot(backtest_results['ds'], backtest_results['actual'],
-                color='black', linewidth=2.5, label='Actual NFP',
-                marker='o', markersize=6, zorder=3)
+        logger.info(f"✓ Generated {len(report_files)} report files")
 
-        # Plot predictions
-        ax.plot(backtest_results['ds'], backtest_results['predicted'],
-                color='#2E86AB', linewidth=2.5, label='Predicted NFP',
-                marker='s', markersize=6, alpha=0.9, zorder=2)
-
-        # Add 95% confidence interval
-        if 'lower_95' in backtest_results.columns:
-            ax.fill_between(backtest_results['ds'],
-                            backtest_results['lower_95'],
-                            backtest_results['upper_95'],
-                            color='#2E86AB', alpha=0.15,
-                            label='95% Confidence Interval', zorder=1)
-
-        # Add 80% confidence interval
-        if 'lower_80' in backtest_results.columns:
-            ax.fill_between(backtest_results['ds'],
-                            backtest_results['lower_80'],
-                            backtest_results['upper_80'],
-                            color='#2E86AB', alpha=0.25,
-                            label='80% Confidence Interval', zorder=1)
-
-        # Add 50% confidence interval
-        if 'lower_50' in backtest_results.columns:
-            ax.fill_between(backtest_results['ds'],
-                            backtest_results['lower_50'],
-                            backtest_results['upper_50'],
-                            color='#2E86AB', alpha=0.35,
-                            label='50% Confidence Interval', zorder=1)
-
-        # Horizontal line at zero
-        ax.axhline(y=0, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, zorder=0)
-
-        # Styling
-        ax.set_xlabel('Date', fontsize=14, fontweight='bold')
-        ax.set_ylabel('NFP MoM Change (thousands)', fontsize=14, fontweight='bold')
-        title = f'{target_type.upper()} Model: NFP MoM Change Predictions vs Actuals ({BACKTEST_MONTHS} Month Backtest)'
-        ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
-        ax.legend(loc='upper left', fontsize=11, framealpha=0.95, shadow=True)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
-        ax.set_axisbelow(True)
-
-        # Format x-axis dates
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, BACKTEST_MONTHS // 12)))
-        plt.xticks(rotation=45, ha='right')
-
-        plt.tight_layout()
-
-        # Save
-        viz_path = results_dir / f"predictions_vs_actual_{target_type}.png"
-        plt.savefig(viz_path, dpi=300, bbox_inches='tight', facecolor='white')
-        plt.close()
-
-        logger.info(f"✓ Saved visualization: {viz_path}")
-
-        # Create error analysis plot
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-        errors = backtest_results['error']
-
-        # Error histogram
-        ax1.hist(errors, bins=15, color='#A23B72', alpha=0.7, edgecolor='black')
-        ax1.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Zero Error')
-        ax1.axvline(x=errors.mean(), color='green', linestyle='--', linewidth=2,
-                    label=f'Mean Error: {errors.mean():.1f}K')
-        ax1.set_xlabel('Prediction Error (thousands)', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Frequency', fontsize=12, fontweight='bold')
-        ax1.set_title('Distribution of Prediction Errors', fontsize=14, fontweight='bold')
-        ax1.legend(fontsize=10)
-        ax1.grid(True, alpha=0.3)
-
-        # Error over time
-        ax2.scatter(backtest_results['ds'], errors, alpha=0.6, s=80, c=abs(errors),
-                    cmap='RdYlGn_r', edgecolors='black', linewidth=0.5)
-        ax2.axhline(y=0, color='red', linestyle='--', linewidth=2)
-        ax2.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Prediction Error (thousands)', fontsize=12, fontweight='bold')
-        ax2.set_title('Prediction Errors Over Time', fontsize=14, fontweight='bold')
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, BACKTEST_MONTHS // 12)))
-        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        ax2.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-
-        error_viz_path = results_dir / f"error_analysis_{target_type}.png"
-        plt.savefig(error_viz_path, dpi=300, bbox_inches='tight', facecolor='white')
-        plt.close()
-
-        logger.info(f"✓ Saved error analysis: {error_viz_path}")
-
-    except ImportError:
-        logger.warning("matplotlib not available - skipping visualizations")
     except Exception as e:
-        logger.warning(f"Failed to generate visualizations: {e}")
+        logger.warning(f"Failed to generate backtest report: {e}")
 
     return model, feature_cols, residuals, backtest_results
 

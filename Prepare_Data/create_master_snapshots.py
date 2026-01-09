@@ -45,7 +45,17 @@ SYMLOG_TRANSFORM_SERIES = [
     "ADP_actual",
     "Credit_Spreads_monthly_chg",
     "Yield_Curve_monthly_chg",
-    "CCSA_MoM_Pct"
+    "CCSA_MoM_Pct",
+    "SP500_monthly_return",
+    "SP500_30d_return",
+    "SP500_max_drawdown",
+    "SP500_worst_day",
+    "Oil_Prices_30d_crash",
+    "Oil_Prices_zscore_min",
+    "Credit_Spreads_zscore_max",
+    "Yield_Curve_zscore_max",
+    "Credit_Spreads_acceleration",
+    "Yield_Curve_acceleration"
 ]
 
 # 3. Skew Handling: Log1p for Positive Values + High Skew (Replace Original)
@@ -56,7 +66,14 @@ LOG1P_TRANSFORM_SERIES = [
     "Oil_Prices_volatility",
     "Credit_Spreads_vol_of_changes",
     "Yield_Curve_vol_of_changes",
-    "Credit_Spreads_avg"
+    "Credit_Spreads_avg",
+    "VIX_mean",
+    "VIX_max",
+    "VIX_volatility",
+    "VIX_30d_spike",
+    "SP500_volatility",
+    "Credit_Spreads_accel_volatility",
+    "Yield_Curve_accel_volatility"
 ]
 
 # 4. Dimension Reduction: NOAA Aggregation

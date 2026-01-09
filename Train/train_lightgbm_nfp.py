@@ -59,9 +59,16 @@ MIN_TARGET_CORR = 0.05  # Minimum absolute correlation with target
 LINEAR_BASELINE_PREDICTORS = [
     # Weekly Claims - PRIMARY EXTRAPOLATION SIGNAL
     'CCSA_monthly_avg_latest',       # Current month average
-    'CCSA_max_spike',                 # Maximum spike (NEW from Task 3)
+    'CCSA_max_spike',                 # Maximum spike
+    'CCSA_weeks_high',                # NEW: Persistence metric (weeks above 95th percentile)
     'CCSA_monthly_avg_lag1',          # Previous month
     'CCSA_monthly_avg_mom_change',    # Month-over-month change
+
+    # NEW: High-velocity shock signals for extreme events
+    'Financial_Stress_zscore_3m_max',  # NEW: Peak stress shock (3-month Z-score)
+    'Oil_Prices_zscore_3m_min',        # NEW: Peak price collapse (3-month Z-score)
+    'SP500_zscore_3m_min',             # NEW: Peak market crash (3-month Z-score)
+    'Weekly_Econ_Index_latest',        # NEW: Real-time GDP signal
 
     # Oil Prices - Economic stress indicator
     'Oil_Prices_mean_latest',         # Current level
@@ -980,12 +987,12 @@ def get_lgbm_params(
     """
     params = {
         'boosting_type': 'gbdt',
-        'num_leaves': 31,
+        'num_leaves': 63,  # INCREASED from 31 to capture panic regime interactions
         'learning_rate': 0.03,
         'feature_fraction': 0.8,
         'bagging_fraction': 0.8,
         'bagging_freq': 5,
-        'min_data_in_leaf': 1,
+        'min_data_in_leaf': 1,  # Allows fitting extreme events (COVID)
         'lambda_l1': 0.1,
         'lambda_l2': 0.1,
         'verbose': -1,
@@ -1038,6 +1045,29 @@ def train_lightgbm_model(
 
     logger.info(f"Training LightGBM on {len(X_train)} samples with {len(feature_cols)} features")
 
+    # NEW: Calculate regime-dependent sample weights
+    # Give 5x weight to panic regime samples (VIX >50 or SP500 crash month)
+    weights = np.ones(len(X_train))
+
+    # Check if regime indicators exist in features
+    vix_panic_exists = 'VIX_panic_regime' in X_train.columns
+    sp500_crash_exists = 'SP500_crash_month' in X_train.columns
+
+    if vix_panic_exists or sp500_crash_exists:
+        panic_mask = np.zeros(len(X_train), dtype=bool)
+
+        if vix_panic_exists:
+            panic_mask |= (X_train['VIX_panic_regime'] == 1)
+        if sp500_crash_exists:
+            panic_mask |= (X_train['SP500_crash_month'] == 1)
+
+        weights[panic_mask] = 5.0
+
+        n_panic_samples = panic_mask.sum()
+        logger.info(f"Applying 5x weight to {n_panic_samples} panic regime samples ({100*n_panic_samples/len(weights):.1f}%)")
+    else:
+        logger.warning("No regime indicators found - using equal weights for all samples")
+
     # LightGBM parameters optimized for small datasets
     params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
@@ -1052,8 +1082,9 @@ def train_lightgbm_model(
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X_train)):
         X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        weights_tr = weights[train_idx]
 
-        train_data = lgb.Dataset(X_tr, label=y_tr)
+        train_data = lgb.Dataset(X_tr, label=y_tr, weight=weights_tr)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
         evals_result = {}
@@ -1097,8 +1128,9 @@ def train_lightgbm_model(
     X_final_val = X_train.iloc[train_size:]
     y_final_train = y.iloc[:train_size]
     y_final_val = y.iloc[train_size:]
+    weights_final_train = weights[:train_size]
 
-    train_data = lgb.Dataset(X_final_train, label=y_final_train)
+    train_data = lgb.Dataset(X_final_train, label=y_final_train, weight=weights_final_train)
     val_data = lgb.Dataset(X_final_val, label=y_final_val, reference=train_data)
 
     evals_result = {}

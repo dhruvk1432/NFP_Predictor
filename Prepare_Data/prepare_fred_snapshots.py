@@ -62,7 +62,8 @@ SYMLOG_TRANSFORM_SERIES = [
 
 # Apply SymLog to ALL MoM changes since employment data universally
 # shows high kurtosis due to recessions/recoveries
-APPLY_SYMLOG_TO_ALL = True
+# CHANGED: Set to False to preserve COVID-19 crash magnitude
+APPLY_SYMLOG_TO_ALL = False
 
 # =============================================================================
 # TRANSFORM FUNCTIONS

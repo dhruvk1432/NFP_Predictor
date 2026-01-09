@@ -923,12 +923,11 @@ def build_training_dataset(
 
         # Add FRED employment features (endogenous data)
         # Load FRED employment snapshot for this month
-        # COMMENTED OUT: Testing model without employment subsector features
-        # fred_df = load_fred_snapshot(snapshot_date)
-        # if fred_df is not None and not fred_df.empty:
-        #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
-        #     for k, v in employment_features.items():
-        #         features[k] = v
+        fred_df = load_fred_snapshot(snapshot_date)
+        if fred_df is not None and not fred_df.empty:
+            employment_features = engineer_employment_features(fred_df, target_month, target_type)
+            for k, v in employment_features.items():
+                features[k] = v
 
         all_features.append(features)
         all_targets.append(target_value)
@@ -1335,12 +1334,11 @@ def run_backtest(
             features[k] = v
 
         # Add FRED employment features
-        # COMMENTED OUT: Testing model without employment subsector features
-        # fred_df = load_fred_snapshot(snapshot_date)
-        # if fred_df is not None and not fred_df.empty:
-        #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
-        #     for k, v in employment_features.items():
-        #         features[k] = v
+        fred_df = load_fred_snapshot(snapshot_date)
+        if fred_df is not None and not fred_df.empty:
+            employment_features = engineer_employment_features(fred_df, target_month, target_type)
+            for k, v in employment_features.items():
+                features[k] = v
 
         # Make prediction with intervals
         pred_result = predict_with_intervals(model, features, residuals, feature_cols)
@@ -1956,12 +1954,11 @@ def predict_nfp_mom(
         features[k] = v
 
     # Add FRED employment features
-    # COMMENTED OUT: Testing model without employment subsector features
-    # fred_df = load_fred_snapshot(snapshot_date)
-    # if fred_df is not None and not fred_df.empty:
-    #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
-    #     for k, v in employment_features.items():
-    #         features[k] = v
+    fred_df = load_fred_snapshot(snapshot_date)
+    if fred_df is not None and not fred_df.empty:
+        employment_features = engineer_employment_features(fred_df, target_month, target_type)
+        for k, v in employment_features.items():
+            features[k] = v
 
     # Make prediction with intervals
     pred_result = predict_with_intervals(model, features, residuals, feature_cols)

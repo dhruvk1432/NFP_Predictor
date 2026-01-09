@@ -403,7 +403,7 @@ def engineer_employment_features(
     positive_sectors = 0
     negative_sectors = 0
 
-    for series_base in KEY_EMPLOYMENT_SERIES['major_subsectors']:
+    for series_base in KEY_EMPLOYMENT_SERIES['service_industries']:
         series_name = series_base + comp_suffix
         series_data = available_df[available_df['series_name'] == series_name]
 
@@ -696,8 +696,10 @@ def load_target_data(target_type: str = 'nsa') -> pd.DataFrame:
     df['y_yoy'] = df['y'].diff(12)
     df['y_mom_yoy'] = df['y_mom'].diff(12)
 
-    # Drop first row (no MoM for first observation)
-    df = df.dropna(subset=['y_mom']).reset_index(drop=True)
+    # Drop first row (no MoM for first observation) but keep future rows with NaN y
+    # Future rows will have y=NaN (unknown future value) and y_mom=NaN (can't calculate)
+    # We drop only the first row where we CAN'T calculate MoM due to lack of prior value
+    df = df[df.index != 0].reset_index(drop=True)
 
     logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations from {df['ds'].min()} to {df['ds'].max()}")
     return df
@@ -887,11 +889,12 @@ def build_training_dataset(
 
         # Add FRED employment features (endogenous data)
         # Load FRED employment snapshot for this month
-        fred_df = load_fred_snapshot(snapshot_date)
-        if fred_df is not None and not fred_df.empty:
-            employment_features = engineer_employment_features(fred_df, target_month, target_type)
-            for k, v in employment_features.items():
-                features[k] = v
+        # COMMENTED OUT: Testing model without employment subsector features
+        # fred_df = load_fred_snapshot(snapshot_date)
+        # if fred_df is not None and not fred_df.empty:
+        #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
+        #     for k, v in employment_features.items():
+        #         features[k] = v
 
         all_features.append(features)
         all_targets.append(target_value)
@@ -1263,11 +1266,12 @@ def run_backtest(
             features[k] = v
 
         # Add FRED employment features
-        fred_df = load_fred_snapshot(snapshot_date)
-        if fred_df is not None and not fred_df.empty:
-            employment_features = engineer_employment_features(fred_df, target_month, target_type)
-            for k, v in employment_features.items():
-                features[k] = v
+        # COMMENTED OUT: Testing model without employment subsector features
+        # fred_df = load_fred_snapshot(snapshot_date)
+        # if fred_df is not None and not fred_df.empty:
+        #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
+        #     for k, v in employment_features.items():
+        #         features[k] = v
 
         # Make prediction with intervals
         pred_result = predict_with_intervals(model, features, residuals, feature_cols)
@@ -1341,8 +1345,7 @@ def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     use_feature_selection: bool = True,
-    feature_selection_interval: int = 6,  # Re-run feature selection every N months
-    warm_start_interval: int = 30  # Reuse model weights every N iterations
+    feature_selection_interval: int = 6  # Re-run feature selection every N months
 ) -> pd.DataFrame:
     """
     Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
@@ -1350,7 +1353,7 @@ def run_expanding_window_backtest(
     Critical Design Principles:
     1. Feature selection is re-run inside the loop using only past data
     2. NaN imputation uses only expanding window means (no future data)
-    3. Model is retrained at each step using only data available at that time
+    3. Model is FULLY retrained from scratch at each step using only data available at that time
     4. No information from future time periods leaks into predictions
 
     Args:
@@ -1358,7 +1361,6 @@ def run_expanding_window_backtest(
         target_type: 'nsa' or 'sa'
         use_feature_selection: Whether to run feature selection
         feature_selection_interval: How often to re-run feature selection (months)
-        warm_start_interval: How often to warm-start from previous model
 
     Returns:
         DataFrame with backtest results
@@ -1367,7 +1369,7 @@ def run_expanding_window_backtest(
     logger.info("EXPANDING WINDOW BACKTEST (No Time-Travel)")
     logger.info("=" * 60)
     logger.info(f"Feature selection re-runs every {feature_selection_interval} months")
-    logger.info(f"Model warm-starts every {warm_start_interval} iterations")
+    logger.info("Model is FULLY retrained from scratch at each step (no warm start)")
 
     # Determine backtest period
     backtest_start_idx = len(target_df) - BACKTEST_MONTHS
@@ -1397,9 +1399,6 @@ def run_expanding_window_backtest(
     cached_features = None
     last_feature_selection_idx = -feature_selection_interval  # Force first selection
 
-    # Cache for warm starting
-    previous_model = None
-
     logger.info(f"\nRunning {len(backtest_months)} predictions...")
 
     for i, target_month in enumerate(backtest_months):
@@ -1422,34 +1421,52 @@ def run_expanding_window_backtest(
         X_train_raw = X_full.iloc[train_idx].copy()
         y_train = y_full.iloc[train_idx].copy()
 
-        # CRITICAL: Impute NaN using ONLY training window statistics
+        # Filter out NaN targets from training data (but keep them for prediction)
+        # This handles future months where y is unknown
+        valid_train_mask = ~y_train.isna()
+        train_idx_valid = [train_idx[i] for i in range(len(train_idx)) if valid_train_mask.iloc[i]]
+
+        if len(train_idx_valid) < 24:
+            logger.warning(f"Insufficient valid training data for {target_month}, skipping")
+            continue
+
+        # CRITICAL: Impute NaN using ONLY training window statistics (use all indices including NaN targets)
         X_train_imputed = impute_with_expanding_window(X_full, train_idx)
         X_train = X_train_imputed.iloc[train_idx].copy()
 
-        # FEATURE SELECTION: Re-run periodically using only training data
-        if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
-            logger.info(f"\n[{target_month.strftime('%Y-%m')}] Re-running feature selection on {len(train_idx)} samples...")
+        # Now filter to only valid (non-NaN) targets for training
+        X_train_valid = X_train.iloc[[i for i in range(len(train_idx)) if valid_train_mask.iloc[i]]].copy()
+        y_train_valid = y_train[valid_train_mask].copy()
 
-            # Feature selection on training data ONLY
-            selected_features, _ = select_features_comprehensive(
-                X=X_train,
-                y=y_train,
-                max_features=MAX_FEATURES,
-                output_dir=None,  # Don't save intermediate results
-                target_type=target_type
-            )
-            cached_features = selected_features
-            last_feature_selection_idx = i
-            logger.info(f"Selected {len(cached_features)} features")
+        # FEATURE SELECTION: Re-run periodically using only valid training data
+        # COMMENTED OUT: Testing model without feature filtering - let LightGBM choose features
+        # if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
+        #     logger.info(f"\n[{target_month.strftime('%Y-%m')}] Re-running feature selection on {len(train_idx_valid)} samples...")
+        #
+        #     # Feature selection on valid training data ONLY
+        #     selected_features, _ = select_features_comprehensive(
+        #         X=X_train_valid,
+        #         y=y_train_valid,
+        #         max_features=MAX_FEATURES,
+        #         output_dir=None,  # Don't save intermediate results
+        #         target_type=target_type
+        #     )
+        #     cached_features = selected_features
+        #     last_feature_selection_idx = i
+        #     logger.info(f"Selected {len(cached_features)} features")
 
         # Get feature columns for this iteration
-        if use_feature_selection and cached_features:
-            feature_cols = [c for c in cached_features if c in X_train.columns and c != 'ds']
-        else:
-            feature_cols = [c for c in X_train.columns if c != 'ds']
+        # COMMENTED OUT: Use all features instead of filtered subset
+        # if use_feature_selection and cached_features:
+        #     feature_cols = [c for c in cached_features if c in X_train_valid.columns and c != 'ds']
+        # else:
+        #     feature_cols = [c for c in X_train_valid.columns if c != 'ds']
+
+        # Use all available features (let LightGBM decide via feature importance)
+        feature_cols = [c for c in X_train_valid.columns if c != 'ds']
 
         # Prepare training data with selected features
-        X_train_selected = X_train[feature_cols]
+        X_train_selected = X_train_valid[feature_cols]
 
         # LightGBM parameters
         params = {
@@ -1469,12 +1486,12 @@ def run_expanding_window_backtest(
             'force_row_wise': True
         }
 
-        # Train model (with optional warm start)
+        # Train model (with optional warm start) using only valid targets
         train_size = int(len(X_train_selected) * 0.85)
         X_tr = X_train_selected.iloc[:train_size]
         X_val = X_train_selected.iloc[train_size:]
-        y_tr = y_train.iloc[:train_size]
-        y_val = y_train.iloc[train_size:]
+        y_tr = y_train_valid.iloc[:train_size]
+        y_val = y_train_valid.iloc[train_size:]
 
         train_data = lgb.Dataset(X_tr, label=y_tr)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
@@ -1484,26 +1501,20 @@ def run_expanding_window_backtest(
             lgb.log_evaluation(period=0)
         ]
 
-        # Warm start from previous model if interval allows
-        init_model = None
-        if previous_model is not None and i % warm_start_interval != 0:
-            init_model = previous_model
-
+        # Train model from scratch every time (no warm start)
+        # This ensures full retraining with each new data point
         model = lgb.train(
             params,
             train_data,
             num_boost_round=500,
             valid_sets=[train_data, val_data],
             valid_names=['train', 'valid'],
-            callbacks=callbacks,
-            init_model=init_model
+            callbacks=callbacks
         )
-
-        previous_model = model
 
         # Calculate residuals from training data for prediction intervals
         train_preds = model.predict(X_train_selected)
-        train_residuals = (y_train.values - train_preds).tolist()
+        train_residuals = (y_train_valid.values - train_preds).tolist()
         all_residuals.extend(train_residuals[-12:])  # Keep recent residuals
 
         # PREDICTION: Get features for target month using same imputation
@@ -1529,45 +1540,68 @@ def run_expanding_window_backtest(
             lower_80, upper_80 = prediction - 1.28*std_est, prediction + 1.28*std_est
             lower_95, upper_95 = prediction - 1.96*std_est, prediction + 1.96*std_est
 
+        # Handle NaN actuals (future predictions)
+        is_future = pd.isna(actual)
+        error = np.nan if is_future else actual - prediction
+        in_50 = np.nan if is_future else (lower_50 <= actual <= upper_50)
+        in_80 = np.nan if is_future else (lower_80 <= actual <= upper_80)
+        in_95 = np.nan if is_future else (lower_95 <= actual <= upper_95)
+
         results.append({
             'ds': target_month,
             'actual': actual,
             'predicted': prediction,
-            'error': actual - prediction,
+            'error': error,
             'lower_50': lower_50,
             'upper_50': upper_50,
             'lower_80': lower_80,
             'upper_80': upper_80,
             'lower_95': lower_95,
             'upper_95': upper_95,
-            'in_50_interval': lower_50 <= actual <= upper_50,
-            'in_80_interval': lower_80 <= actual <= upper_80,
-            'in_95_interval': lower_95 <= actual <= upper_95,
-            'n_train_samples': len(train_idx),
+            'in_50_interval': in_50,
+            'in_80_interval': in_80,
+            'in_95_interval': in_95,
+            'n_train_samples': len(train_idx_valid),
             'n_features': len(feature_cols)
         })
 
         # Progress logging
         if (i + 1) % 6 == 0 or i == 0:
-            logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
-                       f"Actual={actual:.0f}, Pred={prediction:.0f}, Error={actual-prediction:.0f}")
+            if is_future:
+                logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
+                           f"Pred={prediction:.0f} (FUTURE - no actual yet)")
+            else:
+                logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
+                           f"Actual={actual:.0f}, Pred={prediction:.0f}, Error={error:.0f}")
 
     results_df = pd.DataFrame(results)
 
-    # Log summary statistics
+    # Log summary statistics (excluding future predictions with NaN actuals)
     if not results_df.empty:
-        rmse = np.sqrt(np.mean(results_df['error'] ** 2))
-        mae = np.mean(np.abs(results_df['error']))
+        # Filter to only rows with actual values (non-NaN) for metrics
+        backtest_rows = results_df[~results_df['error'].isna()]
+        future_rows = results_df[results_df['error'].isna()]
 
-        logger.info("\n" + "=" * 60)
-        logger.info("EXPANDING WINDOW BACKTEST RESULTS")
-        logger.info("=" * 60)
-        logger.info(f"Predictions: {len(results_df)}")
-        logger.info(f"RMSE: {rmse:.2f}")
-        logger.info(f"MAE: {mae:.2f}")
-        logger.info(f"Coverage 50%: {results_df['in_50_interval'].mean()*100:.1f}%")
-        logger.info(f"Coverage 80%: {results_df['in_80_interval'].mean()*100:.1f}%")
-        logger.info(f"Coverage 95%: {results_df['in_95_interval'].mean()*100:.1f}%")
+        if not backtest_rows.empty:
+            rmse = np.sqrt(np.mean(backtest_rows['error'] ** 2))
+            mae = np.mean(np.abs(backtest_rows['error']))
+
+            logger.info("\n" + "=" * 60)
+            logger.info("EXPANDING WINDOW BACKTEST RESULTS")
+            logger.info("=" * 60)
+            logger.info(f"Backtest predictions: {len(backtest_rows)}")
+            logger.info(f"Future predictions: {len(future_rows)}")
+            logger.info(f"RMSE: {rmse:.2f}")
+            logger.info(f"MAE: {mae:.2f}")
+            logger.info(f"Coverage 50%: {backtest_rows['in_50_interval'].mean()*100:.1f}%")
+            logger.info(f"Coverage 80%: {backtest_rows['in_80_interval'].mean()*100:.1f}%")
+            logger.info(f"Coverage 95%: {backtest_rows['in_95_interval'].mean()*100:.1f}%")
+
+        if not future_rows.empty:
+            logger.info("\nFUTURE PREDICTIONS (No actuals yet):")
+            for _, row in future_rows.iterrows():
+                logger.info(f"  {row['ds'].strftime('%Y-%m')}: Pred={row['predicted']:.0f} "
+                           f"[{row['lower_80']:.0f}, {row['upper_80']:.0f}]")
 
     return results_df
 
@@ -1620,8 +1654,7 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
         target_df=target_df,
         target_type=target_type,
         use_feature_selection=use_feature_selection,
-        feature_selection_interval=6,  # Re-select features every 6 months
-        warm_start_interval=3  # Warm start model every 3 iterations
+        feature_selection_interval=6  # Re-select features every 6 months
     )
 
     if backtest_results.empty:
@@ -1635,28 +1668,41 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
 
     X_full, y_full = build_training_dataset(target_df, target_type=target_type)
 
+    # Filter out NaN targets for final model training (same as backtest logic)
+    # Keep future months in X_full for potential predictions but exclude from training
+    valid_mask = ~y_full.isna()
+    X_full_valid = X_full[valid_mask].copy()
+    y_full_valid = y_full[valid_mask].copy()
+
+    logger.info(f"Total observations: {len(X_full)}, Valid for training: {len(X_full_valid)}")
+
     # Final feature selection on full training data (for production model only)
-    if use_feature_selection:
-        feature_output_dir = OUTPUT_DIR / "feature_selection" / target_type
-        feature_output_dir.mkdir(parents=True, exist_ok=True)
+    # COMMENTED OUT: Testing model without feature filtering - let LightGBM choose features
+    # if use_feature_selection:
+    #     feature_output_dir = OUTPUT_DIR / "feature_selection" / target_type
+    #     feature_output_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #     selected_features, selection_metadata = select_features_comprehensive(
+    #         X=X_full_valid,
+    #         y=y_full_valid,
+    #         max_features=MAX_FEATURES,
+    #         output_dir=feature_output_dir,
+    #         target_type=target_type
+    #     )
+    #     feature_cols = selected_features
+    #     X_train = X_full_valid[['ds'] + [c for c in selected_features if c in X_full_valid.columns]].copy()
+    # else:
+    #     feature_cols = [c for c in X_full_valid.columns if c != 'ds']
+    #     X_train = X_full_valid.copy()
 
-        selected_features, selection_metadata = select_features_comprehensive(
-            X=X_full,
-            y=y_full,
-            max_features=MAX_FEATURES,
-            output_dir=feature_output_dir,
-            target_type=target_type
-        )
-        feature_cols = selected_features
-        X_train = X_full[['ds'] + [c for c in selected_features if c in X_full.columns]].copy()
-    else:
-        feature_cols = [c for c in X_full.columns if c != 'ds']
-        X_train = X_full.copy()
+    # Use all available features (let LightGBM decide via feature importance)
+    feature_cols = [c for c in X_full_valid.columns if c != 'ds']
+    X_train = X_full_valid.copy()
 
-    # Train final model
+    # Train final model (using only valid targets)
     model, importance, residuals = train_lightgbm_model(
         X_train,
-        y_full,
+        y_full_valid,
         n_splits=5,
         num_boost_round=1000,
         early_stopping_rounds=50
@@ -1799,11 +1845,12 @@ def predict_nfp_mom(
         features[k] = v
 
     # Add FRED employment features
-    fred_df = load_fred_snapshot(snapshot_date)
-    if fred_df is not None and not fred_df.empty:
-        employment_features = engineer_employment_features(fred_df, target_month, target_type)
-        for k, v in employment_features.items():
-            features[k] = v
+    # COMMENTED OUT: Testing model without employment subsector features
+    # fred_df = load_fred_snapshot(snapshot_date)
+    # if fred_df is not None and not fred_df.empty:
+    #     employment_features = engineer_employment_features(fred_df, target_month, target_type)
+    #     for k, v in employment_features.items():
+    #         features[k] = v
 
     # Make prediction with intervals
     pred_result = predict_with_intervals(model, features, residuals, feature_cols)

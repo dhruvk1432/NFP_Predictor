@@ -13,10 +13,12 @@ from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE
 logger = setup_logger(__file__, TEMP_DIR)
 
 FRED_SERIES = {
-    #Daily Data
+    #Daily Data - Financial Market Indicators
     "Credit_Spreads": "BAMLH0A0HYM2",
     "Yield_Curve": "T10Y3M",
     "Oil_Prices": "DCOILWTICO",
+    "VIX": "VIXCLS",  # CBOE Volatility Index - Market fear gauge
+    "SP500": "SP500",  # S&P 500 Index - Market crashes & recoveries
     #Monthly Data (JOLTS_Openings and JOLTS_Hires dropped due to multicollinearity)
     # "JOLTS_Openings": "JTSJOL",  # DROPPED
     # "JOLTS_Hires": "JTSHIL",  # DROPPED
@@ -302,7 +304,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
     # 1. Fetch all history 
     history_cache = {}
 
-    DAILY_SERIES = ["Credit_Spreads", "Yield_Curve", "Oil_Prices"]
+    DAILY_SERIES = ["Credit_Spreads", "Yield_Curve", "Oil_Prices", "VIX", "SP500"]
     # Dropped JOLTS_Openings and JOLTS_Hires due to multicollinearity
     JOLTS_SERIES = ["JOLTS_Quits", "JOLTS_Layoffs"]
     # Dropped ICSA and IURSA due to multicollinearity (kept CCSA only)
@@ -474,69 +476,225 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
             sub_df = latest[['date', 'value']].set_index('date').sort_index()
             
             # --- START OF EDITED TRANSFORMATION LOGIC ---
-            
-            if name in ["Credit_Spreads", "Yield_Curve"]:
-                # IMPROVED STRATEGY:
-                # Use volatility of CHANGES (not levels) and Momentum (sum of changes)
-                # Removed "_last" to eliminate collinearity with "_avg"
+
+            if name == "VIX":
+                # VIX: Volatility Index - Market Fear Gauge
+                # Key features for detecting crashes like COVID
                 sub_df['daily_chg'] = sub_df['value'].diff()
 
+                # Calculate rolling 52-week high/low for regime detection
+                sub_df['rolling_52w_high'] = sub_df['value'].rolling(window=252, min_periods=20).max()
+                sub_df['rolling_52w_low'] = sub_df['value'].rolling(window=252, min_periods=20).min()
+
+                # 30-day spike detection (VIX >3x in 30 days = extreme event)
+                sub_df['vix_30d_ago'] = sub_df['value'].shift(21)  # ~30 trading days
+                sub_df['vix_spike_ratio'] = sub_df['value'] / sub_df['vix_30d_ago']
+
                 monthly_agg = sub_df.resample('MS').agg({
-                    'value': 'mean',           # State (removed 'last' for collinearity)
-                    'daily_chg': ['std', 'sum']  # Volatility & Direction
+                    'value': ['mean', 'max'],  # Average fear & Peak fear
+                    'daily_chg': 'std',  # Volatility of volatility
+                    'vix_spike_ratio': 'max',  # Largest spike in month
+                    'rolling_52w_high': 'last'  # Reference point for regime
                 })
-                # Flatten column names if multi-level
+
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
                     monthly_agg.columns = ['_'.join(col).strip() for col in monthly_agg.columns.values]
 
                 temp_df = pd.DataFrame(index=monthly_agg.index)
-                # Check column names after aggregation
-                value_col = 'value_mean' if 'value_mean' in monthly_agg.columns else 'value'
+                # Handle potential column name variations after MultiIndex flattening
+                mean_col = 'value_mean' if 'value_mean' in monthly_agg.columns else 'value'
+                max_col = 'value_max' if 'value_max' in monthly_agg.columns else 'max'
+                vol_col = 'daily_chg_std' if 'daily_chg_std' in monthly_agg.columns else 'std'
+                spike_col = 'vix_spike_ratio_max' if 'vix_spike_ratio_max' in monthly_agg.columns else 'max'
 
-                temp_df[f'{name}_avg'] = monthly_agg[value_col]
-                # Standard deviation of daily changes = Realized Volatility
-                temp_df[f'{name}_vol_of_changes'] = monthly_agg['daily_chg_std']
-                # Sum of daily changes = Monthly Momentum (approx Last - First)
-                temp_df[f'{name}_monthly_chg'] = monthly_agg['daily_chg_sum']
+                temp_df['VIX_mean'] = monthly_agg[mean_col] if mean_col in monthly_agg.columns else np.nan
+                temp_df['VIX_max'] = monthly_agg[max_col] if max_col in monthly_agg.columns else np.nan
+                temp_df['VIX_volatility'] = monthly_agg[vol_col] if vol_col in monthly_agg.columns else np.nan
+
+                if spike_col in monthly_agg.columns:
+                    temp_df['VIX_30d_spike'] = monthly_agg[spike_col]
+                else:
+                    temp_df['VIX_30d_spike'] = np.nan
+
+                # Regime indicators (will be further processed downstream)
+                # VIX >50 = Extreme Panic (COVID hit 82)
+                temp_df['VIX_panic_regime'] = (temp_df['VIX_max'] > 50).astype(int)
+                # VIX >40 = High Fear
+                temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 40).astype(int)
 
                 sub_df = temp_df.reset_index().melt(
                     id_vars=['date'],
                     var_name='series_name',
                     value_name='value'
                 )
-                # Financial data is available at end of month
-                # date = first day of month, release_date = last day of month
                 sub_df['release_date'] = sub_df['date'] + pd.offsets.MonthEnd(0)
 
-            elif name == "Oil_Prices":
-                # UPDATED: Use Dollar Change (diff) instead of Log Returns
-                # This ensures mathematical stability even when prices are negative (Apr 2020)
-                # Removed min, max, end_of_month due to high collinearity
+            elif name == "SP500":
+                # S&P 500: Market Crash Detection
+                # Key features for detecting COVID-like crashes and recoveries
                 sub_df['daily_chg'] = sub_df['value'].diff()
+                sub_df['daily_return'] = sub_df['value'].pct_change()
+
+                # Rolling 52-week high for drawdown calculation
+                sub_df['rolling_52w_high'] = sub_df['value'].rolling(window=252, min_periods=20).max()
+                sub_df['drawdown'] = (sub_df['value'] - sub_df['rolling_52w_high']) / sub_df['rolling_52w_high'] * 100
+
+                # 30-day performance
+                sub_df['value_30d_ago'] = sub_df['value'].shift(21)
+                sub_df['return_30d'] = (sub_df['value'] - sub_df['value_30d_ago']) / sub_df['value_30d_ago'] * 100
+
+                # Daily volatility (21-day rolling)
+                sub_df['volatility_21d'] = sub_df['daily_return'].rolling(window=21, min_periods=10).std() * np.sqrt(252) * 100
 
                 monthly_agg = sub_df.resample('MS').agg({
-                    'value': 'mean',        # State (removed min/max/last for collinearity)
-                    'daily_chg': 'std'      # Volatility of dollar moves (not percent)
+                    'value': ['first', 'last', 'min'],  # Month start/end/low
+                    'drawdown': 'min',  # Maximum drawdown in month
+                    'return_30d': 'last',  # Month-end 30-day return
+                    'volatility_21d': 'mean',  # Average volatility
+                    'daily_return': ['std', 'min']  # Monthly vol & worst day
                 })
-                # Flatten column names if multi-level
+
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
                     monthly_agg.columns = ['_'.join(col).strip() for col in monthly_agg.columns.values]
 
                 temp_df = pd.DataFrame(index=monthly_agg.index)
-                # Check column names after aggregation
+                # Handle column name variations
+                first_col = 'value_first' if 'value_first' in monthly_agg.columns else 'first'
+                last_col = 'value_last' if 'value_last' in monthly_agg.columns else 'last'
+                ret_col = 'return_30d_last' if 'return_30d_last' in monthly_agg.columns else 'last'
+                dd_col = 'drawdown_min' if 'drawdown_min' in monthly_agg.columns else 'min'
+                vol_col = 'volatility_21d_mean' if 'volatility_21d_mean' in monthly_agg.columns else 'mean'
+                worst_col = 'daily_return_min' if 'daily_return_min' in monthly_agg.columns else 'min'
+
+                # Monthly return
+                if first_col in monthly_agg.columns and last_col in monthly_agg.columns:
+                    temp_df['SP500_monthly_return'] = ((monthly_agg[last_col] - monthly_agg[first_col])
+                                                        / monthly_agg[first_col] * 100)
+                else:
+                    temp_df['SP500_monthly_return'] = np.nan
+
+                temp_df['SP500_30d_return'] = monthly_agg[ret_col] if ret_col in monthly_agg.columns else np.nan
+                temp_df['SP500_max_drawdown'] = monthly_agg[dd_col] if dd_col in monthly_agg.columns else np.nan
+                temp_df['SP500_volatility'] = monthly_agg[vol_col] if vol_col in monthly_agg.columns else np.nan
+                temp_df['SP500_worst_day'] = (monthly_agg[worst_col] * 100) if worst_col in monthly_agg.columns else np.nan
+
+                # Crash indicators
+                # Bear market: Down >20% from 52w high
+                temp_df['SP500_bear_market'] = (temp_df['SP500_max_drawdown'] < -20).astype(int)
+                # Crash month: Down >10% in the month
+                temp_df['SP500_crash_month'] = (temp_df['SP500_monthly_return'] < -10).astype(int)
+                # Circuit breaker: Any day down >5%
+                if worst_col in monthly_agg.columns:
+                    temp_df['SP500_circuit_breaker'] = (monthly_agg[worst_col] < -0.05).astype(int)
+                else:
+                    temp_df['SP500_circuit_breaker'] = 0
+
+                sub_df = temp_df.reset_index().melt(
+                    id_vars=['date'],
+                    var_name='series_name',
+                    value_name='value'
+                )
+                sub_df['release_date'] = sub_df['date'] + pd.offsets.MonthEnd(0)
+
+            elif name in ["Credit_Spreads", "Yield_Curve"]:
+                # ENHANCED: Add extreme event detection for crash scenarios
+                # Use volatility of CHANGES (not levels) and Momentum (sum of changes)
+                sub_df['daily_chg'] = sub_df['value'].diff()
+
+                # Extreme event features: Historical percentile & acceleration
+                sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
+                sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
+                sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
+
+                # Acceleration (rate of change of change)
+                sub_df['acceleration'] = sub_df['daily_chg'].diff()
+
+                monthly_agg = sub_df.resample('MS').agg({
+                    'value': 'mean',           # State
+                    'daily_chg': ['std', 'sum'],  # Volatility & Direction
+                    'z_score': 'max',  # How extreme vs. history
+                    'acceleration': ['mean', 'std']  # Speed of change & volatility
+                })
+
+                if isinstance(monthly_agg.columns, pd.MultiIndex):
+                    monthly_agg.columns = ['_'.join(col).strip() for col in monthly_agg.columns.values]
+
+                temp_df = pd.DataFrame(index=monthly_agg.index)
+                value_col = 'value_mean' if 'value_mean' in monthly_agg.columns else 'value'
+                vol_col = 'daily_chg_std' if 'daily_chg_std' in monthly_agg.columns else 'std'
+                sum_col = 'daily_chg_sum' if 'daily_chg_sum' in monthly_agg.columns else 'sum'
+                z_col = 'z_score_max' if 'z_score_max' in monthly_agg.columns else 'max'
+                accel_mean_col = 'acceleration_mean' if 'acceleration_mean' in monthly_agg.columns else 'mean'
+                accel_std_col = 'acceleration_std' if 'acceleration_std' in monthly_agg.columns else 'std'
+
+                temp_df[f'{name}_avg'] = monthly_agg[value_col] if value_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_vol_of_changes'] = monthly_agg[vol_col] if vol_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_monthly_chg'] = monthly_agg[sum_col] if sum_col in monthly_agg.columns else np.nan
+
+                # NEW: Extreme event features
+                temp_df[f'{name}_zscore_max'] = monthly_agg[z_col] if z_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_acceleration'] = monthly_agg[accel_mean_col] if accel_mean_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_accel_volatility'] = monthly_agg[accel_std_col] if accel_std_col in monthly_agg.columns else np.nan
+
+                sub_df = temp_df.reset_index().melt(
+                    id_vars=['date'],
+                    var_name='series_name',
+                    value_name='value'
+                )
+                sub_df['release_date'] = sub_df['date'] + pd.offsets.MonthEnd(0)
+
+            elif name == "Oil_Prices":
+                # ENHANCED: Add extreme event detection for crashes (COVID: $60 → -$37)
+                # Use Dollar Change (diff) for mathematical stability with negative prices
+                sub_df['daily_chg'] = sub_df['value'].diff()
+
+                # 30-day crash detection (>40% drop = extreme event)
+                sub_df['value_30d_ago'] = sub_df['value'].shift(21)  # ~30 trading days
+                sub_df['crash_30d_pct'] = ((sub_df['value'] - sub_df['value_30d_ago'])
+                                           / sub_df['value_30d_ago'].abs()) * 100
+
+                # Negative price indicator (unprecedented Apr 2020)
+                sub_df['is_negative'] = (sub_df['value'] < 0).astype(int)
+
+                # Historical z-score
+                sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
+                sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
+                sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
+
+                monthly_agg = sub_df.resample('MS').agg({
+                    'value': 'mean',        # State
+                    'daily_chg': 'std',     # Volatility of dollar moves
+                    'crash_30d_pct': 'min',  # Worst 30-day crash in month
+                    'is_negative': 'max',    # Did it go negative?
+                    'z_score': 'min'         # How extreme vs. history (min = biggest crash)
+                })
+
+                if isinstance(monthly_agg.columns, pd.MultiIndex):
+                    monthly_agg.columns = ['_'.join(col).strip() for col in monthly_agg.columns.values]
+
+                temp_df = pd.DataFrame(index=monthly_agg.index)
                 value_col = 'value_mean' if 'value_mean' in monthly_agg.columns else 'value'
                 chg_col = 'daily_chg_std' if 'daily_chg_std' in monthly_agg.columns else 'daily_chg'
+                crash_col = 'crash_30d_pct_min' if 'crash_30d_pct_min' in monthly_agg.columns else ('crash_30d_pct' if 'crash_30d_pct' in monthly_agg.columns else None)
+                neg_col = 'is_negative_max' if 'is_negative_max' in monthly_agg.columns else ('is_negative' if 'is_negative' in monthly_agg.columns else None)
+                zscore_col = 'z_score_min' if 'z_score_min' in monthly_agg.columns else ('z_score' if 'z_score' in monthly_agg.columns else None)
 
                 temp_df['Oil_Prices_mean'] = monthly_agg[value_col]
                 temp_df['Oil_Prices_volatility'] = monthly_agg[chg_col]
 
+                # NEW: Extreme event features
+                if crash_col and crash_col in monthly_agg.columns:
+                    temp_df['Oil_Prices_30d_crash'] = monthly_agg[crash_col]
+                if neg_col and neg_col in monthly_agg.columns:
+                    temp_df['Oil_Prices_went_negative'] = monthly_agg[neg_col]
+                if zscore_col and zscore_col in monthly_agg.columns:
+                    temp_df['Oil_Prices_zscore_min'] = monthly_agg[zscore_col]
+
                 sub_df = temp_df.reset_index().melt(
                     id_vars=['date'],
                     var_name='series_name',
                     value_name='value'
                 )
-                # Oil price data is available at end of month
-                # date = first day of month, release_date = last day of month
                 sub_df['release_date'] = sub_df['date'] + pd.offsets.MonthEnd(0)
                 
             elif name in ["ICSA", "CCSA", "IURSA"]:

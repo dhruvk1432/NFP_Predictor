@@ -241,7 +241,7 @@ def plot_predictions_vs_actual(
     Create shaded prediction graph with confidence intervals.
 
     Args:
-        predictions_df: DataFrame with columns: date, pred, actual, [lower_bound, upper_bound]
+        predictions_df: DataFrame with columns: date, pred, actual, [lower_50, upper_50, lower_80, upper_80, lower_95, upper_95]
         output_dir: Directory to save plot
         title: Plot title
 
@@ -258,32 +258,64 @@ def plot_predictions_vs_actual(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create figure
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=(16, 8))
 
-    # Plot actual values
-    ax.plot(predictions_df['date'], predictions_df['actual'],
-            color='black', linewidth=2, label='Actual', marker='o', markersize=4)
+    # Ensure date is datetime
+    df = predictions_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
 
-    # Plot predictions
-    ax.plot(predictions_df['date'], predictions_df['pred'],
-            color='#2E86AB', linewidth=2, label='Predicted', marker='s', markersize=4, alpha=0.8)
+    # Separate historical (with actuals) and future predictions (NaN actuals)
+    historical = df[df['actual'].notna()].copy()
+    future = df[df['actual'].isna()].copy()
 
-    # Add confidence interval if available
-    if 'lower_bound' in predictions_df.columns and 'upper_bound' in predictions_df.columns:
-        ax.fill_between(predictions_df['date'],
-                        predictions_df['lower_bound'],
-                        predictions_df['upper_bound'],
-                        color='#2E86AB', alpha=0.2, label='95% Confidence Interval')
+    # Add multiple confidence interval shadings (from widest to narrowest)
+    # This creates a "gradient" effect showing different confidence levels
+
+    # 95% CI (lightest shade)
+    if 'lower_95' in df.columns and 'upper_95' in df.columns:
+        ax.fill_between(df['date'],
+                        df['lower_95'],
+                        df['upper_95'],
+                        color='#2E86AB', alpha=0.15, label='95% Confidence Interval')
+
+    # 80% CI (medium shade)
+    if 'lower_80' in df.columns and 'upper_80' in df.columns:
+        ax.fill_between(df['date'],
+                        df['lower_80'],
+                        df['upper_80'],
+                        color='#2E86AB', alpha=0.25, label='80% Confidence Interval')
+
+    # 50% CI (darkest shade)
+    if 'lower_50' in df.columns and 'upper_50' in df.columns:
+        ax.fill_between(df['date'],
+                        df['lower_50'],
+                        df['upper_50'],
+                        color='#2E86AB', alpha=0.35, label='50% Confidence Interval')
+
+    # Plot predictions line
+    ax.plot(df['date'], df['pred'],
+            color='#2E86AB', linewidth=2.5, label='Predicted', marker='s', markersize=5, alpha=0.9, zorder=3)
+
+    # Plot actual values (only for historical data)
+    if not historical.empty:
+        ax.plot(historical['date'], historical['actual'],
+                color='black', linewidth=2.5, label='Actual', marker='o', markersize=5, zorder=4)
+
+    # Highlight future predictions with different marker
+    if not future.empty:
+        ax.plot(future['date'], future['pred'],
+                color='#E63946', linewidth=2.5, label='Future Prediction', marker='D',
+                markersize=6, linestyle='--', alpha=0.9, zorder=3)
 
     # Horizontal line at zero
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=1.5, alpha=0.5, zorder=1)
 
     # Styling
-    ax.set_xlabel('Date', fontsize=12, fontweight='bold')
-    ax.set_ylabel('MoM Change (thousands)', fontsize=12, fontweight='bold')
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
-    ax.legend(loc='best', fontsize=10, framealpha=0.9)
-    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlabel('Date', fontsize=13, fontweight='bold')
+    ax.set_ylabel('MoM Change (thousands)', fontsize=13, fontweight='bold')
+    ax.set_title(title, fontsize=15, fontweight='bold', pad=20)
+    ax.legend(loc='best', fontsize=10, framealpha=0.95, shadow=True)
+    ax.grid(True, alpha=0.3, linestyle='--', zorder=0)
 
     # Rotate x-axis labels
     plt.xticks(rotation=45, ha='right')

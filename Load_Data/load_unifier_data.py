@@ -251,12 +251,17 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
                 # Only include if released BEFORE snapshot date (strict <)
                 # Changed from <= to strict < to prevent same-day data leakage
                 if release_date < snap_date:
-                    # Additional check: data for month M should be released before NFP for month M
                     obs_date = row['date']
+
+                    # Additional check: data for month M should NOT appear in snapshots
+                    # BEFORE NFP for month M is released (point-in-time correctness)
+                    # But if we're creating a future snapshot (snap_date > nfp_for_month_M),
+                    # we should include all historical data that was released before snap_date
                     if obs_date in nfp_release_map:
                         nfp_for_this_month = nfp_release_map[obs_date]
-                        if release_date > nfp_for_this_month:
-                            continue  # Skip - released after NFP for this month
+                        # Only apply this restriction if we're at or before the NFP release for this month
+                        if snap_date <= nfp_for_this_month and release_date > nfp_for_this_month:
+                            continue  # Skip - would cause lookahead bias for this month's snapshot
 
                     results.append({
                         'date': obs_date,

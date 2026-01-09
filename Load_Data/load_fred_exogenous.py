@@ -270,6 +270,97 @@ def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
 
     return monthly_agg
 
+def calculate_weekly_spike_stats(weekly_df, nfp_schedule):
+    """
+    Calculate maximum weekly spike and persistence metrics per NFP target month.
+
+    This function identifies extreme spikes in weekly claims data (like COVID collapse)
+    that would be hidden by monthly averages.
+
+    Args:
+        weekly_df: DataFrame with columns ['date', 'value', 'realtime_start']
+        nfp_schedule: DataFrame with columns ['data_month', 'nfp_release_date']
+
+    Returns:
+        DataFrame with columns: date, max_value, weeks_above_p95, release_date
+    """
+    if weekly_df.empty or nfp_schedule is None:
+        return pd.DataFrame(columns=['date', 'max_value', 'weeks_above_p95', 'release_date'])
+
+    # Prepare weekly data
+    weekly_clean = weekly_df[['date', 'value', 'realtime_start']].copy()
+    weekly_clean = weekly_clean.sort_values('realtime_start')
+
+    # Use earliest release per week (handle revisions)
+    weekly_clean = weekly_clean.groupby('date').first().reset_index()
+    weekly_clean.columns = ['week_ending', 'value', 'release_date']
+
+    # Calculate historical 95th percentile (expanding window for proper vintaging)
+    weekly_sorted = weekly_clean.sort_values('week_ending').copy()
+    weekly_sorted['expanding_p95'] = weekly_sorted['value'].expanding(min_periods=52).quantile(0.95)
+
+    # Merge back the p95 threshold
+    weekly_clean = weekly_clean.merge(
+        weekly_sorted[['week_ending', 'expanding_p95']],
+        on='week_ending',
+        how='left'
+    )
+    weekly_clean['threshold_p95'] = weekly_clean['expanding_p95']
+
+    # Prepare NFP schedule for assignment
+    nfp_schedule = nfp_schedule.sort_values('nfp_release_date').copy()
+    weekly_clean = weekly_clean.sort_values('release_date')
+
+    # Assign target months using searchsorted (same logic as aggregate_weekly_to_monthly_nfp_based)
+    idx = np.searchsorted(
+        nfp_schedule['nfp_release_date'].values,
+        weekly_clean['release_date'].values,
+        side='left'
+    )
+    idx = np.clip(idx, 0, len(nfp_schedule) - 1)
+    weekly_clean['target_month'] = nfp_schedule.iloc[idx]['data_month'].values
+
+    # Filter to valid window (same as aggregate function)
+    valid_rows = []
+    for target_month, group in weekly_clean.groupby('target_month'):
+        current_nfp = nfp_schedule[nfp_schedule['data_month'] == target_month]['nfp_release_date']
+        if current_nfp.empty:
+            continue
+        current_nfp_date = current_nfp.iloc[0]
+
+        prev_nfp = nfp_schedule[nfp_schedule['nfp_release_date'] < current_nfp_date]
+        prev_nfp_date = prev_nfp.iloc[-1]['nfp_release_date'] if not prev_nfp.empty else pd.Timestamp('1900-01-01')
+
+        valid = group[
+            (group['release_date'] >= prev_nfp_date) &
+            (group['release_date'] < current_nfp_date)
+        ].copy()
+
+        valid_rows.append(valid)
+
+    if not valid_rows:
+        return pd.DataFrame(columns=['date', 'max_value', 'weeks_above_p95', 'release_date'])
+
+    weekly_assigned = pd.concat(valid_rows, ignore_index=True)
+
+    # Aggregate spike statistics
+    spike_stats = weekly_assigned.groupby('target_month').agg({
+        'value': 'max',  # Maximum weekly spike
+        'release_date': 'max'
+    }).reset_index()
+
+    # Count weeks above 95th percentile
+    weekly_assigned['is_high'] = weekly_assigned['value'] > weekly_assigned['threshold_p95']
+    weeks_high = weekly_assigned.groupby('target_month')['is_high'].sum().reset_index()
+    weeks_high.columns = ['target_month', 'weeks_above_p95']
+
+    # Merge
+    spike_stats = spike_stats.merge(weeks_high, on='target_month', how='left')
+    spike_stats = spike_stats.rename(columns={'target_month': 'date', 'value': 'max_value'})
+    spike_stats['weeks_above_p95'] = spike_stats['weeks_above_p95'].fillna(0)
+
+    return spike_stats
+
 def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
     if not FRED_API_KEY:
         logger.error("FRED_API_KEY not found.")
@@ -490,11 +581,17 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 sub_df['vix_30d_ago'] = sub_df['value'].shift(21)  # ~30 trading days
                 sub_df['vix_spike_ratio'] = sub_df['value'] / sub_df['vix_30d_ago']
 
+                # NEW: Calculate daily z-scores (standard deviations from 12-month rolling mean)
+                sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+                sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+                sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
                 monthly_agg = sub_df.resample('MS').agg({
                     'value': ['mean', 'max'],  # Average fear & Peak fear
                     'daily_chg': 'std',  # Volatility of volatility
                     'vix_spike_ratio': 'max',  # Largest spike in month
-                    'rolling_52w_high': 'last'  # Reference point for regime
+                    'rolling_52w_high': 'last',  # Reference point for regime
+                    'z_score_12m': ['mean', 'max', 'min']  # NEW: Regime detection via z-scores
                 })
 
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
@@ -515,6 +612,15 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                     temp_df['VIX_30d_spike'] = monthly_agg[spike_col]
                 else:
                     temp_df['VIX_30d_spike'] = np.nan
+
+                # NEW: Z-score features (standard deviations from 12-month mean)
+                zscore_mean_col = 'z_score_12m_mean' if 'z_score_12m_mean' in monthly_agg.columns else None
+                zscore_max_col = 'z_score_12m_max' if 'z_score_12m_max' in monthly_agg.columns else None
+                zscore_min_col = 'z_score_12m_min' if 'z_score_12m_min' in monthly_agg.columns else None
+
+                temp_df['VIX_zscore_12m_mean'] = monthly_agg[zscore_mean_col] if zscore_mean_col and zscore_mean_col in monthly_agg.columns else np.nan
+                temp_df['VIX_zscore_12m_max'] = monthly_agg[zscore_max_col] if zscore_max_col and zscore_max_col in monthly_agg.columns else np.nan
+                temp_df['VIX_zscore_12m_min'] = monthly_agg[zscore_min_col] if zscore_min_col and zscore_min_col in monthly_agg.columns else np.nan
 
                 # Regime indicators (will be further processed downstream)
                 # VIX >50 = Extreme Panic (COVID hit 82)
@@ -546,12 +652,18 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 # Daily volatility (21-day rolling)
                 sub_df['volatility_21d'] = sub_df['daily_return'].rolling(window=21, min_periods=10).std() * np.sqrt(252) * 100
 
+                # NEW: Calculate daily z-scores (standard deviations from 12-month rolling mean)
+                sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+                sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+                sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
                 monthly_agg = sub_df.resample('MS').agg({
                     'value': ['first', 'last', 'min'],  # Month start/end/low
                     'drawdown': 'min',  # Maximum drawdown in month
                     'return_30d': 'last',  # Month-end 30-day return
                     'volatility_21d': 'mean',  # Average volatility
-                    'daily_return': ['std', 'min']  # Monthly vol & worst day
+                    'daily_return': ['std', 'min'],  # Monthly vol & worst day
+                    'z_score_12m': ['mean', 'max', 'min']  # NEW: Regime detection via z-scores
                 })
 
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
@@ -577,6 +689,15 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 temp_df['SP500_max_drawdown'] = monthly_agg[dd_col] if dd_col in monthly_agg.columns else np.nan
                 temp_df['SP500_volatility'] = monthly_agg[vol_col] if vol_col in monthly_agg.columns else np.nan
                 temp_df['SP500_worst_day'] = (monthly_agg[worst_col] * 100) if worst_col in monthly_agg.columns else np.nan
+
+                # NEW: Z-score features (standard deviations from 12-month mean)
+                zscore_mean_col = 'z_score_12m_mean' if 'z_score_12m_mean' in monthly_agg.columns else None
+                zscore_max_col = 'z_score_12m_max' if 'z_score_12m_max' in monthly_agg.columns else None
+                zscore_min_col = 'z_score_12m_min' if 'z_score_12m_min' in monthly_agg.columns else None
+
+                temp_df['SP500_zscore_12m_mean'] = monthly_agg[zscore_mean_col] if zscore_mean_col and zscore_mean_col in monthly_agg.columns else np.nan
+                temp_df['SP500_zscore_12m_max'] = monthly_agg[zscore_max_col] if zscore_max_col and zscore_max_col in monthly_agg.columns else np.nan
+                temp_df['SP500_zscore_12m_min'] = monthly_agg[zscore_min_col] if zscore_min_col and zscore_min_col in monthly_agg.columns else np.nan
 
                 # Crash indicators
                 # Bear market: Down >20% from 52w high
@@ -609,11 +730,17 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 # Acceleration (rate of change of change)
                 sub_df['acceleration'] = sub_df['daily_chg'].diff()
 
+                # NEW: Calculate daily z-scores (standard deviations from 12-month rolling mean)
+                sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+                sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+                sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
                 monthly_agg = sub_df.resample('MS').agg({
                     'value': 'mean',           # State
                     'daily_chg': ['std', 'sum'],  # Volatility & Direction
-                    'z_score': 'max',  # How extreme vs. history
-                    'acceleration': ['mean', 'std']  # Speed of change & volatility
+                    'z_score': 'max',  # How extreme vs. history (expanding)
+                    'acceleration': ['mean', 'std'],  # Speed of change & volatility
+                    'z_score_12m': ['mean', 'max', 'min']  # NEW: 12-month regime detection
                 })
 
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
@@ -631,10 +758,19 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 temp_df[f'{name}_vol_of_changes'] = monthly_agg[vol_col] if vol_col in monthly_agg.columns else np.nan
                 temp_df[f'{name}_monthly_chg'] = monthly_agg[sum_col] if sum_col in monthly_agg.columns else np.nan
 
-                # NEW: Extreme event features
+                # Extreme event features (expanding z-score)
                 temp_df[f'{name}_zscore_max'] = monthly_agg[z_col] if z_col in monthly_agg.columns else np.nan
                 temp_df[f'{name}_acceleration'] = monthly_agg[accel_mean_col] if accel_mean_col in monthly_agg.columns else np.nan
                 temp_df[f'{name}_accel_volatility'] = monthly_agg[accel_std_col] if accel_std_col in monthly_agg.columns else np.nan
+
+                # NEW: Z-score 12m features (standard deviations from 12-month mean)
+                zscore_12m_mean_col = 'z_score_12m_mean' if 'z_score_12m_mean' in monthly_agg.columns else None
+                zscore_12m_max_col = 'z_score_12m_max' if 'z_score_12m_max' in monthly_agg.columns else None
+                zscore_12m_min_col = 'z_score_12m_min' if 'z_score_12m_min' in monthly_agg.columns else None
+
+                temp_df[f'{name}_zscore_12m_mean'] = monthly_agg[zscore_12m_mean_col] if zscore_12m_mean_col and zscore_12m_mean_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_zscore_12m_max'] = monthly_agg[zscore_12m_max_col] if zscore_12m_max_col and zscore_12m_max_col in monthly_agg.columns else np.nan
+                temp_df[f'{name}_zscore_12m_min'] = monthly_agg[zscore_12m_min_col] if zscore_12m_min_col and zscore_12m_min_col in monthly_agg.columns else np.nan
 
                 sub_df = temp_df.reset_index().melt(
                     id_vars=['date'],
@@ -656,17 +792,23 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 # Negative price indicator (unprecedented Apr 2020)
                 sub_df['is_negative'] = (sub_df['value'] < 0).astype(int)
 
-                # Historical z-score
+                # Historical z-score (expanding - kept for compatibility)
                 sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
                 sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
                 sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
+
+                # NEW: Calculate daily z-scores (standard deviations from 12-month rolling mean)
+                sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+                sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+                sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
 
                 monthly_agg = sub_df.resample('MS').agg({
                     'value': 'mean',        # State
                     'daily_chg': 'std',     # Volatility of dollar moves
                     'crash_30d_pct': 'min',  # Worst 30-day crash in month
                     'is_negative': 'max',    # Did it go negative?
-                    'z_score': 'min'         # How extreme vs. history (min = biggest crash)
+                    'z_score': 'min',        # How extreme vs. history (min = biggest crash)
+                    'z_score_12m': ['mean', 'max', 'min']  # NEW: 12-month regime detection
                 })
 
                 if isinstance(monthly_agg.columns, pd.MultiIndex):
@@ -682,13 +824,22 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 temp_df['Oil_Prices_mean'] = monthly_agg[value_col]
                 temp_df['Oil_Prices_volatility'] = monthly_agg[chg_col]
 
-                # NEW: Extreme event features
+                # Extreme event features
                 if crash_col and crash_col in monthly_agg.columns:
                     temp_df['Oil_Prices_30d_crash'] = monthly_agg[crash_col]
                 if neg_col and neg_col in monthly_agg.columns:
                     temp_df['Oil_Prices_went_negative'] = monthly_agg[neg_col]
                 if zscore_col and zscore_col in monthly_agg.columns:
                     temp_df['Oil_Prices_zscore_min'] = monthly_agg[zscore_col]
+
+                # NEW: Z-score 12m features (standard deviations from 12-month mean)
+                zscore_12m_mean_col = 'z_score_12m_mean' if 'z_score_12m_mean' in monthly_agg.columns else None
+                zscore_12m_max_col = 'z_score_12m_max' if 'z_score_12m_max' in monthly_agg.columns else None
+                zscore_12m_min_col = 'z_score_12m_min' if 'z_score_12m_min' in monthly_agg.columns else None
+
+                temp_df['Oil_Prices_zscore_12m_mean'] = monthly_agg[zscore_12m_mean_col] if zscore_12m_mean_col and zscore_12m_mean_col in monthly_agg.columns else np.nan
+                temp_df['Oil_Prices_zscore_12m_max'] = monthly_agg[zscore_12m_max_col] if zscore_12m_max_col and zscore_12m_max_col in monthly_agg.columns else np.nan
+                temp_df['Oil_Prices_zscore_12m_min'] = monthly_agg[zscore_12m_min_col] if zscore_12m_min_col and zscore_12m_min_col in monthly_agg.columns else np.nan
 
                 sub_df = temp_df.reset_index().melt(
                     id_vars=['date'],
@@ -704,16 +855,33 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 # Prepare data for aggregation function
                 weekly_data = latest[['date', 'value', 'realtime_start']].copy()
 
-                # Use NFP-based aggregation
+                # Get monthly average (existing)
                 monthly_avg = aggregate_weekly_to_monthly_nfp_based(weekly_data, nfp_schedule)
 
                 if monthly_avg.empty:
                     logger.warning(f"No monthly data generated for {name}")
                     continue
 
-                monthly_avg['series_name'] = f"{name}_monthly_avg"
-                sub_df = monthly_avg.copy()
-                logger.info(f"Calculated NFP-based monthly average for {name}")
+                # NEW: Calculate spike statistics per target month
+                monthly_spike_stats = calculate_weekly_spike_stats(weekly_data, nfp_schedule)
+
+                # Create multiple series for this claims data
+                avg_series = monthly_avg.copy()
+                avg_series['series_name'] = f"{name}_monthly_avg"
+
+                # Create spike series
+                spike_series = monthly_spike_stats.copy()
+                spike_series = spike_series.rename(columns={'max_value': 'value'})
+                spike_series['series_name'] = f"{name}_max_spike"
+
+                # Create weeks_high series
+                weeks_high_series = monthly_spike_stats[['date', 'weeks_above_p95', 'release_date']].copy()
+                weeks_high_series = weeks_high_series.rename(columns={'weeks_above_p95': 'value'})
+                weeks_high_series['series_name'] = f"{name}_weeks_high"
+
+                # Combine all series for this claims indicator
+                sub_df = pd.concat([avg_series, spike_series, weeks_high_series], ignore_index=True)
+                logger.info(f"Calculated NFP-based features for {name}: monthly_avg, max_spike, weeks_high")
                 
             else:
                 # JOLTS and other monthly data

@@ -16,7 +16,7 @@ Key Features:
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import sys
 import pickle
 from datetime import datetime
@@ -35,6 +35,7 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
     from sklearn.feature_selection import mutual_info_regression
+    from sklearn.linear_model import LinearRegression
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     logger.warning("LightGBM/sklearn not available. Install with: pip install lightgbm scikit-learn")
@@ -51,6 +52,39 @@ MAX_FEATURES = 80  # Maximum number of features to use in final model
 VIF_THRESHOLD = 10.0  # Remove features with VIF above this
 CORR_THRESHOLD = 0.95  # Remove one of a pair with correlation above this
 MIN_TARGET_CORR = 0.05  # Minimum absolute correlation with target
+
+# Linear baseline predictors for extrapolation capability
+# These are chosen because they have strong linear relationships with NFP
+# and can extrapolate beyond training ranges (unlike trees)
+LINEAR_BASELINE_PREDICTORS = [
+    # Weekly Claims - PRIMARY EXTRAPOLATION SIGNAL
+    'CCSA_monthly_avg_latest',       # Current month average
+    'CCSA_max_spike',                 # Maximum spike (NEW from Task 3)
+    'CCSA_monthly_avg_lag1',          # Previous month
+    'CCSA_monthly_avg_mom_change',    # Month-over-month change
+
+    # Oil Prices - Economic stress indicator
+    'Oil_Prices_mean_latest',         # Current level
+    'Oil_Prices_30d_crash',           # Crash magnitude
+
+    # Yield Curve - Leading indicator (12-month lag)
+    'Yield_Curve_avg_lag12',          # Signal from year ago
+    'Yield_Curve_monthly_chg_lag12',  # Change from year ago
+
+    # Past NFP as autoregressive component
+    'nfp_nsa_mom_lag1',               # Previous NFP MoM
+    'nfp_sa_mom_lag1',                # Previous SA NFP MoM
+]
+
+# Binary regime flags that should never be removed by feature selection
+# These capture critical extreme events (COVID-like scenarios)
+PROTECTED_BINARY_FLAGS = [
+    'VIX_panic_regime',       # VIX >50 (extreme panic)
+    'VIX_high_regime',        # VIX >40 (high fear)
+    'SP500_crash_month',      # Monthly return <-10%
+    'SP500_bear_market',      # Drawdown <-20% from 52w high
+    'SP500_circuit_breaker',  # Any day down >5%
+]
 
 
 # --- Path Configuration ---
@@ -931,12 +965,56 @@ def build_training_dataset(
     return X, y
 
 
+def get_lgbm_params(
+    use_huber_loss: bool = False,
+    huber_delta: float = 1.0
+) -> Dict:
+    """
+    Get LightGBM parameters with optional Huber loss.
+
+    Args:
+        use_huber_loss: If True, use Huber objective (robust to outliers)
+        huber_delta: Huber delta parameter (transition point between L1 and L2)
+
+    Returns:
+        Dictionary of LightGBM parameters
+    """
+    params = {
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'learning_rate': 0.03,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'min_data_in_leaf': 1,
+        'lambda_l1': 0.1,
+        'lambda_l2': 0.1,
+        'verbose': -1,
+        'seed': 42,
+        'force_row_wise': True
+    }
+
+    if use_huber_loss:
+        params['objective'] = 'huber'
+        params['alpha'] = huber_delta  # Huber delta parameter
+        params['metric'] = ['huber', 'mae']
+        logger.info(f"Using Huber loss with delta={huber_delta}")
+    else:
+        params['objective'] = 'regression'
+        params['metric'] = ['rmse', 'mae']
+        logger.info("Using standard RMSE regression loss")
+
+    return params
+
+
 def train_lightgbm_model(
     X: pd.DataFrame,
     y: pd.Series,
     n_splits: int = 5,
     num_boost_round: int = 1000,
-    early_stopping_rounds: int = 50
+    early_stopping_rounds: int = 50,
+    use_huber_loss: bool = False,
+    huber_delta: float = 1.0
 ) -> Tuple[lgb.Booster, Dict, List[float]]:
     """
     Train LightGBM model with time-series cross-validation.
@@ -962,22 +1040,7 @@ def train_lightgbm_model(
     logger.info(f"Training LightGBM on {len(X_train)} samples with {len(feature_cols)} features")
 
     # LightGBM parameters optimized for small datasets
-    params = {
-        'objective': 'regression',
-        'metric': ['rmse', 'mae'],
-        'boosting_type': 'gbdt',
-        'num_leaves': 31,
-        'learning_rate': 0.03,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 5,
-        'min_data_in_leaf': 10,
-        'lambda_l1': 0.1,
-        'lambda_l2': 0.1,
-        'verbose': -1,
-        'seed': 42,
-        'force_row_wise': True
-    }
+    params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
     # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -1160,7 +1223,9 @@ def save_model(
     residuals: List[float],
     importance: Dict,
     save_dir: Path = MODEL_SAVE_DIR,
-    target_type: str = 'nsa'
+    target_type: str = 'nsa',
+    linear_model: Optional[Any] = None,
+    linear_cols: Optional[List[str]] = None
 ):
     """Save model and associated metadata."""
     # Create subdirectory for target type
@@ -1179,7 +1244,9 @@ def save_model(
         'trained_at': datetime.now().isoformat(),
         'std_residual': np.std(residuals),
         'mean_residual': np.mean(residuals),
-        'target_type': target_type
+        'target_type': target_type,
+        'linear_model': linear_model,
+        'linear_cols': linear_cols
     }
 
     metadata_path = type_save_dir / f"model_metadata_{target_type}.pkl"
@@ -1188,6 +1255,8 @@ def save_model(
 
     logger.info(f"Saved {target_type.upper()} model to {model_path}")
     logger.info(f"Saved metadata to {metadata_path}")
+    if linear_model is not None:
+        logger.info(f"Saved linear baseline model with {len(linear_cols)} predictors")
 
 
 def load_model(save_dir: Path = MODEL_SAVE_DIR, target_type: str = 'nsa') -> Tuple[lgb.Booster, Dict]:
@@ -1345,7 +1414,9 @@ def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     use_feature_selection: bool = True,
-    feature_selection_interval: int = 6  # Re-run feature selection every N months
+    feature_selection_interval: int = 6,  # Re-run feature selection every N months
+    use_huber_loss: bool = False,
+    huber_delta: float = 1.0
 ) -> pd.DataFrame:
     """
     Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
@@ -1439,52 +1510,55 @@ def run_expanding_window_backtest(
         y_train_valid = y_train[valid_train_mask].copy()
 
         # FEATURE SELECTION: Re-run periodically using only valid training data
-        # COMMENTED OUT: Testing model without feature filtering - let LightGBM choose features
-        # if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
-        #     logger.info(f"\n[{target_month.strftime('%Y-%m')}] Re-running feature selection on {len(train_idx_valid)} samples...")
-        #
-        #     # Feature selection on valid training data ONLY
-        #     selected_features, _ = select_features_comprehensive(
-        #         X=X_train_valid,
-        #         y=y_train_valid,
-        #         max_features=MAX_FEATURES,
-        #         output_dir=None,  # Don't save intermediate results
-        #         target_type=target_type
-        #     )
-        #     cached_features = selected_features
-        #     last_feature_selection_idx = i
-        #     logger.info(f"Selected {len(cached_features)} features")
+        if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
+            logger.info(f"\n[{target_month.strftime('%Y-%m')}] Re-running feature selection on {len(train_idx_valid)} samples...")
+
+            # Feature selection on valid training data ONLY
+            selected_features, _ = select_features_comprehensive(
+                X=X_train_valid,
+                y=y_train_valid,
+                max_features=MAX_FEATURES,
+                output_dir=None,  # Don't save intermediate results
+                target_type=target_type
+            )
+            cached_features = selected_features
+            last_feature_selection_idx = i
+            logger.info(f"Selected {len(cached_features)} features")
 
         # Get feature columns for this iteration
-        # COMMENTED OUT: Use all features instead of filtered subset
-        # if use_feature_selection and cached_features:
-        #     feature_cols = [c for c in cached_features if c in X_train_valid.columns and c != 'ds']
-        # else:
-        #     feature_cols = [c for c in X_train_valid.columns if c != 'ds']
+        if use_feature_selection and cached_features:
+            feature_cols = [c for c in cached_features if c in X_train_valid.columns and c != 'ds']
+        else:
+            feature_cols = [c for c in X_train_valid.columns if c != 'ds']
 
-        # Use all available features (let LightGBM decide via feature importance)
-        feature_cols = [c for c in X_train_valid.columns if c != 'ds']
+        # NEW: Train Linear Baseline and Add as Feature
+        linear_model, linear_cols_used = train_linear_baseline(
+            X_train_valid,
+            y_train_valid,
+            LINEAR_BASELINE_PREDICTORS
+        )
+
+        if linear_model is not None:
+            # Add linear baseline prediction as feature to training data
+            X_train_valid['linear_baseline_pred'] = create_linear_baseline_feature(
+                X_train_valid,
+                linear_model,
+                linear_cols_used
+            )
+
+            # Ensure it's in feature_cols
+            if 'linear_baseline_pred' not in feature_cols:
+                feature_cols.append('linear_baseline_pred')
+
+            logger.info(f"Added linear baseline feature using {len(linear_cols_used)} predictors")
+        else:
+            logger.warning("Linear baseline model failed, proceeding without it")
 
         # Prepare training data with selected features
         X_train_selected = X_train_valid[feature_cols]
 
         # LightGBM parameters
-        params = {
-            'objective': 'regression',
-            'metric': ['rmse', 'mae'],
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.03,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'min_data_in_leaf': 10,
-            'lambda_l1': 0.1,
-            'lambda_l2': 0.1,
-            'verbose': -1,
-            'seed': 42,
-            'force_row_wise': True
-        }
+        params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
         # Train model (with optional warm start) using only valid targets
         train_size = int(len(X_train_selected) * 0.85)
@@ -1519,7 +1593,17 @@ def run_expanding_window_backtest(
 
         # PREDICTION: Get features for target month using same imputation
         X_pred_imputed = impute_with_expanding_window(X_full, train_idx)
-        X_pred = X_pred_imputed.iloc[[target_idx]][feature_cols]
+        X_pred = X_pred_imputed.iloc[[target_idx]].copy()
+
+        # NEW: Add linear baseline feature to prediction
+        if linear_model is not None:
+            X_pred['linear_baseline_pred'] = create_linear_baseline_feature(
+                X_pred,
+                linear_model,
+                linear_cols_used
+            )
+
+        X_pred = X_pred[feature_cols]
 
         # Make prediction
         prediction = model.predict(X_pred)[0]
@@ -1606,7 +1690,12 @@ def run_expanding_window_backtest(
     return results_df
 
 
-def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = True):
+def train_and_evaluate(
+    target_type: str = 'nsa',
+    use_feature_selection: bool = True,
+    use_huber_loss: bool = False,
+    huber_delta: float = 1.0
+):
     """
     Main training and evaluation function using EXPANDING WINDOW methodology.
 
@@ -1654,7 +1743,9 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
         target_df=target_df,
         target_type=target_type,
         use_feature_selection=use_feature_selection,
-        feature_selection_interval=6  # Re-select features every 6 months
+        feature_selection_interval=6,  # Re-select features every 6 months
+        use_huber_loss=use_huber_loss,
+        huber_delta=huber_delta
     )
 
     if backtest_results.empty:
@@ -1676,28 +1767,38 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
 
     logger.info(f"Total observations: {len(X_full)}, Valid for training: {len(X_full_valid)}")
 
-    # Final feature selection on full training data (for production model only)
-    # COMMENTED OUT: Testing model without feature filtering - let LightGBM choose features
-    # if use_feature_selection:
-    #     feature_output_dir = OUTPUT_DIR / "feature_selection" / target_type
-    #     feature_output_dir.mkdir(parents=True, exist_ok=True)
-    #
-    #     selected_features, selection_metadata = select_features_comprehensive(
-    #         X=X_full_valid,
-    #         y=y_full_valid,
-    #         max_features=MAX_FEATURES,
-    #         output_dir=feature_output_dir,
-    #         target_type=target_type
-    #     )
-    #     feature_cols = selected_features
-    #     X_train = X_full_valid[['ds'] + [c for c in selected_features if c in X_full_valid.columns]].copy()
-    # else:
-    #     feature_cols = [c for c in X_full_valid.columns if c != 'ds']
-    #     X_train = X_full_valid.copy()
+    # NEW: Train linear baseline on full training data BEFORE feature selection
+    logger.info("\nTraining Linear Baseline Model for Production...")
+    linear_model_prod, linear_cols_prod = train_linear_baseline(
+        X_full_valid,
+        y_full_valid,
+        LINEAR_BASELINE_PREDICTORS
+    )
 
-    # Use all available features (let LightGBM decide via feature importance)
-    feature_cols = [c for c in X_full_valid.columns if c != 'ds']
-    X_train = X_full_valid.copy()
+    if linear_model_prod is not None:
+        X_full_valid['linear_baseline_pred'] = create_linear_baseline_feature(
+            X_full_valid,
+            linear_model_prod,
+            linear_cols_prod
+        )
+
+    # Final feature selection on full training data (for production model only)
+    if use_feature_selection:
+        feature_output_dir = OUTPUT_DIR / "feature_selection" / target_type
+        feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+        selected_features, selection_metadata = select_features_comprehensive(
+            X=X_full_valid,
+            y=y_full_valid,
+            max_features=MAX_FEATURES,
+            output_dir=feature_output_dir,
+            target_type=target_type
+        )
+        feature_cols = selected_features
+        X_train = X_full_valid[['ds'] + [c for c in selected_features if c in X_full_valid.columns]].copy()
+    else:
+        feature_cols = [c for c in X_full_valid.columns if c != 'ds']
+        X_train = X_full_valid.copy()
 
     # Train final model (using only valid targets)
     model, importance, residuals = train_lightgbm_model(
@@ -1705,11 +1806,21 @@ def train_and_evaluate(target_type: str = 'nsa', use_feature_selection: bool = T
         y_full_valid,
         n_splits=5,
         num_boost_round=1000,
-        early_stopping_rounds=50
+        early_stopping_rounds=50,
+        use_huber_loss=use_huber_loss,
+        huber_delta=huber_delta
     )
 
     # Save production model
-    save_model(model, feature_cols, residuals, importance, target_type=target_type)
+    save_model(
+        model,
+        feature_cols,
+        residuals,
+        importance,
+        target_type=target_type,
+        linear_model=linear_model_prod,
+        linear_cols=linear_cols_prod
+    )
 
     # Save backtest results
     results_dir = OUTPUT_DIR / "backtest_results" / target_type
@@ -1864,6 +1975,84 @@ def predict_nfp_mom(
         'features_used': len(feature_cols),
         'target_type': target_type
     }
+
+
+def train_linear_baseline(
+    X: pd.DataFrame,
+    y: pd.Series,
+    predictor_cols: List[str]
+) -> Tuple[Any, List[str]]:
+    """
+    Train simple OLS baseline using key predictors for extrapolation.
+
+    This linear model can extrapolate beyond training data ranges,
+    unlike tree-based models which are bounded by training leaves.
+
+    Args:
+        X: Feature DataFrame
+        y: Target Series
+        predictor_cols: List of column names to use as predictors
+
+    Returns:
+        Tuple of (trained LinearRegression model, actual columns used)
+    """
+    if not LIGHTGBM_AVAILABLE:
+        logger.warning("sklearn not available, cannot train linear baseline")
+        return None, []
+
+    # Filter to only requested predictors that exist
+    available_cols = [c for c in predictor_cols if c in X.columns]
+
+    if not available_cols:
+        logger.warning("No linear baseline predictors found, returning None")
+        return None, []
+
+    X_linear = X[available_cols].copy()
+
+    # Handle missing values (fill with 0 for simplicity)
+    X_linear = X_linear.fillna(0)
+
+    # Train OLS
+    model = LinearRegression()
+    model.fit(X_linear, y)
+
+    # Log coefficients
+    logger.info("Linear Baseline Model Coefficients:")
+    for col, coef in zip(available_cols, model.coef_):
+        logger.info(f"  {col}: {coef:.4f}")
+    logger.info(f"  Intercept: {model.intercept_:.4f}")
+
+    # Calculate R² on training data
+    r2 = model.score(X_linear, y)
+    logger.info(f"  Training R²: {r2:.4f}")
+
+    return model, available_cols
+
+
+def create_linear_baseline_feature(
+    X: pd.DataFrame,
+    linear_model: Any,
+    predictor_cols: List[str]
+) -> pd.Series:
+    """
+    Generate predictions from linear baseline model as a feature.
+
+    Args:
+        X: Feature DataFrame
+        linear_model: Trained LinearRegression model
+        predictor_cols: Column names used by linear model
+
+    Returns:
+        Series of linear baseline predictions
+    """
+    if linear_model is None or not predictor_cols:
+        return pd.Series(0, index=X.index)
+
+    X_linear = X[predictor_cols].copy()
+    X_linear = X_linear.fillna(0)
+
+    predictions = linear_model.predict(X_linear)
+    return pd.Series(predictions, index=X.index, name='linear_baseline_pred')
 
 
 def convert_mom_to_level(
@@ -2339,10 +2528,19 @@ def select_features_comprehensive(
     logger.info("=" * 60)
     logger.info(f"Starting with {len(X.columns)} features, target: {max_features}")
 
+    # Identify protected binary flags present in dataset
+    protected_features_present = [f for f in PROTECTED_BINARY_FLAGS if f in X.columns]
+
+    if protected_features_present:
+        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal:")
+        for f in protected_features_present:
+            logger.info(f"  - {f}")
+
     # Initialize metadata
     metadata = {
         'initial_features': len(X.columns),
         'target_features': max_features,
+        'protected_features': protected_features_present,
         'steps': []
     }
 
@@ -2354,6 +2552,10 @@ def select_features_comprehensive(
     # Remove columns with too many NaN (>50%)
     nan_pct = X_work.isna().mean()
     high_nan_cols = nan_pct[nan_pct > 0.5].index.tolist()
+
+    # Don't remove protected features
+    high_nan_cols = [c for c in high_nan_cols if c not in protected_features_present]
+
     X_work = X_work.drop(columns=high_nan_cols)
     logger.info(f"Step 1: Removed {len(high_nan_cols)} high-NaN columns, {len(X_work.columns)} remaining")
     metadata['steps'].append({'step': 'high_nan_removal', 'removed': len(high_nan_cols), 'remaining': len(X_work.columns)})
@@ -2364,6 +2566,10 @@ def select_features_comprehensive(
 
     # Remove zero variance
     zero_var = X_work.columns[X_work.var() == 0].tolist()
+
+    # Don't remove protected features
+    zero_var = [c for c in zero_var if c not in protected_features_present]
+
     X_work = X_work.drop(columns=zero_var)
     logger.info(f"Step 2: Removed {len(zero_var)} zero-variance columns, {len(X_work.columns)} remaining")
     metadata['steps'].append({'step': 'zero_variance_removal', 'removed': len(zero_var), 'remaining': len(X_work.columns)})
@@ -2371,11 +2577,27 @@ def select_features_comprehensive(
     # Step 2: Target correlation filter
     logger.info("\nStep 3: Target Correlation Filter")
     X_work, removed = select_by_target_correlation(X_work, y, min_corr=MIN_TARGET_CORR)
+
+    # Add back any protected features that were removed
+    removed_protected = [f for f in protected_features_present if f not in X_work.columns and f in X.columns]
+    if removed_protected:
+        logger.info(f"Re-adding {len(removed_protected)} protected features removed by correlation filter")
+        for f in removed_protected:
+            X_work[f] = X[f]
+
     metadata['steps'].append({'step': 'target_correlation_filter', 'removed': len(removed), 'remaining': len(X_work.columns)})
 
     # Step 3: High correlation removal
     logger.info("\nStep 4: High Correlation Removal")
     X_work, removed = remove_correlated_features(X_work, y, corr_threshold=CORR_THRESHOLD)
+
+    # Add back protected features
+    removed_protected = [f for f in protected_features_present if f not in X_work.columns and f in X.columns]
+    if removed_protected:
+        logger.info(f"Re-adding {len(removed_protected)} protected features removed by correlation filter")
+        for f in removed_protected:
+            X_work[f] = X[f]
+
     metadata['steps'].append({'step': 'high_correlation_removal', 'removed': len(removed), 'remaining': len(X_work.columns)})
 
     # Step 4: Compute importance metrics
@@ -2428,6 +2650,12 @@ def select_features_comprehensive(
     # Step 6: Select top features
     selected_features = ranking_df['feature'].head(max_features).tolist()
 
+    # Ensure all protected features are included (even if outside top-N)
+    for f in protected_features_present:
+        if f not in selected_features and f in X_work.columns:
+            selected_features.append(f)
+            logger.info(f"Force-included protected feature: {f}")
+
     logger.info(f"\nSelected {len(selected_features)} features based on aggregated ranking")
 
     # Step 7: Optional VIF check on final set
@@ -2435,6 +2663,15 @@ def select_features_comprehensive(
         logger.info("\nStep 7: VIF Check on Selected Features")
         X_selected = X_work[selected_features]
         X_selected, vif_removed = remove_high_vif_features(X_selected, vif_threshold=VIF_THRESHOLD, max_iterations=20)
+
+        # Add back protected features if they were removed by VIF
+        vif_removed_protected = [f for f in protected_features_present if f in vif_removed]
+        if vif_removed_protected:
+            logger.info(f"VIF removed {len(vif_removed_protected)} protected features - adding them back")
+            for f in vif_removed_protected:
+                if f in X_work.columns:
+                    X_selected[f] = X_work[f]
+
         if vif_removed:
             selected_features = list(X_selected.columns)
             logger.info(f"After VIF check: {len(selected_features)} features")
@@ -2562,6 +2799,10 @@ if __name__ == "__main__":
                         help='Target type: nsa (non-seasonally adjusted) or sa (seasonally adjusted)')
     parser.add_argument('--train-both', action='store_true', help='Train both NSA and SA models')
     parser.add_argument('--diagnostics', action='store_true', help='Run feature diagnostics (VIF, correlations)')
+    parser.add_argument('--huber-loss', action='store_true',
+                        help='Use Huber loss instead of RMSE (robust to outliers)')
+    parser.add_argument('--huber-delta', type=float, default=1.0,
+                        help='Huber delta parameter (default: 1.0)')
 
     args = parser.parse_args()
 
@@ -2570,10 +2811,10 @@ if __name__ == "__main__":
         run_feature_diagnostics(target_type=args.target)
     elif args.train_both:
         logger.info("Training both NSA and SA models...")
-        train_and_evaluate(target_type='nsa')
-        train_and_evaluate(target_type='sa')
+        train_and_evaluate(target_type='nsa', use_huber_loss=args.huber_loss, huber_delta=args.huber_delta)
+        train_and_evaluate(target_type='sa', use_huber_loss=args.huber_loss, huber_delta=args.huber_delta)
     elif args.train:
-        train_and_evaluate(target_type=args.target)
+        train_and_evaluate(target_type=args.target, use_huber_loss=args.huber_loss, huber_delta=args.huber_delta)
     elif args.predict:
         target_month = pd.Timestamp(args.predict + '-01')
         result = predict_nfp_mom(target_month, target_type=args.target)

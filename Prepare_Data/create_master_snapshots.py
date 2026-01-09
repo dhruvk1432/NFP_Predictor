@@ -41,15 +41,16 @@ PCT_CHANGE_SERIES = [
 
 # 2. Crash Handling: SymLog for Negative Values + Outliers (Replace Original)
 # Formula: sign(x) * log1p(abs(x))
+# NOTE: Panic indicators (CCSA_MoM_Pct, SP500_*) removed to preserve raw magnitude for linear extrapolation
 SYMLOG_TRANSFORM_SERIES = [
     "ADP_actual",
     "Credit_Spreads_monthly_chg",
     "Yield_Curve_monthly_chg",
-    "CCSA_MoM_Pct",
-    "SP500_monthly_return",
-    "SP500_30d_return",
-    "SP500_max_drawdown",
-    "SP500_worst_day",
+    # "CCSA_MoM_Pct",  # REMOVED: Need linear extrapolation for extreme spikes
+    # "SP500_monthly_return",  # REMOVED: Preserve crash magnitude
+    # "SP500_30d_return",  # REMOVED: Preserve crash magnitude
+    # "SP500_max_drawdown",  # REMOVED: Preserve crash magnitude
+    # "SP500_worst_day",  # REMOVED: Preserve crash magnitude
     "Oil_Prices_30d_crash",
     "Oil_Prices_zscore_min",
     "Credit_Spreads_zscore_max",

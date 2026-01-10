@@ -1,0 +1,156 @@
+2026-01-08 14:50:09,579 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:283 - Preparing FRED Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 14:50:09,579 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:284 - Options: mom_conversion=True, transforms=True, scaling=True
+2026-01-08 14:50:09,813 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1990-01-31
+2026-01-08 14:50:12,626 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1991-01-31
+2026-01-08 14:50:15,515 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1992-01-31
+2026-01-08 14:50:18,391 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1993-01-31
+2026-01-08 14:50:21,265 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1994-01-31
+2026-01-08 14:50:24,187 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1995-01-31
+2026-01-08 14:50:27,111 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1996-01-31
+2026-01-08 14:50:30,057 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1997-01-31
+2026-01-08 14:50:33,017 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1998-01-31
+2026-01-08 14:50:35,979 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 1999-01-31
+2026-01-08 14:50:38,954 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2000-01-31
+2026-01-08 14:50:41,945 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2001-01-31
+2026-01-08 14:50:44,944 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2002-01-31
+2026-01-08 14:50:47,952 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2003-01-31
+2026-01-08 14:50:50,955 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2004-01-31
+2026-01-08 14:50:53,941 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2005-01-31
+2026-01-08 14:50:56,951 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2006-01-31
+2026-01-08 14:50:59,984 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2007-01-31
+2026-01-08 14:51:02,986 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2008-01-31
+2026-01-08 14:51:06,006 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2009-01-31
+2026-01-08 14:51:09,012 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2010-01-31
+2026-01-08 14:51:12,022 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2011-01-31
+2026-01-08 14:51:15,133 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2012-01-31
+2026-01-08 14:51:18,224 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2013-01-31
+2026-01-08 14:51:21,360 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2014-01-31
+2026-01-08 14:51:24,481 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2015-01-31
+2026-01-08 14:51:27,645 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2016-01-31
+2026-01-08 14:51:30,806 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2017-01-31
+2026-01-08 14:51:33,971 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2018-01-31
+2026-01-08 14:51:37,138 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2019-01-31
+2026-01-08 14:51:40,336 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2020-01-31
+2026-01-08 14:51:43,530 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2021-01-31
+2026-01-08 14:51:46,745 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2022-01-31
+2026-01-08 14:51:49,956 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2023-01-31
+2026-01-08 14:51:53,175 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2024-01-31
+2026-01-08 14:51:56,411 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:324 - Prepared snapshot for 2025-01-31
+2026-01-08 14:51:59,410 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:326 - FRED Snapshots preparation complete.
+2026-01-08 14:51:59,411 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:335 - Verifying Prepared FRED Snapshots...
+2026-01-08 14:51:59,414 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:357 - --- Verification Report for 2025-12-31 ---
+2026-01-08 14:51:59,414 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:358 - Total unique series: 258
+2026-01-08 14:51:59,414 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:359 - Columns: ['date', 'value', 'series_name', 'series_code', 'release_date', 'value_level', 'value_raw', 'snapshot_date']
+2026-01-08 14:51:59,414 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:366 - OK: No lag features (created downstream)
+2026-01-08 14:51:59,414 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:371 - OK: No rolling features (created downstream)
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:383 - 
+'total' series statistics:
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:384 -   Raw MoM - Skew: -24.124, Kurt: 718.397
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:385 -   Transformed - Skew: -1.333, Kurt: 0.033
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:386 -   Range: [-6.560, 1.472]
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:394 - OK: Schema matches expected format
+2026-01-08 14:51:59,415 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:396 - Verification Complete.
+2026-01-09 00:23:17,096 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:284 - Preparing FRED Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 00:23:17,098 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:285 - Options: mom_conversion=True, transforms=True, scaling=True
+2026-01-09 00:23:17,383 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1990-01-31
+2026-01-09 00:23:20,163 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1991-01-31
+2026-01-09 00:23:23,074 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1992-01-31
+2026-01-09 00:23:26,004 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1993-01-31
+2026-01-09 00:23:28,943 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1994-01-31
+2026-01-09 00:23:31,888 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1995-01-31
+2026-01-09 00:23:34,854 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1996-01-31
+2026-01-09 00:23:37,820 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1997-01-31
+2026-01-09 00:23:40,854 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1998-01-31
+2026-01-09 00:23:43,846 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1999-01-31
+2026-01-09 00:23:46,858 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2000-01-31
+2026-01-09 00:23:49,883 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2001-01-31
+2026-01-09 00:23:52,915 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2002-01-31
+2026-01-09 00:23:55,944 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2003-01-31
+2026-01-09 00:23:58,972 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2004-01-31
+2026-01-09 00:24:02,002 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2005-01-31
+2026-01-09 00:24:05,037 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2006-01-31
+2026-01-09 00:24:08,057 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2007-01-31
+2026-01-09 00:24:11,117 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2008-01-31
+2026-01-09 00:24:14,167 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2009-01-31
+2026-01-09 00:24:17,205 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2010-01-31
+2026-01-09 00:24:20,255 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2011-01-31
+2026-01-09 00:24:23,380 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2012-01-31
+2026-01-09 00:24:26,505 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2013-01-31
+2026-01-09 00:24:29,654 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2014-01-31
+2026-01-09 00:24:32,794 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2015-01-31
+2026-01-09 00:24:35,973 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2016-01-31
+2026-01-09 00:24:39,142 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2017-01-31
+2026-01-09 00:24:42,350 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2018-01-31
+2026-01-09 00:24:45,539 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2019-01-31
+2026-01-09 00:24:48,759 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2020-01-31
+2026-01-09 00:24:51,951 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2021-01-31
+2026-01-09 00:24:55,165 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2022-01-31
+2026-01-09 00:24:58,376 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2023-01-31
+2026-01-09 00:25:01,594 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2024-01-31
+2026-01-09 00:25:04,830 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2025-01-31
+2026-01-09 00:25:07,802 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:327 - FRED Snapshots preparation complete.
+2026-01-09 00:25:07,804 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:336 - Verifying Prepared FRED Snapshots...
+2026-01-09 00:25:07,810 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:358 - --- Verification Report for 2025-12-31 ---
+2026-01-09 00:25:07,810 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:359 - Total unique series: 258
+2026-01-09 00:25:07,810 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:360 - Columns: ['date', 'value', 'series_name', 'series_code', 'release_date', 'value_level', 'value_raw', 'snapshot_date']
+2026-01-09 00:25:07,810 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:367 - OK: No lag features (created downstream)
+2026-01-09 00:25:07,810 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:372 - OK: No rolling features (created downstream)
+2026-01-09 00:25:07,811 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:384 - 
+'total' series statistics:
+2026-01-09 00:25:07,811 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:385 -   Raw MoM - Skew: -24.124, Kurt: 718.397
+2026-01-09 00:25:07,811 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:386 -   Transformed - Skew: -24.124, Kurt: 718.397
+2026-01-09 00:25:07,812 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:387 -   Range: [-86.408, 18.731]
+2026-01-09 00:25:07,812 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:395 - OK: Schema matches expected format
+2026-01-09 00:25:07,812 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:397 - Verification Complete.
+2026-01-09 16:05:05,516 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:284 - Preparing FRED Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 16:05:05,517 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:285 - Options: mom_conversion=True, transforms=True, scaling=True
+2026-01-09 16:05:05,756 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1990-01-31
+2026-01-09 16:05:08,649 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1991-01-31
+2026-01-09 16:05:11,583 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1992-01-31
+2026-01-09 16:05:14,572 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1993-01-31
+2026-01-09 16:05:17,601 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1994-01-31
+2026-01-09 16:05:20,608 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1995-01-31
+2026-01-09 16:05:23,633 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1996-01-31
+2026-01-09 16:05:26,616 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1997-01-31
+2026-01-09 16:05:29,653 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1998-01-31
+2026-01-09 16:05:32,743 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 1999-01-31
+2026-01-09 16:05:35,817 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2000-01-31
+2026-01-09 16:05:38,868 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2001-01-31
+2026-01-09 16:05:41,902 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2002-01-31
+2026-01-09 16:05:44,954 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2003-01-31
+2026-01-09 16:05:47,999 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2004-01-31
+2026-01-09 16:05:51,034 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2005-01-31
+2026-01-09 16:05:54,108 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2006-01-31
+2026-01-09 16:05:57,185 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2007-01-31
+2026-01-09 16:06:00,296 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2008-01-31
+2026-01-09 16:06:03,366 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2009-01-31
+2026-01-09 16:06:06,416 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2010-01-31
+2026-01-09 16:06:09,423 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2011-01-31
+2026-01-09 16:06:12,506 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2012-01-31
+2026-01-09 16:06:15,597 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2013-01-31
+2026-01-09 16:06:18,798 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2014-01-31
+2026-01-09 16:06:21,929 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2015-01-31
+2026-01-09 16:06:25,085 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2016-01-31
+2026-01-09 16:06:28,233 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2017-01-31
+2026-01-09 16:06:31,397 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2018-01-31
+2026-01-09 16:06:34,569 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2019-01-31
+2026-01-09 16:06:37,774 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2020-01-31
+2026-01-09 16:06:40,951 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2021-01-31
+2026-01-09 16:06:44,174 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2022-01-31
+2026-01-09 16:06:47,351 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2023-01-31
+2026-01-09 16:06:50,606 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2024-01-31
+2026-01-09 16:06:53,846 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:325 - Prepared snapshot for 2025-01-31
+2026-01-09 16:06:56,792 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - prepare_fred_snapshots:327 - FRED Snapshots preparation complete.
+2026-01-09 16:06:56,792 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:336 - Verifying Prepared FRED Snapshots...
+2026-01-09 16:06:56,795 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:358 - --- Verification Report for 2025-12-31 ---
+2026-01-09 16:06:56,795 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:359 - Total unique series: 257
+2026-01-09 16:06:56,795 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:360 - Columns: ['date', 'value', 'series_name', 'series_code', 'release_date', 'value_level', 'value_raw', 'snapshot_date']
+2026-01-09 16:06:56,795 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:367 - OK: No lag features (created downstream)
+2026-01-09 16:06:56,795 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:372 - OK: No rolling features (created downstream)
+2026-01-09 16:06:56,796 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:384 - 
+'total' series statistics:
+2026-01-09 16:06:56,796 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:385 -   Raw MoM - Skew: -24.124, Kurt: 718.397
+2026-01-09 16:06:56,796 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:386 -   Transformed - Skew: -24.124, Kurt: 718.397
+2026-01-09 16:06:56,796 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:387 -   Range: [-86.408, 18.731]
+2026-01-09 16:06:56,797 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:395 - OK: Schema matches expected format
+2026-01-09 16:06:56,797 - INFO - prepare_fred_snapshots - prepare_fred_snapshots.py - verify_prepared_snapshot:397 - Verification Complete.

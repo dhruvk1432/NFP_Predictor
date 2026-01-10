@@ -13,11 +13,29 @@ from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UN
 logger = setup_logger(__file__, TEMP_DIR)
 
 UNIFIER_SERIES = {
+    # Existing series
     "Challenger_Job_Cuts": "USCGJCUTP",
     "ISM_Manufacturing_Index": "USNAPMEM",
     "ISM_NonManufacturing_Index": "USNPNE..Q",
     "CB_Consumer_Confidence": "USCNFCONQ",
+    
+    # NEW: Hours/Wages (hours lead employment changes)
+    "AWH_All_Private": "USWHIP..O",           # Avg Weekly Hours - critical leading signal
+    "AWH_Manufacturing": "USHKIM..O",          # Manufacturing hours
+    "AHE_Private": "USWAGES.D",                # Avg Hourly Earnings - wage tightness
+    
+    # NEW: Housing/Consumer (leading indicators)
+    "Housing_Starts": "USHOUSE.O",             # Housing cycle
+    "Retail_Sales": "USRETTOTB",               # Consumer demand (100% release dates)
+    
+    # NEW: Regional PMIs (early signals)
+    "Empire_State_Mfg": "USFRNFMFQ",           # First regional PMI each month
+    "UMich_Expectations": "USUMCONEH",         # Forward-looking sentiment
+    
+    # NEW: Industrial activity
+    "Industrial_Production": "USIPTOT.G",      # Manufacturing activity
 }
+
 
 def calculate_series_lag(df, series_name):
     """

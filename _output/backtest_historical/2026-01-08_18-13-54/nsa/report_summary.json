@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-01-08T18:08:37.398419",
+  "num_predictions": 100,
+  "num_features": 66,
+  "metrics": {
+    "RMSE": 2133.8279791337563,
+    "MAE": 521.9482640250641,
+    "MAPE": 62.705523624497665,
+    "MedAPE": 25.474075218255937,
+    "Mean_Error": 44.839430178932595,
+    "Median_Error": -91.04422620252973,
+    "Std_Error": 2133.3568079520314,
+    "Max_Error": 20318.276234522546,
+    "Min_Error": 0.15122116386658035,
+    "P90_Error": 733.4645714266761,
+    "P95_Error": 975.8576990544004,
+    "R2": 0.1677364695730399,
+    "Direction_Accuracy": 92.92929292929293,
+    "N": 99
+  },
+  "files": {
+    "features_table": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/selected_features.csv",
+    "features_summary": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/features_summary.csv",
+    "metrics_table": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/metrics_summary.csv",
+    "metrics_json": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/metrics_raw.json",
+    "prediction_plot": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/predictions_vs_actual.png",
+    "predictions": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/predictions.csv"
+  }
+}

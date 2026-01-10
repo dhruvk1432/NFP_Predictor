@@ -1,0 +1,2 @@
+2026-01-08 13:46:18,377 - ERROR - scrape_bls_schedule - scrape_bls_schedule.py - scrape_bls_year_schedule:150 - Failed to fetch BLS schedule for 2026: 403 Client Error: Forbidden for url: https://www.bls.gov/schedule/2026/home.htm
+2026-01-08 13:46:37,775 - ERROR - scrape_bls_schedule - scrape_bls_schedule.py - scrape_bls_year_schedule:161 - Failed to fetch BLS schedule for 2026: 403 Client Error: Forbidden for url: https://www.bls.gov/schedule/2026/home.htm

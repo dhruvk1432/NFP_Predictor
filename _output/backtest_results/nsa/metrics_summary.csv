@@ -1,0 +1,18 @@
+Metric,Value
+Root Mean Squared Error (RMSE),2141.84
+Mean Absolute Error (MAE),573.65
+Mean Absolute Percentage Error (MAPE),61.04%
+Median Absolute Percentage Error (MedAPE),27.14%
+---,---
+Mean Error (Bias),+2.59
+Median Error,-106.72
+---,---
+Error Standard Deviation,2141.84
+Maximum Error,20164.89
+90th Percentile Error,766.02
+95th Percentile Error,1247.51
+---,---
+R² Score,0.1615
+Directional Accuracy,92.9%
+---,---
+Sample Size (N),99

@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nfp-predictor"
+version = "1.0.0"
+description = "Machine learning system for predicting US Non-Farm Payrolls (NFP)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Private"}
+authors = [
+    {name = "Dhruv Kohli"}
+]
+keywords = ["nfp", "economics", "machine-learning", "forecasting", "lightgbm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "pre-commit>=3.5",
+]
+hyperopt = [
+    "optuna>=3.5",
+]
+
+[tool.ruff]
+# Line length - allow up to 120 for data science code
+line-length = 120
+
+# Target Python 3.10+
+target-version = "py310"
+
+# Exclude generated/build files
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "*.egg-info",
+    "build",
+    "dist",
+    "tester.ipynb",
+    "_temp",
+    "_output",
+]
+
+[tool.ruff.lint]
+# Enable these rule categories
+select = [
+    "E",    # pycodestyle errors
+    "F",    # Pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort (imports)
+    "UP",   # pyupgrade (modern Python syntax)
+    "B",    # flake8-bugbear (common bugs)
+    "SIM",  # flake8-simplify
+]
+
+# Ignore these specific rules
+ignore = [
+    "E501",   # Line too long (handled by formatter)
+    "E402",   # Module import not at top (needed for sys.path)
+    "F401",   # Unused imports (sometimes needed for re-exports)
+    "B008",   # Function call in default argument (common pattern)
+]
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.isort]
+known-first-party = ["Train", "Load_Data", "Prepare_Data", "utils"]
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Skip formatting magic trailing comma
+skip-magic-trailing-comma = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["Train", "utils"]
+omit = [
+    "tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

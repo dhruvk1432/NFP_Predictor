@@ -16,7 +16,7 @@ from settings import (
     REFRESH_CACHE, TEMP_DIR, NBEATSX_MODEL_TYPE, setup_logger
 )
 from pipeline_helpers import build_hierarchy_structure
-from Load_Data.scrape_bls_schedule import get_future_nfp_dates, fill_missing_with_first_friday
+from Load_Data.scrape_bls_schedule import get_future_nfp_dates
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -739,46 +739,20 @@ def extend_target_with_complete_date_range(
     if future_missing:
         logger.info(f"Scraping BLS for {len(future_missing)} future months")
 
-        try:
-            # Scrape BLS for future dates
-            future_start = future_missing[0]
-            future_end = future_missing[-1]
+        # Scrape BLS for future dates
+        future_start = future_missing[0]
+        future_end = future_missing[-1]
 
-            scraped_df = get_future_nfp_dates(future_start, future_end)
+        scraped_df = get_future_nfp_dates(future_start, future_end)
 
-            # Fill in any gaps with first Friday fallback
-            complete_future_df = fill_missing_with_first_friday(
-                future_start,
-                future_end,
-                scraped_df
-            )
-
-            # Convert to target format
-            for _, row in complete_future_df.iterrows():
-                new_row = {
-                    'ds': row['observation_month'],
-                    'y': float('nan'),
-                    'release_date': row['release_date']
-                }
-                new_rows.append(new_row)
-
-        except Exception as e:
-            logger.error(
-                f"BLS scraping failed: {e}. "
-                f"Using first Friday fallback for all {len(future_missing)} future months"
-            )
-            # Fallback: use first Friday for all future months
-            for month in future_missing:
-                next_month = month + pd.DateOffset(months=1)
-                release_date = get_first_friday_of_month(next_month)
-
-                row = {
-                    'ds': month,
-                    'y': float('nan'),
-                    'release_date': release_date
-                }
-
-                new_rows.append(row)
+        # Convert to target format
+        for _, row in scraped_df.iterrows():
+            new_row = {
+                'ds': row['observation_month'],
+                'y': float('nan'),
+                'release_date': row['release_date']
+            }
+            new_rows.append(new_row)
 
     # Combine with existing data
     if new_rows:

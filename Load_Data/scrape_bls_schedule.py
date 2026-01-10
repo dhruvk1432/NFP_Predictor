@@ -2,7 +2,8 @@
 BLS Employment Situation Release Date Scraper
 
 Scrapes the BLS website to get official NFP release dates for future months.
-Falls back to first Friday of next month rule if scraping fails.
+Scrapes the BLS website to get official NFP release dates for future months.
+Raises errors if scraping fails.
 """
 from __future__ import annotations
 import sys
@@ -19,18 +20,7 @@ from settings import TEMP_DIR, setup_logger
 
 logger = setup_logger(__file__, TEMP_DIR)
 
-def get_first_friday_of_month(date: pd.Timestamp) -> pd.Timestamp:
-    """
-    Returns the 1st Friday of the month for the date provided.
-    Replicates logic from fred_snapshots.py for consistency.
-    """
-    # Snap to start of month
-    start = date.replace(day=1)
 
-    # Calculate days to add to reach Friday (weekday 4)
-    days_to_add = (4 - start.weekday() + 7) % 7
-
-    return start + pd.Timedelta(days=days_to_add)
 
 
 def parse_bls_date(date_str: str) -> Optional[pd.Timestamp]:
@@ -111,8 +101,7 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
         tables = soup.find_all('table')
 
         if not tables:
-            logger.warning("No tables found on BLS Employment Situation page")
-            return pd.DataFrame(columns=['observation_month', 'release_date'])
+            raise ValueError("No tables found on BLS Employment Situation page")
 
         results = []
 
@@ -156,8 +145,7 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
                     continue
 
         if not results:
-            logger.warning("No Employment Situation releases found")
-            return pd.DataFrame(columns=['observation_month', 'release_date'])
+            raise ValueError("No Employment Situation releases parsed from BLS page")
 
         df = pd.DataFrame(results)
         # Remove duplicates (in case same month appears multiple times)
@@ -168,11 +156,9 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
         return df
 
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch BLS Employment Situation schedule: {e}")
-        return pd.DataFrame(columns=['observation_month', 'release_date'])
+        raise RuntimeError(f"Failed to fetch BLS Employment Situation schedule: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error scraping BLS schedule: {e}")
-        return pd.DataFrame(columns=['observation_month', 'release_date'])
+        raise RuntimeError(f"Unexpected error scraping BLS schedule: {e}")
 
 
 def get_future_nfp_dates(
@@ -192,9 +178,7 @@ def get_future_nfp_dates(
     # Scrape the Employment Situation schedule page
     all_dates = scrape_bls_employment_situation_schedule()
 
-    if all_dates.empty:
-        logger.warning("No BLS data scraped, returning empty DataFrame")
-        return pd.DataFrame(columns=['observation_month', 'release_date'])
+
 
     # Filter to requested range
     filtered = all_dates[
@@ -207,64 +191,7 @@ def get_future_nfp_dates(
     return filtered
 
 
-def fill_missing_with_first_friday(
-    date_range_start: pd.Timestamp,
-    date_range_end: pd.Timestamp,
-    existing_df: Optional[pd.DataFrame] = None
-) -> pd.DataFrame:
-    """
-    Fill in any missing months with first Friday of next month rule.
 
-    Args:
-        date_range_start: First month that should have a release date
-        date_range_end: Last month that should have a release date
-        existing_df: Optional DataFrame with already-scraped dates
-
-    Returns:
-        Complete DataFrame with all months filled
-    """
-    # Generate all months in range
-    all_months = pd.date_range(
-        start=date_range_start,
-        end=date_range_end,
-        freq='MS'  # Month start
-    )
-
-    # Start with existing data if provided
-    if existing_df is not None and not existing_df.empty:
-        result_df = existing_df.copy()
-        existing_months = set(existing_df['observation_month'].dt.to_period('M'))
-    else:
-        result_df = pd.DataFrame(columns=['observation_month', 'release_date'])
-        existing_months = set()
-
-    # Fill missing months with first Friday rule
-    missing_rows = []
-    for month in all_months:
-        month_period = month.to_period('M')
-
-        if month_period not in existing_months:
-            # Calculate first Friday of next month
-            next_month = month + pd.DateOffset(months=1)
-            release_date = get_first_friday_of_month(next_month)
-
-            missing_rows.append({
-                'observation_month': month,
-                'release_date': release_date
-            })
-
-            logger.warning(
-                f"Missing BLS date for {month.strftime('%B %Y')}, "
-                f"using first Friday fallback: {release_date.strftime('%Y-%m-%d')}"
-            )
-
-    if missing_rows:
-        missing_df = pd.DataFrame(missing_rows)
-        result_df = pd.concat([result_df, missing_df], ignore_index=True)
-
-    result_df = result_df.sort_values('observation_month').reset_index(drop=True)
-
-    return result_df
 
 
 if __name__ == "__main__":
@@ -282,7 +209,4 @@ if __name__ == "__main__":
     range_df = get_future_nfp_dates(start, end)
     print(range_df)
 
-    # Test filling missing dates
-    print(f"\nFilling any missing months with first Friday fallback:")
-    complete_df = fill_missing_with_first_friday(start, end, range_df)
-    print(complete_df)
+    print(range_df)

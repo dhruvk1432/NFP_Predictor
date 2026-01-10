@@ -421,7 +421,8 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 df = df.reset_index()
                 df['date'] = pd.to_datetime(df['date'])
                 # Assume no revisions: value known on its own observation date
-                df['realtime_start'] = df['date']
+                # FORCE 1-DAY LAG: Data from Day T is available on Day T+1
+                df['realtime_start'] = df['date'] + pd.Timedelta(days=1)
                 df['value'] = pd.to_numeric(df['value'], errors='coerce')
 
             # ------------------------------------------------------------------

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(xargs python:*)",
       "Bash(python:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(awk:*)"
     ]
   }
 }

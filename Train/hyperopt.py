@@ -25,8 +25,8 @@ from Train.config import (
     N_CV_SPLITS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
-    PANIC_REGIME_WEIGHT,
 )
+from Train.model import calculate_sample_weights
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -97,22 +97,7 @@ def get_search_space(trial: 'optuna.Trial') -> Dict:
 # OBJECTIVE FUNCTION
 # =============================================================================
 
-def calculate_sample_weights(X: pd.DataFrame) -> np.ndarray:
-    """
-    Calculate sample weights for regime-dependent training.
-    
-    Assigns higher weights to extreme event periods.
-    """
-    weights = np.ones(len(X))
-    
-    # Check for panic regime flags
-    for col in X.columns:
-        if 'panic_regime' in col.lower() or 'crash_month' in col.lower():
-            panic_mask = X[col] == 1
-            weights[panic_mask] = PANIC_REGIME_WEIGHT
-            break
-    
-    return weights
+# NOTE: calculate_sample_weights is imported from Train.model
 
 
 def create_objective(

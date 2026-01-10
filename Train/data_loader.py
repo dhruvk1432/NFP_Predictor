@@ -98,40 +98,47 @@ def load_target_data(target_type: str = 'nsa') -> pd.DataFrame:
         and additional momentum/divergence features
     """
     # Load appropriate target file
-    if target_type.lower() == 'nsa':
-        target_path = TARGET_PATH_NSA
-    else:
+    if target_type.lower() == 'sa':
         target_path = TARGET_PATH_SA
+        logger.info("Loading SA (seasonally adjusted) target data")
+    else:
+        target_path = TARGET_PATH_NSA
+        logger.info("Loading NSA (non-seasonally adjusted) target data")
 
     if not target_path.exists():
         raise FileNotFoundError(f"Target file not found: {target_path}")
 
     df = pd.read_parquet(target_path)
     df['ds'] = pd.to_datetime(df['ds'])
-    df = df.sort_values('ds')
+    df = df.sort_values('ds').reset_index(drop=True)
 
     # Calculate MoM change (our prediction target)
     df['y_mom'] = df['y'].diff()
 
-    # Add momentum features
-    df['y_mom_lag1'] = df['y_mom'].shift(1)
-    df['y_mom_lag2'] = df['y_mom'].shift(2)
-    df['y_mom_lag3'] = df['y_mom'].shift(3)
+    # Rolling averages (for momentum/divergence features)
+    df['y_rolling_3m'] = df['y'].rolling(window=3, min_periods=1).mean()
+    df['y_rolling_6m'] = df['y'].rolling(window=6, min_periods=1).mean()
+    df['y_rolling_12m'] = df['y'].rolling(window=12, min_periods=1).mean()
 
-    # Rolling statistics
-    df['y_mom_rolling_3m'] = df['y_mom'].shift(1).rolling(3).mean()
-    df['y_mom_rolling_6m'] = df['y_mom'].shift(1).rolling(6).mean()
-    df['y_mom_rolling_12m'] = df['y_mom'].shift(1).rolling(12).mean()
+    # MoM rolling averages
+    df['y_mom_rolling_3m'] = df['y_mom'].rolling(window=3, min_periods=1).mean()
+    df['y_mom_rolling_6m'] = df['y_mom'].rolling(window=6, min_periods=1).mean()
 
-    # Volatility
-    df['y_mom_volatility_6m'] = df['y_mom'].shift(1).rolling(6).std()
+    # Divergence: Current minus rolling average (momentum indicator)
+    df['divergence_3m'] = df['y'] - df['y_rolling_3m']
+    df['divergence_6m'] = df['y'] - df['y_rolling_6m']
 
-    # Trend (difference between 3m and 12m rolling)
-    df['y_mom_trend'] = df['y_mom_rolling_3m'] - df['y_mom_rolling_12m']
+    # Acceleration: Diff of diffs (second derivative - is hiring accelerating?)
+    df['acceleration'] = df['y_mom'].diff()
 
     # YoY change
-    df['y_yoy'] = df['y'] - df['y'].shift(12)
+    df['y_yoy'] = df['y'].diff(12)
+    df['y_mom_yoy'] = df['y_mom'].diff(12)
 
+    # Drop first row (no MoM for first observation) but keep future rows with NaN y
+    df = df[df.index != 0].reset_index(drop=True)
+
+    logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations from {df['ds'].min()} to {df['ds'].max()}")
     return df
 
 
@@ -234,6 +241,8 @@ def pivot_snapshot_to_wide(
     Convert long-format snapshot to wide format, taking the latest value for target month.
 
     Uses only data available at the snapshot date to predict month M.
+    Includes short-term (1-3), medium-term (6), and long-term (12, 18, 24) lags
+    for capturing macroeconomic cycles and structural trends.
 
     Args:
         snapshot_df: Long-format snapshot DataFrame
@@ -245,40 +254,94 @@ def pivot_snapshot_to_wide(
     if snapshot_df is None or snapshot_df.empty:
         return pd.DataFrame()
 
-    # Filter to data available before or at target_month
-    df = snapshot_df.copy()
-    df['date'] = pd.to_datetime(df['date'])
+    features = {}
 
-    # Get latest value for each series
-    latest_values = {}
+    # Get unique series in the snapshot
+    series_names = snapshot_df['series_name'].unique()
 
-    for series_name in df['series_name'].unique():
-        series_data = df[df['series_name'] == series_name].copy()
+    for series_name in series_names:
+        series_data = snapshot_df[snapshot_df['series_name'] == series_name].copy()
         series_data = series_data.sort_values('date')
 
-        # Get data up to and including target_month
+        if series_data.empty:
+            continue
+
+        # Get the latest available value (most recent date <= target_month)
+        # This ensures no look-ahead bias
         available_data = series_data[series_data['date'] <= target_month]
 
         if not available_data.empty:
-            latest_values[f"{series_name}_latest"] = available_data['value'].iloc[-1]
+            # Latest value
+            latest_row = available_data.iloc[-1]
+            features[f'{series_name}_latest'] = latest_row['value']
 
-            # Add lag features if enough history
+            # --- Short-term lags (1, 2, 3 months) ---
+            # Capture recent momentum and business cycle dynamics
             if len(available_data) >= 2:
-                latest_values[f"{series_name}_lag1"] = available_data['value'].iloc[-2]
+                features[f'{series_name}_lag1'] = available_data.iloc[-2]['value']
+                features[f'{series_name}_mom_change'] = latest_row['value'] - available_data.iloc[-2]['value']
 
+            if len(available_data) >= 3:
+                features[f'{series_name}_lag2'] = available_data.iloc[-3]['value']
+
+            if len(available_data) >= 4:
+                features[f'{series_name}_lag3'] = available_data.iloc[-4]['value']
+
+            # --- Medium-term lag (6 months) ---
+            # Semi-annual patterns
             if len(available_data) >= 7:
-                latest_values[f"{series_name}_lag6"] = available_data['value'].iloc[-7]
+                features[f'{series_name}_lag6'] = available_data.iloc[-7]['value']
+                features[f'{series_name}_6m_change'] = latest_row['value'] - available_data.iloc[-7]['value']
 
+            # --- Long-term lags (12, 18, 24 months) ---
+            # Structural trends and secular patterns in macroeconomic data
             if len(available_data) >= 13:
-                latest_values[f"{series_name}_lag12"] = available_data['value'].iloc[-13]
+                features[f'{series_name}_lag12'] = available_data.iloc[-13]['value']
+                features[f'{series_name}_yoy_change'] = latest_row['value'] - available_data.iloc[-13]['value']
 
-            # MoM change
-            if len(available_data) >= 2:
-                mom_change = available_data['value'].iloc[-1] - available_data['value'].iloc[-2]
-                latest_values[f"{series_name}_mom_change"] = mom_change
+            if len(available_data) >= 19:
+                features[f'{series_name}_lag18'] = available_data.iloc[-19]['value']
+                features[f'{series_name}_18m_change'] = latest_row['value'] - available_data.iloc[-19]['value']
 
-    # Convert to single-row DataFrame
-    result = pd.DataFrame([latest_values])
-    result['ds'] = target_month
+            if len(available_data) >= 25:
+                features[f'{series_name}_lag24'] = available_data.iloc[-25]['value']
+                features[f'{series_name}_2yr_change'] = latest_row['value'] - available_data.iloc[-25]['value']
 
-    return result
+            # --- Rolling means (smoothed signals) ---
+            if len(available_data) >= 3:
+                features[f'{series_name}_rolling_mean_3'] = available_data['value'].iloc[-3:].mean()
+
+            if len(available_data) >= 6:
+                features[f'{series_name}_rolling_mean_6'] = available_data['value'].iloc[-6:].mean()
+
+            if len(available_data) >= 12:
+                features[f'{series_name}_rolling_mean_12'] = available_data['value'].iloc[-12:].mean()
+
+            if len(available_data) >= 24:
+                features[f'{series_name}_rolling_mean_24'] = available_data['value'].iloc[-24:].mean()
+
+            # --- Volatility features ---
+            if len(available_data) >= 6:
+                recent_values = available_data['value'].iloc[-6:]
+                features[f'{series_name}_volatility_6m'] = recent_values.std()
+
+            if len(available_data) >= 12:
+                recent_values = available_data['value'].iloc[-12:]
+                features[f'{series_name}_volatility_12m'] = recent_values.std()
+
+            # --- Trend features ---
+            if len(available_data) >= 12:
+                # Linear trend slope over last 12 months
+                recent_values = available_data['value'].iloc[-12:].values
+                x = np.arange(12)
+                if not np.isnan(recent_values).any():
+                    try:
+                        slope = np.polyfit(x, recent_values, 1)[0]
+                        features[f'{series_name}_trend_12m'] = slope
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass
+
+    if not features:
+        return pd.DataFrame()
+
+    return pd.DataFrame([features])

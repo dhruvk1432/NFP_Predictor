@@ -83,16 +83,56 @@ def calculate_sample_weights(X: pd.DataFrame) -> np.ndarray:
         Array of sample weights
     """
     weights = np.ones(len(X))
-    
-    # Check for panic regime flags
-    if 'VIX_panic_regime_latest' in X.columns:
-        panic_mask = X['VIX_panic_regime_latest'] == 1
-        weights[panic_mask] = PANIC_REGIME_WEIGHT
-    
-    if 'SP500_crash_month_latest' in X.columns:
-        crash_mask = X['SP500_crash_month_latest'] == 1
-        weights[crash_mask] = PANIC_REGIME_WEIGHT
-    
+
+    # Check for panic regime flags - try multiple column name patterns
+    # Pattern 1: With _latest suffix (from pivot_snapshot_to_wide)
+    # Pattern 2: Without suffix (direct column names)
+    vix_panic_cols = ['VIX_panic_regime', 'VIX_panic_regime_latest']
+    sp500_crash_cols = ['SP500_crash_month', 'SP500_crash_month_latest']
+    vix_high_cols = ['VIX_high_regime', 'VIX_high_regime_latest']
+    sp500_bear_cols = ['SP500_bear_market', 'SP500_bear_market_latest']
+    sp500_circuit_cols = ['SP500_circuit_breaker', 'SP500_circuit_breaker_latest']
+
+    panic_mask = np.zeros(len(X), dtype=bool)
+
+    # Check VIX panic regime
+    for col in vix_panic_cols:
+        if col in X.columns:
+            panic_mask |= (X[col] == 1)
+            break
+
+    # Check SP500 crash month
+    for col in sp500_crash_cols:
+        if col in X.columns:
+            panic_mask |= (X[col] == 1)
+            break
+
+    # Check VIX high regime
+    for col in vix_high_cols:
+        if col in X.columns:
+            panic_mask |= (X[col] == 1)
+            break
+
+    # Check SP500 bear market
+    for col in sp500_bear_cols:
+        if col in X.columns:
+            panic_mask |= (X[col] == 1)
+            break
+
+    # Check SP500 circuit breaker
+    for col in sp500_circuit_cols:
+        if col in X.columns:
+            panic_mask |= (X[col] == 1)
+            break
+
+    weights[panic_mask] = PANIC_REGIME_WEIGHT
+
+    n_panic_samples = panic_mask.sum()
+    if n_panic_samples > 0:
+        logger.info(f"Applying {PANIC_REGIME_WEIGHT}x weight to {n_panic_samples} panic regime samples ({100*n_panic_samples/len(weights):.1f}%)")
+    else:
+        logger.warning("No regime indicators found or no panic samples detected - using equal weights")
+
     return weights
 
 
@@ -108,7 +148,7 @@ def train_lightgbm_model(
     early_stopping_rounds: int = EARLY_STOPPING_ROUNDS,
     use_huber_loss: bool = False,
     huber_delta: float = HUBER_DELTA
-) -> Tuple[lgb.Booster, List[float], Dict]:
+) -> Tuple[lgb.Booster, Dict, List[float]]:
     """
     Train LightGBM model with time-series cross-validation.
 
@@ -122,85 +162,123 @@ def train_lightgbm_model(
         huber_delta: Huber delta parameter
 
     Returns:
-        Tuple of (trained model, residuals list, feature importance dict)
+        Tuple of (trained model, feature importance dict, residuals list)
     """
     if not LIGHTGBM_AVAILABLE:
         raise ImportError("LightGBM not available")
-    
-    # Get feature columns (exclude date column)
+
+    # Separate date column
+    dates = X['ds'] if 'ds' in X.columns else None
     feature_cols = [c for c in X.columns if c != 'ds']
-    
+    X_train = X[feature_cols].copy()
+
+    logger.info(f"Training LightGBM on {len(X_train)} samples with {len(feature_cols)} features")
+
     # Remove any remaining NaN/Inf from features
-    X_clean = X[feature_cols].replace([np.inf, -np.inf], np.nan)
-    
-    # Drop rows with any NaN
-    valid_mask = ~(X_clean.isna().any(axis=1) | y.isna())
-    X_clean = X_clean[valid_mask]
-    y_clean = y[valid_mask]
-    
+    X_train = X_train.replace([np.inf, -np.inf], np.nan)
+
+    # Drop rows with any NaN in features or target
+    valid_mask = ~(X_train.isna().any(axis=1) | y.isna())
+    X_clean = X_train[valid_mask].copy()
+    y_clean = y[valid_mask].copy()
+
     if len(X_clean) < 50:
         raise ValueError(f"Not enough valid training samples: {len(X_clean)}")
-    
-    logger.info(f"Training on {len(X_clean)} samples with {len(feature_cols)} features")
-    
-    # Calculate sample weights
+
+    logger.info(f"After cleaning: {len(X_clean)} valid samples")
+
+    # Calculate sample weights based on regime indicators
     weights = calculate_sample_weights(X[valid_mask])
-    
-    # Get parameters
-    params = get_lgbm_params(use_huber_loss, huber_delta)
-    
-    # Time series cross-validation
+
+    # LightGBM parameters
+    params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
+
+    # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    
-    residuals = []
-    feature_importance = {col: 0 for col in feature_cols}
-    
+    cv_scores = []
+    cv_residuals = []
+    oof_predictions = np.zeros(len(X_clean))
+
+    logger.info(f"Running {n_splits}-fold time series cross-validation...")
+
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X_clean)):
-        X_train = X_clean.iloc[train_idx]
-        y_train = y_clean.iloc[train_idx]
-        X_val = X_clean.iloc[val_idx]
-        y_val = y_clean.iloc[val_idx]
-        w_train = weights[train_idx]
-        
-        train_data = lgb.Dataset(X_train, label=y_train, weight=w_train)
+        X_tr, X_val = X_clean.iloc[train_idx], X_clean.iloc[val_idx]
+        y_tr, y_val = y_clean.iloc[train_idx], y_clean.iloc[val_idx]
+        weights_tr = weights[train_idx]
+
+        train_data = lgb.Dataset(X_tr, label=y_tr, weight=weights_tr)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
-        
+
+        evals_result = {}
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=early_stopping_rounds),
+            lgb.log_evaluation(period=0),  # Suppress per-iteration output
+            lgb.record_evaluation(evals_result)
+        ]
         model = lgb.train(
             params,
             train_data,
             num_boost_round=num_boost_round,
-            valid_sets=[val_data],
-            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)]
+            valid_sets=[train_data, val_data],
+            valid_names=['train', 'valid'],
+            callbacks=callbacks
         )
-        
-        # Collect residuals and importance
-        preds = model.predict(X_val)
-        fold_residuals = (y_val.values - preds).tolist()
-        residuals.extend(fold_residuals)
-        
-        for i, col in enumerate(feature_cols):
-            feature_importance[col] += model.feature_importance()[i]
-    
-    # Final model on all data
-    final_train_data = lgb.Dataset(X_clean, label=y_clean, weight=weights)
+
+        # Get predictions and residuals
+        val_pred = model.predict(X_val)
+        oof_predictions[val_idx] = val_pred
+        fold_residuals = y_val.values - val_pred
+        cv_residuals.extend(fold_residuals.tolist())
+
+        fold_rmse = np.sqrt(np.mean(fold_residuals ** 2))
+        fold_mae = np.mean(np.abs(fold_residuals))
+        cv_scores.append({'fold': fold + 1, 'rmse': fold_rmse, 'mae': fold_mae})
+
+        logger.info(f"Fold {fold + 1}: RMSE = {fold_rmse:.2f}, MAE = {fold_mae:.2f}")
+
+    # Overall CV performance
+    mean_rmse = np.mean([s['rmse'] for s in cv_scores])
+    mean_mae = np.mean([s['mae'] for s in cv_scores])
+    logger.info(f"\nOverall CV Performance: RMSE = {mean_rmse:.2f}, MAE = {mean_mae:.2f}")
+
+    # Train final model on all data
+    logger.info("\nTraining final model on all data...")
+
+    # Split for final early stopping
+    train_size = int(len(X_clean) * 0.85)
+    X_final_train = X_clean.iloc[:train_size]
+    X_final_val = X_clean.iloc[train_size:]
+    y_final_train = y_clean.iloc[:train_size]
+    y_final_val = y_clean.iloc[train_size:]
+    weights_final_train = weights[:train_size]
+
+    train_data = lgb.Dataset(X_final_train, label=y_final_train, weight=weights_final_train)
+    val_data = lgb.Dataset(X_final_val, label=y_final_val, reference=train_data)
+
+    evals_result = {}
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=early_stopping_rounds),
+        lgb.log_evaluation(period=100),
+        lgb.record_evaluation(evals_result)
+    ]
     final_model = lgb.train(
         params,
-        final_train_data,
-        num_boost_round=num_boost_round // 2  # Use fewer rounds for final
+        train_data,
+        num_boost_round=num_boost_round,
+        valid_sets=[train_data, val_data],
+        valid_names=['train', 'valid'],
+        callbacks=callbacks
     )
-    
-    # Normalize importance
-    for col in feature_importance:
-        feature_importance[col] /= n_splits
-    
-    # Sort by importance
-    feature_importance = dict(sorted(
-        feature_importance.items(), 
-        key=lambda x: x[1], 
-        reverse=True
-    ))
-    
-    return final_model, residuals, feature_importance
+
+    # Feature importance
+    importance = dict(zip(feature_cols, final_model.feature_importance(importance_type='gain')))
+    importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+
+    logger.info(f"\nTop 15 most important features:")
+    for i, (feat, imp) in enumerate(list(importance.items())[:15], 1):
+        logger.info(f"  {i}. {feat}: {imp:.1f}")
+
+    return final_model, importance, cv_residuals
 
 
 # =============================================================================
@@ -265,13 +343,34 @@ def predict_with_intervals(
         feature_cols: Feature column names used by model
 
     Returns:
-        Dictionary with prediction and interval information
+        Dictionary with prediction and interval information including:
+        - prediction: Point estimate
+        - intervals: Dict with both numeric (0.50) and string ('50%') keys
+        - std: Standard deviation of residuals
+        - mean_residual_bias: Mean bias from residuals
     """
-    X = features[feature_cols].values.reshape(1, -1)
+    # Handle missing feature columns gracefully
+    available_cols = [c for c in feature_cols if c in features.columns]
+    if len(available_cols) < len(feature_cols):
+        missing = set(feature_cols) - set(available_cols)
+        logger.warning(f"Missing {len(missing)} feature columns: {list(missing)[:5]}...")
+
+    X = features[available_cols].values.reshape(1, -1)
     prediction = model.predict(X)[0]
-    
-    intervals = calculate_prediction_intervals(residuals, prediction)
-    
+
+    intervals_numeric = calculate_prediction_intervals(residuals, prediction)
+
+    # Calculate residual statistics
+    residuals_array = np.array(residuals) if residuals else np.array([0])
+    std = float(np.std(residuals_array)) if len(residuals_array) > 1 else 50.0
+    mean_residual_bias = float(np.mean(residuals_array)) if len(residuals_array) > 0 else 0.0
+
+    # Create intervals dict with both numeric and string keys for compatibility
+    intervals = {}
+    for level, bounds in intervals_numeric.items():
+        intervals[level] = bounds  # Numeric key (0.50, 0.80, 0.95)
+        intervals[f'{int(level * 100)}%'] = bounds  # String key ('50%', '80%', '95%')
+
     return {
         'prediction': prediction,
         'intervals': intervals,
@@ -281,6 +380,8 @@ def predict_with_intervals(
         'upper_80': intervals.get(0.80, (np.nan, np.nan))[1],
         'lower_95': intervals.get(0.95, (np.nan, np.nan))[0],
         'upper_95': intervals.get(0.95, (np.nan, np.nan))[1],
+        'std': std,
+        'mean_residual_bias': mean_residual_bias,
     }
 
 

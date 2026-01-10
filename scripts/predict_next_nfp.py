@@ -85,19 +85,19 @@ def build_prediction_features(
         get_lagged_target_features,
         load_target_data
     )
-    from Train.feature_engineering import add_calendar_features
-    
+    from Train.feature_engineering import add_calendar_features, get_calendar_features_dict
+
     # Pivot snapshot to wide format
     features = {}
-    
+
     # Get latest value for each series
     for series_name in snapshot_df['series_name'].unique():
         series_data = snapshot_df[snapshot_df['series_name'] == series_name]
         if not series_data.empty:
             features[f"{series_name}_latest"] = series_data['value'].iloc[-1]
-    
-    # Add calendar features
-    calendar_features = add_calendar_features(None, target_month)
+
+    # Add calendar features using the dict function
+    calendar_features = get_calendar_features_dict(target_month)
     features.update(calendar_features)
     
     # Add lagged target features

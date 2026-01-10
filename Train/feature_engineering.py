@@ -78,39 +78,96 @@ def calculate_weeks_between_surveys(target_month: pd.Timestamp) -> int:
     return weeks
 
 
-def add_calendar_features(df: pd.DataFrame, target_month: pd.Timestamp) -> Dict[str, float]:
+def add_calendar_features(df: pd.DataFrame, target_month: pd.Timestamp) -> pd.DataFrame:
     """
-    Add comprehensive calendar-based features.
+    Add comprehensive calendar-based features to a DataFrame.
 
     Includes:
     - Cyclical month encoding (sin/cos) - preserves December/January proximity
+    - Quarter cyclical encoding
     - Survey interval (4 vs 5 weeks)
-    - Quarter indicators
+    - Seasonal and timing indicators
+
+    Args:
+        df: Input DataFrame to add features to
+        target_month: Target month being predicted
+
+    Returns:
+        DataFrame with calendar features added as columns
+    """
+    df = df.copy()
+
+    month = target_month.month
+
+    # --- Cyclical Month Encoding (NO one-hot) ---
+    # This preserves the cyclical nature: December is close to January
+    df['month_sin'] = np.sin(2 * np.pi * month / 12)
+    df['month_cos'] = np.cos(2 * np.pi * month / 12)
+
+    # Quarter cyclical encoding
+    df['quarter_sin'] = np.sin(2 * np.pi * target_month.quarter / 4)
+    df['quarter_cos'] = np.cos(2 * np.pi * target_month.quarter / 4)
+
+    # --- Survey Interval Feature ---
+    # The "4 vs 5 weeks" logic - critical for NSA prediction
+    weeks_since_survey = calculate_weeks_between_surveys(target_month)
+    df['weeks_since_last_survey'] = weeks_since_survey
+    df['is_5_week_month'] = int(weeks_since_survey == 5)
+
+    # --- Seasonal adjustment timing ---
+    # BLS updates seasonal factors in January
+    df['is_jan'] = int(month == 1)
+    # Mid-year benchmark revision month
+    df['is_july'] = int(month == 7)
+
+    # Year (for capturing secular trends if needed)
+    df['year'] = target_month.year
+
+    # --- Additional seasonal indicators ---
+    # Summer slowdown period
+    df['is_summer'] = int(month in [6, 7, 8])
+
+    # Holiday season (Nov-Dec hiring surge)
+    df['is_holiday_season'] = int(month in [11, 12])
+
+    # Beginning/end of year effects
+    df['is_december'] = int(month == 12)
+
+    return df
+
+
+def get_calendar_features_dict(target_month: pd.Timestamp) -> Dict[str, float]:
+    """
+    Get calendar features as a dictionary (for merging into feature dict).
+
+    Args:
+        target_month: Target month being predicted
+
+    Returns:
+        Dictionary of calendar features
     """
     features = {}
-    
     month = target_month.month
-    
-    # Cyclical encoding - preserves that December and January are close
+
+    # Cyclical encoding
     features['month_sin'] = np.sin(2 * np.pi * month / 12)
     features['month_cos'] = np.cos(2 * np.pi * month / 12)
-    
-    # Quarter
-    features['quarter'] = (month - 1) // 3 + 1
-    
-    # Survey week interval (4 vs 5 weeks logic)
-    features['survey_weeks'] = calculate_weeks_between_surveys(target_month)
-    
-    # Beginning/end of year effects
-    features['is_january'] = 1 if month == 1 else 0
-    features['is_december'] = 1 if month == 12 else 0
-    
-    # Summer slowdown
-    features['is_summer'] = 1 if month in [6, 7, 8] else 0
-    
-    # Holiday season
-    features['is_holiday_season'] = 1 if month in [11, 12] else 0
-    
+    features['quarter_sin'] = np.sin(2 * np.pi * target_month.quarter / 4)
+    features['quarter_cos'] = np.cos(2 * np.pi * target_month.quarter / 4)
+
+    # Survey interval
+    weeks_since_survey = calculate_weeks_between_surveys(target_month)
+    features['weeks_since_last_survey'] = weeks_since_survey
+    features['is_5_week_month'] = int(weeks_since_survey == 5)
+
+    # Seasonal timing
+    features['is_jan'] = int(month == 1)
+    features['is_july'] = int(month == 7)
+    features['year'] = target_month.year
+    features['is_summer'] = int(month in [6, 7, 8])
+    features['is_holiday_season'] = int(month in [11, 12])
+    features['is_december'] = int(month == 12)
+
     return features
 
 

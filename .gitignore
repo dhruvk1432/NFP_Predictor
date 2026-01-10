@@ -1,54 +1,54 @@
 # Environment files
 
-#.env
-#.env.local
-#.env.*.local
+.env
+.env.local
+.env.*.local
 
 # Data folder
-#data/
+data/
 
 # Temporary files and cache
-#_temp/
-#__pycache__/
-#*.pyc
-#*.pyo
-#*.pyd
-#.Python
+_temp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 
 # Logs
-#*.log
-#logs/
+*.log
+logs/
 
 # Source code (as requested)
-#src/
+src/
 
 # IDE and editor files
-#.vscode/
-#.idea/
-#*.swp
-#*.swo
-#*~
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
 # OS files
-#.DS_Store
-#Thumbs.db
+.DS_Store
+Thumbs.db
 
 # Jupyter Notebook checkpoints
-#.ipynb_checkpoints/
-#tester.ipynb
+.ipynb_checkpoints/
+tester.ipynb
 
 # Python virtual environments
-#venv/
-#env/
-#ENV/
-#.venv/
+venv/
+env/
+ENV/
+.venv/
 
 # Distribution / packaging
-#build/
-#dist/
-#*.egg-info/
+build/
+dist/
+*.egg-info/
 
 # Model outputs and training artifacts
-#_output/
-#*.ckpt
-#*.pkl
+_output/
+*.ckpt
+*.pkl

@@ -1,8 +1,0 @@
-2026-01-09 00:20:59,196 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Empire_State_Emp: Bad Request.  The series does not exist.
-2026-01-09 00:20:59,358 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Philly_Fed_Emp: Bad Request.  The series does not exist.
-2026-01-09 11:53:18,677 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Empire_State_Emp: Bad Request.  The series does not exist.
-2026-01-09 11:53:18,827 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Philly_Fed_Emp: Bad Request.  The series does not exist.
-2026-01-09 12:25:24,501 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Empire_State_Emp: Bad Request.  The series does not exist.
-2026-01-09 12:25:24,621 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Philly_Fed_Emp: Bad Request.  The series does not exist.
-2026-01-09 15:52:56,004 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Empire_State_Emp: Bad Request.  The series does not exist.
-2026-01-09 15:52:56,141 - ERROR - load_fred_exogenous - load_fred_exogenous.py - fetch_fred_exogenous_snapshots:542 - Error fetching history for Philly_Fed_Emp: Bad Request.  The series does not exist.

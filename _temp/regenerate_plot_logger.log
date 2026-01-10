@@ -1,0 +1,20 @@
+2026-01-08 15:43:28,743 - INFO - regenerate_plot - regenerate_plot.py - main:20 - ============================================================
+2026-01-08 15:43:28,743 - INFO - regenerate_plot - regenerate_plot.py - main:21 - REGENERATING PREDICTION PLOTS WITH CI SHADING
+2026-01-08 15:43:28,743 - INFO - regenerate_plot - regenerate_plot.py - main:22 - ============================================================
+2026-01-08 15:43:28,743 - INFO - regenerate_plot - regenerate_plot.py - main:32 - 
+Loading predictions from: /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/backtest_results_nsa.csv
+2026-01-08 15:43:28,752 - INFO - regenerate_plot - regenerate_plot.py - main:41 - Loaded 36 predictions
+2026-01-08 15:43:28,752 - INFO - regenerate_plot - regenerate_plot.py - main:42 - Date range: 2023-01-01 to 2025-12-01
+2026-01-08 15:43:28,752 - INFO - regenerate_plot - regenerate_plot.py - main:47 - Available CI columns: ['lower_50', 'upper_50', 'lower_80', 'upper_80', 'lower_95', 'upper_95']
+2026-01-08 15:43:28,752 - INFO - regenerate_plot - regenerate_plot.py - main:51 - 
+Generating enhanced plot with confidence intervals...
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:60 - 
+✓ Successfully saved plot to: /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/_output/backtest_results/nsa/predictions_vs_actual.png
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:61 - 
+The plot now includes:
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:62 -   • Three confidence interval bands (50%, 80%, 95%)
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:63 -   • Gradient shading effect (darker = higher confidence)
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:64 -   • Future predictions highlighted in red
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:65 -   • Actual values in black, predictions in blue
+2026-01-08 15:43:29,335 - INFO - regenerate_plot - regenerate_plot.py - main:69 - 
+============================================================

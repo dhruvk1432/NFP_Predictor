@@ -1,0 +1,267 @@
+2026-01-08 14:49:02,902 - INFO - load_unifier_data - load_unifier_data.py - <module>:284 - Fetching Unifier data from 1990-01-01 to 2025-12-31
+2026-01-08 14:49:02,940 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching Challenger_Job_Cuts (USCGJCUTP)
+2026-01-08 14:49:20,269 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - Challenger_Job_Cuts: Calculated median lag = 4 days from end of month (based on 155 observations with first_release_date)
+2026-01-08 14:49:20,269 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 383 rows for Challenger_Job_Cuts
+2026-01-08 14:49:20,269 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_Manufacturing_Index (USNAPMEM)
+2026-01-08 14:49:22,571 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_Manufacturing_Index: Calculated median lag = 1 days from end of month (based on 158 observations with first_release_date)
+2026-01-08 14:49:22,571 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 936 rows for ISM_Manufacturing_Index
+2026-01-08 14:49:22,571 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_NonManufacturing_Index (USNPNE..Q)
+2026-01-08 14:49:26,326 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_NonManufacturing_Index: Calculated median lag = 5 days from end of month (based on 208 observations with first_release_date)
+2026-01-08 14:49:26,327 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 342 rows for ISM_NonManufacturing_Index
+2026-01-08 14:49:26,327 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching CB_Consumer_Confidence (USCNFCONQ)
+2026-01-08 14:49:27,612 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - CB_Consumer_Confidence: Calculated median lag = -3 days from end of month (based on 196 observations with first_release_date)
+2026-01-08 14:49:27,613 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 707 rows for CB_Consumer_Confidence
+2026-01-08 14:49:27,613 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:204 - Calculating NFP-relative timing offsets for each series...
+2026-01-08 14:49:27,623 - WARNING - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:223 - Could not calculate NFP offsets: 'first_release_date_series'
+2026-01-08 14:49:28,229 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1990
+2026-01-08 14:49:28,879 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1991
+2026-01-08 14:49:29,536 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1992
+2026-01-08 14:49:30,195 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1993
+2026-01-08 14:49:30,857 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1994
+2026-01-08 14:49:31,519 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1995
+2026-01-08 14:49:32,193 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1996
+2026-01-08 14:49:32,863 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1997
+2026-01-08 14:49:33,532 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1998
+2026-01-08 14:49:34,207 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 1999
+2026-01-08 14:49:34,896 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2000
+2026-01-08 14:49:35,578 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2001
+2026-01-08 14:49:36,256 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2002
+2026-01-08 14:49:36,943 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2003
+2026-01-08 14:49:37,648 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2004
+2026-01-08 14:49:38,336 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2005
+2026-01-08 14:49:39,014 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2006
+2026-01-08 14:49:39,708 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2007
+2026-01-08 14:49:40,411 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2008
+2026-01-08 14:49:41,112 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2009
+2026-01-08 14:49:41,829 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2010
+2026-01-08 14:49:42,522 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2011
+2026-01-08 14:49:43,220 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2012
+2026-01-08 14:49:43,917 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2013
+2026-01-08 14:49:44,624 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2014
+2026-01-08 14:49:45,333 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2015
+2026-01-08 14:49:46,036 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2016
+2026-01-08 14:49:46,741 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2017
+2026-01-08 14:49:47,464 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2018
+2026-01-08 14:49:48,179 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2019
+2026-01-08 14:49:48,890 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2020
+2026-01-08 14:49:49,604 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2021
+2026-01-08 14:49:50,321 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2022
+2026-01-08 14:49:51,043 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2023
+2026-01-08 14:49:51,762 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2024
+2026-01-08 14:49:52,464 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:281 - Generated snapshots for 2025
+2026-01-08 17:41:35,792 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching Challenger_Job_Cuts (USCGJCUTP)
+2026-01-08 17:41:38,507 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - Challenger_Job_Cuts: Calculated median lag = 4 days from end of month (based on 155 observations with first_release_date)
+2026-01-08 17:41:38,507 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 383 rows for Challenger_Job_Cuts
+2026-01-08 17:41:38,507 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_Manufacturing_Index (USNAPMEM)
+2026-01-08 17:41:39,831 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_Manufacturing_Index: Calculated median lag = 1 days from end of month (based on 158 observations with first_release_date)
+2026-01-08 17:41:39,832 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 936 rows for ISM_Manufacturing_Index
+2026-01-08 17:41:39,832 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_NonManufacturing_Index (USNPNE..Q)
+2026-01-08 17:41:43,357 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_NonManufacturing_Index: Calculated median lag = 5 days from end of month (based on 208 observations with first_release_date)
+2026-01-08 17:41:43,357 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 342 rows for ISM_NonManufacturing_Index
+2026-01-08 17:41:43,357 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching CB_Consumer_Confidence (USCNFCONQ)
+2026-01-08 17:41:45,379 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - CB_Consumer_Confidence: Calculated median lag = -3 days from end of month (based on 196 observations with first_release_date)
+2026-01-08 17:41:45,379 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 707 rows for CB_Consumer_Confidence
+2026-01-08 17:41:45,379 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:204 - Calculating NFP-relative timing offsets for each series...
+2026-01-08 17:41:45,389 - WARNING - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:223 - Could not calculate NFP offsets: 'first_release_date_series'
+2026-01-08 17:41:45,456 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2024
+2026-01-08 17:43:19,901 - INFO - load_unifier_data - load_unifier_data.py - <module>:289 - Fetching Unifier data from 1990-01-01 to 2025-12-31
+2026-01-08 17:43:19,977 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching Challenger_Job_Cuts (USCGJCUTP)
+2026-01-08 17:43:21,587 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - Challenger_Job_Cuts: Calculated median lag = 4 days from end of month (based on 155 observations with first_release_date)
+2026-01-08 17:43:21,587 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 383 rows for Challenger_Job_Cuts
+2026-01-08 17:43:21,587 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_Manufacturing_Index (USNAPMEM)
+2026-01-08 17:43:22,927 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_Manufacturing_Index: Calculated median lag = 1 days from end of month (based on 158 observations with first_release_date)
+2026-01-08 17:43:22,928 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 936 rows for ISM_Manufacturing_Index
+2026-01-08 17:43:22,928 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching ISM_NonManufacturing_Index (USNPNE..Q)
+2026-01-08 17:43:25,888 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - ISM_NonManufacturing_Index: Calculated median lag = 5 days from end of month (based on 208 observations with first_release_date)
+2026-01-08 17:43:25,888 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 342 rows for ISM_NonManufacturing_Index
+2026-01-08 17:43:25,888 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:161 - Fetching CB_Consumer_Confidence (USCNFCONQ)
+2026-01-08 17:43:29,240 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:49 - CB_Consumer_Confidence: Calculated median lag = -3 days from end of month (based on 196 observations with first_release_date)
+2026-01-08 17:43:29,241 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:192 - Fetched 707 rows for CB_Consumer_Confidence
+2026-01-08 17:43:29,241 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:204 - Calculating NFP-relative timing offsets for each series...
+2026-01-08 17:43:29,252 - WARNING - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:223 - Could not calculate NFP offsets: 'first_release_date_series'
+2026-01-08 17:43:29,946 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1990
+2026-01-08 17:43:30,630 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1991
+2026-01-08 17:43:31,311 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1992
+2026-01-08 17:43:31,997 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1993
+2026-01-08 17:43:32,682 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1994
+2026-01-08 17:43:33,388 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1995
+2026-01-08 17:43:34,081 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1996
+2026-01-08 17:43:34,772 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1997
+2026-01-08 17:43:35,469 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1998
+2026-01-08 17:43:36,163 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 1999
+2026-01-08 17:43:36,865 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2000
+2026-01-08 17:43:37,572 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2001
+2026-01-08 17:43:38,286 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2002
+2026-01-08 17:43:38,994 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2003
+2026-01-08 17:43:39,714 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2004
+2026-01-08 17:43:40,420 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2005
+2026-01-08 17:43:41,125 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2006
+2026-01-08 17:43:41,836 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2007
+2026-01-08 17:43:42,545 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2008
+2026-01-08 17:43:43,252 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2009
+2026-01-08 17:43:43,969 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2010
+2026-01-08 17:43:44,675 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2011
+2026-01-08 17:43:45,412 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2012
+2026-01-08 17:43:46,166 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2013
+2026-01-08 17:43:46,924 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2014
+2026-01-08 17:43:47,687 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2015
+2026-01-08 17:43:48,412 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2016
+2026-01-08 17:43:49,155 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2017
+2026-01-08 17:43:49,895 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2018
+2026-01-08 17:43:50,629 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2019
+2026-01-08 17:43:51,366 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2020
+2026-01-08 17:43:52,107 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2021
+2026-01-08 17:43:52,838 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2022
+2026-01-08 17:43:53,568 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2023
+2026-01-08 17:43:54,311 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2024
+2026-01-08 17:43:55,056 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:286 - Generated snapshots for 2025
+2026-01-09 15:26:26,959 - INFO - load_unifier_data - load_unifier_data.py - <module>:307 - Fetching Unifier data from 1990-01-01 to 2025-12-31
+2026-01-09 15:26:27,072 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Challenger_Job_Cuts (USCGJCUTP)
+2026-01-09 15:26:30,960 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Challenger_Job_Cuts: Calculated median lag = 4 days from end of month (based on 156 observations with first_release_date)
+2026-01-09 15:26:30,961 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 384 rows for Challenger_Job_Cuts
+2026-01-09 15:26:30,961 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching ISM_Manufacturing_Index (USNAPMEM)
+2026-01-09 15:26:33,393 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - ISM_Manufacturing_Index: Calculated median lag = 1 days from end of month (based on 158 observations with first_release_date)
+2026-01-09 15:26:33,394 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 936 rows for ISM_Manufacturing_Index
+2026-01-09 15:26:33,394 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching ISM_NonManufacturing_Index (USNPNE..Q)
+2026-01-09 15:26:35,462 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - ISM_NonManufacturing_Index: Calculated median lag = 5 days from end of month (based on 208 observations with first_release_date)
+2026-01-09 15:26:35,462 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 342 rows for ISM_NonManufacturing_Index
+2026-01-09 15:26:35,462 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching CB_Consumer_Confidence (USCNFCONQ)
+2026-01-09 15:26:36,579 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - CB_Consumer_Confidence: Calculated median lag = -3 days from end of month (based on 196 observations with first_release_date)
+2026-01-09 15:26:36,579 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 707 rows for CB_Consumer_Confidence
+2026-01-09 15:26:36,579 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AWH_All_Private (USWHIP..O)
+2026-01-09 15:26:37,831 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AWH_All_Private: Calculated median lag = 5 days from end of month (based on 191 observations with first_release_date)
+2026-01-09 15:26:37,832 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 237 rows for AWH_All_Private
+2026-01-09 15:26:37,832 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AWH_Manufacturing (USHKIM..O)
+2026-01-09 15:26:41,715 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AWH_Manufacturing: Calculated median lag = 5 days from end of month (based on 672 observations with first_release_date)
+2026-01-09 15:26:41,715 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 1043 rows for AWH_Manufacturing
+2026-01-09 15:26:41,715 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AHE_Private (USWAGES.D)
+2026-01-09 15:26:42,990 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AHE_Private: Calculated median lag = 14 days from end of month (based on 190 observations with first_release_date)
+2026-01-09 15:26:42,990 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 236 rows for AHE_Private
+2026-01-09 15:26:42,990 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Housing_Starts (USHOUSE.O)
+2026-01-09 15:26:45,806 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Housing_Starts: Calculated median lag = 17 days from end of month (based on 669 observations with first_release_date)
+2026-01-09 15:26:45,806 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 800 rows for Housing_Starts
+2026-01-09 15:26:45,806 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Retail_Sales (USRETTOTB)
+2026-01-09 15:26:47,037 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Retail_Sales: Calculated median lag = 14 days from end of month (based on 406 observations with first_release_date)
+2026-01-09 15:26:47,037 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 406 rows for Retail_Sales
+2026-01-09 15:26:47,037 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Empire_State_Mfg (USFRNFMFQ)
+2026-01-09 15:26:48,172 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Empire_State_Mfg: Calculated median lag = -15 days from end of month (based on 208 observations with first_release_date)
+2026-01-09 15:26:48,173 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 294 rows for Empire_State_Mfg
+2026-01-09 15:26:48,173 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching UMich_Expectations (USUMCONEH)
+2026-01-09 15:26:50,822 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - UMich_Expectations: Calculated median lag = -16 days from end of month (based on 420 observations with first_release_date)
+2026-01-09 15:26:50,823 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 663 rows for UMich_Expectations
+2026-01-09 15:26:50,823 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Industrial_Production (USIPTOT.G)
+2026-01-09 15:26:51,965 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Industrial_Production: Calculated median lag = 15 days from end of month (based on 672 observations with first_release_date)
+2026-01-09 15:26:51,965 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 1283 rows for Industrial_Production
+2026-01-09 15:26:51,965 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:222 - Calculating NFP-relative timing offsets for each series...
+2026-01-09 15:26:51,974 - WARNING - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:241 - Could not calculate NFP offsets: 'first_release_date_series'
+2026-01-09 15:26:53,640 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1990
+2026-01-09 15:26:55,462 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1991
+2026-01-09 15:26:57,318 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1992
+2026-01-09 15:26:59,153 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1993
+2026-01-09 15:27:01,001 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1994
+2026-01-09 15:27:02,888 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1995
+2026-01-09 15:27:04,754 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1996
+2026-01-09 15:27:06,637 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1997
+2026-01-09 15:27:08,541 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1998
+2026-01-09 15:27:10,412 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1999
+2026-01-09 15:27:12,344 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2000
+2026-01-09 15:27:14,233 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2001
+2026-01-09 15:27:16,146 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2002
+2026-01-09 15:27:18,087 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2003
+2026-01-09 15:27:19,997 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2004
+2026-01-09 15:27:21,938 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2005
+2026-01-09 15:27:23,871 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2006
+2026-01-09 15:27:25,803 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2007
+2026-01-09 15:27:27,786 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2008
+2026-01-09 15:27:29,745 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2009
+2026-01-09 15:27:31,698 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2010
+2026-01-09 15:27:33,679 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2011
+2026-01-09 15:27:35,625 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2012
+2026-01-09 15:27:37,608 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2013
+2026-01-09 15:27:39,583 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2014
+2026-01-09 15:27:41,575 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2015
+2026-01-09 15:27:43,570 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2016
+2026-01-09 15:27:45,535 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2017
+2026-01-09 15:27:47,548 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2018
+2026-01-09 15:27:49,529 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2019
+2026-01-09 15:27:51,525 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2020
+2026-01-09 15:27:53,538 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2021
+2026-01-09 15:27:55,533 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2022
+2026-01-09 15:27:57,572 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2023
+2026-01-09 15:27:59,590 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2024
+2026-01-09 15:28:01,611 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2025
+2026-01-09 15:59:44,110 - INFO - load_unifier_data - load_unifier_data.py - <module>:307 - Fetching Unifier data from 1990-01-01 to 2025-12-31
+2026-01-09 15:59:44,150 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Challenger_Job_Cuts (USCGJCUTP)
+2026-01-09 15:59:46,172 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Challenger_Job_Cuts: Calculated median lag = 4 days from end of month (based on 156 observations with first_release_date)
+2026-01-09 15:59:46,172 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 384 rows for Challenger_Job_Cuts
+2026-01-09 15:59:46,172 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching ISM_Manufacturing_Index (USNAPMEM)
+2026-01-09 15:59:47,257 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - ISM_Manufacturing_Index: Calculated median lag = 1 days from end of month (based on 158 observations with first_release_date)
+2026-01-09 15:59:47,257 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 936 rows for ISM_Manufacturing_Index
+2026-01-09 15:59:47,257 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching ISM_NonManufacturing_Index (USNPNE..Q)
+2026-01-09 15:59:49,718 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - ISM_NonManufacturing_Index: Calculated median lag = 5 days from end of month (based on 208 observations with first_release_date)
+2026-01-09 15:59:49,718 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 342 rows for ISM_NonManufacturing_Index
+2026-01-09 15:59:49,718 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching CB_Consumer_Confidence (USCNFCONQ)
+2026-01-09 15:59:50,845 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - CB_Consumer_Confidence: Calculated median lag = -3 days from end of month (based on 196 observations with first_release_date)
+2026-01-09 15:59:50,846 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 707 rows for CB_Consumer_Confidence
+2026-01-09 15:59:50,846 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AWH_All_Private (USWHIP..O)
+2026-01-09 15:59:51,956 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AWH_All_Private: Calculated median lag = 5 days from end of month (based on 191 observations with first_release_date)
+2026-01-09 15:59:51,956 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 237 rows for AWH_All_Private
+2026-01-09 15:59:51,956 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AWH_Manufacturing (USHKIM..O)
+2026-01-09 15:59:54,842 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AWH_Manufacturing: Calculated median lag = 5 days from end of month (based on 672 observations with first_release_date)
+2026-01-09 15:59:54,842 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 1043 rows for AWH_Manufacturing
+2026-01-09 15:59:54,842 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching AHE_Private (USWAGES.D)
+2026-01-09 15:59:57,356 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - AHE_Private: Calculated median lag = 14 days from end of month (based on 190 observations with first_release_date)
+2026-01-09 15:59:57,356 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 236 rows for AHE_Private
+2026-01-09 15:59:57,356 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Housing_Starts (USHOUSE.O)
+2026-01-09 16:00:00,043 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Housing_Starts: Calculated median lag = 17 days from end of month (based on 669 observations with first_release_date)
+2026-01-09 16:00:00,043 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 800 rows for Housing_Starts
+2026-01-09 16:00:00,043 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Retail_Sales (USRETTOTB)
+2026-01-09 16:00:01,546 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Retail_Sales: Calculated median lag = 14 days from end of month (based on 406 observations with first_release_date)
+2026-01-09 16:00:01,546 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 406 rows for Retail_Sales
+2026-01-09 16:00:01,546 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Empire_State_Mfg (USFRNFMFQ)
+2026-01-09 16:00:02,826 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Empire_State_Mfg: Calculated median lag = -15 days from end of month (based on 208 observations with first_release_date)
+2026-01-09 16:00:02,826 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 294 rows for Empire_State_Mfg
+2026-01-09 16:00:02,826 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching UMich_Expectations (USUMCONEH)
+2026-01-09 16:00:05,080 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - UMich_Expectations: Calculated median lag = -16 days from end of month (based on 420 observations with first_release_date)
+2026-01-09 16:00:05,080 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 663 rows for UMich_Expectations
+2026-01-09 16:00:05,081 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:179 - Fetching Industrial_Production (USIPTOT.G)
+2026-01-09 16:00:06,434 - INFO - load_unifier_data - load_unifier_data.py - calculate_series_lag:67 - Industrial_Production: Calculated median lag = 15 days from end of month (based on 672 observations with first_release_date)
+2026-01-09 16:00:06,435 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:210 - Fetched 1283 rows for Industrial_Production
+2026-01-09 16:00:06,435 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:222 - Calculating NFP-relative timing offsets for each series...
+2026-01-09 16:00:06,442 - WARNING - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:241 - Could not calculate NFP offsets: 'first_release_date_series'
+2026-01-09 16:00:08,205 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1990
+2026-01-09 16:00:10,085 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1991
+2026-01-09 16:00:11,970 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1992
+2026-01-09 16:00:13,895 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1993
+2026-01-09 16:00:15,802 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1994
+2026-01-09 16:00:17,690 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1995
+2026-01-09 16:00:19,648 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1996
+2026-01-09 16:00:21,612 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1997
+2026-01-09 16:00:23,581 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1998
+2026-01-09 16:00:25,528 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 1999
+2026-01-09 16:00:27,493 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2000
+2026-01-09 16:00:29,480 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2001
+2026-01-09 16:00:31,457 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2002
+2026-01-09 16:00:33,426 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2003
+2026-01-09 16:00:35,405 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2004
+2026-01-09 16:00:37,348 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2005
+2026-01-09 16:00:39,366 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2006
+2026-01-09 16:00:41,328 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2007
+2026-01-09 16:00:43,303 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2008
+2026-01-09 16:00:45,331 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2009
+2026-01-09 16:00:47,341 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2010
+2026-01-09 16:00:49,365 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2011
+2026-01-09 16:00:51,363 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2012
+2026-01-09 16:00:53,340 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2013
+2026-01-09 16:00:55,323 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2014
+2026-01-09 16:00:57,295 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2015
+2026-01-09 16:00:59,247 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2016
+2026-01-09 16:01:01,212 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2017
+2026-01-09 16:01:03,179 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2018
+2026-01-09 16:01:05,154 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2019
+2026-01-09 16:01:07,143 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2020
+2026-01-09 16:01:09,124 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2021
+2026-01-09 16:01:11,117 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2022
+2026-01-09 16:01:13,098 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2023
+2026-01-09 16:01:15,095 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2024
+2026-01-09 16:01:17,212 - INFO - load_unifier_data - load_unifier_data.py - fetch_unifier_snapshots:304 - Generated snapshots for 2025

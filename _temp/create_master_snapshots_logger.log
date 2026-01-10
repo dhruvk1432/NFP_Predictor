@@ -1,0 +1,458 @@
+2026-01-08 14:52:10,294 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:265 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 14:52:10,484 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1991-01-31
+2026-01-08 14:52:10,620 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1992-01-31
+2026-01-08 14:52:10,754 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1993-01-31
+2026-01-08 14:52:10,896 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1994-01-31
+2026-01-08 14:52:11,043 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1995-01-31
+2026-01-08 14:52:11,192 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1996-01-31
+2026-01-08 14:52:11,339 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1997-01-31
+2026-01-08 14:52:11,516 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1998-01-31
+2026-01-08 14:52:11,696 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1999-01-31
+2026-01-08 14:52:11,881 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2000-01-31
+2026-01-08 14:52:12,066 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2001-01-31
+2026-01-08 14:52:12,283 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2002-01-31
+2026-01-08 14:52:12,493 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2003-01-31
+2026-01-08 14:52:12,700 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2004-01-31
+2026-01-08 14:52:12,909 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2005-01-31
+2026-01-08 14:52:13,122 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2006-01-31
+2026-01-08 14:52:13,341 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2007-01-31
+2026-01-08 14:52:13,562 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2008-01-31
+2026-01-08 14:52:13,799 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2009-01-31
+2026-01-08 14:52:14,031 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2010-01-31
+2026-01-08 14:52:14,260 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2011-01-31
+2026-01-08 14:52:14,494 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2012-01-31
+2026-01-08 14:52:14,745 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2013-01-31
+2026-01-08 14:52:14,990 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2014-01-31
+2026-01-08 14:52:15,233 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2015-01-31
+2026-01-08 14:52:15,477 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2016-01-31
+2026-01-08 14:52:15,736 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2017-01-31
+2026-01-08 14:52:15,991 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2018-01-31
+2026-01-08 14:52:16,241 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2019-01-31
+2026-01-08 14:52:16,501 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2020-01-31
+2026-01-08 14:52:16,761 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2021-01-31
+2026-01-08 14:52:17,033 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2022-01-31
+2026-01-08 14:52:17,300 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2023-01-31
+2026-01-08 14:52:17,561 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2024-01-31
+2026-01-08 14:52:17,828 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2025-01-31
+2026-01-08 14:52:18,086 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:311 - Master Snapshots generation complete.
+2026-01-08 14:52:18,086 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:319 - Verifying Master Snapshots...
+2026-01-08 14:52:18,087 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:341 - --- Verification Report for 2025-12-31 ---
+2026-01-08 14:52:18,087 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:342 - Total unique series: 15
+2026-01-08 14:52:18,087 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:347 - ✓ No Lags found (Correct).
+2026-01-08 14:52:18,087 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:354 - ✓ No Rolling Means found (Correct).
+2026-01-08 14:52:18,087 - WARNING - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:362 - ? No NOAA data found.
+2026-01-08 14:52:18,087 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - Verification Complete.
+2026-01-08 14:57:40,235 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:265 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 14:57:40,467 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1991-01-31
+2026-01-08 14:57:40,647 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1992-01-31
+2026-01-08 14:57:40,828 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1993-01-31
+2026-01-08 14:57:41,018 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1994-01-31
+2026-01-08 14:57:41,216 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1995-01-31
+2026-01-08 14:57:41,415 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1996-01-31
+2026-01-08 14:57:41,619 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1997-01-31
+2026-01-08 14:57:41,856 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1998-01-31
+2026-01-08 14:57:42,094 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 1999-01-31
+2026-01-08 14:57:42,331 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2000-01-31
+2026-01-08 14:57:42,572 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2001-01-31
+2026-01-08 14:57:42,853 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2002-01-31
+2026-01-08 14:57:43,129 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2003-01-31
+2026-01-08 14:57:43,429 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2004-01-31
+2026-01-08 14:57:43,715 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2005-01-31
+2026-01-08 14:57:44,006 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2006-01-31
+2026-01-08 14:57:44,296 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2007-01-31
+2026-01-08 14:57:44,593 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2008-01-31
+2026-01-08 14:57:44,909 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2009-01-31
+2026-01-08 14:57:45,231 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2010-01-31
+2026-01-08 14:57:45,594 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2011-01-31
+2026-01-08 14:57:45,928 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2012-01-31
+2026-01-08 14:57:46,279 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2013-01-31
+2026-01-08 14:57:46,653 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2014-01-31
+2026-01-08 14:57:47,023 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2015-01-31
+2026-01-08 14:57:47,390 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2016-01-31
+2026-01-08 14:57:47,737 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2017-01-31
+2026-01-08 14:57:48,102 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2018-01-31
+2026-01-08 14:57:48,464 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2019-01-31
+2026-01-08 14:57:48,840 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2020-01-31
+2026-01-08 14:57:49,204 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2021-01-31
+2026-01-08 14:57:49,567 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2022-01-31
+2026-01-08 14:57:49,944 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2023-01-31
+2026-01-08 14:57:50,331 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2024-01-31
+2026-01-08 14:57:50,719 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:309 - Generated Snapshot for 2025-01-31
+2026-01-08 14:57:51,079 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:311 - Master Snapshots generation complete.
+2026-01-08 14:57:51,079 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:319 - Verifying Master Snapshots...
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:341 - --- Verification Report for 2025-12-31 ---
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:342 - Total unique series: 19
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:347 - ✓ No Lags found (Correct).
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:354 - ✓ No Rolling Means found (Correct).
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - ✓ NOAA Indices present.
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:368 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:370 - ✓ ADP appears scaled.
+2026-01-08 14:57:51,081 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - Verification Complete.
+2026-01-08 18:11:57,895 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:282 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 18:11:58,299 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1991-01-31
+2026-01-08 18:11:58,532 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1992-01-31
+2026-01-08 18:11:58,773 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1993-01-31
+2026-01-08 18:11:59,016 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1994-01-31
+2026-01-08 18:11:59,273 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1995-01-31
+2026-01-08 18:11:59,532 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1996-01-31
+2026-01-08 18:11:59,797 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1997-01-31
+2026-01-08 18:12:00,100 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1998-01-31
+2026-01-08 18:12:00,399 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1999-01-31
+2026-01-08 18:12:00,708 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2000-01-31
+2026-01-08 18:12:01,031 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2001-01-31
+2026-01-08 18:12:01,383 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2002-01-31
+2026-01-08 18:12:01,743 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2003-01-31
+2026-01-08 18:12:02,106 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2004-01-31
+2026-01-08 18:12:02,486 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2005-01-31
+2026-01-08 18:12:02,882 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2006-01-31
+2026-01-08 18:12:03,272 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2007-01-31
+2026-01-08 18:12:03,677 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2008-01-31
+2026-01-08 18:12:04,107 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2009-01-31
+2026-01-08 18:12:04,547 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2010-01-31
+2026-01-08 18:12:04,992 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2011-01-31
+2026-01-08 18:12:05,435 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2012-01-31
+2026-01-08 18:12:05,888 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2013-01-31
+2026-01-08 18:12:06,348 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2014-01-31
+2026-01-08 18:12:06,809 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2015-01-31
+2026-01-08 18:12:07,283 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2016-01-31
+2026-01-08 18:12:07,779 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2017-01-31
+2026-01-08 18:12:08,260 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2018-01-31
+2026-01-08 18:12:08,748 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2019-01-31
+2026-01-08 18:12:09,255 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2020-01-31
+2026-01-08 18:12:09,797 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2021-01-31
+2026-01-08 18:12:10,318 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2022-01-31
+2026-01-08 18:12:10,855 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2023-01-31
+2026-01-08 18:12:11,393 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2024-01-31
+2026-01-08 18:12:11,938 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2025-01-31
+2026-01-08 18:12:12,458 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:328 - Master Snapshots generation complete.
+2026-01-08 18:12:12,458 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:336 - Verifying Master Snapshots...
+2026-01-08 18:12:12,460 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:358 - --- Verification Report for 2025-12-31 ---
+2026-01-08 18:12:12,460 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - Total unique series: 19
+2026-01-08 18:12:12,460 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:364 - ✓ No Lags found (Correct).
+2026-01-08 18:12:12,460 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:371 - ✓ No Rolling Means found (Correct).
+2026-01-08 18:12:12,460 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:377 - ✓ NOAA Indices present.
+2026-01-08 18:12:12,461 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:385 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-08 18:12:12,461 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:387 - ✓ ADP appears scaled.
+2026-01-08 18:12:12,461 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:389 - Verification Complete.
+2026-01-08 18:26:13,803 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:282 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 18:26:14,067 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1991-01-31
+2026-01-08 18:26:14,281 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1992-01-31
+2026-01-08 18:26:14,494 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1993-01-31
+2026-01-08 18:26:14,701 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1994-01-31
+2026-01-08 18:26:14,929 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1995-01-31
+2026-01-08 18:26:15,168 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1996-01-31
+2026-01-08 18:26:15,407 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1997-01-31
+2026-01-08 18:26:15,668 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1998-01-31
+2026-01-08 18:26:15,943 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1999-01-31
+2026-01-08 18:26:16,225 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2000-01-31
+2026-01-08 18:26:16,519 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2001-01-31
+2026-01-08 18:26:16,841 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2002-01-31
+2026-01-08 18:26:17,173 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2003-01-31
+2026-01-08 18:26:17,513 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2004-01-31
+2026-01-08 18:26:17,857 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2005-01-31
+2026-01-08 18:26:18,205 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2006-01-31
+2026-01-08 18:26:18,564 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2007-01-31
+2026-01-08 18:26:18,923 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2008-01-31
+2026-01-08 18:26:19,299 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2009-01-31
+2026-01-08 18:26:19,690 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2010-01-31
+2026-01-08 18:26:20,096 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2011-01-31
+2026-01-08 18:26:20,496 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2012-01-31
+2026-01-08 18:26:20,908 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2013-01-31
+2026-01-08 18:26:21,330 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2014-01-31
+2026-01-08 18:26:21,748 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2015-01-31
+2026-01-08 18:26:22,183 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2016-01-31
+2026-01-08 18:26:22,637 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2017-01-31
+2026-01-08 18:26:23,096 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2018-01-31
+2026-01-08 18:26:23,561 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2019-01-31
+2026-01-08 18:26:24,027 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2020-01-31
+2026-01-08 18:26:24,530 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2021-01-31
+2026-01-08 18:26:25,007 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2022-01-31
+2026-01-08 18:26:25,510 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2023-01-31
+2026-01-08 18:26:26,002 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2024-01-31
+2026-01-08 18:26:26,503 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2025-01-31
+2026-01-08 18:26:26,970 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:328 - Master Snapshots generation complete.
+2026-01-08 18:26:26,970 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:336 - Verifying Master Snapshots...
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:358 - --- Verification Report for 2025-12-31 ---
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - Total unique series: 19
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:364 - ✓ No Lags found (Correct).
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:371 - ✓ No Rolling Means found (Correct).
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:377 - ✓ NOAA Indices present.
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:385 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:387 - ✓ ADP appears scaled.
+2026-01-08 18:26:26,972 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:389 - Verification Complete.
+2026-01-08 18:29:07,018 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:282 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 18:29:07,389 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1991-01-31
+2026-01-08 18:29:07,703 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1992-01-31
+2026-01-08 18:29:08,027 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1993-01-31
+2026-01-08 18:29:08,354 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1994-01-31
+2026-01-08 18:29:08,703 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1995-01-31
+2026-01-08 18:29:09,069 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1996-01-31
+2026-01-08 18:29:09,438 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1997-01-31
+2026-01-08 18:29:09,859 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1998-01-31
+2026-01-08 18:29:10,303 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 1999-01-31
+2026-01-08 18:29:10,755 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2000-01-31
+2026-01-08 18:29:11,218 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2001-01-31
+2026-01-08 18:29:11,730 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2002-01-31
+2026-01-08 18:29:12,251 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2003-01-31
+2026-01-08 18:29:12,788 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2004-01-31
+2026-01-08 18:29:13,331 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2005-01-31
+2026-01-08 18:29:13,899 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2006-01-31
+2026-01-08 18:29:14,467 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2007-01-31
+2026-01-08 18:29:15,061 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2008-01-31
+2026-01-08 18:29:15,659 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2009-01-31
+2026-01-08 18:29:16,282 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2010-01-31
+2026-01-08 18:29:16,930 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2011-01-31
+2026-01-08 18:29:17,580 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2012-01-31
+2026-01-08 18:29:18,249 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2013-01-31
+2026-01-08 18:29:18,928 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2014-01-31
+2026-01-08 18:29:19,626 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2015-01-31
+2026-01-08 18:29:20,330 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2016-01-31
+2026-01-08 18:29:21,104 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2017-01-31
+2026-01-08 18:29:21,885 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2018-01-31
+2026-01-08 18:29:22,689 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2019-01-31
+2026-01-08 18:29:23,501 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2020-01-31
+2026-01-08 18:29:24,338 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2021-01-31
+2026-01-08 18:29:25,175 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2022-01-31
+2026-01-08 18:29:26,031 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2023-01-31
+2026-01-08 18:29:26,909 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2024-01-31
+2026-01-08 18:29:27,797 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:326 - Generated Snapshot for 2025-01-31
+2026-01-08 18:29:28,619 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:328 - Master Snapshots generation complete.
+2026-01-08 18:29:28,620 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:336 - Verifying Master Snapshots...
+2026-01-08 18:29:28,621 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:358 - --- Verification Report for 2025-12-31 ---
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - Total unique series: 42
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:364 - ✓ No Lags found (Correct).
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:371 - ✓ No Rolling Means found (Correct).
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:377 - ✓ NOAA Indices present.
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:385 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:387 - ✓ ADP appears scaled.
+2026-01-08 18:29:28,622 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:389 - Verification Complete.
+2026-01-08 23:31:29,308 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:283 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-08 23:31:29,733 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1991-01-31
+2026-01-08 23:31:30,109 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1992-01-31
+2026-01-08 23:31:30,483 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1993-01-31
+2026-01-08 23:31:30,877 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1994-01-31
+2026-01-08 23:31:31,275 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1995-01-31
+2026-01-08 23:31:31,716 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1996-01-31
+2026-01-08 23:31:32,147 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1997-01-31
+2026-01-08 23:31:32,652 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1998-01-31
+2026-01-08 23:31:33,179 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1999-01-31
+2026-01-08 23:31:33,704 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2000-01-31
+2026-01-08 23:31:34,264 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2001-01-31
+2026-01-08 23:31:34,856 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2002-01-31
+2026-01-08 23:31:35,461 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2003-01-31
+2026-01-08 23:31:36,089 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2004-01-31
+2026-01-08 23:31:36,746 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2005-01-31
+2026-01-08 23:31:37,417 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2006-01-31
+2026-01-08 23:31:38,094 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2007-01-31
+2026-01-08 23:31:38,791 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2008-01-31
+2026-01-08 23:31:39,510 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2009-01-31
+2026-01-08 23:31:40,249 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2010-01-31
+2026-01-08 23:31:40,995 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2011-01-31
+2026-01-08 23:31:41,753 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2012-01-31
+2026-01-08 23:31:42,557 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2013-01-31
+2026-01-08 23:31:43,346 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2014-01-31
+2026-01-08 23:31:44,156 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2015-01-31
+2026-01-08 23:31:44,978 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2016-01-31
+2026-01-08 23:31:45,859 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2017-01-31
+2026-01-08 23:31:46,779 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2018-01-31
+2026-01-08 23:31:47,721 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2019-01-31
+2026-01-08 23:31:48,670 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2020-01-31
+2026-01-08 23:31:49,641 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2021-01-31
+2026-01-08 23:31:50,633 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2022-01-31
+2026-01-08 23:31:51,640 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2023-01-31
+2026-01-08 23:31:52,648 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2024-01-31
+2026-01-08 23:31:53,687 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2025-01-31
+2026-01-08 23:31:54,657 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:329 - Master Snapshots generation complete.
+2026-01-08 23:31:54,657 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:337 - Verifying Master Snapshots...
+2026-01-08 23:31:54,659 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - --- Verification Report for 2025-12-31 ---
+2026-01-08 23:31:54,659 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - Total unique series: 59
+2026-01-08 23:31:54,659 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:365 - ✓ No Lags found (Correct).
+2026-01-08 23:31:54,659 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - ✓ No Rolling Means found (Correct).
+2026-01-08 23:31:54,659 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:378 - ✓ NOAA Indices present.
+2026-01-08 23:31:54,660 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:386 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-08 23:31:54,660 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:388 - ✓ ADP appears scaled.
+2026-01-08 23:31:54,660 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:390 - Verification Complete.
+2026-01-09 00:29:06,049 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:283 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 00:29:06,534 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1991-01-31
+2026-01-09 00:29:06,950 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1992-01-31
+2026-01-09 00:29:07,374 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1993-01-31
+2026-01-09 00:29:07,828 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1994-01-31
+2026-01-09 00:29:08,279 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1995-01-31
+2026-01-09 00:29:08,770 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1996-01-31
+2026-01-09 00:29:09,268 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1997-01-31
+2026-01-09 00:29:09,823 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1998-01-31
+2026-01-09 00:29:10,413 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1999-01-31
+2026-01-09 00:29:11,032 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2000-01-31
+2026-01-09 00:29:11,652 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2001-01-31
+2026-01-09 00:29:12,324 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2002-01-31
+2026-01-09 00:29:13,046 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2003-01-31
+2026-01-09 00:29:13,788 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2004-01-31
+2026-01-09 00:29:14,547 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2005-01-31
+2026-01-09 00:29:15,294 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2006-01-31
+2026-01-09 00:29:16,084 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2007-01-31
+2026-01-09 00:29:16,897 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2008-01-31
+2026-01-09 00:29:17,725 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2009-01-31
+2026-01-09 00:29:18,578 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2010-01-31
+2026-01-09 00:29:19,459 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2011-01-31
+2026-01-09 00:29:20,378 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2012-01-31
+2026-01-09 00:29:21,310 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2013-01-31
+2026-01-09 00:29:22,247 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2014-01-31
+2026-01-09 00:29:23,195 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2015-01-31
+2026-01-09 00:29:24,149 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2016-01-31
+2026-01-09 00:29:25,225 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2017-01-31
+2026-01-09 00:29:26,350 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2018-01-31
+2026-01-09 00:29:27,440 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2019-01-31
+2026-01-09 00:29:28,621 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2020-01-31
+2026-01-09 00:29:29,834 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2021-01-31
+2026-01-09 00:29:31,044 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2022-01-31
+2026-01-09 00:29:32,250 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2023-01-31
+2026-01-09 00:29:33,471 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2024-01-31
+2026-01-09 00:29:34,715 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2025-01-31
+2026-01-09 00:29:35,865 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:329 - Master Snapshots generation complete.
+2026-01-09 00:29:35,865 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:337 - Verifying Master Snapshots...
+2026-01-09 00:29:35,868 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - --- Verification Report for 2025-12-31 ---
+2026-01-09 00:29:35,868 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - Total unique series: 70
+2026-01-09 00:29:35,868 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:365 - ✓ No Lags found (Correct).
+2026-01-09 00:29:35,869 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - ✓ No Rolling Means found (Correct).
+2026-01-09 00:29:35,869 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:378 - ✓ NOAA Indices present.
+2026-01-09 00:29:35,870 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:386 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-09 00:29:35,870 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:388 - ✓ ADP appears scaled.
+2026-01-09 00:29:35,870 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:390 - Verification Complete.
+2026-01-09 12:31:36,220 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:283 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 12:31:36,734 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1991-01-31
+2026-01-09 12:31:37,198 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1992-01-31
+2026-01-09 12:31:37,682 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1993-01-31
+2026-01-09 12:31:38,189 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1994-01-31
+2026-01-09 12:31:38,735 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1995-01-31
+2026-01-09 12:31:39,275 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1996-01-31
+2026-01-09 12:31:39,834 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1997-01-31
+2026-01-09 12:31:40,538 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1998-01-31
+2026-01-09 12:31:41,257 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1999-01-31
+2026-01-09 12:31:42,007 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2000-01-31
+2026-01-09 12:31:42,777 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2001-01-31
+2026-01-09 12:31:43,548 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2002-01-31
+2026-01-09 12:31:44,366 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2003-01-31
+2026-01-09 12:31:45,204 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2004-01-31
+2026-01-09 12:31:46,047 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2005-01-31
+2026-01-09 12:31:46,994 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2006-01-31
+2026-01-09 12:31:47,914 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2007-01-31
+2026-01-09 12:31:48,846 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2008-01-31
+2026-01-09 12:31:49,868 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2009-01-31
+2026-01-09 12:31:50,888 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2010-01-31
+2026-01-09 12:31:51,963 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2011-01-31
+2026-01-09 12:31:53,008 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2012-01-31
+2026-01-09 12:31:54,042 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2013-01-31
+2026-01-09 12:31:55,095 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2014-01-31
+2026-01-09 12:31:56,158 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2015-01-31
+2026-01-09 12:31:57,243 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2016-01-31
+2026-01-09 12:31:58,453 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2017-01-31
+2026-01-09 12:31:59,677 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2018-01-31
+2026-01-09 12:32:00,923 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2019-01-31
+2026-01-09 12:32:02,238 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2020-01-31
+2026-01-09 12:32:03,567 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2021-01-31
+2026-01-09 12:32:04,905 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2022-01-31
+2026-01-09 12:32:06,267 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2023-01-31
+2026-01-09 12:32:07,668 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2024-01-31
+2026-01-09 12:32:09,121 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2025-01-31
+2026-01-09 12:32:10,474 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:329 - Master Snapshots generation complete.
+2026-01-09 12:32:10,475 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:337 - Verifying Master Snapshots...
+2026-01-09 12:32:10,477 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - --- Verification Report for 2025-12-31 ---
+2026-01-09 12:32:10,477 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - Total unique series: 86
+2026-01-09 12:32:10,477 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:365 - ✓ No Lags found (Correct).
+2026-01-09 12:32:10,477 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - ✓ No Rolling Means found (Correct).
+2026-01-09 12:32:10,477 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:378 - ✓ NOAA Indices present.
+2026-01-09 12:32:10,479 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:386 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-09 12:32:10,479 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:388 - ✓ ADP appears scaled.
+2026-01-09 12:32:10,479 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:390 - Verification Complete.
+2026-01-09 15:33:18,470 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:283 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 15:33:19,102 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1991-01-31
+2026-01-09 15:33:19,703 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1992-01-31
+2026-01-09 15:33:20,279 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1993-01-31
+2026-01-09 15:33:20,905 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1994-01-31
+2026-01-09 15:33:21,559 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1995-01-31
+2026-01-09 15:33:22,240 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1996-01-31
+2026-01-09 15:33:22,946 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1997-01-31
+2026-01-09 15:33:23,752 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1998-01-31
+2026-01-09 15:33:24,606 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1999-01-31
+2026-01-09 15:33:25,441 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2000-01-31
+2026-01-09 15:33:26,310 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2001-01-31
+2026-01-09 15:33:27,240 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2002-01-31
+2026-01-09 15:33:28,211 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2003-01-31
+2026-01-09 15:33:29,186 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2004-01-31
+2026-01-09 15:33:30,193 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2005-01-31
+2026-01-09 15:33:31,226 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2006-01-31
+2026-01-09 15:33:32,303 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2007-01-31
+2026-01-09 15:33:33,423 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2008-01-31
+2026-01-09 15:33:34,553 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2009-01-31
+2026-01-09 15:33:35,683 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2010-01-31
+2026-01-09 15:33:36,871 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2011-01-31
+2026-01-09 15:33:38,072 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2012-01-31
+2026-01-09 15:33:39,268 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2013-01-31
+2026-01-09 15:33:40,507 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2014-01-31
+2026-01-09 15:33:41,767 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2015-01-31
+2026-01-09 15:33:43,089 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2016-01-31
+2026-01-09 15:33:44,510 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2017-01-31
+2026-01-09 15:33:45,950 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2018-01-31
+2026-01-09 15:33:47,425 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2019-01-31
+2026-01-09 15:33:48,923 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2020-01-31
+2026-01-09 15:33:50,472 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2021-01-31
+2026-01-09 15:33:52,044 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2022-01-31
+2026-01-09 15:33:53,643 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2023-01-31
+2026-01-09 15:33:55,274 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2024-01-31
+2026-01-09 15:33:56,926 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2025-01-31
+2026-01-09 15:33:58,484 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:329 - Master Snapshots generation complete.
+2026-01-09 15:33:58,485 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:337 - Verifying Master Snapshots...
+2026-01-09 15:33:58,489 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - --- Verification Report for 2025-12-31 ---
+2026-01-09 15:33:58,489 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - Total unique series: 94
+2026-01-09 15:33:58,489 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:365 - ✓ No Lags found (Correct).
+2026-01-09 15:33:58,489 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - ✓ No Rolling Means found (Correct).
+2026-01-09 15:33:58,489 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:378 - ✓ NOAA Indices present.
+2026-01-09 15:33:58,490 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:386 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-09 15:33:58,490 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:388 - ✓ ADP appears scaled.
+2026-01-09 15:33:58,490 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:390 - Verification Complete.
+2026-01-09 16:09:55,457 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:283 - Generating Cleaned Master Snapshots from 1990-01-01 to 2025-12-31
+2026-01-09 16:09:56,124 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1991-01-31
+2026-01-09 16:09:56,692 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1992-01-31
+2026-01-09 16:09:57,292 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1993-01-31
+2026-01-09 16:09:57,934 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1994-01-31
+2026-01-09 16:09:58,616 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1995-01-31
+2026-01-09 16:09:59,300 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1996-01-31
+2026-01-09 16:09:59,982 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1997-01-31
+2026-01-09 16:10:00,780 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1998-01-31
+2026-01-09 16:10:01,606 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 1999-01-31
+2026-01-09 16:10:02,480 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2000-01-31
+2026-01-09 16:10:03,372 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2001-01-31
+2026-01-09 16:10:04,300 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2002-01-31
+2026-01-09 16:10:05,265 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2003-01-31
+2026-01-09 16:10:06,267 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2004-01-31
+2026-01-09 16:10:07,282 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2005-01-31
+2026-01-09 16:10:08,330 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2006-01-31
+2026-01-09 16:10:09,402 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2007-01-31
+2026-01-09 16:10:10,516 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2008-01-31
+2026-01-09 16:10:11,648 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2009-01-31
+2026-01-09 16:10:12,819 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2010-01-31
+2026-01-09 16:10:13,998 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2011-01-31
+2026-01-09 16:10:15,215 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2012-01-31
+2026-01-09 16:10:16,426 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2013-01-31
+2026-01-09 16:10:17,693 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2014-01-31
+2026-01-09 16:10:18,972 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2015-01-31
+2026-01-09 16:10:20,275 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2016-01-31
+2026-01-09 16:10:21,697 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2017-01-31
+2026-01-09 16:10:23,167 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2018-01-31
+2026-01-09 16:10:24,659 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2019-01-31
+2026-01-09 16:10:26,158 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2020-01-31
+2026-01-09 16:10:27,709 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2021-01-31
+2026-01-09 16:10:29,284 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2022-01-31
+2026-01-09 16:10:30,874 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2023-01-31
+2026-01-09 16:10:32,505 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2024-01-31
+2026-01-09 16:10:34,182 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:327 - Generated Snapshot for 2025-01-31
+2026-01-09 16:10:35,721 - INFO - create_master_snapshots - create_master_snapshots.py - create_master_snapshots:329 - Master Snapshots generation complete.
+2026-01-09 16:10:35,722 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:337 - Verifying Master Snapshots...
+2026-01-09 16:10:35,725 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:359 - --- Verification Report for 2025-12-31 ---
+2026-01-09 16:10:35,725 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:360 - Total unique series: 94
+2026-01-09 16:10:35,725 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:365 - ✓ No Lags found (Correct).
+2026-01-09 16:10:35,726 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:372 - ✓ No Rolling Means found (Correct).
+2026-01-09 16:10:35,726 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:378 - ✓ NOAA Indices present.
+2026-01-09 16:10:35,727 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:386 - ADP (Scaled): Min=-16.92, Max=1.61
+2026-01-09 16:10:35,727 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:388 - ✓ ADP appears scaled.
+2026-01-09 16:10:35,727 - INFO - create_master_snapshots - create_master_snapshots.py - verify_master_snapshot:390 - Verification Complete.

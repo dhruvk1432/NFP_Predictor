@@ -1,0 +1,122 @@
+2026-01-08 14:57:13,182 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:217 - ======================================================================
+2026-01-08 14:57:13,182 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:218 - ADP SNAPSHOT CREATION (NFP-ALIGNED)
+2026-01-08 14:57:13,182 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:219 - ======================================================================
+2026-01-08 14:57:13,212 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:85 - Loaded 507 raw ADP rows
+2026-01-08 14:57:13,212 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:86 - Date range: 2001-05-01 to 2025-12-01
+2026-01-08 14:57:13,212 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:87 - Release range: 2001-06-01 to 2026-01-07
+2026-01-08 14:57:13,212 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:45 - Loading NFP release dates from /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_nsa_first_release.parquet
+2026-01-08 14:57:13,215 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:60 - Loaded 431 NFP release dates
+2026-01-08 14:57:13,215 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:61 - Date range: 1990-02-01 to 2025-12-01
+2026-01-08 14:57:13,215 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:92 - Creating 431 ADP snapshots aligned with NFP releases...
+2026-01-08 14:57:13,299 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 50 snapshots...
+2026-01-08 14:57:13,368 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 100 snapshots...
+2026-01-08 14:57:13,430 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 150 snapshots...
+2026-01-08 14:57:13,492 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 200 snapshots...
+2026-01-08 14:57:13,558 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 250 snapshots...
+2026-01-08 14:57:13,625 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:135 - Created 295 ADP snapshots
+2026-01-08 14:57:13,625 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:136 - Location: /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/ADP_snapshots/decades
+2026-01-08 14:57:13,625 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:140 - Sample snapshot (latest):
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:142 -   File: 2025-12.parquet
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:143 -   Rows: 507
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:144 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:145 -   Series: ['ADP_forecast', 'ADP_actual']
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:146 -   Date range: 2001-05-01 to 2025-12-01
+2026-01-08 14:57:13,626 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:151 - Validating ADP snapshots...
+2026-01-08 14:57:13,628 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:155 - Found 295 snapshot files
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2020s/2021/2021-09.parquet:
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 409
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 2
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-08 14:57:13,629 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2000s/2004/2004-06.parquet:
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 38
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 1
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-08 14:57:13,630 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2000s/2002/2002-01.parquet:
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 8
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 1
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-08 14:57:13,631 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:194 - Verifying target month mapping...
+2026-01-08 14:57:13,634 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:206 - Sample target month mappings:
+2026-01-08 14:57:13,634 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jan 07, 2026  (Dec) -> Reference month: Dec
+2026-01-08 14:57:13,634 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Dec 03, 2025  (Nov) -> Reference month: Nov
+2026-01-08 14:57:13,634 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Nov 05, 2025  (Oct) -> Reference month: Oct
+2026-01-08 14:57:13,634 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Oct 01, 2025  (Sep) -> Reference month: Sep
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Sep 04, 2025  (Aug) -> Reference month: Aug
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jul 30, 2025  (Jul) -> Reference month: Jul
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jul 02, 2025  (Jun) -> Reference month: Jun
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jun 04, 2025  (May) -> Reference month: May
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Apr 30, 2025  (Apr) -> Reference month: Apr
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Apr 02, 2025  (Mar) -> Reference month: Mar
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:225 - ======================================================================
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:226 - ADP snapshot system complete!
+2026-01-08 14:57:13,635 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:227 - ======================================================================
+2026-01-09 16:02:59,876 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:217 - ======================================================================
+2026-01-09 16:02:59,877 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:218 - ADP SNAPSHOT CREATION (NFP-ALIGNED)
+2026-01-09 16:02:59,877 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:219 - ======================================================================
+2026-01-09 16:02:59,943 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:85 - Loaded 507 raw ADP rows
+2026-01-09 16:02:59,943 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:86 - Date range: 2001-05-01 to 2025-12-01
+2026-01-09 16:02:59,943 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:87 - Release range: 2001-06-01 to 2026-01-07
+2026-01-09 16:02:59,943 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:45 - Loading NFP release dates from /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_nsa_first_release.parquet
+2026-01-09 16:02:59,948 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:60 - Loaded 431 NFP release dates
+2026-01-09 16:02:59,948 - INFO - create_adp_snapshots - create_adp_snapshots.py - load_nfp_release_dates:61 - Date range: 1990-02-01 to 2025-12-01
+2026-01-09 16:02:59,948 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:92 - Creating 431 ADP snapshots aligned with NFP releases...
+2026-01-09 16:03:00,034 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 50 snapshots...
+2026-01-09 16:03:00,091 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 100 snapshots...
+2026-01-09 16:03:00,148 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 150 snapshots...
+2026-01-09 16:03:00,211 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 200 snapshots...
+2026-01-09 16:03:00,274 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:133 -   Created 250 snapshots...
+2026-01-09 16:03:00,334 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:135 - Created 295 ADP snapshots
+2026-01-09 16:03:00,334 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:136 - Location: /Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/ADP_snapshots/decades
+2026-01-09 16:03:00,334 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:140 - Sample snapshot (latest):
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:142 -   File: 2025-12.parquet
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:143 -   Rows: 507
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:144 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:145 -   Series: ['ADP_forecast', 'ADP_actual']
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - create_adp_snapshots:146 -   Date range: 2001-05-01 to 2025-12-01
+2026-01-09 16:03:00,335 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:151 - Validating ADP snapshots...
+2026-01-09 16:03:00,337 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:155 - Found 295 snapshot files
+2026-01-09 16:03:00,337 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2000s/2009/2009-03.parquet:
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 109
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 2
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-09 16:03:00,338 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2000s/2008/2008-02.parquet:
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 83
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 2
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-09 16:03:00,339 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:167 - 2020s/2024/2024-11.parquet:
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:168 -   Columns: ['date', 'series_name', 'value', 'snapshot_date', 'release_date']
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:169 -   Rows: 481
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:170 -   Series: 2
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:171 -   Duplicates: 0
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:177 -   release_date present
+2026-01-09 16:03:00,340 - INFO - create_adp_snapshots - create_adp_snapshots.py - validate_snapshots:184 -   Point-in-time: OK (all releases <= snapshot)
+2026-01-09 16:03:00,341 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:194 - Verifying target month mapping...
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:206 - Sample target month mappings:
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jan 07, 2026  (Dec) -> Reference month: Dec
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Dec 03, 2025  (Nov) -> Reference month: Nov
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Nov 05, 2025  (Oct) -> Reference month: Oct
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Oct 01, 2025  (Sep) -> Reference month: Sep
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Sep 04, 2025  (Aug) -> Reference month: Aug
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jul 30, 2025  (Jul) -> Reference month: Jul
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jul 02, 2025  (Jun) -> Reference month: Jun
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Jun 04, 2025  (May) -> Reference month: May
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Apr 30, 2025  (Apr) -> Reference month: Apr
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - verify_target_month_mapping:213 -   Apr 02, 2025  (Mar) -> Reference month: Mar
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:225 - ======================================================================
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:226 - ADP snapshot system complete!
+2026-01-09 16:03:00,346 - INFO - create_adp_snapshots - create_adp_snapshots.py - <module>:227 - ======================================================================

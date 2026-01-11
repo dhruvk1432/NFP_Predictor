@@ -10,6 +10,7 @@ import warnings
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, START_DATE, END_DATE
+from utils.transforms import apply_symlog, apply_log1p
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -98,9 +99,8 @@ NOAA_COLS_TO_DROP = NOAA_HUMAN_IMPACT_COLS + NOAA_ECONOMIC_DAMAGE_COLS + ["storm
 # CLEANING FUNCTIONS
 # =============================================================================
 
-def apply_symlog(x):
-    """Apply symmetric log transform: sign(x) * log1p(abs(x))"""
-    return np.sign(x) * np.log1p(np.abs(x))
+# NOTE: apply_symlog and apply_log1p are imported from utils.transforms
+
 
 def preprocess_noaa_indices(df: pd.DataFrame) -> pd.DataFrame:
     """Create NOAA composite indices and drop original granular columns."""
@@ -195,7 +195,7 @@ def preprocess_transforms(df: pd.DataFrame) -> pd.DataFrame:
         if mask.any():
             df.loc[mask, 'value'] = apply_symlog(df.loc[mask, 'value'])
 
-    # 2. Log1p
+    # 2. Log1p (using imported apply_log1p from utils.transforms)
     for pattern in LOG1P_TRANSFORM_SERIES:
         mask = df['series_name'].str.contains(pattern, regex=False)
         if mask.any():
@@ -205,7 +205,7 @@ def preprocess_transforms(df: pd.DataFrame) -> pd.DataFrame:
                 logger.warning(f"Negative values in {pattern} (Log1p target). Using SymLog fallback.")
                 df.loc[mask, 'value'] = apply_symlog(vals)
             else:
-                df.loc[mask, 'value'] = np.log1p(vals)
+                df.loc[mask, 'value'] = apply_log1p(vals)
                 
     return df
 

@@ -19,12 +19,12 @@ FRED_SERIES = {
     "Oil_Prices": "DCOILWTICO",
     "VIX": "VIXCLS",  # CBOE Volatility Index - Market fear gauge
     "SP500": "SP500",  # S&P 500 Index - Market crashes & recoveries
-    # NEW: High-velocity economic indicators for extreme events
+    # High-velocity economic indicators for extreme events
     "Financial_Stress": "STLFSI4",  # St. Louis Fed Financial Stress Index (weekly)
     "Weekly_Econ_Index": "WEI",  # Weekly Economic Index (real-time)
     #Monthly Data (JOLTS_Openings and JOLTS_Hires dropped due to multicollinearity)
-    # "JOLTS_Openings": "JTSJOL",  # DROPPED
-    # "JOLTS_Hires": "JTSHIL",  # DROPPED
+    "JOLTS_Openings": "JTSJOL",  # DROPPED
+    "JOLTS_Hires": "JTSHIL",  # DROPPED
     "JOLTS_Quits": "JTSQUR",
     "JOLTS_Layoffs": "JTSLDL",
     # NEW: Regional Fed Employment Indices (monthly)
@@ -32,9 +32,9 @@ FRED_SERIES = {
     "Philly_Fed_Emp": "USPHCICH",  # Philadelphia Fed Employment Diffusion Index
     # Weekly Jobless Claims (ICSA and IURSA dropped due to multicollinearity)
     # only data available before each NFP report is included in that month's features
-    # "ICSA": "ICSA",  # DROPPED - Initial Claims Seasonally Adjusted
+    "ICSA": "ICSA", #Initial Claims Seasonally Adjusted
     "CCSA": "CCSA",  # Continued Claims Seasonally Adjusted (KEPT)
-    # "IURSA": "IURSA"  # DROPPED - Insured Unemployment Rate Seasonally Adjusted
+    "IURSA": "IURSA" # Insured Unemployment Rate Seasonally Adjusted
 }
 
 def clean_jolts_release_dates(df, ref_month_col='date', release_col='realtime_start', nfp_offset_days=None):

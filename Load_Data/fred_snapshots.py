@@ -489,7 +489,9 @@ def get_first_friday_of_month(dates: pd.Series) -> pd.Series:
 def impute_target_release_date_simple(df: pd.DataFrame) -> pd.DataFrame:
     """
     SIMPLE LOGIC (For NFP Target "First Release" files):
-    If release_date missing or > 14 days after month end -> First Friday of next month.
+    Imputes release dates using First Friday of next month rule, but only for:
+    - Dates before 2009-01-01 with release_date > 14 days after month-end
+    - After 2009-01-01, use actual FRED data (no imputation until future dates)
     """
     if "release_date" not in df.columns and "realtime_start" in df.columns:
         df = df.rename(columns={"realtime_start": "release_date"})
@@ -501,29 +503,39 @@ def impute_target_release_date_simple(df: pd.DataFrame) -> pd.DataFrame:
     month_end = df["ds"] + MonthEnd(0)
     threshold = month_end + pd.Timedelta(days=14)
 
-    mask = df["release_date"].isna() | (df["release_date"] > threshold)
+    cutoff_date = pd.Timestamp("2009-01-01")
+
+    # Only impute if:
+    # 1. (Missing OR > 14 days after month-end) AND
+    # 2. Observation date is before 2009-01-01
+    mask = (df["release_date"].isna() | (df["release_date"] > threshold)) & (df["ds"] < cutoff_date)
 
     # Ensure alignment by using the index
     df.loc[mask, "release_date"] = imputed_dates[mask]
+
     df["release_date"] = pd.to_datetime(df["release_date"])
     return df
 
 def impute_target_release_date_complex(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.DataFrame:
     """
     COMPLEX LOGIC (For NFP Target "Last Release" files):
-    Applies Option 1, 2, or 3 based on relationship between Data Date, Snapshot Date, and ALFRED Release Date.
-    Same logic as calculate_complex_release_date but works with "ds" column instead of "date".
+    Applies Options 1/2/3 based on relationship between Data Date, Snapshot Date, and ALFRED Release Date.
+    Only imputes for dates before 2009-01-01. After 2009, uses actual FRED data.
     """
     if "release_date" not in df.columns and "realtime_start" in df.columns:
         df = df.rename(columns={"realtime_start": "release_date"})
+
+    cutoff_date = pd.Timestamp("2009-01-01")
 
     # 1. Identify rows that need imputation
     # Condition: Missing OR > 12 months after data date
     one_year_later = df["ds"] + DateOffset(years=1)
 
-    needs_imputation = (df["release_date"].isna()) | (df["release_date"] > one_year_later)
+    # Only consider imputation for dates before 2009-01-01
+    needs_imputation = ((df["release_date"].isna()) | (df["release_date"] > one_year_later)) & (df["ds"] < cutoff_date)
 
     if not needs_imputation.any():
+        df["release_date"] = pd.to_datetime(df["release_date"])
         return df
 
     # Prepare Candidate Dates
@@ -582,25 +594,29 @@ def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp
     """
     COMPLEX LOGIC (For Snapshots):
     Applies Option 1, 2, or 3 based on relationship between Data Date, Snapshot Date, and ALFRED Release Date.
+    Only imputes for dates before 2009-01-01. After 2009, uses actual FRED data.
     """
+    cutoff_date = pd.Timestamp("2009-01-01")
+
     # 1. Identify rows that need imputation
     # Condition: Missing OR > 12 months after data date
     one_year_later = df["date"] + DateOffset(years=1)
-    
-    needs_imputation = (df["release_date"].isna()) | (df["release_date"] > one_year_later)
-    
+
+    # Only consider imputation for dates before 2009-01-01
+    needs_imputation = ((df["release_date"].isna()) | (df["release_date"] > one_year_later)) & (df["date"] < cutoff_date)
+
     if not needs_imputation.any():
         return df
 
     # Prepare Candidate Dates
-    
+
     # Candidate A: First Friday of NEXT YEAR'S February
     # (e.g., Data Jan 2020 -> Feb 2021)
     # Constructing as Series to preserve index
     next_year_feb_str = (df["date"] + DateOffset(years=1)).dt.year.astype(str) + "-02-01"
     next_year_feb = pd.to_datetime(next_year_feb_str)
     cand_feb_next_year = get_first_friday_of_month(next_year_feb)
-    
+
     # Candidate B1: First Friday of M+1
     cand_m1 = get_first_friday_of_month(df["date"] + DateOffset(months=1))
     # Candidate B2: First Friday of M+2
@@ -610,41 +626,41 @@ def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp
 
     # We need to apply logic row by row or via masks. Using masks for speed.
     # Because snapshot_date is constant for the whole file, this is efficient.
-    
+
     # --- LOGIC GATES ---
-    
+
     # Gate 1: Snapshot is > 1 year after data date
     # OR
     # Gate 2: Snapshot includes next Feb (Snapshot >= cand_feb_next_year)
     # ACTION: Use cand_feb_next_year
     gate_1_2 = (snapshot_date > one_year_later) | (snapshot_date >= cand_feb_next_year)
-    
+
     # Gate 3: Snapshot is closer (Option 3 logic)
     # Take latest of m1, m2, m3 AS LONG AS it is <= snapshot_date
-    gate_3 = (~gate_1_2)
-    
+    gate_3 = ~gate_1_2
+
     # Apply Option 1 & 2
     mask_1_2 = needs_imputation & gate_1_2
     df.loc[mask_1_2, "release_date"] = cand_feb_next_year[mask_1_2]
-    
+
     # Apply Option 3
     # We need to find Max(m1, m2, m3) where date <= snapshot_date
     if gate_3.any():
         mask_3 = needs_imputation & gate_3
-        
+
         # Create a mini dataframe to do the row-wise max logic efficiently
         candidates = pd.DataFrame({
             "m1": cand_m1[mask_3],
             "m2": cand_m2[mask_3],
             "m3": cand_m3[mask_3]
         }, index=df.index[mask_3]) # Ensure index alignment
-        
+
         # Filter: Set dates > snapshot_date to NaT
         candidates[candidates > snapshot_date] = pd.NaT
-        
+
         # Take the Max (latest valid date)
         best_date = candidates.max(axis=1)
-        
+
         # Assign
         df.loc[mask_3, "release_date"] = best_date
 
@@ -860,6 +876,8 @@ def _fetch_one_all_asof(fred: Fred, fred_id: str, uid: str, as_of_str: str) -> p
     earliest_vintage = df.groupby('ds')['realtime_start'].min()
     actual_lags = earliest_vintage - earliest_vintage.index
 
+    cutoff_date = pd.Timestamp("2009-01-01")
+
     # Define data quality issue criteria
     data_quality_issues_mask = (
         # Case 1: Negative lag (impossible - release before observation)
@@ -871,6 +889,9 @@ def _fetch_one_all_asof(fred: Fred, fred_id: str, uid: str, as_of_str: str) -> p
         # Case 3: Missing release dates (NaT)
         (earliest_vintage.isna())
     )
+
+    # Only fix issues for dates before 2009-01-01
+    data_quality_issues_mask = data_quality_issues_mask & (earliest_vintage.index < cutoff_date)
 
     if data_quality_issues_mask.any():
         issue_dates = earliest_vintage[data_quality_issues_mask].index
@@ -915,7 +936,7 @@ def _fetch_one_all_asof(fred: Fred, fred_id: str, uid: str, as_of_str: str) -> p
 
         logger.info(
             f"{uid}: Fixed {len(issue_dates)} observations with data quality issues "
-            f"(using First Friday of next month rule)"
+            f"(using First Friday of next month rule) - only for dates before 2009-01-01"
         )
 
     return df[["unique_id","ds","y","realtime_start"]]
@@ -997,29 +1018,29 @@ def collapse_latest_asof(audit: pd.DataFrame, as_of_cutoff: pd.Timestamp) -> pd.
     """
     Revised collapse function:
     1. Keeps realtime_start (renames to release_date).
-    2. Imputes release_date using COMPLEX LOGIC (Option 1/2/3).
+    2. COMMENTED OUT: Does NOT impute release_date - uses actual FRED data as-is.
     3. Uses strict < instead of <= to prevent same-day data leakage.
     """
     # Changed from <= to strict < to prevent same-day data leakage
     df = audit[audit["realtime_start"] < as_of_cutoff]
     if df.empty:
         return pd.DataFrame(columns=["date", "value", "series_name", "series_code", "release_date"])
-    
+
     out = (
         df.drop_duplicates(["unique_id", "ds"], keep="last")
           .loc[:, ["unique_id", "ds", "y", "realtime_start"]]
           .reset_index(drop=True)
     )
-    
+
     out = out.rename(columns={"ds": "date", "y": "value", "realtime_start": "release_date"})
     out["series_name"] = out["unique_id"]
     out["series_code"] = out["unique_id"].map(FRED_EMPLOYMENT_CODES)
-    
-    # --- Apply Complex Imputation Logic ---
+
+    # Apply Complex Imputation Logic (only for dates before 2009-01-01)
     out = calculate_complex_release_date(out, as_of_cutoff)
-    
+
     out = out[["date", "value", "series_name", "series_code", "release_date"]]
-    
+
     out["series_name"] = out["series_name"].astype("category")
     out["series_code"] = out["series_code"].astype("category")
     return out

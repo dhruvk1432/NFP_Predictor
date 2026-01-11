@@ -53,20 +53,28 @@ def init_driver() -> webdriver.Chrome:
     opts.page_load_strategy = "eager"
 
     driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(180)  # Increased from 60 to 180 seconds
+    driver.set_page_load_timeout(60)  # Reasonable timeout for page load
     return driver
 
 
-def click_show_more(driver, wait_sec: int = 10, max_clicks: int = 50) -> None:
-    """Keep clicking 'Show more' until all history is loaded or max_clicks reached."""
+def click_show_more(driver, wait_sec: int = 10, max_clicks: int = 50, max_no_change_attempts: int = 3) -> None:
+    """Keep clicking 'Show more' until all history is loaded or max_clicks reached.
+
+    Args:
+        driver: Selenium webdriver instance
+        wait_sec: Seconds to wait for button visibility
+        max_clicks: Maximum number of clicks to attempt
+        max_no_change_attempts: Stop after this many consecutive failed row additions
+    """
     clicks = 0
-    
+    no_change_count = 0
+
     while clicks < max_clicks:
         try:
             # First check if there are any rows at all
             current_rows = driver.find_elements(By.CSS_SELECTOR, "#eventHistoryTable1 tbody tr")
             logger.info(f"Current row count: {len(current_rows)}")
-            
+
             # Try to find the "Show more" button
             show_more = WebDriverWait(driver, wait_sec).until(
                 EC.visibility_of_element_located((By.ID, "showMoreHistory1"))
@@ -75,30 +83,36 @@ def click_show_more(driver, wait_sec: int = 10, max_clicks: int = 50) -> None:
             if not show_more.is_displayed():
                 logger.info("'Show more' button is hidden - all history loaded")
                 break
-                
+
             rows_before = len(current_rows)
 
             # Scroll and click
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", show_more)
             driver.execute_script("arguments[0].click();", show_more)
-            
+
             clicks += 1
             logger.info(f"Clicked 'Show more' (click #{clicks})")
 
-            # Wait for new rows with shorter timeout
+            # Wait for new rows with shorter timeout (reduced from 5 to 3 seconds)
             try:
-                WebDriverWait(driver, 5).until(
+                WebDriverWait(driver, 3).until(
                     lambda d: len(d.find_elements(By.CSS_SELECTOR, "#eventHistoryTable1 tbody tr")) > rows_before
                 )
                 logger.info(f"✓ New rows loaded")
+                no_change_count = 0  # Reset counter on success
             except:
-                logger.warning("No new rows appeared after clicking - may have reached end")
-                break
+                no_change_count += 1
+                logger.warning(f"No new rows appeared after clicking (attempt {no_change_count}/{max_no_change_attempts})")
+
+                # If we've failed to load new rows N times in a row, stop trying
+                if no_change_count >= max_no_change_attempts:
+                    logger.info(f"Stopped after {no_change_count} consecutive failed attempts to load new rows")
+                    break
 
         except Exception as e:
             logger.info(f"Stopped clicking 'Show more': {type(e).__name__}")
             break
-    
+
     final_rows = driver.find_elements(By.CSS_SELECTOR, "#eventHistoryTable1 tbody tr")
     logger.info(f"Final row count: {len(final_rows)} (after {clicks} clicks)")
 
@@ -259,19 +273,24 @@ def format_adp_data() -> None:
 
 
 def main() -> None:
+    # Force unbuffered output for terminal visibility
+    print("Starting ADP scraper...", flush=True)
     logger.info("Started ADP scraper")
-    
+
     max_retries = 3
     retry_delay = 5  # seconds
     
     for attempt in range(max_retries):
         driver = None
         try:
+            print(f"Attempt {attempt + 1}/{max_retries}: Initializing Chrome driver...", flush=True)
             logger.info(f"Attempt {attempt + 1}/{max_retries}: Initializing Chrome driver...")
             driver = init_driver()
             
+            print(f"Loading page: {URL}", flush=True)
             logger.info(f"Loading page: {URL}")
             driver.get(URL)
+            print("✓ Page loaded successfully", flush=True)
             logger.info("✓ Page loaded successfully")
 
             try:
@@ -283,14 +302,18 @@ def main() -> None:
             except Exception:
                 logger.warning("No cookie consent banner found, continuing without it")
 
+            print("Clicking 'Show more' to load historical data...", flush=True)
             logger.info("Clicking 'Show more' to load historical data...")
             click_show_more(driver)
-            
+
+            print("Parsing table data...", flush=True)
             logger.info("Parsing table data...")
             rows = parse_table(driver.page_source)
-            
+
+            print(f"Saving {len(rows)} rows to CSV...", flush=True)
             logger.info(f"Saving {len(rows)} rows to CSV...")
             save_csv(rows)
+            print("✓ Scraping completed successfully", flush=True)
             logger.info("✓ Scraping completed successfully")
             
             # If we got here, scraping succeeded - break out of retry loop
@@ -313,8 +336,10 @@ def main() -> None:
                 driver.quit()
     
     # Format the data after scraping
+    print("Formatting ADP data to long format...", flush=True)
     logger.info("Formatting ADP data to long format...")
     format_adp_data()
+    print("✓ ADP data pipeline complete!", flush=True)
     logger.info("✓ ADP data pipeline complete!")
 
 

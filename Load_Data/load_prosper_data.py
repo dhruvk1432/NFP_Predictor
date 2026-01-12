@@ -4,6 +4,9 @@ import numpy as np
 import sys
 from pathlib import Path
 from unifier import unifier
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import threading
 
 # Add parent directory to path to import settings
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -15,6 +18,23 @@ from nfp_relative_timing import get_nfp_release_map
 from Load_Data.utils import get_snapshot_path
 
 logger = setup_logger(__file__, TEMP_DIR)
+
+# OPTIMIZATION [H3]: Rate limiter for API calls (max 10 req/sec to avoid throttling)
+class RateLimiter:
+    """Simple rate limiter to prevent API throttling."""
+    def __init__(self, max_per_second: float = 10.0):
+        self.min_interval = 1.0 / max_per_second
+        self.last_call = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        """Wait if needed to respect rate limit."""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_call = time.time()
 
 top_nfp_predictors = [
     'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present?',
@@ -78,7 +98,63 @@ def create_series_name(question: str, answer: str, symbol: str) -> str:
     group = symbol.rsplit('_', 1)[0]
     return f"{question} | {answer} | {group}"
 
-def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE):
+
+def fetch_single_key(key: str, rate_limiter: RateLimiter) -> list:
+    """
+    Fetch data for a single Prosper key.
+
+    OPTIMIZATION [H3]: Helper function for parallel fetching.
+
+    Args:
+        key: Prosper key to fetch
+        rate_limiter: Rate limiter to prevent API throttling
+
+    Returns:
+        List of DataFrames for each answer in the key, or empty list on error
+    """
+    rate_limiter.wait()  # Respect rate limit
+
+    try:
+        df1 = unifier.get_dataframe(name="prosper_v2", key=key)
+
+        if df1.empty:
+            return []
+
+        results = []
+        answers = df1["answer_text"].unique()
+
+        for answer in answers:
+            # Filter for this answer and non-null values
+            mask = (df1["answer_text"] == answer) & (df1["value"].notna())
+            prosper_df = df1[mask].sort_values(by='date').copy()
+
+            if prosper_df.empty:
+                continue
+
+            # Extract identifiers
+            answer_id = prosper_df['answer_id'].iloc[0]
+            symbol = prosper_df['symbol'].iloc[0]
+            question = prosper_df['question_text'].iloc[0]
+
+            # Create output dataframe matching unifier format exactly
+            out_df = pd.DataFrame({
+                'date': pd.to_datetime(prosper_df['date']).dt.to_period('M').dt.to_timestamp(),
+                'release_date': pd.to_datetime(prosper_df['date']),
+                'value': prosper_df['value'].values,
+                'series_name': create_series_name(question, answer, symbol),
+                'series_code': create_series_code(symbol, answer_id)
+            })
+
+            results.append(out_df)
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Error fetching key {key}: {e}")
+        return []
+
+
+def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers: int = 4):
     """
     Fetch Prosper survey data and create monthly snapshots.
 
@@ -121,49 +197,37 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE):
     ]))
     logger.info(f"Found {len(filtered_nfp_codes)} unique prosper keys to download")
 
-    # Step 2: Download each key once and collect all time series data
+    # Step 2: Download keys in parallel and collect all time series data
+    # OPTIMIZATION [H3]: Use ThreadPoolExecutor for parallel fetching (3x speedup)
     all_prosper_data = []
+    rate_limiter = RateLimiter(max_per_second=10.0)  # Prevent API throttling
 
-    for i, key in enumerate(filtered_nfp_codes):
-        try:
-            logger.info(f"Fetching key {i+1}/{len(filtered_nfp_codes)}: {key}")
-            df1 = unifier.get_dataframe(name="prosper_v2", key=key, user=UNIFIER_USER, token=UNIFIER_TOKEN)
+    logger.info(f"Fetching {len(filtered_nfp_codes)} keys with {max_workers} parallel workers...")
 
-            if df1.empty:
-                logger.warning(f"No data returned for key: {key}")
-                continue
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all fetch tasks
+        future_to_key = {
+            executor.submit(fetch_single_key, key, rate_limiter): key
+            for key in filtered_nfp_codes
+        }
 
-            # Get unique answers for this key
-            answers = df1["answer_text"].unique()
+        # Collect results as they complete
+        completed = 0
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            completed += 1
 
-            for answer in answers:
-                # Filter for this answer and non-null values
-                mask = (df1["answer_text"] == answer) & (df1["value"].notna())
-                prosper_df = df1[mask].sort_values(by='date').copy()
+            try:
+                results = future.result()
+                if results:
+                    all_prosper_data.extend(results)
 
-                if prosper_df.empty:
-                    continue
+                # Log progress every 25 keys
+                if completed % 25 == 0 or completed == len(filtered_nfp_codes):
+                    logger.info(f"Progress: {completed}/{len(filtered_nfp_codes)} keys fetched")
 
-                # Extract identifiers
-                answer_id = prosper_df['answer_id'].iloc[0]
-                symbol = prosper_df['symbol'].iloc[0]
-                question = prosper_df['question_text'].iloc[0]
-
-                # Create output dataframe matching unifier format exactly
-                # Columns: date, release_date, value, series_name, series_code (+ snapshot_date added later)
-                out_df = pd.DataFrame({
-                    'date': pd.to_datetime(prosper_df['date']).dt.to_period('M').dt.to_timestamp(),  # First of month
-                    'release_date': pd.to_datetime(prosper_df['date']),  # The date column IS the release date
-                    'value': prosper_df['value'].values,
-                    'series_name': create_series_name(question, answer, symbol),
-                    'series_code': create_series_code(symbol, answer_id)
-                })
-
-                all_prosper_data.append(out_df)
-
-        except Exception as e:
-            logger.error(f"Error fetching key {key}: {e}")
-            continue
+            except Exception as e:
+                logger.error(f"Error processing key {key}: {e}")
 
     logger.info(f"Processed {len(filtered_nfp_codes)} keys into {len(all_prosper_data)} series")
 

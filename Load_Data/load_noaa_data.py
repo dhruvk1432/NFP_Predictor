@@ -35,6 +35,8 @@ from dateutil.relativedelta import relativedelta
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
+# INT1: Import NFP utilities at module level for consistency
+from nfp_relative_timing import apply_nfp_relative_adjustment
 
 # ---------------------------------------------------------------------
 # User parameters
@@ -288,21 +290,16 @@ def calculate_noaa_release_date(event_date: pd.Timestamp, lag_days: int = 75, nf
     base_release = month_end + pd.Timedelta(days=lag_days)
     
     # Apply NFP-relative adjustment if provided
+    # INT1: Uses apply_nfp_relative_adjustment imported at module level
     if nfp_offset_days is not None:
-        try:
-            from nfp_relative_timing import apply_nfp_relative_adjustment
-            
-            event_month = event_date.replace(day=1)
-            adjusted_release = apply_nfp_relative_adjustment(
-                event_month=event_month,
-                base_release_date=base_release,
-                median_offset_days=nfp_offset_days,
-                use_adjustment=True
-            )
-            return adjusted_release
-        except Exception:
-            # Fallback to base estimate if NFP adjustment fails
-            return base_release
+        event_month = event_date.replace(day=1)
+        adjusted_release = apply_nfp_relative_adjustment(
+            event_month=event_month,
+            base_release_date=base_release,
+            median_offset_days=nfp_offset_days,
+            use_adjustment=True
+        )
+        return adjusted_release
     else:
         return base_release
 

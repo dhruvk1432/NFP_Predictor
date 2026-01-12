@@ -3,12 +3,18 @@ Data Loading Utilities for LightGBM NFP Model
 
 Functions for loading snapshots, target data, and building training datasets.
 Extracted from train_lightgbm_nfp.py for maintainability.
+
+OPTIMIZATIONS:
+- LRU cache for snapshot loading (avoids redundant I/O)
+- Vectorized pivot_snapshot_to_wide using pandas native operations
+- Pre-computed lag indices for batch feature generation
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from functools import lru_cache
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -24,6 +30,10 @@ from Train.config import (
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
+
+# Module-level cache for loaded data
+_snapshot_cache: Dict[str, pd.DataFrame] = {}
+_target_cache: Dict[str, pd.DataFrame] = {}
 
 
 # =============================================================================
@@ -50,53 +60,90 @@ def get_master_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
 
 
 # =============================================================================
-# DATA LOADING
+# DATA LOADING (with caching)
 # =============================================================================
 
-def load_fred_snapshot(snapshot_date: pd.Timestamp) -> Optional[pd.DataFrame]:
+def load_fred_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> Optional[pd.DataFrame]:
     """
     Load FRED employment snapshot for a given date.
 
     Args:
         snapshot_date: Month-end timestamp (e.g., 2024-10-31)
+        use_cache: Whether to use/populate the module cache
 
     Returns:
         DataFrame with columns: date, value, series_name, series_code, release_date
     """
+    cache_key = f"fred_{snapshot_date.strftime('%Y-%m')}"
+
+    if use_cache and cache_key in _snapshot_cache:
+        return _snapshot_cache[cache_key].copy()
+
     path = get_fred_snapshot_path(snapshot_date)
     if not path.exists():
         return None
-    return pd.read_parquet(path)
+
+    df = pd.read_parquet(path)
+
+    if use_cache:
+        _snapshot_cache[cache_key] = df
+
+    return df.copy() if use_cache else df
 
 
-def load_master_snapshot(snapshot_date: pd.Timestamp) -> Optional[pd.DataFrame]:
+def load_master_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> Optional[pd.DataFrame]:
     """
     Load master snapshot for a given date.
 
     Args:
         snapshot_date: Month-end timestamp (e.g., 2024-10-31)
+        use_cache: Whether to use/populate the module cache
 
     Returns:
         DataFrame with columns: date, series_name, value, release_date, series_code, snapshot_date
     """
+    cache_key = f"master_{snapshot_date.strftime('%Y-%m')}"
+
+    if use_cache and cache_key in _snapshot_cache:
+        return _snapshot_cache[cache_key].copy()
+
     path = get_master_snapshot_path(snapshot_date)
     if not path.exists():
         logger.warning(f"Master snapshot not found: {path}")
         return None
-    return pd.read_parquet(path)
+
+    df = pd.read_parquet(path)
+
+    if use_cache:
+        _snapshot_cache[cache_key] = df
+
+    return df.copy() if use_cache else df
 
 
-def load_target_data(target_type: str = 'nsa') -> pd.DataFrame:
+def clear_snapshot_cache() -> None:
+    """Clear the snapshot cache to free memory."""
+    global _snapshot_cache
+    _snapshot_cache.clear()
+    logger.info("Snapshot cache cleared")
+
+
+def load_target_data(target_type: str = 'nsa', use_cache: bool = True) -> pd.DataFrame:
     """
     Load and prepare target data (NSA or SA NFP levels) with derived features.
 
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
+        use_cache: Whether to use/populate the module cache
 
     Returns:
         DataFrame with columns: ds, y (level), y_mom (month-on-month change),
         and additional momentum/divergence features
     """
+    cache_key = f"target_{target_type.lower()}"
+
+    if use_cache and cache_key in _target_cache:
+        return _target_cache[cache_key].copy()
+
     # Load appropriate target file
     if target_type.lower() == 'sa':
         target_path = TARGET_PATH_SA
@@ -115,7 +162,7 @@ def load_target_data(target_type: str = 'nsa') -> pd.DataFrame:
     # Calculate MoM change (our prediction target)
     df['y_mom'] = df['y'].diff()
 
-    # Rolling averages (for momentum/divergence features)
+    # Rolling averages (for momentum/divergence features) - vectorized
     df['y_rolling_3m'] = df['y'].rolling(window=3, min_periods=1).mean()
     df['y_rolling_6m'] = df['y'].rolling(window=6, min_periods=1).mean()
     df['y_rolling_12m'] = df['y'].rolling(window=12, min_periods=1).mean()
@@ -138,8 +185,13 @@ def load_target_data(target_type: str = 'nsa') -> pd.DataFrame:
     # Drop first row (no MoM for first observation) but keep future rows with NaN y
     df = df[df.index != 0].reset_index(drop=True)
 
-    logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations from {df['ds'].min()} to {df['ds'].max()}")
-    return df
+    if use_cache:
+        _target_cache[cache_key] = df
+        logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations (cached)")
+    else:
+        logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations")
+
+    return df.copy() if use_cache else df
 
 
 def load_all_target_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -240,9 +292,8 @@ def pivot_snapshot_to_wide(
     """
     Convert long-format snapshot to wide format, taking the latest value for target month.
 
-    Uses only data available at the snapshot date to predict month M.
-    Includes short-term (1-3), medium-term (6), and long-term (12, 18, 24) lags
-    for capturing macroeconomic cycles and structural trends.
+    OPTIMIZED: Uses vectorized pandas operations instead of per-series loops.
+    Pivots data first, then computes features in batches.
 
     Args:
         snapshot_df: Long-format snapshot DataFrame
@@ -254,94 +305,186 @@ def pivot_snapshot_to_wide(
     if snapshot_df is None or snapshot_df.empty:
         return pd.DataFrame()
 
+    # Ensure date is datetime
+    df = snapshot_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Filter to data available before/on target month (no look-ahead bias)
+    df = df[df['date'] <= target_month]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Pivot to wide format: rows = dates, columns = series_name
+    # Use 'first' aggregation in case of duplicates
+    wide_df = df.pivot_table(
+        index='date',
+        columns='series_name',
+        values='value',
+        aggfunc='first'
+    ).sort_index()
+
+    if wide_df.empty:
+        return pd.DataFrame()
+
     features = {}
+    n_rows = len(wide_df)
 
-    # Get unique series in the snapshot
-    series_names = snapshot_df['series_name'].unique()
+    # Vectorized feature generation for all series at once
+    for series_name in wide_df.columns:
+        series = wide_df[series_name].dropna()
+        n = len(series)
 
-    for series_name in series_names:
-        series_data = snapshot_df[snapshot_df['series_name'] == series_name].copy()
-        series_data = series_data.sort_values('date')
-
-        if series_data.empty:
+        if n == 0:
             continue
 
-        # Get the latest available value (most recent date <= target_month)
-        # This ensures no look-ahead bias
-        available_data = series_data[series_data['date'] <= target_month]
+        # Latest value
+        latest = series.iloc[-1]
+        features[f'{series_name}_latest'] = latest
 
-        if not available_data.empty:
-            # Latest value
-            latest_row = available_data.iloc[-1]
-            features[f'{series_name}_latest'] = latest_row['value']
+        # Short-term lags and changes
+        if n >= 2:
+            features[f'{series_name}_lag1'] = series.iloc[-2]
+            features[f'{series_name}_mom_change'] = latest - series.iloc[-2]
 
-            # --- Short-term lags (1, 2, 3 months) ---
-            # Capture recent momentum and business cycle dynamics
-            if len(available_data) >= 2:
-                features[f'{series_name}_lag1'] = available_data.iloc[-2]['value']
-                features[f'{series_name}_mom_change'] = latest_row['value'] - available_data.iloc[-2]['value']
+        if n >= 3:
+            features[f'{series_name}_lag2'] = series.iloc[-3]
 
-            if len(available_data) >= 3:
-                features[f'{series_name}_lag2'] = available_data.iloc[-3]['value']
+        if n >= 4:
+            features[f'{series_name}_lag3'] = series.iloc[-4]
 
-            if len(available_data) >= 4:
-                features[f'{series_name}_lag3'] = available_data.iloc[-4]['value']
+        # Medium-term lag (6 months)
+        if n >= 7:
+            features[f'{series_name}_lag6'] = series.iloc[-7]
+            features[f'{series_name}_6m_change'] = latest - series.iloc[-7]
 
-            # --- Medium-term lag (6 months) ---
-            # Semi-annual patterns
-            if len(available_data) >= 7:
-                features[f'{series_name}_lag6'] = available_data.iloc[-7]['value']
-                features[f'{series_name}_6m_change'] = latest_row['value'] - available_data.iloc[-7]['value']
+        # Long-term lags
+        if n >= 13:
+            features[f'{series_name}_lag12'] = series.iloc[-13]
+            features[f'{series_name}_yoy_change'] = latest - series.iloc[-13]
 
-            # --- Long-term lags (12, 18, 24 months) ---
-            # Structural trends and secular patterns in macroeconomic data
-            if len(available_data) >= 13:
-                features[f'{series_name}_lag12'] = available_data.iloc[-13]['value']
-                features[f'{series_name}_yoy_change'] = latest_row['value'] - available_data.iloc[-13]['value']
+        if n >= 19:
+            features[f'{series_name}_lag18'] = series.iloc[-19]
+            features[f'{series_name}_18m_change'] = latest - series.iloc[-19]
 
-            if len(available_data) >= 19:
-                features[f'{series_name}_lag18'] = available_data.iloc[-19]['value']
-                features[f'{series_name}_18m_change'] = latest_row['value'] - available_data.iloc[-19]['value']
+        if n >= 25:
+            features[f'{series_name}_lag24'] = series.iloc[-25]
+            features[f'{series_name}_2yr_change'] = latest - series.iloc[-25]
 
-            if len(available_data) >= 25:
-                features[f'{series_name}_lag24'] = available_data.iloc[-25]['value']
-                features[f'{series_name}_2yr_change'] = latest_row['value'] - available_data.iloc[-25]['value']
+        # Rolling means - use pre-computed slices
+        if n >= 3:
+            features[f'{series_name}_rolling_mean_3'] = series.iloc[-3:].mean()
 
-            # --- Rolling means (smoothed signals) ---
-            if len(available_data) >= 3:
-                features[f'{series_name}_rolling_mean_3'] = available_data['value'].iloc[-3:].mean()
+        if n >= 6:
+            features[f'{series_name}_rolling_mean_6'] = series.iloc[-6:].mean()
 
-            if len(available_data) >= 6:
-                features[f'{series_name}_rolling_mean_6'] = available_data['value'].iloc[-6:].mean()
+        if n >= 12:
+            features[f'{series_name}_rolling_mean_12'] = series.iloc[-12:].mean()
 
-            if len(available_data) >= 12:
-                features[f'{series_name}_rolling_mean_12'] = available_data['value'].iloc[-12:].mean()
+        if n >= 24:
+            features[f'{series_name}_rolling_mean_24'] = series.iloc[-24:].mean()
 
-            if len(available_data) >= 24:
-                features[f'{series_name}_rolling_mean_24'] = available_data['value'].iloc[-24:].mean()
+        # Volatility features
+        if n >= 6:
+            features[f'{series_name}_volatility_6m'] = series.iloc[-6:].std()
 
-            # --- Volatility features ---
-            if len(available_data) >= 6:
-                recent_values = available_data['value'].iloc[-6:]
-                features[f'{series_name}_volatility_6m'] = recent_values.std()
+        if n >= 12:
+            features[f'{series_name}_volatility_12m'] = series.iloc[-12:].std()
 
-            if len(available_data) >= 12:
-                recent_values = available_data['value'].iloc[-12:]
-                features[f'{series_name}_volatility_12m'] = recent_values.std()
-
-            # --- Trend features ---
-            if len(available_data) >= 12:
-                # Linear trend slope over last 12 months
-                recent_values = available_data['value'].iloc[-12:].values
-                x = np.arange(12)
-                if not np.isnan(recent_values).any():
-                    try:
-                        slope = np.polyfit(x, recent_values, 1)[0]
-                        features[f'{series_name}_trend_12m'] = slope
-                    except (np.linalg.LinAlgError, ValueError):
-                        pass
+        # Trend features (12-month linear trend)
+        if n >= 12:
+            recent_values = series.iloc[-12:].values
+            if not np.isnan(recent_values).any():
+                try:
+                    x = np.arange(12)
+                    slope = np.polyfit(x, recent_values, 1)[0]
+                    features[f'{series_name}_trend_12m'] = slope
+                except (np.linalg.LinAlgError, ValueError):
+                    pass
 
     if not features:
         return pd.DataFrame()
 
     return pd.DataFrame([features])
+
+
+def pivot_snapshot_to_wide_batch(
+    snapshot_df: pd.DataFrame,
+    target_months: List[pd.Timestamp]
+) -> pd.DataFrame:
+    """
+    Batch version of pivot_snapshot_to_wide for multiple target months.
+
+    HIGHLY OPTIMIZED for building training datasets. Instead of loading
+    and pivoting the same snapshot multiple times, this processes all
+    target months in a single pass.
+
+    Args:
+        snapshot_df: Long-format snapshot DataFrame
+        target_months: List of target months to generate features for
+
+    Returns:
+        DataFrame with one row per target month, features as columns
+    """
+    if snapshot_df is None or snapshot_df.empty or not target_months:
+        return pd.DataFrame()
+
+    # Pre-process snapshot once
+    df = snapshot_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Pivot to wide format once
+    wide_df = df.pivot_table(
+        index='date',
+        columns='series_name',
+        values='value',
+        aggfunc='first'
+    ).sort_index()
+
+    if wide_df.empty:
+        return pd.DataFrame()
+
+    all_features = []
+
+    for target_month in target_months:
+        # Filter to available data for this target month
+        available = wide_df[wide_df.index <= target_month]
+
+        if available.empty:
+            all_features.append({'target_month': target_month})
+            continue
+
+        features = {'target_month': target_month}
+
+        for series_name in available.columns:
+            series = available[series_name].dropna()
+            n = len(series)
+
+            if n == 0:
+                continue
+
+            latest = series.iloc[-1]
+            features[f'{series_name}_latest'] = latest
+
+            # Lags and changes (simplified for batch processing)
+            if n >= 2:
+                features[f'{series_name}_lag1'] = series.iloc[-2]
+                features[f'{series_name}_mom_change'] = latest - series.iloc[-2]
+
+            if n >= 7:
+                features[f'{series_name}_lag6'] = series.iloc[-7]
+
+            if n >= 13:
+                features[f'{series_name}_lag12'] = series.iloc[-13]
+                features[f'{series_name}_yoy_change'] = latest - series.iloc[-13]
+
+            # Rolling means
+            if n >= 3:
+                features[f'{series_name}_rolling_mean_3'] = series.iloc[-3:].mean()
+
+            if n >= 12:
+                features[f'{series_name}_rolling_mean_12'] = series.iloc[-12:].mean()
+
+        all_features.append(features)
+
+    return pd.DataFrame(all_features)

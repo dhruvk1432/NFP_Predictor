@@ -7,7 +7,9 @@
       "Bash(awk:*)",
       "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor:*)",
       "Bash(wc:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(tree:*)"
     ]
   }
 }

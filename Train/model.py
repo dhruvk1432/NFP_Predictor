@@ -3,6 +3,10 @@ LightGBM Model Training for NFP Prediction
 
 Core model training, prediction, and interval calculation functions.
 Extracted from train_lightgbm_nfp.py for maintainability.
+
+MULTI-TARGET SUPPORT:
+Model save/load functions support 4 target configurations:
+- nsa_first, nsa_last, sa_first, sa_last
 """
 
 import pandas as pd
@@ -25,6 +29,9 @@ from Train.config import (
     CONFIDENCE_LEVELS,
     MODEL_SAVE_DIR,
     PROTECTED_BINARY_FLAGS,
+    get_model_id,
+    VALID_TARGET_TYPES,
+    VALID_RELEASE_TYPES,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -396,50 +403,118 @@ def save_model(
     importance: Dict,
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
+    release_type: str = 'first',
     linear_model: Optional[Any] = None,
     linear_cols: Optional[List[str]] = None
 ) -> None:
-    """Save model and associated metadata."""
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
+    """
+    Save model and associated metadata.
+
+    Args:
+        model: Trained LightGBM model
+        feature_cols: List of feature column names used
+        residuals: List of residuals for prediction intervals
+        importance: Feature importance dictionary
+        save_dir: Base directory for model storage
+        target_type: 'nsa' or 'sa'
+        release_type: 'first' or 'last'
+        linear_model: Optional linear baseline model
+        linear_cols: Optional columns used by linear model
+    """
+    model_id = get_model_id(target_type, release_type)
+
+    # Create subdirectory for this model variant
+    model_dir = save_dir / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+
     # Save LightGBM model
-    model.save_model(str(save_dir / f"lightgbm_{target_type}_model.txt"))
-    
+    model.save_model(str(model_dir / f"lightgbm_{model_id}_model.txt"))
+
     # Save metadata
     metadata = {
         'feature_cols': feature_cols,
         'residuals': residuals,
         'importance': importance,
         'target_type': target_type,
+        'release_type': release_type,
+        'model_id': model_id,
         'linear_model': linear_model,
         'linear_cols': linear_cols,
     }
-    
-    with open(save_dir / f"lightgbm_{target_type}_metadata.pkl", 'wb') as f:
+
+    with open(model_dir / f"lightgbm_{model_id}_metadata.pkl", 'wb') as f:
         pickle.dump(metadata, f)
-    
-    logger.info(f"Model saved to {save_dir}")
+
+    logger.info(f"Model {model_id.upper()} saved to {model_dir}")
 
 
 def load_model(
-    save_dir: Path = MODEL_SAVE_DIR, 
-    target_type: str = 'nsa'
+    save_dir: Path = MODEL_SAVE_DIR,
+    target_type: str = 'nsa',
+    release_type: str = 'first'
 ) -> Tuple[lgb.Booster, Dict]:
-    """Load model and associated metadata."""
-    model_path = save_dir / f"lightgbm_{target_type}_model.txt"
-    metadata_path = save_dir / f"lightgbm_{target_type}_metadata.pkl"
-    
+    """
+    Load model and associated metadata.
+
+    Args:
+        save_dir: Base directory for model storage
+        target_type: 'nsa' or 'sa'
+        release_type: 'first' or 'last'
+
+    Returns:
+        Tuple of (model, metadata)
+    """
+    model_id = get_model_id(target_type, release_type)
+    model_dir = save_dir / model_id
+
+    model_path = model_dir / f"lightgbm_{model_id}_model.txt"
+    metadata_path = model_dir / f"lightgbm_{model_id}_metadata.pkl"
+
+    # Fallback to legacy paths for backward compatibility
     if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
-    
+        # Try legacy path format
+        legacy_model_path = save_dir / f"lightgbm_{target_type}_model.txt"
+        legacy_metadata_path = save_dir / f"lightgbm_{target_type}_metadata.pkl"
+
+        if legacy_model_path.exists():
+            logger.warning(f"Using legacy model path: {legacy_model_path}")
+            model_path = legacy_model_path
+            metadata_path = legacy_metadata_path
+        else:
+            raise FileNotFoundError(f"Model not found: {model_path}")
+
     model = lgb.Booster(model_file=str(model_path))
-    
+
     with open(metadata_path, 'rb') as f:
         metadata = pickle.load(f)
-    
-    logger.info(f"Model loaded from {save_dir}")
-    
+
+    logger.info(f"Model {model_id.upper()} loaded from {model_dir}")
+
     return model, metadata
+
+
+def list_available_models(save_dir: Path = MODEL_SAVE_DIR) -> List[str]:
+    """
+    List all available trained models.
+
+    Args:
+        save_dir: Base directory for model storage
+
+    Returns:
+        List of model_ids that have trained models
+    """
+    available = []
+
+    for target_type in VALID_TARGET_TYPES:
+        for release_type in VALID_RELEASE_TYPES:
+            model_id = get_model_id(target_type, release_type)
+            model_dir = save_dir / model_id
+
+            model_path = model_dir / f"lightgbm_{model_id}_model.txt"
+            if model_path.exists():
+                available.append(model_id)
+
+    return available
 
 
 # =============================================================================

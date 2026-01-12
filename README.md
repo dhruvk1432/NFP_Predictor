@@ -11,6 +11,26 @@ This project predicts monthly employment changes (Month-over-Month) for the US B
 - **Point-in-time snapshots** ensuring no look-ahead bias
 - **Extreme event detection** with COVID-specific features (VIX spikes, circuit breakers)
 - **Confidence intervals** based on historical residuals
+- **Multi-target support** for 4 model variants (NSA/SA x first/last release)
+
+## Model Variants
+
+The system supports 4 target configurations:
+
+| Model ID | Target Type | Release Type | Description |
+|----------|-------------|--------------|-------------|
+| `nsa_first` | NSA | First | Non-seasonally adjusted, initial release |
+| `nsa_last` | NSA | Last | Non-seasonally adjusted, final revised |
+| `sa_first` | SA | First | Seasonally adjusted, initial release |
+| `sa_last` | SA | Last | Seasonally adjusted, final revised |
+
+**Target Types:**
+- **NSA (Non-Seasonally Adjusted)**: Raw employment data with seasonal patterns
+- **SA (Seasonally Adjusted)**: Employment data with seasonal adjustment applied
+
+**Release Types:**
+- **First Release**: Initial BLS estimate (~7 days after month-end)
+- **Last Release**: Final revised values after all revisions complete
 
 ## Quick Start
 
@@ -27,11 +47,11 @@ python Load_Data/fred_snapshots.py           # Employment data
 python Load_Data/load_fred_exogenous.py      # Exogenous indicators
 python Prepare_Data/create_master_snapshots.py  # Consolidate all data
 
-# 4. Train model
-python Train/train_lightgbm_nfp.py --target nsa
+# 4. Train all 4 model variants
+python Train/train_lightgbm_nfp.py --train-all
 
-# 5. Run backtest
-python Train/train_lightgbm_nfp.py --backtest --months 36
+# Or train a single model (default: nsa_first)
+python Train/train_lightgbm_nfp.py --train --target nsa --release first
 ```
 
 ## Directory Structure
@@ -51,14 +71,38 @@ NFP_Predictor/
 │   └── create_noaa_weighted.py     # NOAA aggregation
 │
 ├── Train/                  # Model training and evaluation
-│   ├── train_lightgbm_nfp.py   # Main training script
-│   ├── evaluate_predictions.py  # Metrics and visualizations
-│   └── snapshot_loader.py       # Data loading utilities
+│   ├── train_lightgbm_nfp.py   # Main training script (multi-target)
+│   ├── config.py               # Configuration constants
+│   ├── data_loader.py          # Data loading with caching
+│   ├── feature_engineering.py  # Feature creation
+│   ├── model.py                # LightGBM training/prediction
+│   ├── backtest_results.py     # Backtest reporting
+│   └── backtest_archiver.py    # Results archiving
 │
-├── Data/                   # Data storage (gitignored)
+├── data/                   # Data storage (gitignored)
 │   ├── fred_data/              # Employment snapshots
+│   ├── fred_data_prepared/     # Preprocessed employment data
 │   ├── Exogenous_data/         # Master snapshots
-│   └── NFP_target/             # First/last release targets
+│   └── NFP_target/             # Target files (4 variants)
+│       ├── y_nsa_first_release.parquet
+│       ├── y_nsa_last_release.parquet
+│       ├── y_sa_first_release.parquet
+│       └── y_sa_last_release.parquet
+│
+├── _output/                # Model outputs and results
+│   ├── backtest_results/       # Per-model backtest results
+│   │   ├── nsa_first/
+│   │   ├── nsa_last/
+│   │   ├── sa_first/
+│   │   └── sa_last/
+│   ├── backtest_historical/    # Timestamped archives
+│   ├── feature_importance/     # Per-model feature importance
+│   ├── feature_selection/      # Per-model feature selection
+│   └── models/lightgbm_nfp/    # Saved models
+│       ├── nsa_first/
+│       ├── nsa_last/
+│       ├── sa_first/
+│       └── sa_last/
 │
 ├── settings.py             # Configuration and environment
 ├── pipeline_helpers.py     # Shared utilities
@@ -123,13 +167,41 @@ Training samples during extreme events (COVID crash) receive **5x weight** to en
 ### Point-in-Time Correctness
 All data is organized into monthly snapshots containing only information available as of each NFP release date, preventing look-ahead bias in backtesting.
 
+## Training Commands
+
+```bash
+# Train all 4 model variants (recommended)
+python Train/train_lightgbm_nfp.py --train-all
+
+# Train a single model
+python Train/train_lightgbm_nfp.py --train --target nsa --release first
+
+# Train both NSA and SA (same release type)
+python Train/train_lightgbm_nfp.py --train-both --release first
+
+# Train both release types (same target type)
+python Train/train_lightgbm_nfp.py --train-both-releases --target nsa
+
+# Train with Huber loss (robust to outliers)
+python Train/train_lightgbm_nfp.py --train-all --huber-loss
+
+# Get prediction for a specific month
+python Train/train_lightgbm_nfp.py --predict 2024-12 --target sa --release first
+
+# Get latest prediction
+python Train/train_lightgbm_nfp.py --latest --target nsa --release first
+
+# Run feature diagnostics
+python Train/train_lightgbm_nfp.py --diagnostics --target nsa
+```
+
 ## Environment Variables
 
 Create a `.env` file with:
 
 ```env
 FRED_API_KEY=your_fred_api_key
-DATA_PATH=./Data
+DATA_PATH=./data
 START_DATE=1990-01-01
 END_DATE=2025-12-31
 BACKTEST_MONTHS=36
@@ -142,10 +214,13 @@ NBEATSX_MODEL_TYPE=generic
 
 ## Model Performance
 
-Typical backtest metrics:
+Typical backtest metrics (varies by target configuration):
 - **Directional Accuracy**: 65-70%
 - **MAE**: 80-120K jobs
 - **RMSE**: 150-250K jobs (higher due to COVID outliers)
+
+Note: "Last release" models may show different metrics since they predict
+the final revised values rather than initial estimates.
 
 ## Dependencies
 

@@ -8,6 +8,10 @@ OPTIMIZATIONS:
 - LRU cache for snapshot loading (avoids redundant I/O)
 - Vectorized pivot_snapshot_to_wide using pandas native operations
 - Pre-computed lag indices for batch feature generation
+
+MULTI-TARGET SUPPORT:
+- Supports 4 target configurations: (nsa/sa) x (first/last release)
+- Cache keys include both target_type and release_type
 """
 
 import pandas as pd
@@ -24,9 +28,11 @@ from Train.config import (
     MASTER_SNAPSHOTS_DIR,
     FRED_SNAPSHOTS_DIR,
     FRED_PREPARED_DIR,
-    TARGET_PATH_NSA,
-    TARGET_PATH_SA,
     USE_PREPARED_FRED_DATA,
+    get_target_path,
+    get_model_id,
+    VALID_TARGET_TYPES,
+    VALID_RELEASE_TYPES,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -127,30 +133,40 @@ def clear_snapshot_cache() -> None:
     logger.info("Snapshot cache cleared")
 
 
-def load_target_data(target_type: str = 'nsa', use_cache: bool = True) -> pd.DataFrame:
+def load_target_data(
+    target_type: str = 'nsa',
+    release_type: str = 'first',
+    use_cache: bool = True
+) -> pd.DataFrame:
     """
     Load and prepare target data (NSA or SA NFP levels) with derived features.
 
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
+        release_type: 'first' for initial release, 'last' for final revised release
         use_cache: Whether to use/populate the module cache
 
     Returns:
         DataFrame with columns: ds, y (level), y_mom (month-on-month change),
         and additional momentum/divergence features
     """
-    cache_key = f"target_{target_type.lower()}"
+    # Validate inputs
+    target_type = target_type.lower()
+    release_type = release_type.lower()
+
+    if target_type not in VALID_TARGET_TYPES:
+        raise ValueError(f"Invalid target_type: {target_type}. Must be one of {VALID_TARGET_TYPES}")
+    if release_type not in VALID_RELEASE_TYPES:
+        raise ValueError(f"Invalid release_type: {release_type}. Must be one of {VALID_RELEASE_TYPES}")
+
+    cache_key = f"target_{get_model_id(target_type, release_type)}"
 
     if use_cache and cache_key in _target_cache:
         return _target_cache[cache_key].copy()
 
-    # Load appropriate target file
-    if target_type.lower() == 'sa':
-        target_path = TARGET_PATH_SA
-        logger.info("Loading SA (seasonally adjusted) target data")
-    else:
-        target_path = TARGET_PATH_NSA
-        logger.info("Loading NSA (non-seasonally adjusted) target data")
+    # Load appropriate target file using dynamic path
+    target_path = get_target_path(target_type, release_type)
+    logger.info(f"Loading {target_type.upper()} {release_type} release target data")
 
     if not target_path.exists():
         raise FileNotFoundError(f"Target file not found: {target_path}")
@@ -185,18 +201,22 @@ def load_target_data(target_type: str = 'nsa', use_cache: bool = True) -> pd.Dat
     # Drop first row (no MoM for first observation) but keep future rows with NaN y
     df = df[df.index != 0].reset_index(drop=True)
 
+    model_id = get_model_id(target_type, release_type)
     if use_cache:
         _target_cache[cache_key] = df
-        logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations (cached)")
+        logger.info(f"Loaded {model_id.upper()} target data: {len(df)} observations (cached)")
     else:
-        logger.info(f"Loaded {target_type.upper()} target data: {len(df)} observations")
+        logger.info(f"Loaded {model_id.upper()} target data: {len(df)} observations")
 
     return df.copy() if use_cache else df
 
 
-def load_all_target_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_all_target_data(release_type: str = 'first') -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load both NSA and SA target data with all derived features.
+    Load both NSA and SA target data with all derived features for a given release type.
+
+    Args:
+        release_type: 'first' for initial release, 'last' for final revised
 
     Returns:
         Tuple of (nsa_df, sa_df) with columns:
@@ -205,9 +225,16 @@ def load_all_target_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         - y_mom: month-on-month change
         - Additional momentum/divergence features
     """
-    nsa_df = load_target_data('nsa')
-    sa_df = load_target_data('sa')
+    nsa_df = load_target_data('nsa', release_type=release_type)
+    sa_df = load_target_data('sa', release_type=release_type)
     return nsa_df, sa_df
+
+
+def clear_target_cache() -> None:
+    """Clear the target data cache to free memory."""
+    global _target_cache
+    _target_cache.clear()
+    logger.info("Target cache cleared")
 
 
 def get_lagged_target_features(

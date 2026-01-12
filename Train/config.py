@@ -3,14 +3,41 @@ LightGBM NFP Model Configuration
 
 Centralized configuration constants for the NFP prediction model.
 Extracted from train_lightgbm_nfp.py for maintainability.
+
+TARGET TYPES:
+    - target_type: 'nsa' (non-seasonally adjusted) or 'sa' (seasonally adjusted)
+    - release_type: 'first' (initial release) or 'last' (final revised)
+
+This creates 4 model variants:
+    - nsa_first: NSA with first release data
+    - nsa_last: NSA with final revised data
+    - sa_first: SA with first release data
+    - sa_last: SA with final revised data
 """
 
 from pathlib import Path
+from typing import Tuple
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, OUTPUT_DIR
+
+
+# =============================================================================
+# VALID TARGET CONFIGURATIONS
+# =============================================================================
+
+VALID_TARGET_TYPES = ('nsa', 'sa')
+VALID_RELEASE_TYPES = ('first', 'last')
+
+# All 4 target combinations
+ALL_TARGET_CONFIGS = [
+    ('nsa', 'first'),
+    ('nsa', 'last'),
+    ('sa', 'first'),
+    ('sa', 'last'),
+]
 
 
 # =============================================================================
@@ -30,12 +57,82 @@ MIN_TARGET_CORR = 0.05  # Minimum absolute correlation with target
 MASTER_SNAPSHOTS_DIR = DATA_PATH / "Exogenous_data" / "master_snapshots" / "decades"
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
 FRED_PREPARED_DIR = DATA_PATH / "fred_data_prepared" / "decades"  # Preprocessed data
-TARGET_PATH_NSA = DATA_PATH / "NFP_target" / "y_nsa_first_release.parquet"
-TARGET_PATH_SA = DATA_PATH / "NFP_target" / "y_sa_first_release.parquet"
+NFP_TARGET_DIR = DATA_PATH / "NFP_target"
 MODEL_SAVE_DIR = OUTPUT_DIR / "models" / "lightgbm_nfp"
 
 # Use prepared data (SymLog transformed, scaled) or raw data
 USE_PREPARED_FRED_DATA = True
+
+
+def get_target_path(target_type: str, release_type: str = 'first') -> Path:
+    """
+    Get target file path based on type and release timing.
+
+    Args:
+        target_type: 'nsa' or 'sa'
+        release_type: 'first' or 'last'
+
+    Returns:
+        Path to target parquet file
+
+    Raises:
+        ValueError: If invalid target_type or release_type
+    """
+    target_type = target_type.lower()
+    release_type = release_type.lower()
+
+    if target_type not in VALID_TARGET_TYPES:
+        raise ValueError(f"Invalid target_type: {target_type}. Must be one of {VALID_TARGET_TYPES}")
+    if release_type not in VALID_RELEASE_TYPES:
+        raise ValueError(f"Invalid release_type: {release_type}. Must be one of {VALID_RELEASE_TYPES}")
+
+    filename = f"y_{target_type}_{release_type}_release.parquet"
+    return NFP_TARGET_DIR / filename
+
+
+def get_model_id(target_type: str, release_type: str = 'first') -> str:
+    """
+    Get a unique model identifier string for the target configuration.
+
+    Args:
+        target_type: 'nsa' or 'sa'
+        release_type: 'first' or 'last'
+
+    Returns:
+        Model identifier string (e.g., 'nsa_first', 'sa_last')
+    """
+    return f"{target_type.lower()}_{release_type.lower()}"
+
+
+def parse_model_id(model_id: str) -> Tuple[str, str]:
+    """
+    Parse a model identifier string into target_type and release_type.
+
+    Args:
+        model_id: Model identifier (e.g., 'nsa_first')
+
+    Returns:
+        Tuple of (target_type, release_type)
+
+    Raises:
+        ValueError: If invalid model_id format
+    """
+    parts = model_id.lower().split('_')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid model_id format: {model_id}. Expected 'target_release' (e.g., 'nsa_first')")
+
+    target_type, release_type = parts
+    if target_type not in VALID_TARGET_TYPES:
+        raise ValueError(f"Invalid target_type in model_id: {target_type}")
+    if release_type not in VALID_RELEASE_TYPES:
+        raise ValueError(f"Invalid release_type in model_id: {release_type}")
+
+    return target_type, release_type
+
+
+# Legacy compatibility - point to first release files
+TARGET_PATH_NSA = get_target_path('nsa', 'first')
+TARGET_PATH_SA = get_target_path('sa', 'first')
 
 
 # =============================================================================

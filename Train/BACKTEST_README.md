@@ -4,6 +4,19 @@
 
 Comprehensive backtesting system for NFP month-over-month change predictions with historical archiving and detailed results presentation.
 
+## Multi-Target Support
+
+The system supports 4 target configurations (model variants):
+
+| Model ID | Target Type | Release Type | Description |
+|----------|-------------|--------------|-------------|
+| `nsa_first` | NSA | First | Non-seasonally adjusted, initial release |
+| `nsa_last` | NSA | Last | Non-seasonally adjusted, final revised |
+| `sa_first` | SA | First | Seasonally adjusted, initial release |
+| `sa_last` | SA | Last | Seasonally adjusted, final revised |
+
+Each model variant has its own output directories for backtest results, feature importance, and saved models.
+
 ## Features
 
 ### 1. **Historical Archiving** (`backtest_archiver.py`)
@@ -25,58 +38,90 @@ BACKTEST_MONTHS=36  # Number of months to backtest (default: 36)
 
 ## Usage
 
-### Run Backtest with Default Settings (36 months from .env)
+### Train All 4 Model Variants (Recommended)
 ```bash
-python Train/run_expanding_backtest.py
+python Train/train_lightgbm_nfp.py --train-all
 ```
 
 This will:
 1. Archive any existing results to `_output/backtest_historical/YYYY-MM-DD_HH-MM-SS/`
-2. Clean `_output/backtest/` directory
-3. Run backtest for last 36 months (as specified in .env)
-4. Generate comprehensive report with:
-   - `selected_features.csv` - Features used after selection
-   - `features_summary.csv` - Feature counts by category
-   - `metrics_summary.csv` - Formatted error metrics table
-   - `metrics_raw.json` - Raw metrics dictionary
-   - `predictions.csv` - All predictions and actuals
-   - `predictions_vs_actual.png` - Shaded visualization
-   - `report_summary.json` - Complete report metadata
+2. Train and backtest all 4 model variants in sequence
+3. Generate comprehensive reports for each variant
 
-### Custom Backtest Period
+### Train Single Model
 ```bash
-# Backtest last 24 months instead of 36
-python Train/run_expanding_backtest.py --months 24
+# Train NSA first release (default)
+python Train/train_lightgbm_nfp.py --train
 
-# Full history backtest
-python Train/run_expanding_backtest.py --months 999
+# Train SA last release
+python Train/train_lightgbm_nfp.py --train --target sa --release last
 ```
 
-### Skip Archiving
+### Train Subsets
 ```bash
-# Don't archive previous results (for testing)
-python Train/run_expanding_backtest.py --skip-archive
+# Train both NSA and SA (same release type)
+python Train/train_lightgbm_nfp.py --train-both --release first
+
+# Train both release types (same target type)
+python Train/train_lightgbm_nfp.py --train-both-releases --target nsa
+```
+
+### Custom Backtest Period
+Configure in `.env`:
+```bash
+BACKTEST_MONTHS=24  # Backtest last 24 months instead of 36
 ```
 
 ## Output Structure
 
 ```
 _output/
-├── backtest/                          # Current backtest results
-│   ├── predictions.csv                # All predictions with actuals
-│   ├── selected_features.csv          # Features after selection
-│   ├── features_summary.csv           # Feature category counts
-│   ├── metrics_summary.csv            # Formatted error metrics
-│   ├── metrics_raw.json               # Raw metrics dictionary
-│   ├── predictions_vs_actual.png      # Shaded prediction graph
-│   ├── report_summary.json            # Report metadata
-│   └── models/                        # Saved models (optional)
+├── backtest_results/                  # Current backtest results (by model)
+│   ├── nsa_first/
+│   │   ├── backtest_results_nsa_first.parquet
+│   │   ├── backtest_results_nsa_first.csv
+│   │   ├── model_summary_nsa_first.csv
+│   │   ├── predictions.csv
+│   │   ├── selected_features.csv
+│   │   ├── features_summary.csv
+│   │   ├── metrics_summary.csv
+│   │   ├── metrics_raw.json
+│   │   ├── predictions_vs_actual.png
+│   │   └── report_summary.json
+│   ├── nsa_last/
+│   │   └── [same structure]
+│   ├── sa_first/
+│   │   └── [same structure]
+│   └── sa_last/
+│       └── [same structure]
+│
+├── feature_importance/                # Feature importance (by model)
+│   ├── nsa_first/
+│   │   └── feature_importance_nsa_first.csv
+│   ├── nsa_last/
+│   ├── sa_first/
+│   └── sa_last/
+│
+├── feature_selection/                 # Feature selection results (by model)
+│   ├── nsa_first/
+│   │   ├── feature_ranking_nsa.csv
+│   │   ├── selected_features_nsa.csv
+│   │   └── feature_selection_metadata_nsa.pkl
+│   ├── nsa_last/
+│   ├── sa_first/
+│   └── sa_last/
+│
+├── models/lightgbm_nfp/               # Saved models (by model)
+│   ├── nsa_first/
+│   │   ├── lightgbm_nsa_first_model.txt
+│   │   └── lightgbm_nsa_first_metadata.pkl
+│   ├── nsa_last/
+│   ├── sa_first/
+│   └── sa_last/
 │
 └── backtest_historical/               # Historical backtest archives
-    ├── 2025-01-15_10-30-45/          # Archive from Jan 15, 2025 10:30:45
-    │   └── [same structure as backtest/]
-    ├── 2025-01-14_14-22-10/          # Archive from Jan 14, 2025 14:22:10
-    │   └── [same structure as backtest/]
+    ├── 2025-01-15_10-30-45/
+    │   └── [all model results at this timestamp]
     └── ...
 ```
 
@@ -163,8 +208,17 @@ print(comparison)
 ls _output/backtest_historical/
 # Output: 2025-01-15_10-30-45  2025-01-14_14-22-10  ...
 
-# View specific archive
-cat _output/backtest_historical/2025-01-15_10-30-45/metrics_summary.csv
+# View specific archive for a model
+cat _output/backtest_historical/2025-01-15_10-30-45/nsa_first/metrics_summary.csv
+```
+
+### List Available Models
+```python
+from Train.model import list_available_models
+
+# List all trained models
+models = list_available_models()
+print(models)  # ['nsa_first', 'nsa_last', 'sa_first', 'sa_last']
 ```
 
 ## Feature Selection Process
@@ -212,10 +266,36 @@ All selected features are documented in `selected_features.csv`.
 ## Integration with Existing Code
 
 The backtest system integrates seamlessly with:
-- `train_lightgbm_nfp.py`: Feature selection and model training
-- `forecast_pipeline.py`: NFP prediction generation
-- `sa_mapper.py`: NSA to SA conversion
+- `train_lightgbm_nfp.py`: Feature selection and model training (multi-target)
+- `config.py`: Target configuration and path utilities
+- `data_loader.py`: Data loading with release_type support
+- `model.py`: Model save/load with model_id support
 - `settings.py`: Configuration (BACKTEST_MONTHS)
+
+## CLI Reference
+
+```bash
+# Training Options
+--train              # Train single model
+--train-all          # Train all 4 model variants
+--train-both         # Train NSA and SA (same release)
+--train-both-releases  # Train first and last (same target)
+
+# Target Selection
+--target {nsa,sa}    # Target type (default: nsa)
+--release {first,last}  # Release type (default: first)
+
+# Loss Function
+--huber-loss         # Use Huber loss (robust to outliers)
+--huber-delta FLOAT  # Huber delta parameter (default: 1.0)
+
+# Prediction
+--predict YYYY-MM    # Predict for specific month
+--latest             # Predict for latest available month
+
+# Diagnostics
+--diagnostics        # Run VIF and correlation analysis
+```
 
 ## Future Enhancements
 
@@ -225,3 +305,4 @@ Potential additions:
 - Error distribution visualizations
 - Subsector prediction accuracy breakdown
 - Confidence interval calibration metrics
+- Cross-model comparison reports

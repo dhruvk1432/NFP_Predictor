@@ -489,9 +489,15 @@ def get_first_friday_of_month(dates: pd.Series) -> pd.Series:
 def impute_target_release_date_simple(df: pd.DataFrame) -> pd.DataFrame:
     """
     SIMPLE LOGIC (For NFP Target "First Release" files):
-    Imputes release dates using First Friday of next month rule, but only for:
-    - Dates before 2009-01-01 with release_date > 14 days after month-end
-    - After 2009-01-01, use actual FRED data (no imputation until future dates)
+    Imputes release dates using First Friday of next month rule with different logic based on data quality era:
+    
+    PRE-2009 (lower data quality):
+    - Impute if release_date is missing OR > 14 days after month-end
+    
+    POST-2009 (higher data quality):
+    - Only impute if release_date is explicitly NaN (missing)
+    - Preserve all existing dates, even if delayed (e.g., Oct 2013 government shutdown)
+    - This prevents lookahead bias from incorrectly "fixing" legitimate historical delays
     """
     if "release_date" not in df.columns and "realtime_start" in df.columns:
         df = df.rename(columns={"realtime_start": "release_date"})
@@ -505,10 +511,14 @@ def impute_target_release_date_simple(df: pd.DataFrame) -> pd.DataFrame:
 
     cutoff_date = pd.Timestamp("2009-01-01")
 
-    # Only impute if:
-    # 1. (Missing OR > 14 days after month-end) AND
-    # 2. Observation date is before 2009-01-01
-    mask = (df["release_date"].isna() | (df["release_date"] > threshold)) & (df["ds"] < cutoff_date)
+    # PRE-2009: Impute if missing OR > 14 days after month-end (old logic for lower quality data)
+    mask_pre_2009 = (df["release_date"].isna() | (df["release_date"] > threshold)) & (df["ds"] < cutoff_date)
+    
+    # POST-2009: Only impute if explicitly missing (preserve legitimate delays)
+    mask_post_2009 = df["release_date"].isna() & (df["ds"] >= cutoff_date)
+    
+    # Combine masks
+    mask = mask_pre_2009 | mask_post_2009
 
     # Ensure alignment by using the index
     df.loc[mask, "release_date"] = imputed_dates[mask]

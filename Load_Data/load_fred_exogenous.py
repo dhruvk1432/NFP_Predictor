@@ -70,7 +70,7 @@ def fred_api_call_with_retry(fred_func, *args, max_retries: int = 3, base_delay:
 FRED_SERIES = {
     #Daily Data - Financial Market Indicators
     "Credit_Spreads": "BAMLH0A0HYM2",
-    "Yield_Curve": "T10Y3M",
+    "Yield_Curve": "T10Y2Y",
     "Oil_Prices": "DCOILWTICO",
     "VIX": "VIXCLS",  # CBOE Volatility Index - Market fear gauge
     "SP500": "SP500",  # S&P 500 Index - Market crashes & recoveries

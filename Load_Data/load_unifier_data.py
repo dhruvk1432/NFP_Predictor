@@ -241,12 +241,23 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
                 logger.warning(f"No data returned for {name} ({code})")
                 continue
 
-            # Select relevant columns
-            cols = ["timestamp", "last_revision_date", "latest_revised_value",
-                    "first_release_date", "first_release_value"]
+            # V2: Schema validation - check required columns exist
+            required_cols = ["timestamp", "latest_revised_value"]
+            optional_cols = ["last_revision_date", "first_release_date", "first_release_value"]
 
-            # Check if columns exist
-            available_cols = [c for c in cols if c in df.columns]
+            missing_required = [c for c in required_cols if c not in df.columns]
+            if missing_required:
+                logger.error(f"Schema validation failed for {name}: missing required columns {missing_required}")
+                logger.error(f"  Available columns: {df.columns.tolist()}")
+                continue
+
+            missing_optional = [c for c in optional_cols if c not in df.columns]
+            if missing_optional:
+                logger.warning(f"{name}: Missing optional columns {missing_optional} - will use defaults")
+
+            # Select available columns
+            all_cols = required_cols + optional_cols
+            available_cols = [c for c in all_cols if c in df.columns]
             df = df[available_cols].copy()
 
             df['series_name'] = name

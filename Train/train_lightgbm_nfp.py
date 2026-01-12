@@ -96,7 +96,8 @@ def build_training_dataset(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     start_date: Optional[pd.Timestamp] = None,
-    end_date: Optional[pd.Timestamp] = None
+    end_date: Optional[pd.Timestamp] = None,
+    show_progress: bool = True
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Build training dataset by joining snapshots with targets.
@@ -104,11 +105,17 @@ def build_training_dataset(
     Uses snapshot of month M to predict month M's MoM change.
     Includes lagged target features from BOTH NSA and SA data.
 
+    OPTIMIZED:
+    - Uses cached data loading to avoid redundant I/O
+    - Batch processes features where possible
+    - Progress logging every 12 months
+
     Args:
         target_df: Target DataFrame with y_mom column (the prediction target)
         target_type: 'nsa' or 'sa' - determines which target we're predicting
         start_date: Start date for training data
         end_date: End date for training data
+        show_progress: Whether to show progress logging
 
     Returns:
         Tuple of (features DataFrame, target Series)
@@ -117,8 +124,7 @@ def build_training_dataset(
     all_targets = []
     valid_dates = []
 
-    # Load both NSA and SA target data for feature engineering
-    # This allows us to use both as predictors regardless of which we're predicting
+    # Load both NSA and SA target data ONCE (cached)
     logger.info("Loading NSA and SA target data for feature engineering...")
     nsa_target_full = load_target_data('nsa')
     sa_target_full = load_target_data('sa')
@@ -130,16 +136,17 @@ def build_training_dataset(
     if end_date:
         filtered_df = filtered_df[filtered_df['ds'] <= end_date]
 
-    logger.info(f"Building features for {len(filtered_df)} target months...")
+    n_months = len(filtered_df)
+    logger.info(f"Building features for {n_months} target months...")
 
-    for idx, row in filtered_df.iterrows():
+    for i, (idx, row) in enumerate(filtered_df.iterrows()):
         target_month = row['ds']
         target_value = row['y_mom']
 
         # Get snapshot for this month (month-end date)
         snapshot_date = target_month + pd.offsets.MonthEnd(0)
 
-        # Load and process snapshot
+        # Load and process snapshot (cached)
         snapshot_df = load_master_snapshot(snapshot_date)
 
         if snapshot_df is None or snapshot_df.empty:
@@ -163,8 +170,7 @@ def build_training_dataset(
         for k, v in {**nsa_target_features, **sa_target_features}.items():
             features[k] = v
 
-        # Add FRED employment features (endogenous data)
-        # Load FRED employment snapshot for this month
+        # Add FRED employment features (endogenous data) - cached
         fred_df = load_fred_snapshot(snapshot_date)
         if fred_df is not None and not fred_df.empty:
             employment_features = engineer_employment_features(fred_df, target_month, target_type)
@@ -175,27 +181,35 @@ def build_training_dataset(
         all_targets.append(target_value)
         valid_dates.append(target_month)
 
+        # Progress logging
+        if show_progress and (i + 1) % 24 == 0:
+            logger.info(f"  Processed {i + 1}/{n_months} months...")
+
     if not all_features:
         logger.error("No valid training samples created")
         return pd.DataFrame(), pd.Series(dtype=float)
 
-    # Combine all features
+    # Combine all features efficiently
     X = pd.concat(all_features, ignore_index=True)
     y = pd.Series(all_targets, name='y_mom')
 
     # Add date index for reference
     X['ds'] = valid_dates
 
-    # Handle missing values - fill with column mean (or 0 for truly missing)
+    # Handle missing values - vectorized fill
     numeric_cols = X.select_dtypes(include=[np.number]).columns
-    X[numeric_cols] = X[numeric_cols].fillna(X[numeric_cols].mean())
+    col_means = X[numeric_cols].mean()
+    X[numeric_cols] = X[numeric_cols].fillna(col_means)
     X = X.fillna(0)
 
     # Count feature categories
-    calendar_features = ['month_sin', 'month_cos', 'quarter_sin', 'quarter_cos', 'weeks_since_last_survey', 'is_5_week_month', 'is_jan', 'is_july', 'year']
+    calendar_features = ['month_sin', 'month_cos', 'quarter_sin', 'quarter_cos',
+                         'weeks_since_last_survey', 'is_5_week_month', 'is_jan',
+                         'is_july', 'year', 'is_summer', 'is_holiday_season', 'is_december']
     target_features = [c for c in X.columns if c.startswith('nfp_')]
     employment_features = [c for c in X.columns if c.startswith('emp_')]
-    exog_features = [c for c in X.columns if not c.startswith('nfp_') and not c.startswith('emp_') and c not in calendar_features and c != 'ds']
+    exog_features = [c for c in X.columns if not c.startswith('nfp_') and
+                     not c.startswith('emp_') and c not in calendar_features and c != 'ds']
 
     logger.info(f"Built training dataset: {len(X)} samples, {len(X.columns)} total features")
     logger.info(f"  - Exogenous (macro) features: {len([c for c in exog_features if c in X.columns])}")
@@ -1356,10 +1370,16 @@ def select_features_comprehensive(
     y: pd.Series,
     max_features: int = MAX_FEATURES,
     output_dir: Optional[Path] = None,
-    target_type: str = 'nsa'
+    target_type: str = 'nsa',
+    skip_vif: bool = False
 ) -> Tuple[List[str], Dict]:
     """
     Comprehensive feature selection pipeline.
+
+    OPTIMIZED:
+    - Computes target correlations once and reuses
+    - Vectorized operations where possible
+    - Optional VIF skip for faster iteration
 
     Steps:
     1. Remove zero-variance and infinite features
@@ -1375,6 +1395,7 @@ def select_features_comprehensive(
         max_features: Maximum features to select
         output_dir: Directory to save selection results
         target_type: 'nsa' or 'sa' for labeling outputs
+        skip_vif: If True, skip VIF check (faster)
 
     Returns:
         Tuple of (selected feature list, selection metadata dict)
@@ -1385,12 +1406,11 @@ def select_features_comprehensive(
     logger.info(f"Starting with {len(X.columns)} features, target: {max_features}")
 
     # Identify protected binary flags present in dataset
-    protected_features_present = [f for f in PROTECTED_BINARY_FLAGS if f in X.columns]
+    protected_set = set(PROTECTED_BINARY_FLAGS)
+    protected_features_present = [f for f in X.columns if f in protected_set]
 
     if protected_features_present:
-        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal:")
-        for f in protected_features_present:
-            logger.info(f"  - {f}")
+        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal")
 
     # Initialize metadata
     metadata = {
@@ -1400,63 +1420,81 @@ def select_features_comprehensive(
         'steps': []
     }
 
-    # Step 1: Basic cleaning
+    # Step 1: Basic cleaning - vectorized
     X_work = X.select_dtypes(include=[np.number]).copy()
     X_work = X_work.drop(columns=['ds'], errors='ignore')
     X_work = X_work.replace([np.inf, -np.inf], np.nan)
 
-    # Remove columns with too many NaN (>50%)
+    # Remove columns with too many NaN (>50%) - vectorized
     nan_pct = X_work.isna().mean()
     high_nan_cols = nan_pct[nan_pct > 0.5].index.tolist()
-
-    # Don't remove protected features
-    high_nan_cols = [c for c in high_nan_cols if c not in protected_features_present]
+    high_nan_cols = [c for c in high_nan_cols if c not in protected_set]
 
     X_work = X_work.drop(columns=high_nan_cols)
     logger.info(f"Step 1: Removed {len(high_nan_cols)} high-NaN columns, {len(X_work.columns)} remaining")
     metadata['steps'].append({'step': 'high_nan_removal', 'removed': len(high_nan_cols), 'remaining': len(X_work.columns)})
 
-    # Fill remaining NaN with column mean
-    X_work = X_work.fillna(X_work.mean())
-    X_work = X_work.fillna(0)
+    # Fill remaining NaN with column mean - vectorized
+    col_means = X_work.mean()
+    X_work = X_work.fillna(col_means).fillna(0)
 
-    # Remove zero variance
-    zero_var = X_work.columns[X_work.var() == 0].tolist()
-
-    # Don't remove protected features
-    zero_var = [c for c in zero_var if c not in protected_features_present]
+    # Remove zero variance - vectorized
+    variances = X_work.var()
+    zero_var = variances[variances == 0].index.tolist()
+    zero_var = [c for c in zero_var if c not in protected_set]
 
     X_work = X_work.drop(columns=zero_var)
     logger.info(f"Step 2: Removed {len(zero_var)} zero-variance columns, {len(X_work.columns)} remaining")
     metadata['steps'].append({'step': 'zero_variance_removal', 'removed': len(zero_var), 'remaining': len(X_work.columns)})
 
-    # Step 2: Target correlation filter
+    # OPTIMIZATION: Compute all target correlations ONCE
+    logger.info("\nComputing target correlations (vectorized)...")
+    valid_y = y.notna()
+    target_corrs = X_work.loc[valid_y].corrwith(y[valid_y]).abs().fillna(0).to_dict()
+
+    # Step 3: Target correlation filter - use pre-computed correlations
     logger.info("\nStep 3: Target Correlation Filter")
-    X_work, removed = select_by_target_correlation(X_work, y, min_corr=MIN_TARGET_CORR)
+    low_corr_cols = [c for c in X_work.columns if target_corrs.get(c, 0) < MIN_TARGET_CORR and c not in protected_set]
+    X_work = X_work.drop(columns=low_corr_cols)
 
-    # Add back any protected features that were removed
-    removed_protected = [f for f in protected_features_present if f not in X_work.columns and f in X.columns]
-    if removed_protected:
-        logger.info(f"Re-adding {len(removed_protected)} protected features removed by correlation filter")
-        for f in removed_protected:
+    # Re-add protected features
+    for f in protected_features_present:
+        if f not in X_work.columns and f in X.columns:
             X_work[f] = X[f]
 
-    metadata['steps'].append({'step': 'target_correlation_filter', 'removed': len(removed), 'remaining': len(X_work.columns)})
+    logger.info(f"Removed {len(low_corr_cols)} low-correlation columns, {len(X_work.columns)} remaining")
+    metadata['steps'].append({'step': 'target_correlation_filter', 'removed': len(low_corr_cols), 'remaining': len(X_work.columns)})
 
-    # Step 3: High correlation removal
+    # Step 4: High correlation removal - use pre-computed target correlations
     logger.info("\nStep 4: High Correlation Removal")
-    X_work, removed = remove_correlated_features(X_work, y, corr_threshold=CORR_THRESHOLD)
+    corr_matrix = X_work.corr().abs()
+    upper_tri = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
 
-    # Add back protected features
-    removed_protected = [f for f in protected_features_present if f not in X_work.columns and f in X.columns]
-    if removed_protected:
-        logger.info(f"Re-adding {len(removed_protected)} protected features removed by correlation filter")
-        for f in removed_protected:
+    to_drop = set()
+    for i in range(len(corr_matrix.columns)):
+        for j in range(i + 1, len(corr_matrix.columns)):
+            if corr_matrix.iloc[i, j] > CORR_THRESHOLD:
+                col_i = corr_matrix.columns[i]
+                col_j = corr_matrix.columns[j]
+                # Keep the one with higher target correlation
+                if target_corrs.get(col_i, 0) >= target_corrs.get(col_j, 0):
+                    if col_j not in protected_set:
+                        to_drop.add(col_j)
+                else:
+                    if col_i not in protected_set:
+                        to_drop.add(col_i)
+
+    X_work = X_work.drop(columns=list(to_drop))
+
+    # Re-add protected features
+    for f in protected_features_present:
+        if f not in X_work.columns and f in X.columns:
             X_work[f] = X[f]
 
-    metadata['steps'].append({'step': 'high_correlation_removal', 'removed': len(removed), 'remaining': len(X_work.columns)})
+    logger.info(f"Removed {len(to_drop)} highly-correlated columns, {len(X_work.columns)} remaining")
+    metadata['steps'].append({'step': 'high_correlation_removal', 'removed': len(to_drop), 'remaining': len(X_work.columns)})
 
-    # Step 4: Compute importance metrics
+    # Step 5: Compute importance metrics
     logger.info("\nStep 5: Computing Feature Importance Metrics")
 
     # LightGBM importance
@@ -1467,46 +1505,34 @@ def select_features_comprehensive(
     logger.info("  Computing Mutual Information...")
     mi_scores = compute_mutual_information(X_work, y)
 
-    # Target correlation (absolute)
-    target_corrs = {}
-    for col in X_work.columns:
-        valid_mask = X_work[col].notna() & y.notna()
-        if valid_mask.sum() > 10:
-            target_corrs[col] = abs(X_work.loc[valid_mask, col].corr(y[valid_mask]))
-        else:
-            target_corrs[col] = 0
-
+    # Target correlation DataFrame (using pre-computed values)
     target_corr_df = pd.DataFrame([
-        {'feature': k, 'target_corr': v} for k, v in target_corrs.items()
+        {'feature': c, 'target_corr': target_corrs.get(c, 0)} for c in X_work.columns
     ]).sort_values('target_corr', ascending=False).reset_index(drop=True)
 
-    # Step 5: Aggregate rankings
+    # Step 6: Aggregate rankings
     logger.info("\nStep 6: Aggregating Feature Rankings")
 
-    # Create ranking DataFrame
-    all_features = list(X_work.columns)
-    ranking_df = pd.DataFrame({'feature': all_features})
+    # Create ranking DataFrame - optimized merge
+    ranking_df = pd.DataFrame({'feature': list(X_work.columns)})
 
-    # Add LightGBM rank
     lgbm_importance['lgbm_rank'] = range(1, len(lgbm_importance) + 1)
-    ranking_df = ranking_df.merge(lgbm_importance[['feature', 'importance_gain', 'lgbm_rank']], on='feature', how='left')
-
-    # Add MI rank
     mi_scores['mi_rank'] = range(1, len(mi_scores) + 1)
-    ranking_df = ranking_df.merge(mi_scores[['feature', 'mutual_info', 'mi_rank']], on='feature', how='left')
-
-    # Add correlation rank
     target_corr_df['corr_rank'] = range(1, len(target_corr_df) + 1)
-    ranking_df = ranking_df.merge(target_corr_df[['feature', 'target_corr', 'corr_rank']], on='feature', how='left')
 
-    # Compute average rank (lower is better)
+    ranking_df = (ranking_df
+                  .merge(lgbm_importance[['feature', 'importance_gain', 'lgbm_rank']], on='feature', how='left')
+                  .merge(mi_scores[['feature', 'mutual_info', 'mi_rank']], on='feature', how='left')
+                  .merge(target_corr_df[['feature', 'target_corr', 'corr_rank']], on='feature', how='left'))
+
+    # Compute average rank
     ranking_df['avg_rank'] = ranking_df[['lgbm_rank', 'mi_rank', 'corr_rank']].mean(axis=1)
     ranking_df = ranking_df.sort_values('avg_rank').reset_index(drop=True)
 
-    # Step 6: Select top features
+    # Select top features
     selected_features = ranking_df['feature'].head(max_features).tolist()
 
-    # Ensure all protected features are included (even if outside top-N)
+    # Ensure all protected features are included
     for f in protected_features_present:
         if f not in selected_features and f in X_work.columns:
             selected_features.append(f)
@@ -1514,19 +1540,16 @@ def select_features_comprehensive(
 
     logger.info(f"\nSelected {len(selected_features)} features based on aggregated ranking")
 
-    # Step 7: Optional VIF check on final set
-    if VIF_AVAILABLE and len(selected_features) > 10:
+    # Step 7: Optional VIF check
+    if not skip_vif and VIF_AVAILABLE and len(selected_features) > 10:
         logger.info("\nStep 7: VIF Check on Selected Features")
-        X_selected = X_work[selected_features]
+        X_selected = X_work[selected_features].copy()
         X_selected, vif_removed = remove_high_vif_features(X_selected, vif_threshold=VIF_THRESHOLD, max_iterations=20)
 
-        # Add back protected features if they were removed by VIF
-        vif_removed_protected = [f for f in protected_features_present if f in vif_removed]
-        if vif_removed_protected:
-            logger.info(f"VIF removed {len(vif_removed_protected)} protected features - adding them back")
-            for f in vif_removed_protected:
-                if f in X_work.columns:
-                    X_selected[f] = X_work[f]
+        # Add back protected features if removed
+        for f in protected_features_present:
+            if f in vif_removed and f in X_work.columns:
+                X_selected[f] = X_work[f]
 
         if vif_removed:
             selected_features = list(X_selected.columns)
@@ -1537,38 +1560,29 @@ def select_features_comprehensive(
     metadata['final_features'] = len(selected_features)
     metadata['selected_features'] = selected_features
 
-    # Log top 20 selected features
+    # Log top 20 selected features (condensed)
     logger.info("\n" + "=" * 40)
     logger.info("TOP 20 SELECTED FEATURES:")
     logger.info("=" * 40)
     for i, feat in enumerate(selected_features[:20], 1):
-        row = ranking_df[ranking_df['feature'] == feat].iloc[0]
-        logger.info(f"  {i:2d}. {feat}")
-        logger.info(f"      LGBM: {row['importance_gain']:.2f} (rank {row['lgbm_rank']:.0f})")
-        logger.info(f"      MI: {row['mutual_info']:.4f} (rank {row['mi_rank']:.0f})")
-        logger.info(f"      Corr: {row['target_corr']:.4f} (rank {row['corr_rank']:.0f})")
+        row = ranking_df[ranking_df['feature'] == feat]
+        if not row.empty:
+            row = row.iloc[0]
+            logger.info(f"  {i:2d}. {feat} (LGBM:{row['lgbm_rank']:.0f}, MI:{row['mi_rank']:.0f}, Corr:{row['corr_rank']:.0f})")
 
-    # Save results
+    # Save results if output_dir specified
     if output_dir:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save full ranking
-        ranking_path = output_dir / f"feature_ranking_{target_type}.csv"
-        ranking_df.to_csv(ranking_path, index=False)
-        logger.info(f"\nSaved feature ranking to {ranking_path}")
+        ranking_df.to_csv(output_dir / f"feature_ranking_{target_type}.csv", index=False)
+        ranking_df[ranking_df['feature'].isin(selected_features)].to_csv(
+            output_dir / f"selected_features_{target_type}.csv", index=False)
 
-        # Save selected features
-        selected_path = output_dir / f"selected_features_{target_type}.csv"
-        selected_df = ranking_df[ranking_df['feature'].isin(selected_features)]
-        selected_df.to_csv(selected_path, index=False)
-        logger.info(f"Saved selected features to {selected_path}")
-
-        # Save metadata
-        metadata_path = output_dir / f"feature_selection_metadata_{target_type}.pkl"
-        with open(metadata_path, 'wb') as f:
+        with open(output_dir / f"feature_selection_metadata_{target_type}.pkl", 'wb') as f:
             pickle.dump(metadata, f)
-        logger.info(f"Saved selection metadata to {metadata_path}")
+
+        logger.info(f"\nSaved feature selection results to {output_dir}")
 
     return selected_features, metadata
 

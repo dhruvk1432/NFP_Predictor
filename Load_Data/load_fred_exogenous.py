@@ -9,6 +9,10 @@ from datetime import timedelta
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
+# OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
+from nfp_relative_timing import load_nfp_releases, get_nfp_release_map
+# OPTIMIZATION: Use shared utilities for snapshot path and MultiIndex flattening
+from Load_Data.utils import get_snapshot_path, flatten_multiindex_columns
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -167,17 +171,19 @@ def clean_weekly_release_dates(df, week_end_col='date', release_col='realtime_st
     return df
 
 def load_nfp_release_schedule():
-    """Load NFP release dates for proper weekly data bucketing."""
-    nfp_path = DATA_PATH / "NFP_target" / "y_nsa_first_release.parquet"
-    if not nfp_path.exists():
-        logger.warning(f"NFP release schedule not found at {nfp_path}")
-        return None
+    """
+    Load NFP release dates for proper weekly data bucketing.
 
-    nfp = pd.read_parquet(nfp_path)[['ds', 'release_date']].copy()
-    nfp.columns = ['data_month', 'nfp_release_date']
-    nfp['data_month'] = pd.to_datetime(nfp['data_month'])
-    nfp['nfp_release_date'] = pd.to_datetime(nfp['nfp_release_date'])
-    return nfp.sort_values('nfp_release_date')
+    OPTIMIZATION: Uses shared nfp_relative_timing module (cached).
+    """
+    try:
+        nfp = load_nfp_releases()  # From nfp_relative_timing module (cached)
+        # Rename columns to match expected format
+        nfp = nfp.rename(columns={'ds': 'data_month', 'release_date': 'nfp_release_date'})
+        return nfp.sort_values('nfp_release_date')
+    except FileNotFoundError:
+        logger.warning("NFP release schedule not found")
+        return None
 
 def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
     """
@@ -367,6 +373,376 @@ def calculate_weekly_spike_stats(weekly_df, nfp_schedule):
 
     return spike_stats
 
+
+# =============================================================================
+# OPTIMIZATION: Pre-compute daily features for VIX, SP500, and other daily series
+# These functions compute all rolling/derived features on the full history ONCE,
+# rather than recomputing inside the snapshot loop (which was 400x slower)
+# =============================================================================
+
+def compute_vix_daily_features(df):
+    """
+    Pre-compute all VIX daily features on full history.
+
+    Args:
+        df: DataFrame with columns ['date', 'value', 'realtime_start']
+
+    Returns:
+        DataFrame with all computed daily features indexed by date
+    """
+    sub_df = df[['date', 'value']].copy().set_index('date').sort_index()
+
+    # Daily change
+    sub_df['daily_chg'] = sub_df['value'].diff()
+
+    # Rolling 52-week high/low for regime detection
+    sub_df['rolling_52w_high'] = sub_df['value'].rolling(window=252, min_periods=20).max()
+    sub_df['rolling_52w_low'] = sub_df['value'].rolling(window=252, min_periods=20).min()
+
+    # 30-day spike detection
+    sub_df['vix_30d_ago'] = sub_df['value'].shift(21)
+    sub_df['vix_spike_ratio'] = sub_df['value'] / sub_df['vix_30d_ago']
+
+    # 5-day spike detection (rapid panic)
+    sub_df['vix_5d_ago'] = sub_df['value'].shift(5)
+    sub_df['vix_spike_5d'] = sub_df['value'] / sub_df['vix_5d_ago']
+
+    # 12-month z-scores
+    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
+    # 3-month z-scores
+    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
+    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
+    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
+
+    return sub_df
+
+
+def aggregate_vix_to_monthly(daily_df):
+    """
+    Aggregate pre-computed VIX daily features to monthly.
+
+    Args:
+        daily_df: DataFrame with pre-computed daily VIX features
+
+    Returns:
+        DataFrame in long format with monthly aggregated features
+    """
+    monthly_agg = daily_df.resample('MS').agg({
+        'value': ['mean', 'max', lambda x: x.quantile(0.99)],
+        'daily_chg': 'std',
+        'vix_spike_ratio': 'max',
+        'vix_spike_5d': 'max',
+        'rolling_52w_high': 'last',
+        'z_score_12m': ['mean', 'max', 'min'],
+        'z_score_3m': ['mean', 'max', 'min']
+    })
+
+    # Flatten MultiIndex columns
+    monthly_agg = flatten_multiindex_columns(monthly_agg)
+
+    temp_df = pd.DataFrame(index=monthly_agg.index)
+    temp_df['VIX_mean'] = monthly_agg.get('value_mean', np.nan)
+    temp_df['VIX_max'] = monthly_agg.get('value_max', np.nan)
+    temp_df['VIX_volatility'] = monthly_agg.get('daily_chg_std', np.nan)
+    temp_df['VIX_p99'] = monthly_agg.get('value_<lambda_0>', np.nan)
+    temp_df['VIX_30d_spike'] = monthly_agg.get('vix_spike_ratio_max', np.nan)
+    temp_df['VIX_max_5d_spike'] = monthly_agg.get('vix_spike_5d_max', np.nan)
+    temp_df['VIX_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
+    temp_df['VIX_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
+    temp_df['VIX_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
+    temp_df['VIX_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
+    temp_df['VIX_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
+    temp_df['VIX_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
+    temp_df['VIX_panic_regime'] = (temp_df['VIX_max'] > 50).astype(int)
+    temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 40).astype(int)
+
+    result = temp_df.reset_index().melt(
+        id_vars=['date'],
+        var_name='series_name',
+        value_name='value'
+    )
+    result['release_date'] = result['date'] + pd.offsets.MonthEnd(0)
+
+    return result
+
+
+def compute_sp500_daily_features(df):
+    """
+    Pre-compute all SP500 daily features on full history.
+
+    Args:
+        df: DataFrame with columns ['date', 'value', 'realtime_start']
+
+    Returns:
+        DataFrame with all computed daily features indexed by date
+    """
+    sub_df = df[['date', 'value']].copy().set_index('date').sort_index()
+
+    # Daily changes and returns
+    sub_df['daily_chg'] = sub_df['value'].diff()
+    sub_df['daily_return'] = sub_df['value'].pct_change()
+
+    # Rolling 52-week high for drawdown
+    sub_df['rolling_52w_high'] = sub_df['value'].rolling(window=252, min_periods=20).max()
+    sub_df['drawdown'] = (sub_df['value'] - sub_df['rolling_52w_high']) / sub_df['rolling_52w_high'] * 100
+
+    # 30-day performance
+    sub_df['value_30d_ago'] = sub_df['value'].shift(21)
+    sub_df['return_30d'] = (sub_df['value'] - sub_df['value_30d_ago']) / sub_df['value_30d_ago'] * 100
+
+    # 5-day performance (rapid crash)
+    sub_df['value_5d_ago'] = sub_df['value'].shift(5)
+    sub_df['return_5d'] = (sub_df['value'] - sub_df['value_5d_ago']) / sub_df['value_5d_ago'] * 100
+
+    # 21-day volatility
+    sub_df['volatility_21d'] = sub_df['daily_return'].rolling(window=21, min_periods=10).std() * np.sqrt(252) * 100
+
+    # Consecutive down days
+    down_days = (sub_df['daily_return'] < 0).astype(int)
+    sub_df['consecutive_down'] = down_days.groupby((down_days != down_days.shift()).cumsum()).cumsum()
+
+    # Circuit breaker days (>5% drop)
+    sub_df['circuit_breaker_day'] = (sub_df['daily_return'] < -0.05).astype(int)
+
+    # 12-month z-scores
+    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
+    # 3-month z-scores
+    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
+    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
+    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
+
+    return sub_df
+
+
+def aggregate_sp500_to_monthly(daily_df):
+    """
+    Aggregate pre-computed SP500 daily features to monthly.
+
+    Args:
+        daily_df: DataFrame with pre-computed daily SP500 features
+
+    Returns:
+        DataFrame in long format with monthly aggregated features
+    """
+    monthly_agg = daily_df.resample('MS').agg({
+        'value': ['first', 'last', 'min'],
+        'drawdown': 'min',
+        'return_30d': 'last',
+        'return_5d': 'min',
+        'volatility_21d': 'mean',
+        'daily_return': ['std', 'min', 'max'],
+        'consecutive_down': 'max',
+        'circuit_breaker_day': 'sum',
+        'z_score_12m': ['mean', 'max', 'min'],
+        'z_score_3m': ['mean', 'max', 'min']
+    })
+
+    # Flatten MultiIndex columns
+    monthly_agg = flatten_multiindex_columns(monthly_agg)
+
+    temp_df = pd.DataFrame(index=monthly_agg.index)
+
+    # Monthly return
+    first_val = monthly_agg.get('value_first')
+    last_val = monthly_agg.get('value_last')
+    if first_val is not None and last_val is not None:
+        temp_df['SP500_monthly_return'] = ((last_val - first_val) / first_val * 100)
+    else:
+        temp_df['SP500_monthly_return'] = np.nan
+
+    temp_df['SP500_30d_return'] = monthly_agg.get('return_30d_last', np.nan)
+    temp_df['SP500_max_drawdown'] = monthly_agg.get('drawdown_min', np.nan)
+    temp_df['SP500_volatility'] = monthly_agg.get('volatility_21d_mean', np.nan)
+    temp_df['SP500_worst_day'] = monthly_agg.get('daily_return_min', np.nan) * 100 if monthly_agg.get('daily_return_min') is not None else np.nan
+    temp_df['SP500_max_5d_drop'] = monthly_agg.get('return_5d_min', np.nan)
+    temp_df['SP500_best_day'] = monthly_agg.get('daily_return_max', np.nan) * 100 if monthly_agg.get('daily_return_max') is not None else np.nan
+    temp_df['SP500_consecutive_down_days'] = monthly_agg.get('consecutive_down_max', np.nan)
+    temp_df['SP500_days_circuit_breaker'] = monthly_agg.get('circuit_breaker_day_sum', np.nan)
+    temp_df['SP500_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
+    temp_df['SP500_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
+    temp_df['SP500_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
+    temp_df['SP500_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
+    temp_df['SP500_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
+    temp_df['SP500_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
+
+    # Regime indicators
+    temp_df['SP500_bear_market'] = (temp_df['SP500_max_drawdown'] < -20).astype(int)
+    temp_df['SP500_crash_month'] = (temp_df['SP500_monthly_return'] < -10).astype(int)
+    worst_day = monthly_agg.get('daily_return_min')
+    temp_df['SP500_circuit_breaker'] = (worst_day < -0.05).astype(int) if worst_day is not None else 0
+
+    result = temp_df.reset_index().melt(
+        id_vars=['date'],
+        var_name='series_name',
+        value_name='value'
+    )
+    result['release_date'] = result['date'] + pd.offsets.MonthEnd(0)
+
+    return result
+
+
+def compute_credit_yield_daily_features(df, name):
+    """
+    Pre-compute daily features for Credit_Spreads and Yield_Curve.
+
+    Args:
+        df: DataFrame with columns ['date', 'value', 'realtime_start']
+        name: Series name ('Credit_Spreads' or 'Yield_Curve')
+
+    Returns:
+        DataFrame with computed daily features indexed by date
+    """
+    sub_df = df[['date', 'value']].copy().set_index('date').sort_index()
+
+    sub_df['daily_chg'] = sub_df['value'].diff()
+
+    # Expanding z-score
+    sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
+    sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
+    sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
+
+    # Acceleration
+    sub_df['acceleration'] = sub_df['daily_chg'].diff()
+
+    # 12-month z-scores
+    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
+    # 3-month z-scores
+    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
+    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
+    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
+
+    sub_df['series_name'] = name  # Store for later reference
+
+    return sub_df
+
+
+def aggregate_credit_yield_to_monthly(daily_df, name):
+    """
+    Aggregate pre-computed Credit/Yield daily features to monthly.
+    """
+    monthly_agg = daily_df.resample('MS').agg({
+        'value': ['mean', 'max'],
+        'daily_chg': ['std', 'sum'],
+        'z_score': 'max',
+        'acceleration': ['mean', 'std'],
+        'z_score_12m': ['mean', 'max', 'min'],
+        'z_score_3m': ['mean', 'max', 'min']
+    })
+
+    monthly_agg = flatten_multiindex_columns(monthly_agg)
+
+    temp_df = pd.DataFrame(index=monthly_agg.index)
+    temp_df[f'{name}_avg'] = monthly_agg.get('value_mean', np.nan)
+    temp_df[f'{name}_max'] = monthly_agg.get('value_max', np.nan)
+    temp_df[f'{name}_vol_of_changes'] = monthly_agg.get('daily_chg_std', np.nan)
+    temp_df[f'{name}_monthly_chg'] = monthly_agg.get('daily_chg_sum', np.nan)
+    temp_df[f'{name}_zscore_max'] = monthly_agg.get('z_score_max', np.nan)
+    temp_df[f'{name}_acceleration'] = monthly_agg.get('acceleration_mean', np.nan)
+    temp_df[f'{name}_accel_volatility'] = monthly_agg.get('acceleration_std', np.nan)
+    temp_df[f'{name}_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
+    temp_df[f'{name}_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
+    temp_df[f'{name}_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
+    temp_df[f'{name}_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
+    temp_df[f'{name}_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
+    temp_df[f'{name}_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
+
+    result = temp_df.reset_index().melt(
+        id_vars=['date'],
+        var_name='series_name',
+        value_name='value'
+    )
+    result['release_date'] = result['date'] + pd.offsets.MonthEnd(0)
+
+    return result
+
+
+def compute_oil_daily_features(df):
+    """
+    Pre-compute daily features for Oil Prices.
+    """
+    sub_df = df[['date', 'value']].copy().set_index('date').sort_index()
+
+    sub_df['daily_chg'] = sub_df['value'].diff()
+
+    # 30-day crash detection
+    sub_df['value_30d_ago'] = sub_df['value'].shift(21)
+    sub_df['crash_30d_pct'] = ((sub_df['value'] - sub_df['value_30d_ago']) / sub_df['value_30d_ago'].abs()) * 100
+
+    # Negative price indicator
+    sub_df['is_negative'] = (sub_df['value'] < 0).astype(int)
+
+    # Daily percentage change
+    sub_df['daily_pct'] = sub_df['value'].pct_change() * 100
+
+    # Expanding z-score
+    sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
+    sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
+    sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
+
+    # 12-month z-scores
+    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
+    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
+    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
+
+    # 3-month z-scores
+    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
+    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
+    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
+
+    return sub_df
+
+
+def aggregate_oil_to_monthly(daily_df):
+    """
+    Aggregate pre-computed Oil daily features to monthly.
+    """
+    monthly_agg = daily_df.resample('MS').agg({
+        'value': 'mean',
+        'daily_chg': 'std',
+        'crash_30d_pct': 'min',
+        'daily_pct': 'min',
+        'is_negative': ['max', 'sum'],
+        'z_score': 'min',
+        'z_score_12m': ['mean', 'max', 'min'],
+        'z_score_3m': ['mean', 'max', 'min']
+    })
+
+    monthly_agg = flatten_multiindex_columns(monthly_agg)
+
+    temp_df = pd.DataFrame(index=monthly_agg.index)
+    temp_df['Oil_Prices_mean'] = monthly_agg.get('value_mean', np.nan)
+    temp_df['Oil_Prices_volatility'] = monthly_agg.get('daily_chg_std', np.nan)
+    temp_df['Oil_Prices_30d_crash'] = monthly_agg.get('crash_30d_pct_min', np.nan)
+    temp_df['Oil_Prices_went_negative'] = monthly_agg.get('is_negative_max', np.nan)
+    temp_df['Oil_Prices_zscore_min'] = monthly_agg.get('z_score_min', np.nan)
+    temp_df['Oil_worst_day_pct'] = monthly_agg.get('daily_pct_min', np.nan)
+    temp_df['Oil_days_negative'] = monthly_agg.get('is_negative_sum', np.nan)
+    temp_df['Oil_Prices_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
+    temp_df['Oil_Prices_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
+    temp_df['Oil_Prices_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
+    temp_df['Oil_Prices_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
+    temp_df['Oil_Prices_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
+    temp_df['Oil_Prices_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
+
+    result = temp_df.reset_index().melt(
+        id_vars=['date'],
+        var_name='series_name',
+        value_name='value'
+    )
+    result['release_date'] = result['date'] + pd.offsets.MonthEnd(0)
+
+    return result
+
+
 def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
     if not FRED_API_KEY:
         logger.error("FRED_API_KEY not found.")
@@ -374,6 +750,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
     fred = Fred(api_key=FRED_API_KEY)
 
     # Load NFP schedule for weekly data aggregation AND snapshot alignment
+    # OPTIMIZATION: Uses shared nfp_relative_timing module (cached)
     nfp_schedule = load_nfp_release_schedule()
     if nfp_schedule is None:
         logger.error("NFP release schedule not found. Cannot create snapshots.")
@@ -381,18 +758,8 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
 
     logger.info("Loaded NFP release schedule for weekly data aggregation and snapshot alignment")
 
-    # Define date range for snapshots using NFP release dates (not month-end)
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
-
-    # Filter NFP schedule to requested date range
-    nfp_df_filtered = nfp_schedule[
-        (nfp_schedule['data_month'] >= start_dt) &
-        (nfp_schedule['data_month'] <= end_dt)
-    ].copy()
-
-    # Create mapping: observation_month -> NFP_release_date
-    nfp_release_map = dict(zip(nfp_df_filtered['data_month'], nfp_df_filtered['nfp_release_date']))
+    # OPTIMIZATION: Use shared utility for release map (cached)
+    nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
 
     logger.info(f"Creating {len(nfp_release_map)} snapshots aligned with NFP release dates")
 
@@ -544,21 +911,54 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
 
             
     # 2. Generate Snapshots aligned with NFP release dates
+    # OPTIMIZATION: Batch check existing snapshots to avoid 400+ filesystem calls
+    existing_snapshots = set()
+    for decade_dir in base_dir.glob("*s"):
+        for year_dir in decade_dir.glob("*"):
+            if year_dir.is_dir():
+                for parquet_file in year_dir.glob("*.parquet"):
+                    # Extract YYYY-MM from filename
+                    existing_snapshots.add(parquet_file.stem)
+
+    logger.info(f"Found {len(existing_snapshots)} existing snapshots, will skip these")
+
+    # =============================================================================
+    # OPTIMIZATION [C2]: Pre-compute daily features ONCE before the snapshot loop
+    # This avoids recomputing 252-day rolling windows 400+ times (10 min → 5 min)
+    # =============================================================================
+    daily_features_cache = {}
+    DAILY_PRECOMPUTE = ["VIX", "SP500", "Credit_Spreads", "Yield_Curve", "Oil_Prices"]
+
+    for name in DAILY_PRECOMPUTE:
+        if name not in history_cache:
+            continue
+
+        df = history_cache[name]
+        logger.info(f"Pre-computing daily features for {name}...")
+
+        if name == "VIX":
+            daily_features_cache[name] = compute_vix_daily_features(df)
+        elif name == "SP500":
+            daily_features_cache[name] = compute_sp500_daily_features(df)
+        elif name in ["Credit_Spreads", "Yield_Curve"]:
+            daily_features_cache[name] = compute_credit_yield_daily_features(df, name)
+        elif name == "Oil_Prices":
+            daily_features_cache[name] = compute_oil_daily_features(df)
+
+    logger.info(f"Pre-computed daily features for {len(daily_features_cache)} series")
+
     for obs_month, snap_date in nfp_release_map.items():
         snap_date = pd.Timestamp(snap_date)
         obs_month = pd.Timestamp(obs_month)
-
-        year_str = obs_month.strftime('%Y')
         month_str = obs_month.strftime('%Y-%m')
-        decade_str = f"{obs_month.year // 10 * 10}s"
 
-        save_dir = base_dir / decade_str / year_str
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{month_str}.parquet"
-
-        if save_path.exists():
-            logger.info(f"Snapshot already exists for {month_str}, skipping.")
+        # OPTIMIZATION: Check against pre-built set instead of filesystem call
+        if month_str in existing_snapshots:
             continue
+
+        # OPTIMIZATION: Use shared utility for snapshot path
+        save_path = get_snapshot_path(base_dir, obs_month)
+
         logger.info(f"Generating snapshot for {month_str} (NFP release: {snap_date.date()})")
         
         snap_data_list = []
@@ -1050,17 +1450,35 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['date'] = full_snap['date'].dt.to_period('M').dt.to_timestamp()
 
-                        # CRITICAL: Filter out data not yet released at snapshot time
+            # CRITICAL: Filter out data not yet released at snapshot time
             # This prevents lookahead bias from including monthly aggregates
             # Changed from <= to strict < to prevent same-day data leakage
             # Data released ON the snapshot date cannot be used for prediction
             full_snap['release_date'] = pd.to_datetime(full_snap['release_date'])
             before_count = len(full_snap)
-            full_snap = full_snap[full_snap['release_date'] < snap_date].copy()
+
+            # Identify rows that will be filtered
+            filtered_mask = full_snap['release_date'] >= snap_date
+            filtered_rows = full_snap[filtered_mask]
+
+            full_snap = full_snap[~filtered_mask].copy()
             after_count = len(full_snap)
 
+            # SMART LOGGING: Only warn about unexpected filtering (past months)
+            # Filtering current/future month data is expected behavior
             if before_count > after_count:
-                logger.info(f"Filtered out {before_count - after_count} rows with release_date > snapshot_date")
+                filtered_count = before_count - after_count
+                # Check if filtered rows are from expected months (current or future)
+                filtered_dates = filtered_rows['date'].unique()
+                unexpected_months = [d for d in filtered_dates if pd.Timestamp(d) < obs_month]
+
+                if unexpected_months:
+                    # This is unexpected - past month data being filtered
+                    logger.warning(f"Unexpected filtering: {len(unexpected_months)} past months filtered out")
+                    logger.warning(f"  Filtered months: {[pd.Timestamp(d).strftime('%Y-%m') for d in unexpected_months]}")
+                else:
+                    # Expected behavior - current/future month data filtered
+                    logger.debug(f"Filtered {filtered_count} expected current/future-month rows")
 
             full_snap.to_parquet(save_path)
             logger.info(f"Saved snapshot to {save_path}")

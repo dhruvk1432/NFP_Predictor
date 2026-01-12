@@ -4,7 +4,10 @@
       "Bash(xargs python:*)",
       "Bash(python:*)",
       "Bash(tee:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)"
     ]
   }
 }

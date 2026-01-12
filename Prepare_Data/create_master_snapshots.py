@@ -29,6 +29,7 @@ FRED_EXOG_DIR = DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades"
 UNIFIER_DIR = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades"
 ADP_SNAPSHOTS_DIR = DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades"
 NOAA_WEIGHTED_DIR = DATA_PATH / "Exogenous_data" / "noaa_weighted_snapshots" / "decades"
+PROSPER_DIR = DATA_PATH / "Exogenous_data" / "prosper" / "decades"
 MASTER_DIR = DATA_PATH / "Exogenous_data" / "master_snapshots" / "decades"
 
 # =============================================================================
@@ -232,7 +233,7 @@ def apply_robust_scaling_vintage(df: pd.DataFrame, snapshot_date: pd.Timestamp) 
 
     # Scale by series_name
     scaled_groups = []
-    for series_name, group in df.groupby('series_name'):
+    for _, group in df.groupby('series_name'):
         group = group.sort_values('date')
 
         if len(group) < 2:
@@ -257,6 +258,130 @@ def apply_robust_scaling_vintage(df: pd.DataFrame, snapshot_date: pd.Timestamp) 
         scaled_groups.append(group)
 
     return pd.concat(scaled_groups, ignore_index=True)
+
+
+# =============================================================================
+# MoM CHANGE FUNCTIONS
+# =============================================================================
+
+def add_mom_difference(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add Month-over-Month difference for Prosper series (which are already in %).
+    Creates new series with '_MoM_Diff' suffix.
+
+    Args:
+        df: DataFrame with 'date', 'series_name', 'value' columns
+
+    Returns:
+        DataFrame with original series + new MoM difference series
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    new_series = []
+
+    # Identify prosper series by series_code pattern (contains '_ans')
+    if 'series_code' in df.columns:
+        prosper_mask = df['series_code'].str.contains('_ans', na=False)
+    else:
+        prosper_mask = pd.Series([False] * len(df))
+
+    prosper_series_names = df.loc[prosper_mask, 'series_name'].unique()
+
+    for s_name in prosper_series_names:
+        subset = df[df['series_name'] == s_name].sort_values('date').copy()
+
+        if len(subset) < 2:
+            continue
+
+        # Calculate MoM difference
+        subset['value'] = subset['value'].diff()
+        subset['series_name'] = s_name + '_MoM_Diff'
+        if 'series_code' in subset.columns:
+            subset['series_code'] = subset['series_code'] + '_MoM_Diff'
+
+        subset = subset.dropna(subset=['value'])
+        new_series.append(subset)
+
+    if new_series:
+        return pd.concat([df] + new_series, ignore_index=True)
+    return df
+
+
+def add_mom_pct_change(df: pd.DataFrame, exclude_patterns: list = None) -> pd.DataFrame:
+    """
+    Add Month-over-Month percentage change for all non-prosper series.
+    Creates new series with '_MoM_Pct' suffix.
+
+    Args:
+        df: DataFrame with 'date', 'series_name', 'value' columns
+        exclude_patterns: List of patterns to exclude (already have MoM or shouldn't be transformed)
+
+    Returns:
+        DataFrame with original series + new MoM percentage change series
+    """
+    if df.empty:
+        return df
+
+    if exclude_patterns is None:
+        exclude_patterns = [
+            '_MoM_Pct',      # Already a MoM percentage
+            '_MoM_Diff',    # Already a MoM difference
+            '_pct_change',  # Already percentage change
+            '_return',      # Already a return
+            '_chg',         # Already a change
+            '_diff',        # Already a difference
+        ]
+
+    df = df.copy()
+    new_series = []
+
+    # Identify prosper series to exclude (they get MoM_Diff instead)
+    if 'series_code' in df.columns:
+        prosper_mask = df['series_code'].str.contains('_ans', na=False)
+        prosper_series_names = set(df.loc[prosper_mask, 'series_name'].unique())
+    else:
+        prosper_series_names = set()
+
+    all_series = df['series_name'].unique()
+
+    for s_name in all_series:
+        # Skip prosper series
+        if s_name in prosper_series_names:
+            continue
+
+        # Skip series that already have MoM/change patterns
+        if any(pattern.lower() in s_name.lower() for pattern in exclude_patterns):
+            continue
+
+        subset = df[df['series_name'] == s_name].sort_values('date').copy()
+
+        if len(subset) < 2:
+            continue
+
+        # Calculate MoM percentage change (* 100 for readability)
+        subset['value'] = subset['value'].pct_change() * 100
+        subset['series_name'] = s_name + '_MoM_Pct'
+        if 'series_code' in subset.columns:
+            subset['series_code'] = subset['series_code'].astype(str) + '_MoM_Pct'
+
+        subset = subset.dropna(subset=['value'])
+
+        # Skip if all values are inf/nan (e.g., division by zero)
+        if subset['value'].replace([np.inf, -np.inf], np.nan).isna().all():
+            continue
+
+        # Replace inf with nan
+        subset['value'] = subset['value'].replace([np.inf, -np.inf], np.nan)
+        subset = subset.dropna(subset=['value'])
+
+        if not subset.empty:
+            new_series.append(subset)
+
+    if new_series:
+        return pd.concat([df] + new_series, ignore_index=True)
+    return df
 
 
 # =============================================================================
@@ -290,8 +415,9 @@ def create_master_snapshots(apply_preprocessing: bool = True):
         unifier_base = load_snapshot(UNIFIER_DIR, snap_date)
         adp = load_snapshot(ADP_SNAPSHOTS_DIR, snap_date)
         noaa_weighted = load_snapshot(NOAA_WEIGHTED_DIR, snap_date)
-        
-        current_vintage_df = pd.concat([fred_exog, unifier_base, adp, noaa_weighted], ignore_index=True)
+        prosper = load_snapshot(PROSPER_DIR, snap_date)
+
+        current_vintage_df = pd.concat([fred_exog, unifier_base, adp, noaa_weighted, prosper], ignore_index=True)
         
         if current_vintage_df.empty: 
             continue
@@ -305,10 +431,16 @@ def create_master_snapshots(apply_preprocessing: bool = True):
             current_vintage_df = preprocess_noaa_indices(current_vintage_df)
             current_vintage_df = preprocess_pct_change(current_vintage_df)
 
-            # B. Value Transforms (SymLog / Log1p)
+            # B. Value Transforms (SymLog / Log1p) - excludes prosper (no transforms)
             current_vintage_df = preprocess_transforms(current_vintage_df)
 
-            # C. Scaling (Fit on HISTORY only, exclude current month to avoid leakage)
+            # C. Add MoM Changes (before scaling)
+            # - Prosper series: MoM difference (already in %)
+            # - Other series: MoM percentage change
+            current_vintage_df = add_mom_difference(current_vintage_df)
+            current_vintage_df = add_mom_pct_change(current_vintage_df)
+
+            # D. Scaling (Fit on HISTORY only, exclude current month to avoid leakage)
             current_vintage_df = apply_robust_scaling_vintage(current_vintage_df, snap_date)
 
         # 3. SAVE
@@ -386,6 +518,22 @@ def verify_master_snapshot():
         logger.info(f"ADP (Scaled): Min={vals.min():.2f}, Max={vals.max():.2f}")
         if vals.max() < 100:
              logger.info("✓ ADP appears scaled.")
+
+    # 5. Check Prosper data
+    if 'series_code' in df.columns:
+        prosper_codes = df[df['series_code'].str.contains('_ans', na=False)]['series_name'].unique()
+        if len(prosper_codes) > 0:
+            logger.info(f"✓ Prosper data present: {len(prosper_codes)} series.")
+        else:
+            logger.warning("? No Prosper data found.")
+    else:
+        logger.warning("? No series_code column - cannot check Prosper data.")
+
+    # 6. Check MoM series
+    mom_pct = [s for s in series if '_MoM_Pct' in s]
+    mom_diff = [s for s in series if '_MoM_Diff' in s]
+    logger.info(f"✓ MoM Percentage series: {len(mom_pct)}")
+    logger.info(f"✓ MoM Difference series: {len(mom_diff)}")
 
     logger.info("Verification Complete.")
 

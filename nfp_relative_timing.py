@@ -77,24 +77,54 @@ def load_nfp_releases() -> pd.DataFrame:
 def get_nfp_release_for_month(event_month: pd.Timestamp) -> Optional[pd.Timestamp]:
     """
     Get the NFP release date for a specific event month.
-    
+
     Args:
         event_month: Month for which NFP data refers (e.g., 2020-01-01)
-    
+
     Returns:
         NFP release date, or None if not found
     """
     nfp_releases = load_nfp_releases()
-    
+
     # Normalize to month start
     event_month = pd.Timestamp(event_month).replace(day=1)
-    
+
     match = nfp_releases[nfp_releases['ds'] == event_month]
-    
+
     if len(match) == 0:
         return None
-    
+
     return match['release_date'].iloc[0]
+
+
+def get_nfp_release_map(start_date=None, end_date=None) -> Dict[pd.Timestamp, pd.Timestamp]:
+    """
+    Get dictionary mapping observation months to NFP release dates.
+
+    This is the format commonly used by data loaders for snapshot alignment.
+    Uses cached NFP releases to avoid redundant file reads.
+
+    Args:
+        start_date: Optional start date filter (inclusive)
+        end_date: Optional end date filter (inclusive)
+
+    Returns:
+        Dict mapping observation_month -> nfp_release_date
+    """
+    nfp_releases = load_nfp_releases()
+
+    df = nfp_releases.copy()
+
+    # Apply date filters if provided
+    if start_date is not None:
+        start_dt = pd.to_datetime(start_date)
+        df = df[df['ds'] >= start_dt]
+
+    if end_date is not None:
+        end_dt = pd.to_datetime(end_date)
+        df = df[df['ds'] <= end_dt]
+
+    return dict(zip(df['ds'], df['release_date']))
 
 
 def calculate_median_offset_from_nfp(

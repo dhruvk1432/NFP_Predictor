@@ -5,6 +5,7 @@ import logging
 import warnings
 from pathlib import Path
 from platform import system
+from datetime import date
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -50,7 +51,7 @@ def get_os() -> str:
 FRED_API_KEY    = _require_env("FRED_API_KEY")
 DATA_PATH       = if_relative_make_abs(_require_env("DATA_PATH"))
 START_DATE      = _require_env("START_DATE")      
-END_DATE        = _require_env("END_DATE")        
+END_DATE        = date.today()     
 BACKTEST_MONTHS = _to_int(_require_env("BACKTEST_MONTHS"))
 DELIM          = _get_env("DELIM", ".")
 DEBUG          = _to_bool(_get_env("DEBUG", "False"))
@@ -61,7 +62,6 @@ UNIFIER_USER   = _require_env("UNIFIER_USER")
 UNIFIER_TOKEN  = _require_env("UNIFIER_TOKEN")
 
 WARM_START_INTERVAL = _to_int(_get_env("WARM_START_INTERVAL", "3"))
-NBEATSX_MODEL_TYPE = _require_env("NBEATSX_MODEL_TYPE")
 
 CACHE_DATA_DIR = DATA_PATH / "cache"
 BACKTEST_DIR   = OUTPUT_DIR / "backtest"

@@ -13,7 +13,11 @@
       "Bash(while true)",
       "Read(//Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/**)",
       "Bash(kill:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(pip show:*)",
+      "Bash(cd:*)",
+      "Bash(pip install:*)",
+      "Bash(pgrep:*)"
     ]
   }
 }

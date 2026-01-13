@@ -9,7 +9,11 @@
       "Bash(wc:*)",
       "Bash(find:*)",
       "Bash(python3:*)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(while true)",
+      "Read(//Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/**)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)"
     ]
   }
 }

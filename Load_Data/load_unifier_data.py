@@ -226,7 +226,7 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
     # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
     nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
 
-    base_dir = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades"
+    base_dir = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data"
 
     # Fetch all data for each series once
     all_series_data = {}

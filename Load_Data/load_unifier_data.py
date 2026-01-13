@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UNIFIER_TOKEN, UNIFIER_USER
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
-from nfp_relative_timing import get_nfp_release_map, calculate_median_offset_from_nfp, apply_nfp_relative_adjustment
+from Prepare_Data.nfp_relative_timing import get_nfp_release_map, calculate_median_offset_from_nfp, apply_nfp_relative_adjustment
 # OPTIMIZATION: Use shared utility for snapshot path
 from Load_Data.utils import get_snapshot_path
 

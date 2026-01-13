@@ -12,7 +12,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
 # INT1: Import all NFP utilities at module level for consistency
-from nfp_relative_timing import load_nfp_releases, get_nfp_release_map, apply_nfp_relative_adjustment
+from Prepare_Data.nfp_relative_timing import load_nfp_releases, get_nfp_release_map, apply_nfp_relative_adjustment
 # OPTIMIZATION: Use shared utilities for snapshot path and MultiIndex flattening
 from Load_Data.utils import get_snapshot_path, flatten_multiindex_columns
 

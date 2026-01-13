@@ -15,7 +15,7 @@ from settings import (
     DATA_PATH, START_DATE, END_DATE, FRED_API_KEY,
     REFRESH_CACHE, TEMP_DIR, NBEATSX_MODEL_TYPE, setup_logger
 )
-from pipeline_helpers import build_hierarchy_structure
+from Train.pipeline_helpers import build_hierarchy_structure
 from Load_Data.scrape_bls_schedule import get_future_nfp_dates
 
 logger = setup_logger(__file__, TEMP_DIR)

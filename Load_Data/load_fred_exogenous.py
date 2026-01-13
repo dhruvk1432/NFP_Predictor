@@ -807,7 +807,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
 
     logger.info(f"Creating {len(nfp_release_map)} snapshots aligned with NFP release dates")
 
-    base_dir = DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades"
+    base_dir = DATA_PATH / "Exogenous_data" / "exogenous_fred_data"
     
     # 1. Fetch all history 
     history_cache = {}

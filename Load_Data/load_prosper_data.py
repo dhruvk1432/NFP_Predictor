@@ -178,7 +178,7 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
     # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
     nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
 
-    base_dir = Path(DATA_PATH) / "Exogenous_data" / "prosper" / "decades"
+    base_dir = Path(DATA_PATH) / "Exogenous_data" / "prosper"
 
     # Step 1: Download metadata to get the list of keys we need
     logger.info("Downloading prosper metadata to identify keys...")

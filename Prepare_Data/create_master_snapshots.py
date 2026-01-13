@@ -352,6 +352,90 @@ def apply_robust_scaling_vintage(df: pd.DataFrame, snapshot_date: pd.Timestamp) 
 
 
 # =============================================================================
+# DISCONTINUED SERIES FILTERING
+# =============================================================================
+
+# Cache for discontinued series - computed once and reused across all snapshots
+_DISCONTINUED_SERIES_CACHE: Optional[set] = None
+
+
+def _identify_discontinued_series() -> set:
+    """
+    Identify series that have no data in the last year before END_DATE.
+    These are considered discontinued and should be excluded from all snapshots.
+
+    Returns:
+        Set of series names that are discontinued
+    """
+    global _DISCONTINUED_SERIES_CACHE
+
+    if _DISCONTINUED_SERIES_CACHE is not None:
+        return _DISCONTINUED_SERIES_CACHE
+
+    end_dt = pd.to_datetime(END_DATE)
+    cutoff_date = end_dt - pd.DateOffset(years=1)
+
+    # Load the most recent snapshot to check which series have recent data
+    recent_snapshot = _load_all_snapshots_parallel(end_dt)
+
+    if recent_snapshot.empty:
+        # Try previous month if END_DATE snapshot doesn't exist
+        end_dt = end_dt - pd.DateOffset(months=1)
+        end_dt = end_dt + pd.offsets.MonthEnd(0)
+        recent_snapshot = _load_all_snapshots_parallel(end_dt)
+
+    if recent_snapshot.empty:
+        logger.warning("Could not load recent snapshot to identify discontinued series")
+        _DISCONTINUED_SERIES_CACHE = set()
+        return _DISCONTINUED_SERIES_CACHE
+
+    recent_snapshot['date'] = pd.to_datetime(recent_snapshot['date'])
+
+    # Find series with data in the last year
+    active_mask = recent_snapshot['date'] >= cutoff_date
+    active_series = set(recent_snapshot.loc[active_mask, 'series_name'].unique())
+    all_series = set(recent_snapshot['series_name'].unique())
+
+    # Discontinued = all series minus active series
+    discontinued = all_series - active_series
+
+    if discontinued:
+        logger.info(f"Identified {len(discontinued)} discontinued series (no data after {cutoff_date.date()})")
+        # Log a sample of discontinued series
+        sample = list(discontinued)[:5]
+        logger.info(f"Sample discontinued series: {sample}")
+
+    _DISCONTINUED_SERIES_CACHE = discontinued
+    return _DISCONTINUED_SERIES_CACHE
+
+
+def filter_discontinued_series(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove discontinued series from the dataframe.
+    A series is discontinued if it has no data in the last year before END_DATE.
+
+    Args:
+        df: DataFrame with 'series_name' column
+
+    Returns:
+        DataFrame with discontinued series removed
+    """
+    if df.empty:
+        return df
+
+    discontinued = _identify_discontinued_series()
+
+    if not discontinued:
+        return df
+
+    # Filter out discontinued series
+    mask = ~df['series_name'].isin(discontinued)
+    filtered_df = df[mask].copy()
+
+    return filtered_df
+
+
+# =============================================================================
 # MoM CHANGE FUNCTIONS
 # =============================================================================
 
@@ -425,6 +509,19 @@ def add_mom_pct_change(df: pd.DataFrame, exclude_patterns: list = None) -> pd.Da
             '_return',      # Already a return
             '_chg',         # Already a change
             '_diff',        # Already a difference
+            # Binary/count indicators - should remain as raw flags, not percentage changes
+            # (pct_change on 0/1 data produces mostly NaN/inf which gets dropped)
+            'Oil_days_negative',
+            'Oil_Prices_went_negative',
+            'SP500_crash_month',
+            'SP500_circuit_breaker',
+            'SP500_days_circuit_breaker',
+            'SP500_bear_market',
+            'VIX_panic_regime',
+            'VIX_high_regime',
+            'IURSA_weeks_high',
+            'ICSA_weeks_high',
+            'CCSA_weeks_high',
         ]
 
     # Build exclusion mask using vectorized string operations
@@ -505,7 +602,14 @@ def _process_single_snapshot(
 
         current_vintage_df['date'] = pd.to_datetime(current_vintage_df['date'])
 
-        # 2. PREPROCESSING PIPELINE
+        # 2. FILTER DISCONTINUED SERIES (always applied, not just during preprocessing)
+        # Remove series that have no data in the last year before END_DATE
+        current_vintage_df = filter_discontinued_series(current_vintage_df)
+
+        if current_vintage_df.empty:
+            return (True, f"Skipped {snap_date.date()} (all series discontinued)")
+
+        # 3. PREPROCESSING PIPELINE
         if apply_preprocessing:
             # A. Structural Changes
             current_vintage_df = preprocess_noaa_indices(current_vintage_df)
@@ -521,7 +625,7 @@ def _process_single_snapshot(
             # D. Scaling (Fit on HISTORY only)
             current_vintage_df = apply_robust_scaling_vintage(current_vintage_df, snap_date)
 
-        # 3. SAVE
+        # 4. SAVE
         current_vintage_df['snapshot_date'] = snap_date
 
         decade_str = f"{snap_date.year // 10 * 10}s"

@@ -146,9 +146,9 @@ def save_csv(rows: List[List[str]]) -> None:
     logger.info(f"Saved raw CSV: {RAW_ADP_CSV}")
 
 
-def format_adp_data(rows: List[List[str]] = None) -> None:
+def format_adp_data() -> None:
     """
-    Format raw ADP data into long-format parquet matching FRED snapshot structure.
+    Format raw ADP CSV into long-format parquet matching FRED snapshot structure.
 
     Reference month determination (priority logic):
     1. Explicit format (with parentheses): Use the month specified in parentheses
@@ -165,18 +165,9 @@ def format_adp_data(rows: List[List[str]] = None) -> None:
     - value: employment change in thousands
     - release_date: when ADP was published
     - series_type: 'adp' for filtering/identification
-
-    Args:
-        rows: Optional list of parsed table rows. If None, reads from RAW_ADP_CSV.
-              This optimization avoids unnecessary disk I/O when data is already in memory.
     """
-    # OPTIMIZATION: Use in-memory data if provided, otherwise read from disk (fallback)
-    if rows is not None:
-        # Create DataFrame directly from rows (skip CSV round-trip)
-        df_raw = pd.DataFrame(rows, columns=["Release Date", "Time", "Actual", "Forecast", "Previous"])
-    else:
-        # Fallback: read from CSV (for backwards compatibility or manual reruns)
-        df_raw = pd.read_csv(RAW_ADP_CSV)
+    # Read raw CSV
+    df_raw = pd.read_csv(RAW_ADP_CSV)
     
     data = []
     for _, row in df_raw.iterrows():
@@ -319,26 +310,18 @@ def main() -> None:
             logger.info("Parsing table data...")
             rows = parse_table(driver.page_source)
 
-            # OPTIMIZATION: Save CSV for backup/debugging but pass rows directly to formatter
-            print(f"Saving {len(rows)} rows to CSV (backup)...", flush=True)
-            logger.info(f"Saving {len(rows)} rows to CSV (backup)...")
+            print(f"Saving {len(rows)} rows to CSV...", flush=True)
+            logger.info(f"Saving {len(rows)} rows to CSV...")
             save_csv(rows)
             print("✓ Scraping completed successfully", flush=True)
             logger.info("✓ Scraping completed successfully")
-
-            # Format the data directly (skip CSV read - optimization)
-            print("Formatting ADP data to long format...", flush=True)
-            logger.info("Formatting ADP data to long format...")
-            format_adp_data(rows=rows)  # OPTIMIZATION: Pass rows directly, skip disk read
-            print("✓ ADP data pipeline complete!", flush=True)
-            logger.info("✓ ADP data pipeline complete!")
-
+            
             # If we got here, scraping succeeded - break out of retry loop
             break
-
+            
         except Exception as e:
             logger.error(f"✗ Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
-
+            
             if attempt < max_retries - 1:
                 logger.info(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
@@ -346,11 +329,18 @@ def main() -> None:
             else:
                 logger.error("All retry attempts failed. Scraping aborted.")
                 raise
-
+                
         finally:
             if driver:
                 logger.info("Closing Chrome driver...")
                 driver.quit()
+    
+    # Format the data after scraping
+    print("Formatting ADP data to long format...", flush=True)
+    logger.info("Formatting ADP data to long format...")
+    format_adp_data()
+    print("✓ ADP data pipeline complete!", flush=True)
+    logger.info("✓ ADP data pipeline complete!")
 
 
 if __name__ == "__main__":

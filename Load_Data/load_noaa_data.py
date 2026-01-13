@@ -36,7 +36,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
 # INT1: Import NFP utilities at module level for consistency
-from nfp_relative_timing import apply_nfp_relative_adjustment
+from Prepare_Data.nfp_relative_timing import apply_nfp_relative_adjustment
 
 # ---------------------------------------------------------------------
 # User parameters

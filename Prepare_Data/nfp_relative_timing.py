@@ -23,7 +23,7 @@ from typing import Dict, Tuple, Optional
 from datetime import timedelta
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger
 

@@ -60,7 +60,7 @@ OUTPUT_DIR     = if_relative_make_abs(_get_env("OUTPUT_DIR", "_output"))
 TEMP_DIR       = if_relative_make_abs(_get_env("TEMP_DIR", "./_temp"))
 UNIFIER_USER   = _require_env("UNIFIER_USER")
 UNIFIER_TOKEN  = _require_env("UNIFIER_TOKEN")
-
+MODEL_TYPE = _get_env("MODEL_TYPE")
 WARM_START_INTERVAL = _to_int(_get_env("WARM_START_INTERVAL", "3"))
 
 CACHE_DATA_DIR = DATA_PATH / "cache"

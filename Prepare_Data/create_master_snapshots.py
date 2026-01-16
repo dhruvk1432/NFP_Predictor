@@ -604,26 +604,26 @@ def _process_single_snapshot(
 
         # 2. FILTER DISCONTINUED SERIES (always applied, not just during preprocessing)
         # Remove series that have no data in the last year before END_DATE
-        current_vintage_df = filter_discontinued_series(current_vintage_df)
+        # current_vintage_df = filter_discontinued_series(current_vintage_df)
 
-        if current_vintage_df.empty:
-            return (True, f"Skipped {snap_date.date()} (all series discontinued)")
+        # if current_vintage_df.empty:
+        #     return (True, f"Skipped {snap_date.date()} (all series discontinued)")
 
         # 3. PREPROCESSING PIPELINE
-        if apply_preprocessing:
-            # A. Structural Changes
-            current_vintage_df = preprocess_noaa_indices(current_vintage_df)
-            current_vintage_df = preprocess_pct_change(current_vintage_df)
+        # if apply_preprocessing:
+        #     # A. Structural Changes
+        current_vintage_df = preprocess_noaa_indices(current_vintage_df)
+        #     current_vintage_df = preprocess_pct_change(current_vintage_df)
 
-            # B. Value Transforms (SymLog / Log1p)
-            current_vintage_df = preprocess_transforms(current_vintage_df)
+        #     # B. Value Transforms (SymLog / Log1p)
+        #     current_vintage_df = preprocess_transforms(current_vintage_df)
 
-            # C. Add MoM Changes (before scaling)
-            current_vintage_df = add_mom_difference(current_vintage_df)
-            current_vintage_df = add_mom_pct_change(current_vintage_df)
+        #     # C. Add MoM Changes (before scaling)
+        #     current_vintage_df = add_mom_difference(current_vintage_df)
+        #     current_vintage_df = add_mom_pct_change(current_vintage_df)
 
-            # D. Scaling (Fit on HISTORY only)
-            current_vintage_df = apply_robust_scaling_vintage(current_vintage_df, snap_date)
+        #     # D. Scaling (Fit on HISTORY only)
+        #     current_vintage_df = apply_robust_scaling_vintage(current_vintage_df, snap_date)
 
         # 4. SAVE
         current_vintage_df['snapshot_date'] = snap_date

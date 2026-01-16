@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from datetime import timedelta
 import time
+import yfinance as yf
 
 # Add parent directory to path to import settings
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -18,6 +19,56 @@ from Load_Data.utils import get_snapshot_path, flatten_multiindex_columns
 
 logger = setup_logger(__file__, TEMP_DIR)
 
+
+# =============================================================================
+# V2: SP500 Data Fetching from Yahoo Finance (FRED only has 2016+ data)
+# =============================================================================
+def fetch_sp500_from_yahoo(start_date, end_date):
+    """
+    Fetch S&P 500 historical data from Yahoo Finance.
+
+    Returns DataFrame with columns ['date', 'value'] to match FRED format.
+    """
+    logger.info(f"Fetching SP500 data from Yahoo Finance: {start_date} to {end_date}")
+
+    try:
+        data = yf.download("^GSPC", start=start_date, end=end_date, interval="1d", progress=False)
+
+        if data.empty:
+            raise ValueError("Yahoo Finance returned empty dataset for SP500")
+
+        # Handle MultiIndex columns (yfinance returns MultiIndex for single ticker)
+        if isinstance(data.columns, pd.MultiIndex):
+            # Flatten MultiIndex columns - take Close price
+            data.columns = data.columns.droplevel(1)
+
+        # Extract Close prices
+        if 'Close' in data.columns:
+            close_series = data['Close']
+        else:
+            raise ValueError("'Close' column not found in Yahoo Finance data")
+
+        # Create DataFrame with proper format
+        df = pd.DataFrame({
+            'date': close_series.index,
+            'value': close_series.values
+        })
+
+        df['date'] = pd.to_datetime(df['date'])
+        df['value'] = pd.to_numeric(df['value'], errors='coerce')
+
+        # Remove any NaN values
+        df = df.dropna(subset=['value'])
+
+        if df.empty:
+            raise ValueError("All SP500 values were NaN after processing")
+
+        logger.info(f"Successfully fetched {len(df)} days of SP500 data from Yahoo Finance")
+        return df
+
+    except Exception as e:
+        logger.error(f"CRITICAL: Failed to fetch SP500 from Yahoo Finance: {e}")
+        raise RuntimeError(f"Cannot proceed without SP500 data: {e}")
 
 # =============================================================================
 # V1: FRED API Retry Logic with Exponential Backoff
@@ -77,92 +128,14 @@ FRED_SERIES = {
     # High-velocity economic indicators for extreme events
     "Financial_Stress": "STLFSI4",  # St. Louis Fed Financial Stress Index (weekly)
     "Weekly_Econ_Index": "WEI",  # Weekly Economic Index (real-time)
-    #Monthly Data (JOLTS_Openings and JOLTS_Hires dropped due to multicollinearity)
-    # "JOLTS_Openings": "JTSJOL",  # DROPPED
-    # "JOLTS_Hires": "JTSHIL",  # DROPPED
-    # "JOLTS_Quits": "JTSQUR",
-    # "JOLTS_Layoffs": "JTSLDL",
     # NEW: Regional Fed Employment Indices (monthly)
     "Empire_State_Emp": "USEPUINDX",  # Empire State Manufacturing Employment Index
-    "Philly_Fed_Emp": "USPHCICH",  # Philadelphia Fed Employment Diffusion Index
     # Weekly Jobless Claims (ICSA and IURSA dropped due to multicollinearity)
     # only data available before each NFP report is included in that month's features
     "ICSA": "ICSA", #Initial Claims Seasonally Adjusted
     "CCSA": "CCSA",  # Continued Claims Seasonally Adjusted (KEPT)
     "IURSA": "IURSA" # Insured Unemployment Rate Seasonally Adjusted
 }
-
-# def clean_jolts_release_dates(df, ref_month_col='date', release_col='realtime_start', nfp_offset_days=None):
-#     """
-#     Clean and impute JOLTS release dates.
-
-#     Logic: For each observation month, if release date is missing or more than 2 months late,
-#     impute it as the first Tuesday of the 2nd month after the observation.
-
-#     ENHANCEMENT: If nfp_offset_days provided, apply NFP-relative adjustment to maintain
-#     historical timing consistency relative to NFP releases.
-
-#     Example:
-#         ref_month = 2020-01-01 (January)
-#         deadline = 2020-03-31 (end of March, 2 months later)
-#         imputed = First Tuesday of March 2020
-#         (optionally adjusted relative to NFP release)
-
-#     Args:
-#         df: DataFrame with JOLTS data
-#         ref_month_col: Column name for the reference month (default: 'date')
-#         release_col: Column name for the release date (default: 'realtime_start')
-#         nfp_offset_days: Optional median offset from NFP (for consistency enhancement)
-
-#     Returns:
-#         DataFrame with cleaned release dates
-#     """
-#     df = df.copy()
-
-#     # Calculate deadline: end of 2nd month after reference month
-#     deadline = df[ref_month_col] + pd.DateOffset(months=2) + pd.offsets.MonthEnd(0)
-
-#     # Identify rows that need imputation (missing OR after deadline)
-#     needs_imputation = df[release_col].isna() | (df[release_col] > deadline)
-
-#     if needs_imputation.sum() > 0:
-#         # Calculate first day of the 2nd month after reference
-#         second_month_start = df[ref_month_col] + pd.DateOffset(months=2)
-#         second_month_start = second_month_start.dt.to_period('M').dt.to_timestamp()
-
-#         # Find first Tuesday of that month (base estimate)
-#         # weekday(): Monday=0, Tuesday=1, ..., Sunday=6
-#         # Days to add to get to Tuesday: (1 - weekday) % 7
-#         first_tuesday = second_month_start + pd.to_timedelta(
-#             (1 - second_month_start.dt.weekday) % 7, unit='D'
-#         )
-
-#         # Apply NFP-relative adjustment if provided
-#         # INT1: Uses apply_nfp_relative_adjustment imported at module level
-#         if nfp_offset_days is not None:
-#             # Apply adjustment row by row for imputed dates
-#             adjusted_dates = []
-#             for idx in df[needs_imputation].index:
-#                 event_month = df.loc[idx, ref_month_col].replace(day=1)
-#                 base_release = first_tuesday.loc[idx]
-
-#                 adjusted = apply_nfp_relative_adjustment(
-#                     event_month=event_month,
-#                     base_release_date=base_release,
-#                     median_offset_days=nfp_offset_days,
-#                     use_adjustment=True
-#                 )
-#                 adjusted_dates.append(adjusted)
-
-#             # Use adjusted dates
-#             df.loc[needs_imputation, release_col] = adjusted_dates
-#             logger.info(f"Imputed {needs_imputation.sum()} JOLTS release dates with NFP-relative adjustment")
-#         else:
-#             # Standard first Tuesday imputation
-#             df.loc[needs_imputation, release_col] = first_tuesday[needs_imputation]
-#             logger.info(f"Imputed {needs_imputation.sum()} JOLTS release dates to first Tuesday rule")
-
-#     return df
 
 def clean_weekly_release_dates(df, week_end_col='date', release_col='realtime_start', nfp_offset_days=None):
     """
@@ -319,6 +292,104 @@ def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
     # Aggregate by target month
     monthly_agg = weekly_assigned.groupby('target_month').agg({
         'value': 'mean',
+        'release_date': 'max'  # Use last release date in the window
+    }).reset_index()
+
+    monthly_agg.columns = ['date', 'value', 'release_date']
+
+    return monthly_agg
+
+def aggregate_weekly_to_monthly_nfp_based_custom(weekly_df, nfp_schedule, agg_func='mean'):
+    """
+    Aggregate weekly data into monthly buckets based on NFP release windows with custom aggregation function.
+
+    Logic: For target month M (e.g., June data released July 3):
+    - Include weekly releases where: NFP_release(M-1) <= weekly_release < NFP_release(M)
+    - Data released ON M-1 NFP day is included in M-1 bucket, not M bucket
+
+    Args:
+        weekly_df: DataFrame with columns ['date', 'value', 'realtime_start']
+        nfp_schedule: DataFrame with columns ['data_month', 'nfp_release_date']
+        agg_func: Aggregation function ('mean', 'max', 'min', etc.)
+
+    Returns:
+        DataFrame with monthly aggregated values
+    """
+    if weekly_df.empty or nfp_schedule is None:
+        # Fallback: simple monthly resampling with 7-day lag
+        logger.warning(f"Using fallback monthly aggregation (no NFP schedule) with {agg_func}")
+        weekly_df = weekly_df.sort_values('date').set_index('date')
+        monthly = weekly_df['value'].resample('MS').agg(agg_func).reset_index()
+        monthly['release_date'] = monthly['date'] + pd.Timedelta(days=7)
+        return monthly
+
+    # Prepare weekly data with release dates
+    weekly_clean = weekly_df[['date', 'value', 'realtime_start']].copy()
+    weekly_clean = weekly_clean.sort_values('realtime_start')
+
+    # Use earliest release per week (handle revisions)
+    weekly_clean = weekly_clean.groupby('date').first().reset_index()
+    weekly_clean.columns = ['week_ending', 'value', 'release_date']
+
+    # Prepare NFP schedule for merging
+    nfp_schedule = nfp_schedule.sort_values('nfp_release_date').copy()
+
+    # Assign each weekly release to a target month using searchsorted
+    # For each weekly release, find the FIRST NFP release that is >= weekly release
+    # That NFP release defines the target month
+    weekly_clean = weekly_clean.sort_values('release_date')
+
+    # Find the target month for each weekly release
+    idx = np.searchsorted(
+        nfp_schedule['nfp_release_date'].values,
+        weekly_clean['release_date'].values,
+        side='left'  # Find first NFP >= weekly release
+    )
+
+    # Handle edge cases (releases after last NFP or before first NFP)
+    idx = np.clip(idx, 0, len(nfp_schedule) - 1)
+
+    # Assign target month
+    weekly_clean['target_month'] = nfp_schedule.iloc[idx]['data_month'].values
+
+    # Filter: Keep only releases where previous_NFP < release <= current_NFP
+    # This means: release_date <= nfp_release_date[target_month]
+    # AND: release_date > nfp_release_date[target_month - 1]
+
+    valid_rows = []
+    for target_month, group in weekly_clean.groupby('target_month'):
+        # Find the NFP release for this target month
+        current_nfp = nfp_schedule[nfp_schedule['data_month'] == target_month]['nfp_release_date']
+        if current_nfp.empty:
+            continue
+        current_nfp_date = current_nfp.iloc[0]
+
+        # Find the previous NFP release
+        prev_nfp = nfp_schedule[nfp_schedule['nfp_release_date'] < current_nfp_date]
+        if prev_nfp.empty:
+            # First NFP in dataset - include all releases up to current
+            prev_nfp_date = pd.Timestamp('1900-01-01')
+        else:
+            prev_nfp_date = prev_nfp.iloc[-1]['nfp_release_date']
+
+        # Filter: prev_NFP <= release < current_NFP
+        # Changed from (> prev & <= current) to (>= prev & < current)
+        # This ensures data released ON M-1 NFP day is included in M-1 bucket
+        valid = group[
+            (group['release_date'] >= prev_nfp_date) &
+            (group['release_date'] < current_nfp_date)
+        ].copy()
+
+        valid_rows.append(valid)
+
+    if not valid_rows:
+        return pd.DataFrame(columns=['date', 'value', 'release_date'])
+
+    weekly_assigned = pd.concat(valid_rows, ignore_index=True)
+
+    # Aggregate by target month with custom aggregation function
+    monthly_agg = weekly_assigned.groupby('target_month').agg({
+        'value': agg_func,
         'release_date': 'max'  # Use last release date in the window
     }).reset_index()
 
@@ -826,16 +897,28 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
             # 1) DAILY FINANCIAL DATA (NO REVISION LOGIC, KNOWN ON THE DAY)
             # ------------------------------------------------------------------
             if name in DAILY_SERIES:
-                # V1: Use retry wrapper for FRED API calls
-                series = fred_api_call_with_retry(fred.get_series, code)
-                df = series.to_frame(name='value')
-                df.index.name = 'date'
-                df = df.reset_index()
-                df['date'] = pd.to_datetime(df['date'])
+                # V2: Special handling for SP500 - use Yahoo Finance ONLY (no FRED fallback)
+                if name == "SP500":
+                    # Yahoo Finance is the only source - will raise error if it fails
+                    # Convert datetime to string if needed
+                    start_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date)
+                    end_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
+                    df = fetch_sp500_from_yahoo(
+                        start_date=start_str,
+                        end_date=end_str
+                    )
+                else:
+                    # V1: Use retry wrapper for FRED API calls (other daily series)
+                    series = fred_api_call_with_retry(fred.get_series, code)
+                    df = series.to_frame(name='value')
+                    df.index.name = 'date'
+                    df = df.reset_index()
+                    df['date'] = pd.to_datetime(df['date'])
+                    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+
                 # Assume no revisions: value known on its own observation date
                 # FORCE 1-DAY LAG: Data from Day T is available on Day T+1
                 df['realtime_start'] = df['date'] + pd.Timedelta(days=1)
-                df['value'] = pd.to_numeric(df['value'], errors='coerce')
 
             # ------------------------------------------------------------------
             # 2) JOLTS MONTHLY SERIES (HEAVY REVISIONS, ~2-MONTH LAG)
@@ -1029,7 +1112,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 if name in daily_features_cache:
                     precomputed = daily_features_cache[name]
                     # Filter to data available before snapshot (strict <)
-                    valid_features = precomputed[precomputed.index < snap_date]
+                    # For daily data, realtime_start = date + 1 day, so data from date D is available on D+1
+                    # Therefore, we need date < snap_date - 1 day to ensure realtime_start < snap_date
+                    cutoff_date = snap_date - pd.Timedelta(days=1)
+                    valid_features = precomputed[precomputed.index < cutoff_date]
                     if not valid_features.empty:
                         sub_df = aggregate_vix_to_monthly(valid_features)
                     else:
@@ -1042,7 +1128,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 if name in daily_features_cache:
                     precomputed = daily_features_cache[name]
                     # Filter to data available before snapshot (strict <)
-                    valid_features = precomputed[precomputed.index < snap_date]
+                    # For daily data, realtime_start = date + 1 day, so data from date D is available on D+1
+                    # Therefore, we need date < snap_date - 1 day to ensure realtime_start < snap_date
+                    cutoff_date = snap_date - pd.Timedelta(days=1)
+                    valid_features = precomputed[precomputed.index < cutoff_date]
                     if not valid_features.empty:
                         sub_df = aggregate_sp500_to_monthly(valid_features)
                     else:
@@ -1055,7 +1144,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 if name in daily_features_cache:
                     precomputed = daily_features_cache[name]
                     # Filter to data available before snapshot (strict <)
-                    valid_features = precomputed[precomputed.index < snap_date]
+                    # For daily data, realtime_start = date + 1 day, so data from date D is available on D+1
+                    # Therefore, we need date < snap_date - 1 day to ensure realtime_start < snap_date
+                    cutoff_date = snap_date - pd.Timedelta(days=1)
+                    valid_features = precomputed[precomputed.index < cutoff_date]
                     if not valid_features.empty:
                         sub_df = aggregate_credit_yield_to_monthly(valid_features, name)
                     else:
@@ -1068,7 +1160,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 if name in daily_features_cache:
                     precomputed = daily_features_cache[name]
                     # Filter to data available before snapshot (strict <)
-                    valid_features = precomputed[precomputed.index < snap_date]
+                    # For daily data, realtime_start = date + 1 day, so data from date D is available on D+1
+                    # Therefore, we need date < snap_date - 1 day to ensure realtime_start < snap_date
+                    cutoff_date = snap_date - pd.Timedelta(days=1)
+                    valid_features = precomputed[precomputed.index < cutoff_date]
                     if not valid_features.empty:
                         sub_df = aggregate_oil_to_monthly(valid_features)
                     else:
@@ -1112,8 +1207,28 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                     # Combine all series for this claims indicator
                     sub_df = pd.concat([avg_series, spike_series, weeks_high_series], ignore_index=True)
                     logger.info(f"Calculated NFP-based features for {name}: monthly_avg, max_spike, weeks_high")
+                elif name == "Weekly_Econ_Index":
+                    # For Weekly_Econ_Index, calculate monthly average, max, and min
+                    # Get monthly max
+                    monthly_max = aggregate_weekly_to_monthly_nfp_based_custom(weekly_data, nfp_schedule, agg_func='max')
+                    # Get monthly min
+                    monthly_min = aggregate_weekly_to_monthly_nfp_based_custom(weekly_data, nfp_schedule, agg_func='min')
+
+                    # Create multiple series
+                    avg_series = monthly_avg.copy()
+                    avg_series['series_name'] = f"{name}_monthly_avg"
+
+                    max_series = monthly_max.copy()
+                    max_series['series_name'] = f"{name}_monthly_max"
+
+                    min_series = monthly_min.copy()
+                    min_series['series_name'] = f"{name}_monthly_min"
+
+                    # Combine all series for Weekly_Econ_Index
+                    sub_df = pd.concat([avg_series, max_series, min_series], ignore_index=True)
+                    logger.info(f"Calculated NFP-based features for {name}: monthly_avg, monthly_max, monthly_min")
                 else:
-                    # For Financial_Stress and Weekly_Econ_Index, just use monthly average
+                    # For Financial_Stress, just use monthly average
                     monthly_avg['series_name'] = f"{name}_monthly_avg"
                     sub_df = monthly_avg.copy()
                     logger.info(f"Calculated NFP-based monthly average for {name}")

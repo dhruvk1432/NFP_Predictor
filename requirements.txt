@@ -30,6 +30,7 @@ unifier
 
 # API clients
 fredapi>=0.5
+yfinance>=1.0  # For S&P 500 historical data (FRED only has 2016+)
 
 # Torch for neuralforecast
 torch>=2.2

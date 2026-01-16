@@ -13,7 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import (
     DATA_PATH, START_DATE, END_DATE, FRED_API_KEY,
-    REFRESH_CACHE, TEMP_DIR, NBEATSX_MODEL_TYPE, setup_logger
+    REFRESH_CACHE, TEMP_DIR, MODEL_TYPE, setup_logger
 )
 from Train.pipeline_helpers import build_hierarchy_structure
 from Load_Data.scrape_bls_schedule import get_future_nfp_dates
@@ -475,12 +475,26 @@ def _write_parquet(df: pd.DataFrame, path: Path, dict_cols: Optional[list[str]] 
 
 # --- DATE CALCULATION HELPERS ---
 
-def get_first_friday_of_month(dates: pd.Series) -> pd.Series:
-    """Returns the 1st Friday of the month for the dates provided."""
-    # Ensure index is preserved by working on the Series directly
+def get_first_friday_of_month(dates):
+    """
+    Returns the 1st Friday of the month for the dates provided.
+
+    Args:
+        dates: pd.Series of dates or a single pd.Timestamp
+
+    Returns:
+        pd.Series or pd.Timestamp with first Friday of month
+    """
+    # Handle single Timestamp
+    if isinstance(dates, pd.Timestamp):
+        start = dates.to_period('M').to_timestamp()
+        days_to_add = (4 - start.dayofweek + 7) % 7
+        return start + pd.Timedelta(days=days_to_add)
+
+    # Handle Series - Ensure index is preserved by working on the Series directly
     # Snap to start of month using Series methods
     starts = dates.dt.to_period('M').dt.to_timestamp()
-    
+
     # Calculate days to add to reach Friday (weekday 4)
     # (4 - dow + 7) % 7
     days_to_add = (4 - starts.dt.dayofweek + 7) % 7
@@ -496,8 +510,6 @@ def impute_target_release_date_simple(df: pd.DataFrame) -> pd.DataFrame:
     
     POST-2009 (higher data quality):
     - Only impute if release_date is explicitly NaN (missing)
-    - Preserve all existing dates, even if delayed (e.g., Oct 2013 government shutdown)
-    - This prevents lookahead bias from incorrectly "fixing" legitimate historical delays
     """
     if "release_date" not in df.columns and "realtime_start" in df.columns:
         df = df.rename(columns={"realtime_start": "release_date"})
@@ -685,7 +697,8 @@ def extend_target_with_complete_date_range(
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
     end_date_setting: pd.Timestamp,
-    is_univariate: bool = True
+    is_univariate: bool = True,
+    is_last_release: bool = False
 ) -> pd.DataFrame:
     """
     Ensure target file has a complete date range from window_start to END_DATE month.
@@ -698,17 +711,26 @@ def extend_target_with_complete_date_range(
     5. Removes any future rows that are now past END_DATE (if it was reduced)
 
     Args:
-        target_df: Existing target data with columns [ds, y, release_date]
+        target_df: Existing target data with columns [ds, y, release_date] for univariate
+                   or [ds, release_date, leaf_col_1, ...] for multivariate
         window_start: First month that should exist in target
         window_end: Last month with actual published data
         end_date_setting: END_DATE from settings (determines final month to include)
         is_univariate: True for single column (y), False for multivariate
+        is_last_release: If True, future release dates are 3 months after observation.
+                        If False, future release dates are 1 month after observation (first Friday).
 
     Returns:
         Extended DataFrame with complete date range
     """
     # Determine the final month we want in the target (based on END_DATE setting)
     final_month = pd.Timestamp(end_date_setting).to_period('M').to_timestamp()
+
+    # Get leaf column names for multivariate case
+    leaf_cols = []
+    if not is_univariate and not target_df.empty:
+        leaf_cols = [c for c in target_df.columns if c not in ['ds', 'release_date']]
+        logger.info(f"Multivariate extension: {len(leaf_cols)} leaf columns")
 
     # Generate complete range of months we should have
     all_months = pd.date_range(
@@ -742,6 +764,20 @@ def extend_target_with_complete_date_range(
 
     new_rows = []
 
+    def _create_row(month: pd.Timestamp, release_date: pd.Timestamp) -> dict:
+        """Create a new row with appropriate columns for univariate or multivariate."""
+        if is_univariate:
+            return {
+                'ds': month,
+                'y': float('nan'),
+                'release_date': release_date
+            }
+        else:
+            row = {'ds': month, 'release_date': release_date}
+            for col in leaf_cols:
+                row[col] = float('nan')
+            return row
+
     # Handle past missing months (backfill with first Friday)
     if past_missing:
         logger.info(f"Backfilling {len(past_missing)} past missing months with first Friday rule")
@@ -749,12 +785,7 @@ def extend_target_with_complete_date_range(
             next_month = month + pd.DateOffset(months=1)
             release_date = get_first_friday_of_month(next_month)
 
-            row = {
-                'ds': month,
-                'y': float('nan'),
-                'release_date': release_date
-            }
-
+            row = _create_row(month, release_date)
             new_rows.append(row)
             logger.warning(
                 f"Backfilled missing month {month.strftime('%Y-%m')} "
@@ -763,22 +794,52 @@ def extend_target_with_complete_date_range(
 
     # Handle future missing months (scrape BLS)
     if future_missing:
-        logger.info(f"Scraping BLS for {len(future_missing)} future months")
+        release_type = "last_release (3-month offset)" if is_last_release else "first_release"
+        logger.info(f"Scraping BLS for {len(future_missing)} future months ({release_type})")
 
-        # Scrape BLS for future dates
-        future_start = future_missing[0]
-        future_end = future_missing[-1]
+        if is_last_release:
+            # For last_release files: release dates are 3 months after observation
+            # Example: Dec 2025 observation -> March 2026 release date
+            # Scrape dates 3 months further out than the observation months
+            future_start_for_scrape = future_missing[0] + pd.DateOffset(months=2)
+            future_end_for_scrape = future_missing[-1] + pd.DateOffset(months=2)
+            scraped_df = get_future_nfp_dates(future_start_for_scrape, future_end_for_scrape)
 
-        scraped_df = get_future_nfp_dates(future_start, future_end)
+            # Build lookup dict from scraped data: release_month -> release_date
+            scraped_lookup = {}
+            for _, row in scraped_df.iterrows():
+                release_month = row['observation_month'] + pd.DateOffset(months=1)
+                scraped_lookup[release_month.to_period('M')] = row['release_date']
 
-        # Convert to target format
-        for _, row in scraped_df.iterrows():
-            new_row = {
-                'ds': row['observation_month'],
-                'y': float('nan'),
-                'release_date': row['release_date']
-            }
-            new_rows.append(new_row)
+            # Map each observation month to its 3-month-out release date
+            for obs_month in future_missing:
+                release_month = obs_month + pd.DateOffset(months=3)
+                release_period = release_month.to_period('M')
+
+                if release_period in scraped_lookup:
+                    release_date = scraped_lookup[release_period]
+                else:
+                    # Fallback: first Friday of release month
+                    release_date = get_first_friday_of_month(release_month)
+                    logger.warning(
+                        f"No scraped date for {obs_month.strftime('%Y-%m')} last_release, "
+                        f"using first Friday of {release_month.strftime('%Y-%m')}: {release_date}"
+                    )
+
+                new_row = _create_row(obs_month, release_date)
+                new_rows.append(new_row)
+        else:
+            # For first_release files: release dates are 1 month after observation
+            # Scrape BLS for future dates
+            future_start = future_missing[0]
+            future_end = future_missing[-1]
+
+            scraped_df = get_future_nfp_dates(future_start, future_end)
+
+            # Convert to target format
+            for _, scraped_row in scraped_df.iterrows():
+                new_row = _create_row(scraped_row['observation_month'], scraped_row['release_date'])
+                new_rows.append(new_row)
 
     # Combine with existing data
     if new_rows:
@@ -1055,20 +1116,45 @@ def collapse_latest_asof(audit: pd.DataFrame, as_of_cutoff: pd.Timestamp) -> pd.
     out["series_code"] = out["series_code"].astype("category")
     return out
 
-def _get_wide_leaf_nodes_with_dates(audit, leaf_uids, mode='last'):
+def _get_wide_leaf_nodes_with_dates(audit, leaf_uids, mode='last', require_complete=False):
+    """
+    Convert long-format audit data into wide-format with leaf node series as columns.
+
+    Args:
+        audit: DataFrame with columns [unique_id, ds, y, realtime_start]
+        leaf_uids: List of leaf node unique_ids to include
+        mode: 'first' for first release, 'last' for latest release
+        require_complete: If True, filter to only rows where ALL leaf columns have data
+
+    Returns:
+        DataFrame with columns [ds, release_date, leaf_col_1, leaf_col_2, ...]
+    """
     df = audit[audit["unique_id"].isin(leaf_uids)].copy()
     if df.empty: return pd.DataFrame(columns=["ds"] + leaf_uids + ["release_date"])
-    
+
     df = df.sort_values(["unique_id", "ds", "realtime_start"])
     keep = 'first' if mode == 'first' else 'last'
     df = df.drop_duplicates(["unique_id", "ds"], keep=keep)
-    
+
     wide = df.pivot(index="ds", columns="unique_id", values="y").reset_index()
     for u in leaf_uids:
         if u not in wide.columns: wide[u] = float('nan')
-        
+
+    # Filter to complete rows only (all leaf columns have data)
+    if require_complete:
+        leaf_cols = [u for u in leaf_uids if u in wide.columns]
+        rows_before = len(wide)
+        complete_mask = wide[leaf_cols].notna().all(axis=1)
+        wide = wide[complete_mask].copy()
+        rows_after = len(wide)
+
+        if rows_after < rows_before:
+            logger.info(f"Complete rows filter: {rows_before} -> {rows_after} rows")
+            if rows_after > 0:
+                logger.info(f"Effective date range: {wide['ds'].min()} to {wide['ds'].max()}")
+
     date_source_uid = "total_nsa" if "total_nsa" in audit["unique_id"].values else leaf_uids[0]
-    
+
     date_df = audit[audit["unique_id"] == date_source_uid].copy()
     if not date_df.empty:
         date_df = date_df.drop_duplicates(["ds"], keep=keep)[["ds", "realtime_start"]]
@@ -1078,7 +1164,7 @@ def _get_wide_leaf_nodes_with_dates(audit, leaf_uids, mode='last'):
         max_dates = df.groupby("ds")["realtime_start"].max().reset_index()
         max_dates = max_dates.rename(columns={"realtime_start": "release_date"})
         wide = pd.merge(wide, max_dates, on="ds", how="left")
-        
+
     cols = ["ds", "release_date"] + sorted(leaf_uids)
     return wide[cols]
 
@@ -1095,74 +1181,246 @@ def _slice_to_window(df, start, end):
     if df.empty: return df
     return df[(df["ds"] >= start) & (df["ds"] <= end)].reset_index(drop=True)
 
-def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
-    _ensure_dir(NFP_target_DIR)
+def _process_and_save_targets(targets, paths, window_start, window_end,
+                               end_date_setting, snapshot_date, is_univariate):
+    """
+    Process and save target files with appropriate imputation and extension.
 
-    # --- NSA TARGET LOGIC ---
-    if NBEATSX_MODEL_TYPE == "univariate":
-        logger.info("Building UNIVARIATE target (Total NSA only).")
-        y_nsa_first = _get_single_series(audit, "total_nsa", mode='first')
-        y_nsa_last = _get_single_series(audit, "total_nsa", mode='last')
-    else:
-        logger.info("Building MULTIVARIATE target (NSA Leaf Nodes).")
-        series_names = list(FRED_EMPLOYMENT_CODES.keys())
-        _, _, bottom_uids = build_hierarchy_structure(series_names, include_nsa=True)
-        y_nsa_first = _get_wide_leaf_nodes_with_dates(audit, bottom_uids, 'first')
-        y_nsa_last = _get_wide_leaf_nodes_with_dates(audit, bottom_uids, 'last')
+    All files get a final row for END_DATE month (e.g., Jan 2026) with y=NaN.
 
-    uid_sa = "total"
-    y_sa_first = _get_single_series(audit, uid_sa, mode='first')
-    y_sa_last = _get_single_series(audit, uid_sa, mode='last')
+    For first_release files:
+        - Historical data keeps y values as-is
+        - Final month (Jan 2026) has y=NaN, release_date = first Friday of next month (Feb 2026)
 
-    targets = {
-        "y_nsa_first": y_nsa_first,
-        "y_nsa_last": y_nsa_last,
-        "y_sa_first": y_sa_first,
-        "y_sa_last": y_sa_last
-    }
+    For last_release files:
+        - Last 3 months (Nov, Dec 2025 + Jan 2026) have y=NaN
+        - Release dates for these 3 months = scraped date 3 months after observation
 
-    paths = {
-        "y_nsa_first": NFP_target_DIR / "y_nsa_first_release.parquet",
-        "y_nsa_last": NFP_target_DIR / "y_nsa_last_release.parquet",
-        "y_sa_first": NFP_target_DIR / "y_sa_first_release.parquet",
-        "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",
-    }
-
-    # Parse END_DATE setting to determine final month to include
-    end_date_setting = pd.to_datetime(END_DATE)
+    Args:
+        targets: Dict of {key: DataFrame} with target data
+        paths: Dict of {key: Path} for output files
+        window_start: Start of data window
+        window_end: End of data window
+        end_date_setting: END_DATE from settings
+        snapshot_date: Date when audit was downloaded
+        is_univariate: If True, processing univariate files. If False, multivariate (apply dropna).
+    """
+    final_month = pd.Timestamp(end_date_setting).to_period('M').to_timestamp()
 
     for key, df in targets.items():
         df_sliced = _slice_to_window(df, window_start, window_end)
 
-        # Apply appropriate logic based on file type
         if "first" in key:
             # SIMPLE logic for "first release" files (14 day threshold)
             df_imputed = impute_target_release_date_simple(df_sliced)
 
-            # EXTEND with complete date range including future months
-            # This adds missing/future months with NaN values and scraped/imputed release dates
-            df_extended = extend_target_with_complete_date_range(
-                target_df=df_imputed,
-                window_start=window_start,
-                window_end=window_end,
-                end_date_setting=end_date_setting,
-                is_univariate=(NBEATSX_MODEL_TYPE == "univariate")
-            )
+            # For multivariate: dropna to ensure full matrix
+            if not is_univariate:
+                leaf_cols = [c for c in df_imputed.columns if c not in ['ds', 'release_date']]
+                rows_before = len(df_imputed)
+                df_imputed = df_imputed.dropna(subset=leaf_cols).reset_index(drop=True)
+                logger.info(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
 
-            _write_parquet(df_extended, paths[key])
-            logger.info(
-                f"Saved {key} with {len(df_extended)} rows "
-                f"(original: {len(df_sliced)}, extended: {len(df_extended) - len(df_sliced)})"
-            )
+            # Trim to before final_month (we'll add final_month row separately)
+            df_final = df_imputed[df_imputed['ds'] < final_month].copy()
+
+            # Add final_month row with NaN values
+            # Scrape release date for final_month (first Friday of next month)
+            scraped_df = get_future_nfp_dates(final_month, final_month)
+            if not scraped_df.empty:
+                final_release_date = scraped_df.iloc[0]['release_date']
+            else:
+                final_release_date = get_first_friday_of_month(final_month + pd.DateOffset(months=1))
+
+            if is_univariate:
+                final_row = pd.DataFrame({
+                    'ds': [final_month],
+                    'y': [float('nan')],
+                    'release_date': [final_release_date]
+                })
+            else:
+                leaf_cols = [c for c in df_final.columns if c not in ['ds', 'release_date']]
+                final_row = pd.DataFrame({'ds': [final_month], 'release_date': [final_release_date]})
+                for col in leaf_cols:
+                    final_row[col] = float('nan')
+
+            df_final = pd.concat([df_final, final_row], ignore_index=True)
+            logger.info(f"Added {final_month.strftime('%Y-%m')} with NaN, release_date: {final_release_date}")
+
+            _write_parquet(df_final, paths[key])
+            logger.info(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
 
         else:  # "last" in key
-            # COMPLEX logic for "last release" files (Options 1/2/3)
-            # DO NOT extend last release files (for now)
+            # COMPLEX logic for "last release" files
             df_imputed = impute_target_release_date_complex(df_sliced, snapshot_date)
-            _write_parquet(df_imputed, paths[key])
-            logger.info(f"Saved {key} with {len(df_imputed)} rows (no extension)")
 
-    return paths
+            # For multivariate: dropna to ensure full matrix
+            if not is_univariate:
+                leaf_cols = [c for c in df_imputed.columns if c not in ['ds', 'release_date']]
+                rows_before = len(df_imputed)
+                df_imputed = df_imputed.dropna(subset=leaf_cols).reset_index(drop=True)
+                logger.info(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
+
+            # Trim to before final_month
+            df_final = df_imputed[df_imputed['ds'] < final_month].copy()
+
+            # Add final_month row with NaN values (placeholder release date, will update below)
+            if is_univariate:
+                final_row = pd.DataFrame({
+                    'ds': [final_month],
+                    'y': [float('nan')],
+                    'release_date': [pd.NaT]
+                })
+            else:
+                leaf_cols = [c for c in df_final.columns if c not in ['ds', 'release_date']]
+                final_row = pd.DataFrame({'ds': [final_month], 'release_date': [pd.NaT]})
+                for col in leaf_cols:
+                    final_row[col] = float('nan')
+
+            df_final = pd.concat([df_final, final_row], ignore_index=True)
+
+            # For last_release: last 3 months (including final_month) get y=NaN and release_date = 3 months out
+            # Get last 3 months
+            last_3_months = df_final['ds'].nlargest(3).values
+            last_3_mask = df_final['ds'].isin(last_3_months)
+
+            logger.info(f"Last_release {key}: Setting NaN for last 3 months: {[pd.Timestamp(m).strftime('%Y-%m') for m in sorted(last_3_months)]}")
+
+            # Set y values to NaN for last 3 months
+            if is_univariate:
+                df_final.loc[last_3_mask, 'y'] = float('nan')
+            else:
+                value_cols = [c for c in df_final.columns if c not in ['ds', 'release_date']]
+                for col in value_cols:
+                    df_final.loc[last_3_mask, col] = float('nan')
+
+            # Scrape release dates for the last 3 months (3 months out)
+            obs_months = sorted([pd.Timestamp(m) for m in last_3_months])
+
+            # Scrape dates for the release months (observation + 3 months)
+            release_start = obs_months[0] + pd.DateOffset(months=2)
+            release_end = obs_months[-1] + pd.DateOffset(months=2)
+
+            scraped_df = get_future_nfp_dates(release_start, release_end)
+
+            # Build lookup: release_month -> release_date
+            scraped_lookup = {}
+            for _, row in scraped_df.iterrows():
+                release_month = row['observation_month'] + pd.DateOffset(months=1)
+                scraped_lookup[release_month.to_period('M')] = row['release_date']
+
+            # Update release dates for last 3 months
+            for obs_month in obs_months:
+                release_month = obs_month + pd.DateOffset(months=3)
+                release_period = release_month.to_period('M')
+
+                if release_period in scraped_lookup:
+                    new_release_date = scraped_lookup[release_period]
+                else:
+                    new_release_date = get_first_friday_of_month(release_month)
+                    logger.warning(f"No scraped date for {obs_month.strftime('%Y-%m')} last_release, using first Friday: {new_release_date}")
+
+                df_final.loc[df_final['ds'] == obs_month, 'release_date'] = new_release_date
+                logger.info(f"  {obs_month.strftime('%Y-%m')} -> release_date: {new_release_date}")
+
+            _write_parquet(df_final, paths[key])
+            logger.info(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
+
+def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
+    """
+    Build NFP target files for both univariate and multivariate models.
+
+    Generates up to 8 files:
+    - 4 univariate files (total NFP only): total_nsa_first_release, total_nsa_last_release,
+      total_sa_first_release, total_sa_last_release
+    - 4 multivariate files (leaf nodes, full matrix): y_nsa_first_release, y_nsa_last_release,
+      y_sa_first_release, y_sa_last_release
+
+    When MODEL_TYPE = "multivariate": generates all 8 files
+    When MODEL_TYPE = "univariate": generates only 4 univariate files
+    """
+    _ensure_dir(NFP_target_DIR)
+
+    is_multivariate = (MODEL_TYPE != "univariate")
+    series_names = list(FRED_EMPLOYMENT_CODES.keys())
+    end_date_setting = pd.to_datetime(END_DATE)
+
+    # ========== ALWAYS BUILD UNIVARIATE (Total NFP) ==========
+    logger.info("Building UNIVARIATE targets (Total NFP).")
+    total_nsa_first = _get_single_series(audit, "total_nsa", mode='first')
+    total_nsa_last = _get_single_series(audit, "total_nsa", mode='last')
+    total_sa_first = _get_single_series(audit, "total", mode='first')
+    total_sa_last = _get_single_series(audit, "total", mode='last')
+
+    univariate_targets = {
+        "total_nsa_first": total_nsa_first,
+        "total_nsa_last": total_nsa_last,
+        "total_sa_first": total_sa_first,
+        "total_sa_last": total_sa_last,
+    }
+
+    univariate_paths = {
+        "total_nsa_first": NFP_target_DIR / "total_nsa_first_release.parquet",
+        "total_nsa_last": NFP_target_DIR / "total_nsa_last_release.parquet",
+        "total_sa_first": NFP_target_DIR / "total_sa_first_release.parquet",
+        "total_sa_last": NFP_target_DIR / "total_sa_last_release.parquet",
+    }
+
+    # ========== BUILD MULTIVARIATE (Leaf Nodes) IF ENABLED ==========
+    if is_multivariate:
+        logger.info("Building MULTIVARIATE targets (Leaf Nodes).")
+
+        # NSA leaf nodes
+        _, _, nsa_bottom_uids = build_hierarchy_structure(series_names, include_nsa=True)
+        logger.info(f"NSA leaf nodes: {len(nsa_bottom_uids)} series")
+
+        # SA leaf nodes
+        _, _, sa_bottom_uids = build_hierarchy_structure(series_names, include_nsa=False)
+        logger.info(f"SA leaf nodes: {len(sa_bottom_uids)} series")
+
+        # Get wide-format data (do NOT apply require_complete here - dropna happens in _process_and_save_targets)
+        y_nsa_first = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'first', require_complete=False)
+        y_nsa_last = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'last', require_complete=False)
+        y_sa_first = _get_wide_leaf_nodes_with_dates(audit, sa_bottom_uids, 'first', require_complete=False)
+        y_sa_last = _get_wide_leaf_nodes_with_dates(audit, sa_bottom_uids, 'last', require_complete=False)
+
+        multivariate_targets = {
+            "y_nsa_first": y_nsa_first,
+            "y_nsa_last": y_nsa_last,
+            "y_sa_first": y_sa_first,
+            "y_sa_last": y_sa_last,
+        }
+
+        multivariate_paths = {
+            "y_nsa_first": NFP_target_DIR / "y_nsa_first_release.parquet",
+            "y_nsa_last": NFP_target_DIR / "y_nsa_last_release.parquet",
+            "y_sa_first": NFP_target_DIR / "y_sa_first_release.parquet",
+            "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",
+        }
+    else:
+        multivariate_targets = {}
+        multivariate_paths = {}
+
+    # ========== PROCESS AND SAVE ALL FILES ==========
+
+    # Process univariate files (always is_univariate=True)
+    logger.info("Processing and saving UNIVARIATE files...")
+    _process_and_save_targets(
+        univariate_targets, univariate_paths,
+        window_start, window_end, end_date_setting, snapshot_date,
+        is_univariate=True
+    )
+
+    # Process multivariate files (is_univariate=False, apply dropna)
+    if multivariate_targets:
+        logger.info("Processing and saving MULTIVARIATE files...")
+        _process_and_save_targets(
+            multivariate_targets, multivariate_paths,
+            window_start, window_end, end_date_setting, snapshot_date,
+            is_univariate=False
+        )
+
+    return {**univariate_paths, **multivariate_paths}
 
 def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_existing, limit_months):
     sched = month_ends(start_date, end_date)

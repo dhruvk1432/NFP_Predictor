@@ -17,7 +17,11 @@
       "Bash(pip show:*)",
       "Bash(cd:*)",
       "Bash(pip install:*)",
-      "Bash(pgrep:*)"
+      "Bash(pgrep:*)",
+      "Bash(ls:*)",
+      "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor && MODEL_TYPE=multivariate python -c:*)",
+      "Bash(MODEL_TYPE=multivariate python Load_Data/fred_snapshots.py)",
+      "Bash(MODEL_TYPE=univariate python:*)"
     ]
   }
 }

@@ -2,6 +2,8 @@ from __future__ import annotations
 import json, math, time
 import sys
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 import pandas as pd
@@ -446,6 +448,8 @@ FRED_EMPLOYMENT_CODES = {
     "total.government.local.excluding_education_nsa": "CEU9093200001",  # Local Government excluding Education (NSA)
     }
 
+TOTAL_UIDS = ["total_nsa", "total"]
+
 FRED_ROOT = (DATA_PATH / "fred_data").resolve()
 DECADES_ROOT = FRED_ROOT / "decades"
 REPORT_FILE = FRED_ROOT / "report.json"
@@ -472,6 +476,40 @@ def _write_parquet(df: pd.DataFrame, path: Path, dict_cols: Optional[list[str]] 
         compression_level=3,
         use_dictionary=dict_cols or []
     )
+
+def _align_audit_to_total_calendar(
+    audit: pd.DataFrame,
+    total_uid: str = "total_nsa",
+) -> pd.DataFrame:
+    """
+    Align all series' realtime_start to the total_nsa release calendar
+    on a per-date, per-vintage-order basis.
+    """
+    if audit.empty or "unique_id" not in audit.columns:
+        return audit
+
+    if total_uid not in audit["unique_id"].unique():
+        return audit
+
+    total = audit[audit["unique_id"] == total_uid].copy()
+    if total.empty:
+        return audit
+
+    total = total.sort_values(["ds", "realtime_start"]).copy()
+    total["vintage_idx"] = total.groupby("ds").cumcount()
+    calendar = total[["ds", "vintage_idx", "realtime_start"]].rename(
+        columns={"realtime_start": "total_realtime_start"}
+    )
+
+    aligned = audit.sort_values(["unique_id", "ds", "realtime_start"]).copy()
+    aligned["vintage_idx"] = aligned.groupby(["unique_id", "ds"]).cumcount()
+    aligned = aligned.merge(calendar, on=["ds", "vintage_idx"], how="left")
+    aligned["realtime_start"] = aligned["total_realtime_start"].combine_first(aligned["realtime_start"])
+    aligned = aligned.drop(columns=["vintage_idx", "total_realtime_start"])
+
+    aligned["realtime_start"] = pd.to_datetime(aligned["realtime_start"])
+    aligned["unique_id"] = aligned["unique_id"].astype("category")
+    return aligned
 
 # --- DATE CALCULATION HELPERS ---
 
@@ -612,11 +650,17 @@ def impute_target_release_date_complex(df: pd.DataFrame, snapshot_date: pd.Times
     df["release_date"] = pd.to_datetime(df["release_date"])
     return df
 
-def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.DataFrame:
+def calculate_complex_release_date(
+    df: pd.DataFrame,
+    snapshot_date: pd.Timestamp
+) -> Tuple[pd.DataFrame, int]:
     """
     COMPLEX LOGIC (For Snapshots):
     Applies Option 1, 2, or 3 based on relationship between Data Date, Snapshot Date, and ALFRED Release Date.
     Only imputes for dates before 2009-01-01. After 2009, uses actual FRED data.
+
+    Returns:
+        (df, imputed_count)
     """
     cutoff_date = pd.Timestamp("2009-01-01")
 
@@ -628,7 +672,7 @@ def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp
     needs_imputation = ((df["release_date"].isna()) | (df["release_date"] > one_year_later)) & (df["date"] < cutoff_date)
 
     if not needs_imputation.any():
-        return df
+        return df, 0
 
     # Prepare Candidate Dates
 
@@ -686,7 +730,8 @@ def calculate_complex_release_date(df: pd.DataFrame, snapshot_date: pd.Timestamp
         # Assign
         df.loc[mask_3, "release_date"] = best_date
 
-    return df
+    df["release_date"] = pd.to_datetime(df["release_date"])
+    return df, int(needs_imputation.sum())
 
 # ----------------------------------------
 # FUTURE DATE EXTENSION HELPERS
@@ -730,7 +775,7 @@ def extend_target_with_complete_date_range(
     leaf_cols = []
     if not is_univariate and not target_df.empty:
         leaf_cols = [c for c in target_df.columns if c not in ['ds', 'release_date']]
-        logger.info(f"Multivariate extension: {len(leaf_cols)} leaf columns")
+        logger.debug(f"Multivariate extension: {len(leaf_cols)} leaf columns")
 
     # Generate complete range of months we should have
     all_months = pd.date_range(
@@ -750,13 +795,13 @@ def extend_target_with_complete_date_range(
     missing_months = [m for m in all_months if m.to_period('M') not in existing_months]
 
     if not missing_months:
-        logger.info("No missing months found in target date range")
+        logger.debug("No missing months found in target date range")
         # Still need to check for future rows to remove
         if not target_df.empty:
             target_df = target_df[target_df['ds'] <= final_month].copy()
         return target_df
 
-    logger.info(f"Found {len(missing_months)} missing months in target range")
+    logger.debug(f"Found {len(missing_months)} missing months in target range")
 
     # Separate missing months into: past/present (backfill) vs future (scrape)
     past_missing = [m for m in missing_months if m <= last_data_month]
@@ -780,7 +825,7 @@ def extend_target_with_complete_date_range(
 
     # Handle past missing months (backfill with first Friday)
     if past_missing:
-        logger.info(f"Backfilling {len(past_missing)} past missing months with first Friday rule")
+        logger.debug(f"Backfilling {len(past_missing)} past missing months with first Friday rule")
         for month in past_missing:
             next_month = month + pd.DateOffset(months=1)
             release_date = get_first_friday_of_month(next_month)
@@ -795,7 +840,7 @@ def extend_target_with_complete_date_range(
     # Handle future missing months (scrape BLS)
     if future_missing:
         release_type = "last_release (3-month offset)" if is_last_release else "first_release"
-        logger.info(f"Scraping BLS for {len(future_missing)} future months ({release_type})")
+        logger.debug(f"Scraping BLS for {len(future_missing)} future months ({release_type})")
 
         if is_last_release:
             # For last_release files: release dates are 3 months after observation
@@ -846,7 +891,7 @@ def extend_target_with_complete_date_range(
         new_df = pd.DataFrame(new_rows)
         result_df = pd.concat([target_df, new_df], ignore_index=True)
         result_df = result_df.sort_values('ds').reset_index(drop=True)
-        logger.info(f"Added {len(new_rows)} new rows to target")
+        logger.debug(f"Added {len(new_rows)} new rows to target")
     else:
         result_df = target_df.copy()
 
@@ -856,7 +901,7 @@ def extend_target_with_complete_date_range(
     rows_removed = rows_before - len(result_df)
 
     if rows_removed > 0:
-        logger.info(f"Removed {rows_removed} future rows that are now past END_DATE")
+        logger.debug(f"Removed {rows_removed} future rows that are now past END_DATE")
 
     return result_df
 
@@ -881,7 +926,7 @@ def save_report(report: Dict[str, Any]) -> None:
 
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, default=str)
-    logger.info(f"Saved consolidated report to {REPORT_FILE}")
+    logger.debug(f"Saved consolidated report to {REPORT_FILE}")
 
 def month_ends(start_date: str, end_date: str) -> List[pd.Timestamp]:
     s = pd.to_datetime(start_date).to_period("M").to_timestamp("M")
@@ -1005,20 +1050,56 @@ def _fetch_one_all_asof(fred: Fred, fred_id: str, uid: str, as_of_str: str) -> p
             # Combine clean data with corrected vintages
             df = pd.concat([df_clean, corrected_df], ignore_index=True)
 
-        logger.info(
+        logger.debug(
             f"{uid}: Fixed {len(issue_dates)} observations with data quality issues "
             f"(using First Friday of next month rule) - only for dates before 2009-01-01"
         )
 
     return df[["unique_id","ds","y","realtime_start"]]
 
+# Thread-safe rate limiting for parallel requests
+_request_lock = threading.Lock()
+_last_request_time = [0.0]
+
+def _fetch_with_retry(fred, fid, uid, as_of_str, max_retries=3, base_delay=30):
+    """Fetch with exponential backoff on rate limit errors."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return _fetch_one_all_asof(fred, fid, uid, as_of_str)
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            is_rate_limit = "rate limit" in error_str or "too many requests" in error_str
+            is_parse_error = "mismatched tag" in error_str or "xml" in error_str
+
+            if (is_rate_limit or is_parse_error) and attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)  # 30s, 60s, 120s
+                logger.warning(f"Retrying {uid} in {wait_time}s (attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(wait_time)
+                continue
+            break
+    raise last_error
+
+def _rate_limited_fetch(fred, fid, uid, as_of_str, per_request_delay, max_retries):
+    """Wrapper enforcing minimum delay between requests across all threads."""
+    with _request_lock:
+        elapsed = time.time() - _last_request_time[0]
+        if elapsed < per_request_delay:
+            time.sleep(per_request_delay - elapsed)
+        _last_request_time[0] = time.time()
+    return _fetch_with_retry(fred, fid, uid, as_of_str, max_retries)
+
 def download_master_audit(
     end_date: str = END_DATE,
     codes: Dict[str, Optional[str]] = FRED_EMPLOYMENT_CODES,
     batch_size: int = 80,
-    pause_seconds: int = 60,
+    pause_seconds: int = 45,        # Reduced from 60 (retries handle rate limits)
     use_disk_cache: bool = True,
     specific_codes: Optional[List[str]] = None,
+    max_workers: int = 3,           # Limited parallelization
+    per_request_delay: float = 0.8, # Delay between requests
+    max_retries: int = 3,           # Retry failed requests
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     _ensure_dir(FRED_ROOT)
     as_of_str = pd.to_datetime(end_date).strftime("%Y-%m-%d")
@@ -1034,39 +1115,70 @@ def download_master_audit(
     report["missing_configurations"] = [k for k, v in codes.items() if v is None]
 
     if use_disk_cache and audit_file.exists() and not REFRESH_CACHE and specific_codes is None:
-        logger.info(f"Loading audit cache → {audit_file.name}")
+        logger.debug(f"Loading audit cache → {audit_file.name}")
         audit = pd.read_parquet(audit_file, engine="pyarrow")
         audit["unique_id"] = audit["unique_id"].astype("category")
+        audit = _align_audit_to_total_calendar(audit, total_uid="total_nsa")
         report["successful_series_count"] = len(audit["unique_id"].unique())
         return audit, report
 
+    logger.info("Download starting.")
+
     if specific_codes is not None:
         items = [(u, codes[u]) for u in specific_codes if codes.get(u)]
-        logger.info(f"Downloading {len(items)} specific series AS OF {as_of_str}")
+        download_groups = [items]
     else:
-        items = [(u, f) for u, f in codes.items() if f]
-        logger.info(f"Downloading ALL {len(items)} series AS OF {as_of_str}")
+        total_items = [(u, codes[u]) for u in TOTAL_UIDS if codes.get(u)]
+        other_items = [(u, f) for u, f in codes.items() if f and u not in TOTAL_UIDS]
+        download_groups = [total_items, other_items]
+        items = total_items + other_items
 
     if not items:
         return pd.DataFrame(columns=["unique_id","ds","y","realtime_start"]), report
 
     frames = []
-    n_batches = math.ceil(len(items) / batch_size)
     fred = Fred(api_key=FRED_API_KEY)
 
-    for b in range(n_batches):
-        batch_items = items[b*batch_size : (b+1)*batch_size]
-        for uid, fid in batch_items:
-            try:
-                df = _fetch_one_all_asof(fred, fid, uid, as_of_str)
-                if not df.empty:
-                    frames.append(df)
-                    report["downloaded_keys"].append(uid)
-            except Exception as e:
-                logger.warning(f"  Error fetching {uid} ({fid}) @ {as_of_str}: {e}")
-                report["download_failures"][uid] = str(e)
-        if b < n_batches - 1:
-            time.sleep(pause_seconds)
+    def _download_items(items_to_fetch: List[Tuple[str, str]]) -> None:
+        if not items_to_fetch:
+            return
+        n_batches = math.ceil(len(items_to_fetch) / batch_size)
+        for b in range(n_batches):
+            batch_items = items_to_fetch[b*batch_size : (b+1)*batch_size]
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_uid = {
+                    executor.submit(
+                        _rate_limited_fetch, fred, fid, uid, as_of_str,
+                        per_request_delay, max_retries
+                    ): uid
+                    for uid, fid in batch_items
+                }
+
+                for future in as_completed(future_to_uid):
+                    uid = future_to_uid[future]
+                    try:
+                        df = future.result()
+                        if not df.empty:
+                            frames.append(df)
+                            report["downloaded_keys"].append(uid)
+                    except Exception as e:
+                        logger.warning(f"  Failed after retries: {uid} @ {as_of_str}: {e}")
+                        report["download_failures"][uid] = str(e)
+
+            if b < n_batches - 1:
+                time.sleep(pause_seconds)
+
+    if specific_codes is None:
+        logger.info("Phase 1 starting.")
+        _download_items(download_groups[0])
+        logger.info("Phase 1 complete.")
+        if len(download_groups) > 1 and download_groups[1]:
+            logger.info("Starting phase 2.")
+            _download_items(download_groups[1])
+    else:
+        for group in download_groups:
+            _download_items(group)
 
     report["successful_series_count"] = len(report["downloaded_keys"])
     report["missing_series_count"] = len(report["download_failures"])
@@ -1077,23 +1189,56 @@ def download_master_audit(
 
     new_data = pd.concat(frames, ignore_index=True)
     new_data["unique_id"] = new_data["unique_id"].astype("category")
+    new_data = _align_audit_to_total_calendar(new_data, total_uid="total_nsa")
     
     if specific_codes is None and use_disk_cache:
          new_data = new_data.sort_values(["unique_id", "ds", "realtime_start"])
          _write_parquet(new_data, audit_file, dict_cols=["unique_id"])
-         logger.info(f"Wrote audit cache → {audit_file}")
+         logger.debug(f"Wrote audit cache → {audit_file}")
 
     return new_data, report
 
 def collapse_latest_asof(audit: pd.DataFrame, as_of_cutoff: pd.Timestamp) -> pd.DataFrame:
     """
     Revised collapse function:
-    1. Keeps realtime_start (renames to release_date).
-    2. COMMENTED OUT: Does NOT impute release_date - uses actual FRED data as-is.
+    1. Imputes total_nsa first-release dates BEFORE snapshot filtering.
+    2. Propagates total_nsa release calendar to all series.
     3. Uses strict < instead of <= to prevent same-day data leakage.
     """
+    if audit.empty:
+        return pd.DataFrame(columns=["date", "value", "series_name", "series_code", "release_date"])
+
+    aligned = audit.copy()
+    imputed_count = 0
+
+    total_uid = "total_nsa" if "total_nsa" in aligned["unique_id"].values else None
+    if total_uid:
+        total = aligned[aligned["unique_id"] == total_uid].copy()
+        total = total.sort_values(["ds", "realtime_start"])
+        total["vintage_idx"] = total.groupby("ds").cumcount()
+
+        first_release = total[total["vintage_idx"] == 0][["ds", "realtime_start"]].rename(
+            columns={"ds": "date", "realtime_start": "release_date"}
+        )
+        first_release, imputed_count = calculate_complex_release_date(first_release, as_of_cutoff)
+        first_map = first_release.set_index("date")["release_date"]
+
+        mask_first = total["vintage_idx"] == 0
+        total.loc[mask_first, "realtime_start"] = total.loc[mask_first, "ds"].map(first_map)
+        total["realtime_start"] = pd.to_datetime(total["realtime_start"])
+
+        calendar = total[["ds", "vintage_idx", "realtime_start"]].rename(
+            columns={"realtime_start": "total_realtime_start"}
+        )
+
+        aligned = aligned.sort_values(["unique_id", "ds", "realtime_start"]).copy()
+        aligned["vintage_idx"] = aligned.groupby(["unique_id", "ds"]).cumcount()
+        aligned = aligned.merge(calendar, on=["ds", "vintage_idx"], how="left")
+        aligned["realtime_start"] = aligned["total_realtime_start"].combine_first(aligned["realtime_start"])
+        aligned = aligned.drop(columns=["vintage_idx", "total_realtime_start"])
+
     # Changed from <= to strict < to prevent same-day data leakage
-    df = audit[audit["realtime_start"] < as_of_cutoff]
+    df = aligned[aligned["realtime_start"] < as_of_cutoff]
     if df.empty:
         return pd.DataFrame(columns=["date", "value", "series_name", "series_code", "release_date"])
 
@@ -1107,8 +1252,11 @@ def collapse_latest_asof(audit: pd.DataFrame, as_of_cutoff: pd.Timestamp) -> pd.
     out["series_name"] = out["unique_id"]
     out["series_code"] = out["unique_id"].map(FRED_EMPLOYMENT_CODES)
 
-    # Apply Complex Imputation Logic (only for dates before 2009-01-01)
-    out = calculate_complex_release_date(out, as_of_cutoff)
+    if not total_uid:
+        out, imputed_count = calculate_complex_release_date(out, as_of_cutoff)
+
+    out["release_date"] = pd.to_datetime(out["release_date"])
+    logger.info(f"Snapshot {as_of_cutoff.date()}: imputed {imputed_count} dates")
 
     out = out[["date", "value", "series_name", "series_code", "release_date"]]
 
@@ -1149,9 +1297,9 @@ def _get_wide_leaf_nodes_with_dates(audit, leaf_uids, mode='last', require_compl
         rows_after = len(wide)
 
         if rows_after < rows_before:
-            logger.info(f"Complete rows filter: {rows_before} -> {rows_after} rows")
+            logger.debug(f"Complete rows filter: {rows_before} -> {rows_after} rows")
             if rows_after > 0:
-                logger.info(f"Effective date range: {wide['ds'].min()} to {wide['ds'].max()}")
+                logger.debug(f"Effective date range: {wide['ds'].min()} to {wide['ds'].max()}")
 
     date_source_uid = "total_nsa" if "total_nsa" in audit["unique_id"].values else leaf_uids[0]
 
@@ -1219,7 +1367,7 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
                 leaf_cols = [c for c in df_imputed.columns if c not in ['ds', 'release_date']]
                 rows_before = len(df_imputed)
                 df_imputed = df_imputed.dropna(subset=leaf_cols).reset_index(drop=True)
-                logger.info(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
+                logger.debug(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
 
             # Trim to before final_month (we'll add final_month row separately)
             df_final = df_imputed[df_imputed['ds'] < final_month].copy()
@@ -1245,10 +1393,10 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
                     final_row[col] = float('nan')
 
             df_final = pd.concat([df_final, final_row], ignore_index=True)
-            logger.info(f"Added {final_month.strftime('%Y-%m')} with NaN, release_date: {final_release_date}")
+            logger.debug(f"Added {final_month.strftime('%Y-%m')} with NaN, release_date: {final_release_date}")
 
             _write_parquet(df_final, paths[key])
-            logger.info(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
+            logger.debug(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
 
         else:  # "last" in key
             # COMPLEX logic for "last release" files
@@ -1259,7 +1407,7 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
                 leaf_cols = [c for c in df_imputed.columns if c not in ['ds', 'release_date']]
                 rows_before = len(df_imputed)
                 df_imputed = df_imputed.dropna(subset=leaf_cols).reset_index(drop=True)
-                logger.info(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
+                logger.debug(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
 
             # Trim to before final_month
             df_final = df_imputed[df_imputed['ds'] < final_month].copy()
@@ -1284,7 +1432,7 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
             last_3_months = df_final['ds'].nlargest(3).values
             last_3_mask = df_final['ds'].isin(last_3_months)
 
-            logger.info(f"Last_release {key}: Setting NaN for last 3 months: {[pd.Timestamp(m).strftime('%Y-%m') for m in sorted(last_3_months)]}")
+            logger.debug(f"Last_release {key}: Setting NaN for last 3 months: {[pd.Timestamp(m).strftime('%Y-%m') for m in sorted(last_3_months)]}")
 
             # Set y values to NaN for last 3 months
             if is_univariate:
@@ -1321,10 +1469,10 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
                     logger.warning(f"No scraped date for {obs_month.strftime('%Y-%m')} last_release, using first Friday: {new_release_date}")
 
                 df_final.loc[df_final['ds'] == obs_month, 'release_date'] = new_release_date
-                logger.info(f"  {obs_month.strftime('%Y-%m')} -> release_date: {new_release_date}")
+                logger.debug(f"  {obs_month.strftime('%Y-%m')} -> release_date: {new_release_date}")
 
             _write_parquet(df_final, paths[key])
-            logger.info(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
+            logger.debug(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
 
 def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     """
@@ -1346,7 +1494,7 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     end_date_setting = pd.to_datetime(END_DATE)
 
     # ========== ALWAYS BUILD UNIVARIATE (Total NFP) ==========
-    logger.info("Building UNIVARIATE targets (Total NFP).")
+    logger.debug("Building UNIVARIATE targets (Total NFP).")
     total_nsa_first = _get_single_series(audit, "total_nsa", mode='first')
     total_nsa_last = _get_single_series(audit, "total_nsa", mode='last')
     total_sa_first = _get_single_series(audit, "total", mode='first')
@@ -1368,15 +1516,15 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
 
     # ========== BUILD MULTIVARIATE (Leaf Nodes) IF ENABLED ==========
     if is_multivariate:
-        logger.info("Building MULTIVARIATE targets (Leaf Nodes).")
+        logger.debug("Building MULTIVARIATE targets (Leaf Nodes).")
 
         # NSA leaf nodes
         _, _, nsa_bottom_uids = build_hierarchy_structure(series_names, include_nsa=True)
-        logger.info(f"NSA leaf nodes: {len(nsa_bottom_uids)} series")
+        logger.debug(f"NSA leaf nodes: {len(nsa_bottom_uids)} series")
 
         # SA leaf nodes
         _, _, sa_bottom_uids = build_hierarchy_structure(series_names, include_nsa=False)
-        logger.info(f"SA leaf nodes: {len(sa_bottom_uids)} series")
+        logger.debug(f"SA leaf nodes: {len(sa_bottom_uids)} series")
 
         # Get wide-format data (do NOT apply require_complete here - dropna happens in _process_and_save_targets)
         y_nsa_first = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'first', require_complete=False)
@@ -1404,7 +1552,7 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     # ========== PROCESS AND SAVE ALL FILES ==========
 
     # Process univariate files (always is_univariate=True)
-    logger.info("Processing and saving UNIVARIATE files...")
+    logger.debug("Processing and saving UNIVARIATE files...")
     _process_and_save_targets(
         univariate_targets, univariate_paths,
         window_start, window_end, end_date_setting, snapshot_date,
@@ -1413,7 +1561,7 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
 
     # Process multivariate files (is_univariate=False, apply dropna)
     if multivariate_targets:
-        logger.info("Processing and saving MULTIVARIATE files...")
+        logger.debug("Processing and saving MULTIVARIATE files...")
         _process_and_save_targets(
             multivariate_targets, multivariate_paths,
             window_start, window_end, end_date_setting, snapshot_date,
@@ -1429,7 +1577,7 @@ def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_exis
     for i, as_of in enumerate(sched, 1):
         out = month_file_path(as_of)
         if out.exists() and not refresh_existing: 
-            logger.info(f"[{i}/{len(sched)}] {as_of.date()} exists.")
+            logger.debug(f"[{i}/{len(sched)}] {as_of.date()} exists.")
             continue
         
         # Pass median_lags removed; logic is now self-contained in calculate_complex_release_date
@@ -1454,6 +1602,7 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
     # Use end_date as snapshot_date since audit was downloaded "as of" this date
     snapshot_date = pd.to_datetime(end_date)
     build_nfp_target_files(audit, s, e, snapshot_date)
+    logger.info("Done.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build NFP Snapshots")

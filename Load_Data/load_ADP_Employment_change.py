@@ -14,9 +14,8 @@ from pathlib import Path
 from typing import List
 
 from bs4 import BeautifulSoup
-from selenium import webdriver
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -39,21 +38,23 @@ URL = "https://www.investing.com/economic-calendar/adp-nonfarm-employment-change
 WAIT_SEC = 10
 
 
-def init_driver() -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--incognito")
-    opts.add_argument("--headless=new")
+def init_driver() -> uc.Chrome:
+    """Initialize undetected-chromedriver to bypass Cloudflare protection.
+
+    Uses headed mode (visible browser) as Cloudflare blocks headless browsers.
+    """
+    opts = uc.ChromeOptions()
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-infobars")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--window-size=1366,768")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.page_load_strategy = "eager"
 
-    driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(60)  # Reasonable timeout for page load
+    # Use headed mode (headless=False) - Cloudflare blocks headless browsers
+    driver = uc.Chrome(options=opts, headless=False)
+    driver.set_page_load_timeout(90)  # Allow more time for Cloudflare challenge
     return driver
 
 
@@ -290,6 +291,12 @@ def main() -> None:
             print(f"Loading page: {URL}", flush=True)
             logger.info(f"Loading page: {URL}")
             driver.get(URL)
+
+            # Wait for Cloudflare challenge to resolve
+            print("Waiting for Cloudflare challenge to resolve...", flush=True)
+            logger.info("Waiting for Cloudflare challenge to resolve...")
+            time.sleep(10)
+
             print("✓ Page loaded successfully", flush=True)
             logger.info("✓ Page loaded successfully")
 

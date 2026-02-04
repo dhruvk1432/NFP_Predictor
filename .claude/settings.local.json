@@ -21,7 +21,8 @@
       "Bash(ls:*)",
       "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor && MODEL_TYPE=multivariate python -c:*)",
       "Bash(MODEL_TYPE=multivariate python Load_Data/fred_snapshots.py)",
-      "Bash(MODEL_TYPE=univariate python:*)"
+      "Bash(MODEL_TYPE=univariate python:*)",
+      "WebFetch(domain:www.investing.com)"
     ]
   }
 }

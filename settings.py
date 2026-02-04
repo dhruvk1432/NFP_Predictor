@@ -51,7 +51,7 @@ def get_os() -> str:
 FRED_API_KEY    = _require_env("FRED_API_KEY")
 DATA_PATH       = if_relative_make_abs(_require_env("DATA_PATH"))
 START_DATE      = _require_env("START_DATE")      
-END_DATE        = date.today()     
+END_DATE        = date.today().strftime("%Y-%m-%d")     
 BACKTEST_MONTHS = _to_int(_require_env("BACKTEST_MONTHS"))
 DELIM          = _get_env("DELIM", ".")
 DEBUG          = _to_bool(_get_env("DEBUG", "False"))

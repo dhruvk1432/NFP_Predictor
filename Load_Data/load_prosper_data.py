@@ -158,6 +158,18 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
 
     base_dir = Path(DATA_PATH) / "Exogenous_data" / "prosper"
 
+    # Skip-if-exists: Check if all snapshots already exist
+    existing_count = 0
+    for obs_month in nfp_release_map.keys():
+        snap_path = get_snapshot_path(base_dir, pd.Timestamp(obs_month))
+        if snap_path.exists():
+            existing_count += 1
+
+    if existing_count == len(nfp_release_map):
+        print(f"✓ Prosper data already exists: {existing_count} monthly snapshots", flush=True)
+        logger.info(f"All {existing_count} Prosper snapshots exist, skipping download")
+        return
+
     # Step 1: Download metadata to get the list of keys we need
     logger.info("Downloading prosper metadata to identify keys...")
     metadata_df = unifier.get_dataframe(name="prosper_v2", back_to="2026-01-01")

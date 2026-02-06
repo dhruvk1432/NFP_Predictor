@@ -7,7 +7,7 @@ the NFP release date for that month.
 
 Output format matches other exogenous snapshots:
 - date: reference month for the ADP data
-- series_name: ADP_actual, ADP_forecast (ADP_previous dropped due to multicollinearity)
+- series_name: ADP_actual (MoM employment change from ADP level data)
 - value: employment change value
 - snapshot_date: NFP release date (when this snapshot was "known")
 - release_date: when ADP was actually published
@@ -28,7 +28,7 @@ logger = setup_logger(__file__, TEMP_DIR)
 ADP_DATA_DIR = DATA_PATH / "Exogenous_data" / "ADP_data"
 ADP_RAW = ADP_DATA_DIR / "ADP_Employment_Change.parquet"
 ADP_SNAPSHOTS_BASE = DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades"
-NFP_TARGET_PATH = DATA_PATH / "NFP_target" / "y_nsa_first_release.parquet"
+NFP_TARGET_PATH = DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet"
 
 
 def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:

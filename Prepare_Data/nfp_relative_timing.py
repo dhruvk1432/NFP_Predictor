@@ -47,7 +47,7 @@ def load_nfp_releases() -> pd.DataFrame:
     if _NFP_RELEASES_CACHE is not None:
         return _NFP_RELEASES_CACHE
     
-    nfp_file = DATA_PATH / "NFP_target" / "y_nsa_first_release.parquet"
+    nfp_file = DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet"
     
     if not nfp_file.exists():
         raise FileNotFoundError(f"NFP target file not found: {nfp_file}")

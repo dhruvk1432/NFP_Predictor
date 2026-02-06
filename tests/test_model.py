@@ -36,16 +36,17 @@ class TestGetLgbmParams:
         params = get_lgbm_params()
         assert isinstance(params, dict)
 
-    def test_default_objective(self):
-        """Test default objective is regression."""
+    def test_default_objective_is_huber(self):
+        """Test default objective is Huber (for outlier robustness)."""
         params = get_lgbm_params()
-        assert params['objective'] == 'regression'
-
-    def test_huber_loss_option(self):
-        """Test Huber loss configuration."""
-        params = get_lgbm_params(use_huber_loss=True)
         assert params['objective'] == 'huber'
         assert 'alpha' in params
+
+    def test_disable_huber_loss(self):
+        """Test disabling Huber loss returns regression objective."""
+        params = get_lgbm_params(use_huber_loss=False)
+        assert params['objective'] == 'regression'
+        assert 'alpha' not in params
 
     def test_huber_delta_customization(self):
         """Test custom Huber delta value."""

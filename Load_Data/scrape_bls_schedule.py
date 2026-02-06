@@ -20,6 +20,18 @@ from settings import TEMP_DIR, setup_logger
 
 logger = setup_logger(__file__, TEMP_DIR)
 
+# =============================================================================
+# HARDCODED RELEASE DATES
+# =============================================================================
+# These dates are guaranteed to be included in results, regardless of BLS scraping.
+# Use this for dates that are known but may not be available on the BLS website
+# (e.g., during government shutdowns, website changes, or for confirmed future dates).
+#
+# Format: {observation_month: release_date}
+HARDCODED_RELEASE_DATES = {
+    pd.Timestamp("2026-01-01"): pd.Timestamp("2026-02-06"),  # January 2026 NFP -> Feb 6, 2026
+}
+
 
 
 
@@ -168,6 +180,9 @@ def get_future_nfp_dates(
     """
     Get NFP release dates for a date range by scraping BLS website.
 
+    Hardcoded release dates (HARDCODED_RELEASE_DATES) are always included and
+    take precedence over scraped dates if there's a conflict.
+
     Args:
         start_month: First observation month to get (e.g., 2025-11-01)
         end_month: Last observation month to get (e.g., 2025-12-01)
@@ -176,9 +191,28 @@ def get_future_nfp_dates(
         DataFrame with columns: ['observation_month', 'release_date']
     """
     # Scrape the Employment Situation schedule page
-    all_dates = scrape_bls_employment_situation_schedule()
+    try:
+        all_dates = scrape_bls_employment_situation_schedule()
+    except Exception as e:
+        logger.warning(f"BLS scraping failed: {e}. Using hardcoded dates only.")
+        all_dates = pd.DataFrame(columns=['observation_month', 'release_date'])
 
-
+    # Inject hardcoded release dates (these take precedence)
+    for obs_month, release_date in HARDCODED_RELEASE_DATES.items():
+        # Check if this month is already in scraped data
+        existing_mask = all_dates['observation_month'] == obs_month
+        if existing_mask.any():
+            # Update existing entry with hardcoded date
+            all_dates.loc[existing_mask, 'release_date'] = release_date
+            logger.info(f"Hardcoded override: {obs_month.strftime('%Y-%m')} -> {release_date.strftime('%Y-%m-%d')}")
+        else:
+            # Add new entry
+            new_row = pd.DataFrame({
+                'observation_month': [obs_month],
+                'release_date': [release_date]
+            })
+            all_dates = pd.concat([all_dates, new_row], ignore_index=True)
+            logger.info(f"Hardcoded added: {obs_month.strftime('%Y-%m')} -> {release_date.strftime('%Y-%m-%d')}")
 
     # Filter to requested range
     filtered = all_dates[

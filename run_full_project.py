@@ -33,7 +33,7 @@ PIPELINE STAGES:
 ----------------
 1. LOAD DATA: Fetch raw data from external sources (FRED, ADP, NOAA, etc.)
 2. PREPARE DATA: Transform and consolidate data into master snapshots
-3. TRAIN: Train all 4 NFP model variants, generate predictions and backtests
+3. TRAIN: Train first release NFP models (nsa_first, sa_first), generate predictions and backtests
 
 Author: NFP Predictor Team
 """
@@ -94,7 +94,7 @@ LOAD_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
         "adp",
         "Load_Data/load_ADP_Employment_change.py",
-        "Scrape ADP employment data from investing.com",
+        "Load ADP employment data from historical CSV",
         [],
     ),
     (
@@ -154,7 +154,7 @@ TRAIN_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
         "train_all_models",
         "Train/train_lightgbm_nfp.py",
-        "Train all 4 NFP model variants (nsa/sa x first/last release)",
+        "Train first release NFP models (nsa_first, sa_first)",
         ["--train-all"],
     ),
 ]

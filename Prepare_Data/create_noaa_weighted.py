@@ -319,7 +319,7 @@ def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:
     Returns:
         DataFrame with columns: ds (event date), release_date (NFP release)
     """
-    nfp_path = DATA_PATH / "NFP_target" / "y_nsa_first_release.parquet"
+    nfp_path = DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet"
 
     if not nfp_path.exists():
         raise FileNotFoundError(f"NFP target file not found: {nfp_path}")

@@ -12,14 +12,14 @@ Key Features:
 - Momentum/divergence and acceleration features
 - Cyclical month encoding (sin/cos)
 
-MULTI-TARGET SUPPORT:
-This model supports 4 target configurations:
+FIRST RELEASE MODELS ONLY:
+This model supports 2 target configurations (first release only):
 - nsa_first: Non-seasonally adjusted, first release
-- nsa_last: Non-seasonally adjusted, final revised
 - sa_first: Seasonally adjusted, first release
-- sa_last: Seasonally adjusted, final revised
 
-Use --train-all to train all 4 models efficiently.
+NOTE: Last release models (nsa_last, sa_last) are disabled.
+
+Use --train-all to train both first release models efficiently.
 
 MODULAR ARCHITECTURE:
 This file is the main entry point. Core functionality is split into:
@@ -56,6 +56,14 @@ from Train.config import (
     VALID_RELEASE_TYPES,
     get_model_id,
     get_target_path,
+    # New config for simplified feature selection and Huber loss
+    USE_HUBER_LOSS_DEFAULT,
+    HUBER_DELTA,
+    FEATURE_RECENCY_MONTHS,
+    MAX_NAN_RATIO,
+    WINSORIZE_FEATURES,
+    WINSORIZE_LOWER_PERCENTILE,
+    WINSORIZE_UPPER_PERCENTILE,
 )
 
 from Train.data_loader import (
@@ -389,14 +397,274 @@ def impute_with_expanding_window(
     return X_imputed, train_means
 
 
+def winsorize_features(
+    X: pd.DataFrame,
+    lower_pct: float = WINSORIZE_LOWER_PERCENTILE,
+    upper_pct: float = WINSORIZE_UPPER_PERCENTILE,
+    train_idx: Optional[np.ndarray] = None
+) -> Tuple[pd.DataFrame, Dict[str, Tuple[float, float]]]:
+    """
+    Winsorize features to reduce impact of COVID-like outliers.
+
+    Clips extreme values to specified percentiles, computed from training data only
+    to avoid look-ahead bias.
+
+    Args:
+        X: Feature DataFrame
+        lower_pct: Lower percentile for clipping (e.g., 1.0 = 1st percentile)
+        upper_pct: Upper percentile for clipping (e.g., 99.0 = 99th percentile)
+        train_idx: Indices to use for computing percentiles (to avoid leakage)
+
+    Returns:
+        Tuple of (winsorized DataFrame, dict of clip bounds per column)
+    """
+    if not WINSORIZE_FEATURES:
+        return X, {}
+
+    X_winsorized = X.copy()
+    numeric_cols = X_winsorized.select_dtypes(include=[np.number]).columns
+    numeric_cols = [c for c in numeric_cols if c != 'ds']
+
+    clip_bounds = {}
+
+    # Use training data only for computing percentiles
+    if train_idx is not None:
+        X_train = X_winsorized.iloc[train_idx]
+    else:
+        X_train = X_winsorized
+
+    for col in numeric_cols:
+        col_data = X_train[col].dropna()
+        if len(col_data) < 10:
+            continue
+
+        lower_bound = np.percentile(col_data, lower_pct)
+        upper_bound = np.percentile(col_data, upper_pct)
+
+        # Only clip if bounds are different (avoid constant columns)
+        if lower_bound < upper_bound:
+            X_winsorized[col] = X_winsorized[col].clip(lower=lower_bound, upper=upper_bound)
+            clip_bounds[col] = (lower_bound, upper_bound)
+
+    n_clipped = len(clip_bounds)
+    if n_clipped > 0:
+        logger.info(f"Winsorized {n_clipped} features to [{lower_pct}, {upper_pct}] percentiles")
+
+    return X_winsorized, clip_bounds
+
+
+def check_feature_recency(
+    X: pd.DataFrame,
+    dates: pd.Series,
+    recency_months: int = FEATURE_RECENCY_MONTHS
+) -> List[str]:
+    """
+    Check which features have data in the last N months.
+
+    Args:
+        X: Feature DataFrame
+        dates: Series of dates corresponding to X rows
+        recency_months: Require non-NaN data within this many months
+
+    Returns:
+        List of feature names that have recent data
+    """
+    if dates is None or len(dates) == 0:
+        return list(X.columns)
+
+    max_date = dates.max()
+    cutoff_date = max_date - pd.DateOffset(months=recency_months)
+    recent_mask = dates >= cutoff_date
+
+    if not recent_mask.any():
+        logger.warning(f"No data found in last {recency_months} months")
+        return list(X.columns)
+
+    X_recent = X.loc[recent_mask]
+    numeric_cols = X_recent.select_dtypes(include=[np.number]).columns
+    numeric_cols = [c for c in numeric_cols if c != 'ds']
+
+    # Features with at least one non-NaN value in recent period
+    recent_features = []
+    for col in numeric_cols:
+        if X_recent[col].notna().any():
+            recent_features.append(col)
+
+    n_removed = len(numeric_cols) - len(recent_features)
+    if n_removed > 0:
+        logger.info(f"Removed {n_removed} features without data in last {recency_months} months")
+
+    return recent_features
+
+
+def select_features_simplified(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: Optional[pd.Series] = None,
+    max_features: int = MAX_FEATURES,
+    output_dir: Optional[Path] = None,
+    target_type: str = 'nsa'
+) -> Tuple[List[str], Dict]:
+    """
+    Simplified feature selection pipeline optimized for gradient boosting.
+
+    Steps:
+    1. Remove high-NaN columns (>50% missing)
+    2. Remove zero-variance columns
+    3. Filter by recency (must have data in last 12 months)
+    4. Apply winsorization to reduce outlier impact
+    5. VIF filtering to remove multicollinearity
+    6. Select top features by LightGBM importance (no multi-metric ranking)
+
+    This simplified approach works well for gradient boosting because:
+    - Tree models naturally handle irrelevant features
+    - VIF handles multicollinearity better than correlation filtering
+    - Recency ensures features are relevant to current predictions
+    - Winsorization reduces outlier dominance in feature data
+
+    Args:
+        X: Full feature DataFrame
+        y: Target series
+        dates: Date series for recency filtering
+        max_features: Maximum features to select
+        output_dir: Directory to save selection results
+        target_type: 'nsa' or 'sa' for labeling outputs
+
+    Returns:
+        Tuple of (selected feature list, selection metadata dict)
+    """
+    logger.info("=" * 60)
+    logger.info("SIMPLIFIED FEATURE SELECTION PIPELINE")
+    logger.info("=" * 60)
+    logger.info(f"Starting with {len(X.columns)} features, target: {max_features}")
+
+    # Identify protected binary flags
+    protected_set = set(PROTECTED_BINARY_FLAGS)
+    protected_features_present = [f for f in X.columns if f in protected_set]
+
+    if protected_features_present:
+        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal")
+
+    metadata = {
+        'initial_features': len(X.columns),
+        'target_features': max_features,
+        'protected_features': protected_features_present,
+        'steps': []
+    }
+
+    # Step 1: Basic cleaning
+    X_work = X.select_dtypes(include=[np.number]).copy()
+    X_work = X_work.drop(columns=['ds'], errors='ignore')
+    X_work = X_work.replace([np.inf, -np.inf], np.nan)
+
+    # Remove high-NaN columns
+    nan_pct = X_work.isna().mean()
+    high_nan_cols = nan_pct[nan_pct > MAX_NAN_RATIO].index.tolist()
+    high_nan_cols = [c for c in high_nan_cols if c not in protected_set]
+    X_work = X_work.drop(columns=high_nan_cols)
+
+    logger.info(f"Step 1: Removed {len(high_nan_cols)} high-NaN columns, {len(X_work.columns)} remaining")
+    metadata['steps'].append({'step': 'high_nan_removal', 'removed': len(high_nan_cols), 'remaining': len(X_work.columns)})
+
+    # Step 2: Remove zero variance
+    col_means = X_work.mean()
+    X_work = X_work.fillna(col_means).fillna(0)
+
+    variances = X_work.var()
+    zero_var = variances[variances == 0].index.tolist()
+    zero_var = [c for c in zero_var if c not in protected_set]
+    X_work = X_work.drop(columns=zero_var)
+
+    logger.info(f"Step 2: Removed {len(zero_var)} zero-variance columns, {len(X_work.columns)} remaining")
+    metadata['steps'].append({'step': 'zero_variance_removal', 'removed': len(zero_var), 'remaining': len(X_work.columns)})
+
+    # Step 3: Recency filter
+    if dates is not None:
+        recent_features = check_feature_recency(X_work, dates, FEATURE_RECENCY_MONTHS)
+        non_recent = [c for c in X_work.columns if c not in recent_features and c not in protected_set]
+        X_work = X_work.drop(columns=non_recent)
+
+        # Re-add protected features
+        for f in protected_features_present:
+            if f not in X_work.columns and f in X.columns:
+                X_work[f] = X[f]
+
+        logger.info(f"Step 3: Removed {len(non_recent)} stale features, {len(X_work.columns)} remaining")
+        metadata['steps'].append({'step': 'recency_filter', 'removed': len(non_recent), 'remaining': len(X_work.columns)})
+    else:
+        logger.info("Step 3: Skipping recency filter (no dates provided)")
+
+    # Step 4: Winsorization (compute bounds from full data for selection phase)
+    X_work, clip_bounds = winsorize_features(X_work)
+    metadata['winsorize_bounds'] = clip_bounds
+
+    # Step 5: VIF filtering
+    if VIF_AVAILABLE and len(X_work.columns) > 10:
+        logger.info("\nStep 5: VIF Filtering")
+        X_work, vif_removed = remove_high_vif_features(X_work, vif_threshold=VIF_THRESHOLD, max_iterations=30)
+
+        # Add back protected features if removed
+        for f in protected_features_present:
+            if f in vif_removed and f in X.columns:
+                X_work[f] = X[f]
+
+        if vif_removed:
+            logger.info(f"Removed {len(vif_removed)} high-VIF features, {len(X_work.columns)} remaining")
+            metadata['steps'].append({'step': 'vif_removal', 'removed': len(vif_removed), 'remaining': len(X_work.columns)})
+    else:
+        logger.info("Step 5: Skipping VIF (not available or too few features)")
+
+    # Step 6: LightGBM importance ranking (simplified - single metric)
+    logger.info("\nStep 6: Computing LightGBM Feature Importance")
+    lgbm_importance = compute_feature_importance_lgbm(X_work, y)
+
+    # Select top features by LightGBM importance
+    selected_features = lgbm_importance['feature'].head(max_features).tolist()
+
+    # Ensure all protected features are included
+    for f in protected_features_present:
+        if f not in selected_features and f in X_work.columns:
+            selected_features.append(f)
+            logger.info(f"Force-included protected feature: {f}")
+
+    logger.info(f"\nSelected {len(selected_features)} features by LightGBM importance")
+
+    # Finalize metadata
+    metadata['final_features'] = len(selected_features)
+    metadata['selected_features'] = selected_features
+
+    # Log top 20 features
+    logger.info("\n" + "=" * 40)
+    logger.info("TOP 20 SELECTED FEATURES:")
+    logger.info("=" * 40)
+    for i, row in lgbm_importance.head(20).iterrows():
+        logger.info(f"  {i+1:2d}. {row['feature']} (gain: {row['importance_gain']:.1f})")
+
+    # Save results
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        lgbm_importance.to_csv(output_dir / f"feature_ranking_{target_type}.csv", index=False)
+        lgbm_importance[lgbm_importance['feature'].isin(selected_features)].to_csv(
+            output_dir / f"selected_features_{target_type}.csv", index=False)
+
+        with open(output_dir / f"feature_selection_metadata_{target_type}.pkl", 'wb') as f:
+            pickle.dump(metadata, f)
+
+        logger.info(f"\nSaved feature selection results to {output_dir}")
+
+    return selected_features, metadata
+
+
 def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
     use_feature_selection: bool = True,
     feature_selection_interval: int = 6,  # Re-run feature selection every N months
-    use_huber_loss: bool = False,
-    huber_delta: float = 1.0
+    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
+    huber_delta: float = HUBER_DELTA
 ) -> pd.DataFrame:
     """
     Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
@@ -504,20 +772,33 @@ def run_expanding_window_backtest(
         X_train_valid = X_train.iloc[valid_local_idx].copy()
         y_train_valid = y_train[valid_train_mask].copy()
 
-        # FEATURE SELECTION: Re-run periodically
+        # WINSORIZATION: Apply to training data to reduce outlier impact
+        # Get dates for the training data
+        train_dates = X_full['ds'].iloc[train_idx_valid] if 'ds' in X_full.columns else None
+
+        # Winsorize features using training data bounds
+        X_train_winsorized, _ = winsorize_features(
+            X_train_valid,
+            train_idx=np.arange(len(X_train_valid))  # Use all training data for bounds
+        )
+
+        # FEATURE SELECTION: Re-run periodically using simplified approach
         if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
             logger.info(f"[{target_month.strftime('%Y-%m')}] Feature selection on {len(train_idx_valid)} samples...")
 
-            selected_features, _ = select_features_comprehensive(
-                X=X_train_valid,
+            selected_features, _ = select_features_simplified(
+                X=X_train_winsorized,
                 y=y_train_valid,
+                dates=train_dates,
                 max_features=MAX_FEATURES,
                 output_dir=None,
-                target_type=target_type,
-                skip_vif=True  # Skip VIF for speed during backtest
+                target_type=target_type
             )
             cached_features = selected_features
             last_feature_selection_idx = i
+
+        # Use winsorized data for subsequent steps
+        X_train_valid = X_train_winsorized
 
         # Get feature columns for this iteration
         if use_feature_selection and cached_features:
@@ -669,8 +950,8 @@ def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
     use_feature_selection: bool = True,
-    use_huber_loss: bool = False,
-    huber_delta: float = 1.0,
+    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
+    huber_delta: float = HUBER_DELTA,
     archive_results: bool = True
 ):
     """
@@ -766,23 +1047,36 @@ def train_and_evaluate(
             linear_cols_prod
         )
 
+    # WINSORIZATION: Apply to training data to reduce outlier impact (COVID, etc.)
+    logger.info("\nApplying Winsorization to Reduce Outlier Impact...")
+    train_dates = X_full_valid['ds'] if 'ds' in X_full_valid.columns else None
+    X_full_winsorized, winsorize_bounds = winsorize_features(
+        X_full_valid,
+        train_idx=np.arange(len(X_full_valid))
+    )
+
     # Final feature selection on full training data (for production model only)
+    # Using simplified approach: VIF filtering + recency + LightGBM importance
     if use_feature_selection:
         feature_output_dir = OUTPUT_DIR / "feature_selection" / model_id
         feature_output_dir.mkdir(parents=True, exist_ok=True)
 
-        selected_features, selection_metadata = select_features_comprehensive(
-            X=X_full_valid,
+        selected_features, selection_metadata = select_features_simplified(
+            X=X_full_winsorized,
             y=y_full_valid,
+            dates=train_dates,
             max_features=MAX_FEATURES,
             output_dir=feature_output_dir,
             target_type=target_type
         )
+        # Store winsorization bounds in metadata for use during prediction
+        selection_metadata['winsorize_bounds'] = winsorize_bounds
+
         feature_cols = selected_features
-        X_train = X_full_valid[['ds'] + [c for c in selected_features if c in X_full_valid.columns]].copy()
+        X_train = X_full_winsorized[['ds'] + [c for c in selected_features if c in X_full_winsorized.columns]].copy()
     else:
-        feature_cols = [c for c in X_full_valid.columns if c != 'ds']
-        X_train = X_full_valid.copy()
+        feature_cols = [c for c in X_full_winsorized.columns if c != 'ds']
+        X_train = X_full_winsorized.copy()
 
     # Train final model (using only valid targets)
     model, importance, residuals = train_lightgbm_model(
@@ -1015,73 +1309,95 @@ def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first')
 
 def train_all_models(
     use_feature_selection: bool = True,
-    use_huber_loss: bool = False,
-    huber_delta: float = 1.0
+    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
+    huber_delta: float = HUBER_DELTA
 ) -> Dict[str, Any]:
     """
-    Train all 4 model variants efficiently.
+    Train all first release model variants efficiently.
 
-    Trains models for all combinations:
-    - nsa_first: NSA with first release
-    - nsa_last: NSA with final revised
-    - sa_first: SA with first release
-    - sa_last: SA with final revised
+    Model architecture:
+    - nsa_first: LightGBM model for NSA predictions
+    - sa_first: SARIMA model for seasonal adjustment (applied to NSA predictions)
 
-    Optimizations:
-    - Shares cached data across models where possible
-    - Archives results only once at the start
+    The SA model uses SARIMA to predict the seasonal adjustment factor
+    (SA - NSA) and adds it to the NSA predictions.
+
+    NOTE: Last release models (nsa_last, sa_last) are disabled.
 
     Args:
-        use_feature_selection: If True, run comprehensive feature selection
-        use_huber_loss: If True, use Huber loss function
-        huber_delta: Huber delta parameter
+        use_feature_selection: If True, run comprehensive feature selection (for NSA)
+        use_huber_loss: If True, use Huber loss function (for NSA)
+        huber_delta: Huber delta parameter (for NSA)
 
     Returns:
         Dictionary with results for each model_id
     """
     logger.info("=" * 70)
-    logger.info("TRAINING ALL 4 MODEL VARIANTS")
+    logger.info("TRAINING ALL FIRST RELEASE MODEL VARIANTS")
     logger.info("=" * 70)
-    logger.info("Configurations: nsa_first, nsa_last, sa_first, sa_last")
+    logger.info("Model 1: NSA (LightGBM)")
+    logger.info("Model 2: SA (SARIMA on seasonal adjustment)")
 
     results = {}
 
-    for i, (target_type, release_type) in enumerate(ALL_TARGET_CONFIGS):
-        model_id = get_model_id(target_type, release_type)
+    # Step 1: Train NSA model with LightGBM (archives previous results)
+    logger.info("\n" + "=" * 70)
+    logger.info("MODEL 1/2: NSA_FIRST (LightGBM)")
+    logger.info("=" * 70)
 
-        logger.info("\n" + "=" * 70)
-        logger.info(f"MODEL {i+1}/4: {model_id.upper()}")
-        logger.info("=" * 70)
+    try:
+        nsa_result = train_and_evaluate(
+            target_type='nsa',
+            release_type='first',
+            use_feature_selection=use_feature_selection,
+            use_huber_loss=use_huber_loss,
+            huber_delta=huber_delta,
+            archive_results=True
+        )
 
-        try:
-            # Only archive on first model
-            archive_results = (i == 0)
+        results['nsa_first'] = {
+            'status': 'success',
+            'model': nsa_result[0] if nsa_result else None,
+            'feature_cols': nsa_result[1] if nsa_result else None,
+            'residuals': nsa_result[2] if nsa_result else None,
+            'backtest_results': nsa_result[3] if nsa_result else None,
+        }
 
-            result = train_and_evaluate(
-                target_type=target_type,
-                release_type=release_type,
-                use_feature_selection=use_feature_selection,
-                use_huber_loss=use_huber_loss,
-                huber_delta=huber_delta,
-                archive_results=archive_results
-            )
+        logger.info("Successfully trained NSA_FIRST")
 
-            results[model_id] = {
-                'status': 'success',
-                'model': result[0] if result else None,
-                'feature_cols': result[1] if result else None,
-                'residuals': result[2] if result else None,
-                'backtest_results': result[3] if result else None,
-            }
+    except Exception as e:
+        logger.error(f"Failed to train NSA_FIRST: {e}")
+        results['nsa_first'] = {
+            'status': 'failed',
+            'error': str(e)
+        }
 
-            logger.info(f"Successfully trained {model_id.upper()}")
+    # Step 2: Train SA model with SARIMA (uses NSA predictions)
+    logger.info("\n" + "=" * 70)
+    logger.info("MODEL 2/2: SA_FIRST (SARIMA)")
+    logger.info("=" * 70)
 
-        except Exception as e:
-            logger.error(f"Failed to train {model_id}: {e}")
-            results[model_id] = {
-                'status': 'failed',
-                'error': str(e)
-            }
+    try:
+        # Import SARIMA training function
+        from Train.train_sarima_sa import train_and_evaluate_sarima
+
+        # Train SARIMA model (uses NSA predictions from step 1)
+        sa_result = train_and_evaluate_sarima(archive_results=False)
+
+        results['sa_first'] = {
+            'status': 'success',
+            'model_type': 'SARIMA',
+            'backtest_results': sa_result if sa_result is not None else None,
+        }
+
+        logger.info("Successfully trained SA_FIRST (SARIMA)")
+
+    except Exception as e:
+        logger.error(f"Failed to train SA_FIRST: {e}")
+        results['sa_first'] = {
+            'status': 'failed',
+            'error': str(e)
+        }
 
     # Summary
     logger.info("\n" + "=" * 70)
@@ -1090,15 +1406,19 @@ def train_all_models(
 
     for model_id, result in results.items():
         status = result['status']
-        if status == 'success' and result.get('backtest_results') is not None:
-            backtest = result['backtest_results']
-            valid_rows = backtest[~backtest['error'].isna()]
-            if not valid_rows.empty:
-                rmse = np.sqrt(np.mean(valid_rows['error'] ** 2))
-                mae = np.mean(np.abs(valid_rows['error']))
-                logger.info(f"  {model_id.upper()}: RMSE={rmse:.1f}, MAE={mae:.1f}")
+        if status == 'success':
+            backtest = result.get('backtest_results')
+            if backtest is not None and isinstance(backtest, pd.DataFrame) and not backtest.empty:
+                valid_rows = backtest[~backtest['error'].isna()]
+                if not valid_rows.empty:
+                    rmse = np.sqrt(np.mean(valid_rows['error'] ** 2))
+                    mae = np.mean(np.abs(valid_rows['error']))
+                    model_type = result.get('model_type', 'LightGBM')
+                    logger.info(f"  {model_id.upper()} ({model_type}): RMSE={rmse:.1f}, MAE={mae:.1f}")
+                else:
+                    logger.info(f"  {model_id.upper()}: Success (no backtest metrics)")
             else:
-                logger.info(f"  {model_id.upper()}: Success (no backtest metrics)")
+                logger.info(f"  {model_id.upper()}: Success (no backtest results)")
         else:
             logger.info(f"  {model_id.upper()}: {status.upper()}")
 
@@ -1806,33 +2126,33 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='LightGBM NFP Prediction Model - Multi-Target Support',
+        description='LightGBM NFP Prediction Model - First Release Only',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Train single model (default: nsa_first)
   python Train/train_lightgbm_nfp.py --train
 
-  # Train NSA with last release
-  python Train/train_lightgbm_nfp.py --train --target nsa --release last
-
-  # Train all 4 model variants
+  # Train all first release model variants (nsa_first, sa_first)
   python Train/train_lightgbm_nfp.py --train-all
 
-  # Train both release types for NSA
-  python Train/train_lightgbm_nfp.py --train-both-releases --target nsa
+  # Train both NSA and SA models (first release)
+  python Train/train_lightgbm_nfp.py --train-both
 
   # Predict with specific model
   python Train/train_lightgbm_nfp.py --predict 2024-12 --target sa --release first
+
+NOTE: Only first release models are supported. Last release models are disabled.
         """
     )
     parser.add_argument('--train', action='store_true', help='Train a single model')
     parser.add_argument('--train-all', action='store_true',
-                        help='Train all 4 model variants (nsa/sa x first/last)')
+                        help='Train all first release model variants (nsa_first, sa_first)')
     parser.add_argument('--train-both', action='store_true',
-                        help='Train both NSA and SA models (same release type)')
-    parser.add_argument('--train-both-releases', action='store_true',
-                        help='Train both first and last release models (same target type)')
+                        help='Train both NSA and SA models (first release)')
+    # DISABLED: --train-both-releases - last release models are not supported
+    # parser.add_argument('--train-both-releases', action='store_true',
+    #                     help='Train both first and last release models (same target type)')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
@@ -1841,12 +2161,16 @@ Examples:
                         help='Release type: first (initial) or last (final revised)')
     parser.add_argument('--diagnostics', action='store_true',
                         help='Run feature diagnostics (VIF, correlations)')
-    parser.add_argument('--huber-loss', action='store_true',
-                        help='Use Huber loss instead of RMSE (robust to outliers)')
-    parser.add_argument('--huber-delta', type=float, default=1.0,
-                        help='Huber delta parameter (default: 1.0)')
+    parser.add_argument('--no-huber-loss', action='store_true',
+                        help='Disable Huber loss (uses MSE instead). Huber is enabled by default for outlier robustness.')
+    parser.add_argument('--huber-delta', type=float, default=HUBER_DELTA,
+                        help=f'Huber delta parameter (default: {HUBER_DELTA}). Lower = more robust to outliers.')
 
     args = parser.parse_args()
+
+    # Convert --no-huber-loss to use_huber_loss boolean
+    # Huber loss is enabled by default (USE_HUBER_LOSS_DEFAULT = True)
+    use_huber_loss = not args.no_huber_loss
 
     model_id = get_model_id(args.target, args.release)
 
@@ -1855,57 +2179,66 @@ Examples:
         run_feature_diagnostics(target_type=args.target)
 
     elif args.train_all:
-        # Train all 4 model variants
-        logger.info("Training all 4 model variants...")
+        # Train all first release model variants
+        logger.info("Training all first release model variants (nsa_first, sa_first)...")
         train_all_models(
-            use_huber_loss=args.huber_loss,
+            use_huber_loss=use_huber_loss,
             huber_delta=args.huber_delta
         )
 
-    elif args.train_both_releases:
-        # Train both first and last release for a single target type
-        logger.info(f"Training both release types for {args.target.upper()}...")
-        train_and_evaluate(
-            target_type=args.target,
-            release_type='first',
-            use_huber_loss=args.huber_loss,
-            huber_delta=args.huber_delta,
-            archive_results=True
-        )
-        train_and_evaluate(
-            target_type=args.target,
-            release_type='last',
-            use_huber_loss=args.huber_loss,
-            huber_delta=args.huber_delta,
-            archive_results=False
-        )
+    # DISABLED: --train-both-releases - last release models are not supported
+    # elif args.train_both_releases:
+    #     # Train both first and last release for a single target type
+    #     logger.info(f"Training both release types for {args.target.upper()}...")
+    #     train_and_evaluate(
+    #         target_type=args.target,
+    #         release_type='first',
+    #         use_huber_loss=use_huber_loss,
+    #         huber_delta=args.huber_delta,
+    #         archive_results=True
+    #     )
+    #     train_and_evaluate(
+    #         target_type=args.target,
+    #         release_type='last',
+    #         use_huber_loss=use_huber_loss,
+    #         huber_delta=args.huber_delta,
+    #         archive_results=False
+    #     )
 
     elif args.train_both:
-        # Train both NSA and SA models (same release type)
-        logger.info(f"Training both NSA and SA models ({args.release} release)...")
+        # Train both NSA and SA models (first release)
+        # NSA uses LightGBM, SA uses SARIMA
+        logger.info(f"Training both NSA and SA models (first release)...")
+        logger.info("NSA: LightGBM, SA: SARIMA")
+
+        # Train NSA with LightGBM
         train_and_evaluate(
             target_type='nsa',
-            release_type=args.release,
-            use_huber_loss=args.huber_loss,
+            release_type='first',
+            use_huber_loss=use_huber_loss,
             huber_delta=args.huber_delta,
             archive_results=True
         )
-        train_and_evaluate(
-            target_type='sa',
-            release_type=args.release,
-            use_huber_loss=args.huber_loss,
-            huber_delta=args.huber_delta,
-            archive_results=False
-        )
+
+        # Train SA with SARIMA
+        from Train.train_sarima_sa import train_and_evaluate_sarima
+        train_and_evaluate_sarima(archive_results=False)
 
     elif args.train:
         # Train single model
-        train_and_evaluate(
-            target_type=args.target,
-            release_type=args.release,
-            use_huber_loss=args.huber_loss,
-            huber_delta=args.huber_delta
-        )
+        if args.target == 'sa':
+            # SA uses SARIMA (requires NSA predictions to exist)
+            logger.info("Training SA model with SARIMA (requires NSA predictions)...")
+            from Train.train_sarima_sa import train_and_evaluate_sarima
+            train_and_evaluate_sarima(archive_results=True)
+        else:
+            # NSA uses LightGBM
+            train_and_evaluate(
+                target_type=args.target,
+                release_type=args.release,
+                use_huber_loss=use_huber_loss,
+                huber_delta=args.huber_delta
+            )
 
     elif args.predict:
         target_month = pd.Timestamp(args.predict + '-01')

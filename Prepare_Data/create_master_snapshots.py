@@ -519,7 +519,8 @@ def add_mom_pct_change(df: pd.DataFrame, exclude_patterns: list = None) -> pd.Da
             'SP500_bear_market',
             'VIX_panic_regime',
             'VIX_high_regime',
-            'IURSA_weeks_high',
+            'ICNSA_weeks_high',
+            'CCNSA_weeks_high'
             'ICSA_weeks_high',
             'CCSA_weeks_high',
         ]

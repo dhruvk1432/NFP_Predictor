@@ -6,13 +6,13 @@ Extracted from train_lightgbm_nfp.py for maintainability.
 
 TARGET TYPES:
     - target_type: 'nsa' (non-seasonally adjusted) or 'sa' (seasonally adjusted)
-    - release_type: 'first' (initial release) or 'last' (final revised)
+    - release_type: 'first' (initial release) only - last release is disabled
 
-This creates 4 model variants:
+This creates 2 model variants (first release only):
     - nsa_first: NSA with first release data
-    - nsa_last: NSA with final revised data
     - sa_first: SA with first release data
-    - sa_last: SA with final revised data
+
+NOTE: Last release models (nsa_last, sa_last) are disabled.
 """
 
 from pathlib import Path
@@ -21,7 +21,7 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, OUTPUT_DIR
+from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE
 
 
 # =============================================================================
@@ -31,12 +31,15 @@ from settings import DATA_PATH, OUTPUT_DIR
 VALID_TARGET_TYPES = ('nsa', 'sa')
 VALID_RELEASE_TYPES = ('first', 'last')
 
-# All 4 target combinations
+# Target combinations - FIRST RELEASE ONLY
+# Only training nsa_first and sa_first models.
+# Last release models are disabled and commented out.
 ALL_TARGET_CONFIGS = [
     ('nsa', 'first'),
-    ('nsa', 'last'),
     ('sa', 'first'),
-    ('sa', 'last'),
+    # DISABLED: Last release models - do not uncomment
+    # ('nsa', 'last'),  # Disabled - last release not supported
+    # ('sa', 'last'),   # Disabled - last release not supported
 ]
 
 
@@ -45,9 +48,23 @@ ALL_TARGET_CONFIGS = [
 # =============================================================================
 
 MAX_FEATURES = 80  # Maximum number of features to use in final model
-VIF_THRESHOLD = 10.0  # Remove features with VIF above this
+VIF_THRESHOLD = 10.0  # Remove features with VIF above this (handles multicollinearity)
 CORR_THRESHOLD = 0.95  # Remove one of a pair with correlation above this
 MIN_TARGET_CORR = 0.05  # Minimum absolute correlation with target
+
+# Simplified feature selection (new approach)
+# - Require features to have data in the last N months
+FEATURE_RECENCY_MONTHS = 12  # Features must have non-NaN data within last 12 months
+MAX_NAN_RATIO = 0.5  # Remove features with >50% missing values
+
+# =============================================================================
+# FEATURE OUTLIER HANDLING (Winsorization)
+# =============================================================================
+
+# Winsorize features to reduce impact of COVID-like outliers in feature data
+WINSORIZE_FEATURES = True  # Enable feature winsorization
+WINSORIZE_LOWER_PERCENTILE = 1.0  # Clip values below 1st percentile
+WINSORIZE_UPPER_PERCENTILE = 99.0  # Clip values above 99th percentile
 
 
 # =============================================================================
@@ -86,7 +103,9 @@ def get_target_path(target_type: str, release_type: str = 'first') -> Path:
     if release_type not in VALID_RELEASE_TYPES:
         raise ValueError(f"Invalid release_type: {release_type}. Must be one of {VALID_RELEASE_TYPES}")
 
-    filename = f"y_{target_type}_{release_type}_release.parquet"
+    # Use 'total_' prefix for univariate mode, 'y_' for multivariate mode
+    prefix = "total" if MODEL_TYPE == "univariate" else "y"
+    filename = f"{prefix}_{target_type}_{release_type}_release.parquet"
     return NFP_TARGET_DIR / filename
 
 
@@ -377,8 +396,9 @@ DEFAULT_LGBM_PARAMS = {
     'n_jobs': -1,
 }
 
-# Huber loss parameters
-HUBER_DELTA = 1.0  # Transition point between L1 and L2 loss
+# Huber loss parameters - ENABLED BY DEFAULT for outlier robustness
+USE_HUBER_LOSS_DEFAULT = True  # Huber loss is more robust to COVID-like outliers
+HUBER_DELTA = 1.0  # Transition point between L1 and L2 loss (lower = more robust)
 
 
 # =============================================================================

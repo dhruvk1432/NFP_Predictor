@@ -228,6 +228,18 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
 
     base_dir = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data"
 
+    # Skip-if-exists: Check if all snapshots already exist
+    existing_count = 0
+    for obs_month in nfp_release_map.keys():
+        snap_path = get_snapshot_path(base_dir, pd.Timestamp(obs_month))
+        if snap_path.exists():
+            existing_count += 1
+
+    if existing_count == len(nfp_release_map):
+        print(f"✓ Unifier data already exists: {existing_count} monthly snapshots", flush=True)
+        logger.info(f"All {existing_count} Unifier snapshots exist, skipping download")
+        return
+
     # Fetch all data for each series once
     all_series_data = {}
     series_median_lags = {}

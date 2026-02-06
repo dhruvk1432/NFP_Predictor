@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from datetime import timedelta
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
 # Add parent directory to path to import settings
@@ -130,12 +132,60 @@ FRED_SERIES = {
     "Weekly_Econ_Index": "WEI",  # Weekly Economic Index (real-time)
     # NEW: Regional Fed Employment Indices (monthly)
     "Empire_State_Emp": "USEPUINDX",  # Empire State Manufacturing Employment Index
-    # Weekly Jobless Claims (ICSA and IURSA dropped due to multicollinearity)
     # only data available before each NFP report is included in that month's features
-    "ICSA": "ICSA", #Initial Claims Seasonally Adjusted
-    "CCSA": "CCSA",  # Continued Claims Seasonally Adjusted (KEPT)
-    "IURSA": "IURSA" # Insured Unemployment Rate Seasonally Adjusted
+    "ICNSA": "ICNSA", #Initial Claims Seasonally Adjusted
+    "ICSA": "ICNA",
+    "CCNSA": "CCNSA",  # Continued Claims Seasonally Adjusted (KEPT)
+    "CCSA": "CCN", 
 }
+
+# =============================================================================
+# Thread-safe rate limiting for parallel FRED API requests
+# =============================================================================
+_request_lock = threading.Lock()
+_last_request_time = [0.0]
+
+def _rate_limited_fetch(fetch_func, *args, per_request_delay=0.8, max_retries=3, **kwargs):
+    """
+    Execute a FRED API fetch with thread-safe rate limiting and retry logic.
+
+    Args:
+        fetch_func: The function to call for fetching data
+        *args: Positional arguments for fetch_func
+        per_request_delay: Minimum delay between requests (seconds)
+        max_retries: Maximum retry attempts for rate limit errors
+        **kwargs: Keyword arguments for fetch_func
+
+    Returns:
+        Result of fetch_func
+    """
+    # Enforce rate limiting across all threads
+    with _request_lock:
+        elapsed = time.time() - _last_request_time[0]
+        if elapsed < per_request_delay:
+            time.sleep(per_request_delay - elapsed)
+        _last_request_time[0] = time.time()
+
+    # Execute with retry logic
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return fetch_func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            error_str = str(e).lower()
+            is_rate_limit = '429' in str(e) or 'rate limit' in error_str or 'too many requests' in error_str
+            is_transient = 'timeout' in error_str or 'connection' in error_str or '503' in str(e)
+
+            if (is_rate_limit or is_transient) and attempt < max_retries - 1:
+                delay = 2.0 * (2 ** attempt)  # Exponential backoff: 2, 4, 8 seconds
+                logger.warning(f"FRED API error (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.info(f"Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+            else:
+                raise
+
+    raise last_exception
 
 def clean_weekly_release_dates(df, week_end_col='date', release_col='realtime_start', nfp_offset_days=None):
     """
@@ -858,7 +908,122 @@ def aggregate_oil_to_monthly(daily_df):
     return result
 
 
-def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
+def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, claims_series):
+    """
+    Fetch a single FRED series with appropriate handling based on series type.
+
+    Args:
+        fred: FRED API client
+        name: Series name (e.g., 'VIX', 'CCSA')
+        code: FRED series code
+        start_date: Start date for data fetch
+        end_date: End date for data fetch
+        daily_series: List of daily series names
+        claims_series: List of weekly claims series names
+
+    Returns:
+        tuple: (name, DataFrame) or (name, None) on error
+    """
+    try:
+        logger.info(f"Fetching full revision history for {name} ({code})")
+
+        # ------------------------------------------------------------------
+        # 1) DAILY FINANCIAL DATA (NO REVISION LOGIC, KNOWN ON THE DAY)
+        # ------------------------------------------------------------------
+        if name in daily_series:
+            # V2: Special handling for SP500 - use Yahoo Finance ONLY (no FRED fallback)
+            if name == "SP500":
+                # Yahoo Finance is the only source - will raise error if it fails
+                # Convert datetime to string if needed
+                start_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date)
+                end_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
+                df = fetch_sp500_from_yahoo(
+                    start_date=start_str,
+                    end_date=end_str
+                )
+            else:
+                # Use rate-limited fetch for FRED API calls (other daily series)
+                series = _rate_limited_fetch(fred.get_series, code)
+                df = series.to_frame(name='value')
+                df.index.name = 'date'
+                df = df.reset_index()
+                df['date'] = pd.to_datetime(df['date'])
+                df['value'] = pd.to_numeric(df['value'], errors='coerce')
+
+            # Assume no revisions: value known on its own observation date
+            # FORCE 1-DAY LAG: Data from Day T is available on Day T+1
+            df['realtime_start'] = df['date'] + pd.Timedelta(days=1)
+
+        # ------------------------------------------------------------------
+        # 2) WEEKLY CLAIMS SERIES (ICSA, CCSA)
+        #    -> USE VINTAGES BUT WITH SHORT LAG (~1 WEEK) FOR MISSING GAPS
+        #    -> CLEAN RELEASE DATES: Impute to next Thursday if missing/late (>14 days)
+        # ------------------------------------------------------------------
+        elif name in claims_series:
+            # Use rate-limited fetch for FRED API calls
+            vintage_df = _rate_limited_fetch(fred.get_series_as_of_date, code, as_of_date='2100-01-01')
+            vintage_df['date'] = pd.to_datetime(vintage_df['date'])
+            vintage_df['realtime_start'] = pd.to_datetime(vintage_df['realtime_start'])
+            vintage_df['value'] = pd.to_numeric(vintage_df['value'], errors='coerce')
+
+            current_series = _rate_limited_fetch(fred.get_series, code)
+            current_df = current_series.to_frame(name='value').reset_index()
+            current_df.columns = ['date', 'value']
+            current_df['date'] = pd.to_datetime(current_df['date'])
+            current_df['value'] = pd.to_numeric(current_df['value'], errors='coerce')
+
+            earliest_vintage = vintage_df.groupby('date')['realtime_start'].min()
+
+            # For weekly claims, initial release should be very close to the observation date.
+            # We still use a generous buffer to detect "truly late" starts only.
+            late_start_dates = earliest_vintage[
+                earliest_vintage > (earliest_vintage.index + pd.Timedelta(days=30))
+            ].index
+            late_start_set = set(late_start_dates)
+
+            # Remove retroactive vintages from vintage_df
+            # We'll replace them with synthetic first releases
+            if late_start_set:
+                logger.info(f"Replacing {len(late_start_set)} retroactive weekly vintages with synthetic 7-day lag")
+                df = vintage_df[~vintage_df['date'].isin(late_start_set)].copy()
+            else:
+                df = vintage_df.copy()
+
+            # Add synthetic first releases for dates with late vintages
+            # Also add truly missing dates
+            missing_dates = (
+                set(current_df['date']) -
+                set(df['date'])  # Dates not in cleaned vintage_df
+            )
+
+            if missing_dates:
+                missing_df = current_df[current_df['date'].isin(missing_dates)].copy()
+                # LESS PESSIMISTIC: approximate weekly claims lag as 7 days
+                missing_df['realtime_start'] = missing_df['date'] + pd.Timedelta(days=7)
+                df = pd.concat([df, missing_df], ignore_index=True)
+
+            # Clean weekly release dates: impute to next Thursday if missing/late (>14 days)
+            df = clean_weekly_release_dates(df, week_end_col='date', release_col='realtime_start')
+
+        else:
+            # Fallback for other series (Financial_Stress, Weekly_Econ_Index, Empire_State_Emp)
+            # Use rate-limited fetch for FRED API calls
+            series = _rate_limited_fetch(fred.get_series, code)
+            df = series.to_frame(name='value')
+            df.index.name = 'date'
+            df = df.reset_index()
+            df['date'] = pd.to_datetime(df['date'])
+            df['realtime_start'] = df['date']
+            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+
+        return (name, df)
+
+    except Exception as e:
+        logger.error(f"Error fetching history for {name}: {e}")
+        return (name, None)
+
+
+def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers=3):
     if not FRED_API_KEY:
         logger.error("FRED_API_KEY not found.")
         return
@@ -879,166 +1044,54 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
     logger.info(f"Creating {len(nfp_release_map)} snapshots aligned with NFP release dates")
 
     base_dir = DATA_PATH / "Exogenous_data" / "exogenous_fred_data"
-    
-    # 1. Fetch all history 
+
+    # Skip-if-exists: Check if all snapshots already exist
+    existing_count = 0
+    for obs_month in nfp_release_map.keys():
+        snap_path = get_snapshot_path(base_dir, pd.Timestamp(obs_month))
+        if snap_path.exists():
+            existing_count += 1
+
+    if existing_count == len(nfp_release_map):
+        print(f"✓ FRED exogenous data already exists: {existing_count} monthly snapshots", flush=True)
+        logger.info(f"All {existing_count} FRED exogenous snapshots exist, skipping download")
+        return
+
+    # 1. Fetch all history with PARALLELIZATION
     history_cache = {}
 
     DAILY_SERIES = ["Credit_Spreads", "Yield_Curve", "Oil_Prices", "VIX", "SP500"]
     # Dropped JOLTS_Openings and JOLTS_Hires due to multicollinearity
     # JOLTS_SERIES = ["JOLTS_Quits", "JOLTS_Layoffs"]
-    # Dropped ICSA and IURSA due to multicollinearity (kept CCSA only)
-    CLAIMS_SERIES = ["CCSA"]
+    CLAIMS_SERIES = ["ICSA, ICNSA, CCNSA, CCSA"]
 
-    for name, code in FRED_SERIES.items():
-        try:
-            logger.info(f"Fetching full revision history for {name} ({code})")
+    # PARALLELIZATION: Fetch all series concurrently with rate limiting
+    logger.info(f"Fetching {len(FRED_SERIES)} FRED series in parallel (max_workers={max_workers})")
 
-            # ------------------------------------------------------------------
-            # 1) DAILY FINANCIAL DATA (NO REVISION LOGIC, KNOWN ON THE DAY)
-            # ------------------------------------------------------------------
-            if name in DAILY_SERIES:
-                # V2: Special handling for SP500 - use Yahoo Finance ONLY (no FRED fallback)
-                if name == "SP500":
-                    # Yahoo Finance is the only source - will raise error if it fails
-                    # Convert datetime to string if needed
-                    start_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date)
-                    end_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
-                    df = fetch_sp500_from_yahoo(
-                        start_date=start_str,
-                        end_date=end_str
-                    )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all fetch tasks
+        future_to_name = {
+            executor.submit(
+                _fetch_single_series,
+                fred, name, code, start_date, end_date, DAILY_SERIES, CLAIMS_SERIES
+            ): name
+            for name, code in FRED_SERIES.items()
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                result_name, df = future.result()
+                if df is not None:
+                    history_cache[result_name] = df
+                    logger.info(f"Successfully fetched {result_name} ({len(df)} rows)")
                 else:
-                    # V1: Use retry wrapper for FRED API calls (other daily series)
-                    series = fred_api_call_with_retry(fred.get_series, code)
-                    df = series.to_frame(name='value')
-                    df.index.name = 'date'
-                    df = df.reset_index()
-                    df['date'] = pd.to_datetime(df['date'])
-                    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+                    logger.warning(f"No data returned for {name}")
+            except Exception as e:
+                logger.error(f"Failed to fetch {name}: {e}")
 
-                # Assume no revisions: value known on its own observation date
-                # FORCE 1-DAY LAG: Data from Day T is available on Day T+1
-                df['realtime_start'] = df['date'] + pd.Timedelta(days=1)
-
-            # ------------------------------------------------------------------
-            # 2) JOLTS MONTHLY SERIES (HEAVY REVISIONS, ~2-MONTH LAG)
-            #    -> USE VINTAGES + 60-DAY SYNTHETIC LAG WHEN VINTAGE MISSING
-            #    -> CLEAN RELEASE DATES: Impute to first Tuesday of 2nd month if missing/late
-            # ------------------------------------------------------------------
-            # elif name in JOLTS_SERIES:
-            #     # V1: Use retry wrapper for FRED API calls
-            #     vintage_df = fred_api_call_with_retry(fred.get_series_as_of_date, code, as_of_date='2100-01-01')
-            #     vintage_df['date'] = pd.to_datetime(vintage_df['date'])
-            #     vintage_df['realtime_start'] = pd.to_datetime(vintage_df['realtime_start'])
-            #     vintage_df['value'] = pd.to_numeric(vintage_df['value'], errors='coerce')
-
-            #     current_series = fred_api_call_with_retry(fred.get_series, code)
-            #     current_df = current_series.to_frame(name='value').reset_index()
-            #     current_df.columns = ['date', 'value']
-            #     current_df['date'] = pd.to_datetime(current_df['date'])
-            #     current_df['value'] = pd.to_numeric(current_df['value'], errors='coerce')
-
-            #     dates_with_vintage = set(vintage_df['date'].unique())
-            #     earliest_vintage = vintage_df.groupby('date')['realtime_start'].min()
-
-            #     # Identify dates where the first vintage appears "too late" (retroactive)
-            #     # These should use synthetic 60-day lag instead of retroactive vintage
-            #     late_start_dates = earliest_vintage[
-            #         earliest_vintage > (earliest_vintage.index + pd.Timedelta(days=120))
-            #     ].index
-            #     late_start_set = set(late_start_dates)
-
-            #     # Remove retroactive vintages from vintage_df
-            #     # We'll replace them with synthetic first releases
-            #     if late_start_set:
-            #         logger.info(f"Replacing {len(late_start_set)} retroactive vintages with synthetic 60-day lag")
-            #         df = vintage_df[~vintage_df['date'].isin(late_start_set)].copy()
-            #     else:
-            #         df = vintage_df.copy()
-
-            #     # Add synthetic first releases for dates with late vintages
-            #     # Also add truly missing dates
-            #     missing_dates = (
-            #         set(current_df['date']) -
-            #         set(df['date'])  # Dates not in cleaned vintage_df
-            #     )
-
-            #     if missing_dates:
-            #         missing_df = current_df[current_df['date'].isin(missing_dates)].copy()
-            #         # JOLTS: synthetic realtime_start approx 2-month lag
-            #         missing_df['realtime_start'] = missing_df['date'] + pd.Timedelta(days=60)
-            #         df = pd.concat([df, missing_df], ignore_index=True)
-
-            #     # Clean JOLTS release dates: impute to first Tuesday of 2nd month if missing/late
-            #     df = clean_jolts_release_dates(df, ref_month_col='date', release_col='realtime_start')
-
-            # ------------------------------------------------------------------
-            # 3) WEEKLY CLAIMS SERIES (ICSA, CCSA, IURSA)
-            #    -> USE VINTAGES BUT WITH SHORT LAG (~1 WEEK) FOR MISSING GAPS
-            #    -> CLEAN RELEASE DATES: Impute to next Thursday if missing/late (>14 days)
-            # ------------------------------------------------------------------
-            elif name in CLAIMS_SERIES:
-                # V1: Use retry wrapper for FRED API calls
-                vintage_df = fred_api_call_with_retry(fred.get_series_as_of_date, code, as_of_date='2100-01-01')
-                vintage_df['date'] = pd.to_datetime(vintage_df['date'])
-                vintage_df['realtime_start'] = pd.to_datetime(vintage_df['realtime_start'])
-                vintage_df['value'] = pd.to_numeric(vintage_df['value'], errors='coerce')
-
-                current_series = fred_api_call_with_retry(fred.get_series, code)
-                current_df = current_series.to_frame(name='value').reset_index()
-                current_df.columns = ['date', 'value']
-                current_df['date'] = pd.to_datetime(current_df['date'])
-                current_df['value'] = pd.to_numeric(current_df['value'], errors='coerce')
-
-                dates_with_vintage = set(vintage_df['date'].unique())
-                earliest_vintage = vintage_df.groupby('date')['realtime_start'].min()
-
-                # For weekly claims, initial release should be very close to the observation date.
-                # We still use a generous buffer to detect "truly late" starts only.
-                late_start_dates = earliest_vintage[
-                    earliest_vintage > (earliest_vintage.index + pd.Timedelta(days=30))
-                ].index
-                late_start_set = set(late_start_dates)
-
-                # Remove retroactive vintages from vintage_df
-                # We'll replace them with synthetic first releases
-                if late_start_set:
-                    logger.info(f"Replacing {len(late_start_set)} retroactive weekly vintages with synthetic 7-day lag")
-                    df = vintage_df[~vintage_df['date'].isin(late_start_set)].copy()
-                else:
-                    df = vintage_df.copy()
-
-                # Add synthetic first releases for dates with late vintages
-                # Also add truly missing dates
-                missing_dates = (
-                    set(current_df['date']) -
-                    set(df['date'])  # Dates not in cleaned vintage_df
-                )
-
-                if missing_dates:
-                    missing_df = current_df[current_df['date'].isin(missing_dates)].copy()
-                    # LESS PESSIMISTIC: approximate weekly claims lag as 7 days
-                    missing_df['realtime_start'] = missing_df['date'] + pd.Timedelta(days=7)
-                    df = pd.concat([df, missing_df], ignore_index=True)
-
-                # Clean weekly release dates: impute to next Thursday if missing/late (>14 days)
-                df = clean_weekly_release_dates(df, week_end_col='date', release_col='realtime_start')
-
-            else:
-                # Fallback (shouldn't really hit given how we've partitioned)
-                # V1: Use retry wrapper for FRED API calls
-                series = fred_api_call_with_retry(fred.get_series, code)
-                df = series.to_frame(name='value')
-                df.index.name = 'date'
-                df = df.reset_index()
-                df['date'] = pd.to_datetime(df['date'])
-                df['realtime_start'] = df['date']
-                df['value'] = pd.to_numeric(df['value'], errors='coerce')
-
-            history_cache[name] = df
-
-        except Exception as e:
-            logger.error(f"Error fetching history for {name}: {e}")
+    logger.info(f"Completed fetching {len(history_cache)}/{len(FRED_SERIES)} series")
 
             
     # 2. Generate Snapshots aligned with NFP release dates
@@ -1171,7 +1224,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                 else:
                     continue
 
-            elif name in ["ICSA", "CCSA", "IURSA", "Financial_Stress", "Weekly_Econ_Index"]:
+            elif name in ["ICSA", "ICNSA", "CCNSA", "CCSA", "Financial_Stress", "Weekly_Econ_Index"]:
                 # NFP-BASED AGGREGATION: Bucket weekly data by NFP release windows
                 # This ensures we only use data that would have been available before each NFP
 
@@ -1186,7 +1239,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE):
                     continue
 
                 # For claims data, calculate spike statistics
-                if name in ["ICSA", "CCSA", "IURSA"]:
+                if name in ["ICSA", "CCSA", "ICNSA", "CCNSA"]:
                     # NEW: Calculate spike statistics per target month
                     monthly_spike_stats = calculate_weekly_spike_stats(weekly_data, nfp_schedule)
 

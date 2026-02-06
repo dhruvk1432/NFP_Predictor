@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
 import sys
+import re
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -40,6 +41,81 @@ logger = setup_logger(__file__, TEMP_DIR)
 # Module-level cache for loaded data
 _snapshot_cache: Dict[str, pd.DataFrame] = {}
 _target_cache: Dict[str, pd.DataFrame] = {}
+
+
+# =============================================================================
+# FEATURE NAME SANITIZATION (for LightGBM compatibility)
+# =============================================================================
+
+def sanitize_feature_name(name: str) -> str:
+    """
+    Sanitize feature name for LightGBM compatibility.
+
+    LightGBM doesn't support special JSON characters in feature names.
+    This function replaces problematic characters with safe alternatives.
+
+    Args:
+        name: Original feature name
+
+    Returns:
+        Sanitized feature name
+    """
+    # Replace pipes with underscores
+    name = name.replace('|', '_')
+    # Replace spaces with underscores
+    name = name.replace(' ', '_')
+    # Replace hyphens with underscores (keep at start/end for negative numbers)
+    name = re.sub(r'(?<!^)-(?!$)', '_', name)
+    # Remove or replace brackets and braces
+    name = name.replace('[', '_').replace(']', '_')
+    name = name.replace('{', '_').replace('}', '_')
+    # Remove quotes
+    name = name.replace('"', '').replace("'", '')
+    name = name.replace('\\', '_')
+    # Replace commas (JSON special character)
+    name = name.replace(',', '_')
+    # Replace parentheses
+    name = name.replace('(', '_').replace(')', '_')
+    # Replace question marks
+    name = name.replace('?', '_')
+    # Replace plus signs
+    name = name.replace('+', 'plus')
+    # Replace other special characters that might cause issues
+    name = name.replace('/', '_')
+    name = name.replace(':', '_')
+    name = name.replace(';', '_')
+    name = name.replace('!', '_')
+    name = name.replace('@', '_')
+    name = name.replace('#', '_')
+    name = name.replace('$', '_')
+    name = name.replace('%', 'pct')
+    name = name.replace('&', '_and_')
+    name = name.replace('*', '_')
+    name = name.replace('=', '_')
+    name = name.replace('<', '_lt_')
+    name = name.replace('>', '_gt_')
+    # Replace periods (e.g., "U.S." -> "US")
+    name = name.replace('.', '_')
+    # Collapse multiple underscores
+    name = re.sub(r'_+', '_', name)
+    # Remove leading/trailing underscores
+    name = name.strip('_')
+    return name
+
+
+def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitize all column names in a DataFrame for LightGBM compatibility.
+
+    Args:
+        df: DataFrame with potentially problematic column names
+
+    Returns:
+        DataFrame with sanitized column names
+    """
+    df = df.copy()
+    df.columns = [sanitize_feature_name(str(c)) for c in df.columns]
+    return df
 
 
 # =============================================================================
@@ -358,12 +434,15 @@ def pivot_snapshot_to_wide(
     n_rows = len(wide_df)
 
     # Vectorized feature generation for all series at once
-    for series_name in wide_df.columns:
-        series = wide_df[series_name].dropna()
+    for raw_series_name in wide_df.columns:
+        series = wide_df[raw_series_name].dropna()
         n = len(series)
 
         if n == 0:
             continue
+
+        # Sanitize series name for LightGBM compatibility
+        series_name = sanitize_feature_name(str(raw_series_name))
 
         # Latest value
         latest = series.iloc[-1]
@@ -483,12 +562,15 @@ def pivot_snapshot_to_wide_batch(
 
         features = {'target_month': target_month}
 
-        for series_name in available.columns:
-            series = available[series_name].dropna()
+        for raw_series_name in available.columns:
+            series = available[raw_series_name].dropna()
             n = len(series)
 
             if n == 0:
                 continue
+
+            # Sanitize series name for LightGBM compatibility
+            series_name = sanitize_feature_name(str(raw_series_name))
 
             latest = series.iloc[-1]
             features[f'{series_name}_latest'] = latest

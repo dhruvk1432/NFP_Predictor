@@ -521,6 +521,14 @@ def load_noaa_data():
     if end_dt < start_dt:
         raise ValueError("END_DATE must be on or after START_DATE")
 
+    # Skip-if-exists: Check if NOAA data already exists
+    us_data_path = OUTPUT_FOLDER / "US_NOAA_data.parquet"
+    if us_data_path.exists():
+        existing_data = pd.read_parquet(us_data_path)
+        print(f"✓ NOAA data already exists: {len(existing_data)} months", flush=True)
+        print(f"  Date range: {existing_data.index.min().date()} to {existing_data.index.max().date()}", flush=True)
+        return
+
     print("Fetching directory listing from NOAA...")
     filenames = get_directory_listing(BASE_URL)
     year_to_file = map_year_to_details_filename(filenames)

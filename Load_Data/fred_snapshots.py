@@ -1319,7 +1319,9 @@ def _get_wide_leaf_nodes_with_dates(audit, leaf_uids, mode='last', require_compl
 def _get_single_series(audit, uid, mode='first'):
     df = audit[audit["unique_id"] == uid]
     if df.empty: return pd.DataFrame(columns=["ds","y", "release_date"])
-    
+
+    # Explicit sort to ensure correct first/last release selection
+    df = df.sort_values(["ds", "realtime_start"])
     keep = 'first' if mode == 'first' else 'last'
     df = df.drop_duplicates(["ds"], keep=keep).loc[:, ["ds","y", "realtime_start"]].reset_index(drop=True)
     df = df.rename(columns={"realtime_start": "release_date"})
@@ -1356,6 +1358,11 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
     final_month = pd.Timestamp(end_date_setting).to_period('M').to_timestamp()
 
     for key, df in targets.items():
+        # DISABLED: Skip last release targets - focusing on first release only
+        if "last" in key:
+            logger.debug(f"Skipping {key} (last release disabled)")
+            continue
+
         df_sliced = _slice_to_window(df, window_start, window_end)
 
         if "first" in key:
@@ -1369,31 +1376,52 @@ def _process_and_save_targets(targets, paths, window_start, window_end,
                 df_imputed = df_imputed.dropna(subset=leaf_cols).reset_index(drop=True)
                 logger.debug(f"Multivariate {key}: dropped {rows_before - len(df_imputed)} incomplete rows")
 
-            # Trim to before final_month (we'll add final_month row separately)
-            df_final = df_imputed[df_imputed['ds'] < final_month].copy()
+            # Get the last month with actual data
+            last_data_month = df_imputed['ds'].max() if not df_imputed.empty else window_start
 
-            # Add final_month row with NaN values
-            # Scrape release date for final_month (first Friday of next month)
-            scraped_df = get_future_nfp_dates(final_month, final_month)
-            if not scraped_df.empty:
-                final_release_date = scraped_df.iloc[0]['release_date']
-            else:
-                final_release_date = get_first_friday_of_month(final_month + pd.DateOffset(months=1))
+            # Identify all months that need placeholder rows (unreleased data)
+            # This includes any months between last_data_month and final_month (inclusive)
+            months_to_add = []
+            current_month = last_data_month + pd.DateOffset(months=1)
+            current_month = current_month.to_period('M').to_timestamp()  # Normalize to month start
 
-            if is_univariate:
-                final_row = pd.DataFrame({
-                    'ds': [final_month],
-                    'y': [float('nan')],
-                    'release_date': [final_release_date]
-                })
-            else:
-                leaf_cols = [c for c in df_final.columns if c not in ['ds', 'release_date']]
-                final_row = pd.DataFrame({'ds': [final_month], 'release_date': [final_release_date]})
-                for col in leaf_cols:
-                    final_row[col] = float('nan')
+            while current_month <= final_month:
+                months_to_add.append(current_month)
+                current_month = current_month + pd.DateOffset(months=1)
 
-            df_final = pd.concat([df_final, final_row], ignore_index=True)
-            logger.debug(f"Added {final_month.strftime('%Y-%m')} with NaN, release_date: {final_release_date}")
+            logger.debug(f"Months needing placeholders: {[m.strftime('%Y-%m') for m in months_to_add]}")
+
+            # Keep only data up to last_data_month (trim any partial/future data)
+            df_final = df_imputed[df_imputed['ds'] <= last_data_month].copy()
+
+            # Get release dates for all placeholder months
+            if months_to_add:
+                scraped_df = get_future_nfp_dates(months_to_add[0], months_to_add[-1])
+                scraped_lookup = {row['observation_month']: row['release_date']
+                                  for _, row in scraped_df.iterrows()}
+
+                # Add placeholder rows for each unreleased month
+                for month in months_to_add:
+                    if month in scraped_lookup:
+                        release_date = scraped_lookup[month]
+                    else:
+                        release_date = get_first_friday_of_month(month + pd.DateOffset(months=1))
+                        logger.warning(f"No scraped date for {month.strftime('%Y-%m')}, using first Friday: {release_date}")
+
+                    if is_univariate:
+                        new_row = pd.DataFrame({
+                            'ds': [month],
+                            'y': [float('nan')],
+                            'release_date': [release_date]
+                        })
+                    else:
+                        leaf_cols = [c for c in df_final.columns if c not in ['ds', 'release_date']]
+                        new_row = pd.DataFrame({'ds': [month], 'release_date': [release_date]})
+                        for col in leaf_cols:
+                            new_row[col] = float('nan')
+
+                    df_final = pd.concat([df_final, new_row], ignore_index=True)
+                    logger.debug(f"Added {month.strftime('%Y-%m')} with NaN, release_date: {release_date}")
 
             _write_parquet(df_final, paths[key])
             logger.debug(f"Saved {key} with {len(df_final)} rows (ending at {final_month.strftime('%Y-%m')})")
@@ -1494,29 +1522,31 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     end_date_setting = pd.to_datetime(END_DATE)
 
     # ========== ALWAYS BUILD UNIVARIATE (Total NFP) ==========
-    logger.debug("Building UNIVARIATE targets (Total NFP).")
+    # NOTE: Last release targets disabled - focusing on first release only
+    logger.debug("Building UNIVARIATE targets (Total NFP) - First Release Only.")
     total_nsa_first = _get_single_series(audit, "total_nsa", mode='first')
-    total_nsa_last = _get_single_series(audit, "total_nsa", mode='last')
+    # total_nsa_last = _get_single_series(audit, "total_nsa", mode='last')  # DISABLED
     total_sa_first = _get_single_series(audit, "total", mode='first')
-    total_sa_last = _get_single_series(audit, "total", mode='last')
+    # total_sa_last = _get_single_series(audit, "total", mode='last')  # DISABLED
 
     univariate_targets = {
         "total_nsa_first": total_nsa_first,
-        "total_nsa_last": total_nsa_last,
+        # "total_nsa_last": total_nsa_last,  # DISABLED
         "total_sa_first": total_sa_first,
-        "total_sa_last": total_sa_last,
+        # "total_sa_last": total_sa_last,  # DISABLED
     }
 
     univariate_paths = {
         "total_nsa_first": NFP_target_DIR / "total_nsa_first_release.parquet",
-        "total_nsa_last": NFP_target_DIR / "total_nsa_last_release.parquet",
+        # "total_nsa_last": NFP_target_DIR / "total_nsa_last_release.parquet",  # DISABLED
         "total_sa_first": NFP_target_DIR / "total_sa_first_release.parquet",
-        "total_sa_last": NFP_target_DIR / "total_sa_last_release.parquet",
+        # "total_sa_last": NFP_target_DIR / "total_sa_last_release.parquet",  # DISABLED
     }
 
     # ========== BUILD MULTIVARIATE (Leaf Nodes) IF ENABLED ==========
+    # NOTE: Last release targets disabled - focusing on first release only
     if is_multivariate:
-        logger.debug("Building MULTIVARIATE targets (Leaf Nodes).")
+        logger.debug("Building MULTIVARIATE targets (Leaf Nodes) - First Release Only.")
 
         # NSA leaf nodes
         _, _, nsa_bottom_uids = build_hierarchy_structure(series_names, include_nsa=True)
@@ -1528,22 +1558,22 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
 
         # Get wide-format data (do NOT apply require_complete here - dropna happens in _process_and_save_targets)
         y_nsa_first = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'first', require_complete=False)
-        y_nsa_last = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'last', require_complete=False)
+        # y_nsa_last = _get_wide_leaf_nodes_with_dates(audit, nsa_bottom_uids, 'last', require_complete=False)  # DISABLED
         y_sa_first = _get_wide_leaf_nodes_with_dates(audit, sa_bottom_uids, 'first', require_complete=False)
-        y_sa_last = _get_wide_leaf_nodes_with_dates(audit, sa_bottom_uids, 'last', require_complete=False)
+        # y_sa_last = _get_wide_leaf_nodes_with_dates(audit, sa_bottom_uids, 'last', require_complete=False)  # DISABLED
 
         multivariate_targets = {
             "y_nsa_first": y_nsa_first,
-            "y_nsa_last": y_nsa_last,
+            # "y_nsa_last": y_nsa_last,  # DISABLED
             "y_sa_first": y_sa_first,
-            "y_sa_last": y_sa_last,
+            # "y_sa_last": y_sa_last,  # DISABLED
         }
 
         multivariate_paths = {
             "y_nsa_first": NFP_target_DIR / "y_nsa_first_release.parquet",
-            "y_nsa_last": NFP_target_DIR / "y_nsa_last_release.parquet",
+            # "y_nsa_last": NFP_target_DIR / "y_nsa_last_release.parquet",  # DISABLED
             "y_sa_first": NFP_target_DIR / "y_sa_first_release.parquet",
-            "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",
+            # "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",  # DISABLED
         }
     else:
         multivariate_targets = {}
@@ -1591,6 +1621,24 @@ def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_exis
 def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existing=False):
     as_of = pd.to_datetime(end_date).strftime("%Y-%m-%d")
     audit_file = FRED_ROOT / f"_audit_asof_{as_of}.parquet"
+
+    # Skip-if-exists check: verify if all data already exists
+    if not refresh_existing:
+        sched = month_ends(start_date, end_date)
+        all_snapshots_exist = all(month_file_path(m).exists() for m in sched)
+
+        # Check NFP target files
+        nfp_target_files = [
+            NFP_target_DIR / "total_nsa_first_release.parquet",
+            NFP_target_DIR / "total_sa_first_release.parquet",
+        ]
+        all_targets_exist = all(f.exists() for f in nfp_target_files)
+
+        if audit_file.exists() and all_snapshots_exist and all_targets_exist:
+            print(f"✓ FRED data already exists: {len(sched)} monthly snapshots", flush=True)
+            print(f"  Date range: {sched[0].date()} to {sched[-1].date()}", flush=True)
+            logger.info(f"All FRED data exists, skipping download (use --refresh to force)")
+            return
 
     if refresh_existing or not audit_file.exists():
         audit, _ = download_master_audit(end_date=end_date)

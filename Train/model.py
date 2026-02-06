@@ -22,6 +22,7 @@ from settings import TEMP_DIR, setup_logger
 from Train.config import (
     DEFAULT_LGBM_PARAMS,
     HUBER_DELTA,
+    USE_HUBER_LOSS_DEFAULT,
     N_CV_SPLITS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
@@ -51,7 +52,7 @@ except ImportError:
 # =============================================================================
 
 def get_lgbm_params(
-    use_huber_loss: bool = False,
+    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA
 ) -> Dict:
     """
@@ -153,7 +154,7 @@ def train_lightgbm_model(
     n_splits: int = N_CV_SPLITS,
     num_boost_round: int = NUM_BOOST_ROUND,
     early_stopping_rounds: int = EARLY_STOPPING_ROUNDS,
-    use_huber_loss: bool = False,
+    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA
 ) -> Tuple[lgb.Booster, Dict, List[float]]:
     """

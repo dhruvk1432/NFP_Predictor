@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 from datetime import datetime, timedelta
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
 import numpy as np
 import requests

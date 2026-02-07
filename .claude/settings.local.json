@@ -25,7 +25,12 @@
       "WebFetch(domain:www.investing.com)",
       "Bash(source venv/bin/activate)",
       "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor && grep:*)",
-      "Bash(grep -n \"NFP_target\\\\|fred_data\\\\|Exogenous_data\\\\|master_snapshot\" Load_Data/*.py Prepare_Data/*.py)"
+      "Bash(grep -n \"NFP_target\\\\|fred_data\\\\|Exogenous_data\\\\|master_snapshot\" Load_Data/*.py Prepare_Data/*.py)",
+      "Bash(grep:*)",
+      "Bash(conda info:*)",
+      "Bash(pip3 list:*)",
+      "Bash(pip3 show:*)",
+      "Bash(/opt/anaconda3/bin/python3:*)"
     ]
   }
 }

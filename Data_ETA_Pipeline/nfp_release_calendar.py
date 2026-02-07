@@ -4,8 +4,12 @@ NFP Release Calendar
 Historical NFP release dates (first Friday of each month).
 Used to determine if exogenous variables are available before NFP.
 """
+import sys
 import pandas as pd
 from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from settings import START_DATE, END_DATE
 
 def get_nfp_release_calendar(start = START_DATE, end = END_DATE):

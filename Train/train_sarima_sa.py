@@ -44,7 +44,9 @@ except ImportError:
 
 def load_adjustment_data() -> pd.DataFrame:
     """
-    Load NSA and SA target data and calculate the MoM adjustment series.
+    Load NSA and SA target data and calculate the seasonal adjustment
+    (SA - NSA) for MoM changes. This is the target the SARIMA model predicts:
+    the adjustment needed to go from the NSA prediction to the SA prediction.
 
     Returns:
         DataFrame with columns: ds, y_mom_nsa, y_mom_sa, adjustment_mom
@@ -52,15 +54,25 @@ def load_adjustment_data() -> pd.DataFrame:
     data_nsa = pd.read_parquet("data/NFP_target/total_nsa_first_release.parquet")
     data_sa = pd.read_parquet("data/NFP_target/total_sa_first_release.parquet")
 
-    # Merge on ds to ensure alignment
-    merged = data_nsa.merge(data_sa, on='ds', suffixes=('_nsa', '_sa'))
+    # Calculate seasonal adjustment (SA - NSA) for MoM changes
+    adjustment_mom = data_sa["y"].diff() - data_nsa["y"].diff()
+    adjustment_mom.index = data_nsa["ds"]
+    adjustment_mom.name = "seasonal_adjustment_mom"
 
-    # Calculate MoM changes
-    merged['y_mom_nsa'] = merged['y_nsa'].diff()
-    merged['y_mom_sa'] = merged['y_sa'].diff()
+    # Also compute individual MoM series for reference
+    y_mom_nsa = data_nsa["y"].diff()
+    y_mom_nsa.index = data_nsa["ds"]
 
-    # Calculate the adjustment in MoM space: SA_MoM - NSA_MoM
-    merged['adjustment_mom'] = merged['y_mom_sa'] - merged['y_mom_nsa']
+    y_mom_sa = data_sa["y"].diff()
+    y_mom_sa.index = data_nsa["ds"]
+
+    # Build output DataFrame
+    merged = pd.DataFrame({
+        'ds': data_nsa["ds"].values,
+        'y_mom_nsa': y_mom_nsa.values,
+        'y_mom_sa': y_mom_sa.values,
+        'adjustment_mom': adjustment_mom.values,
+    })
 
     # Keep only rows with valid adjustment
     merged = merged.dropna(subset=['adjustment_mom'])

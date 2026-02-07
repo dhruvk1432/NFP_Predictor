@@ -53,10 +53,9 @@ def load_adp_from_csv() -> pd.DataFrame:
         DataFrame with columns: date, series_name, value, release_date, series_type
     """
     if not HISTORICAL_CSV.exists():
-        logger.warning(f"Historical CSV not found: {HISTORICAL_CSV}")
+        logger.error(f"Historical CSV not found: {HISTORICAL_CSV}")
         return pd.DataFrame()
 
-    logger.info(f"Loading historical ADP data from {HISTORICAL_CSV}")
     df = pd.read_csv(HISTORICAL_CSV)
     df['DateTime'] = pd.to_datetime(df['DateTime'])
     df = df.sort_values('DateTime')
@@ -79,9 +78,6 @@ def load_adp_from_csv() -> pd.DataFrame:
         'series_type': 'adp'
     })
 
-    logger.info(f"Loaded {len(result)} months of historical ADP data")
-    logger.info(f"Date range: {result['date'].min().date()} to {result['date'].max().date()}")
-
     return result
 
 
@@ -92,34 +88,28 @@ def main() -> None:
     Web scraping is disabled due to Cloudflare "are you human" verification.
     Uses us-private-employment.csv as the sole data source.
     """
-    print("Starting ADP data loader...", flush=True)
-    logger.info("Started ADP data loader (CSV-only mode)")
+    logger.info("Starting ADP data load")
 
     # Check if data already exists
     if CLEAN_ADP_PARQUET.exists():
         existing_data = pd.read_parquet(CLEAN_ADP_PARQUET)
         print(f"✓ ADP data already exists: {len(existing_data)} rows", flush=True)
         print(f"  Date range: {existing_data['date'].min().date()} to {existing_data['date'].max().date()}", flush=True)
-        logger.info(f"ADP data already exists at {CLEAN_ADP_PARQUET}, skipping download")
+        logger.info(f"ADP data already exists, skipping")
         return
 
     # Load data from CSV
-    print("Loading ADP data from historical CSV...", flush=True)
-    logger.info("Loading ADP data from historical CSV...")
-
     csv_data = load_adp_from_csv()
     if csv_data.empty:
-        logger.error("No CSV data available. Cannot proceed.")
+        logger.error("No CSV data available")
         raise RuntimeError("ADP data unavailable: CSV file not found or empty")
 
     # Save CSV data as the output parquet
     csv_data.to_parquet(CLEAN_ADP_PARQUET, index=False)
-    logger.info(f"Saved ADP data to {CLEAN_ADP_PARQUET}")
     print(f"✓ Saved {len(csv_data)} rows from historical CSV", flush=True)
     print(f"  Date range: {csv_data['date'].min().date()} to {csv_data['date'].max().date()}", flush=True)
 
-    print("✓ ADP data pipeline complete!", flush=True)
-    logger.info("✓ ADP data pipeline complete!")
+    logger.info("✓ ADP data load complete")
 
 
 if __name__ == "__main__":

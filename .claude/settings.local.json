@@ -23,7 +23,9 @@
       "Bash(MODEL_TYPE=multivariate python Load_Data/fred_snapshots.py)",
       "Bash(MODEL_TYPE=univariate python:*)",
       "WebFetch(domain:www.investing.com)",
-      "Bash(source venv/bin/activate)"
+      "Bash(source venv/bin/activate)",
+      "Bash(cd /Users/dhruvkohli/Desktop/Github\\\\ Repos/NFP_Predictor && grep:*)",
+      "Bash(grep -n \"NFP_target\\\\|fred_data\\\\|Exogenous_data\\\\|master_snapshot\" Load_Data/*.py Prepare_Data/*.py)"
     ]
   }
 }

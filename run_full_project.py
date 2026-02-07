@@ -26,8 +26,8 @@ USAGE:
     # Skip specific steps (comma-separated):
     python run_full_project.py --skip noaa,prosper
 
-    # Run with verbose output:
-    python run_full_project.py --verbose
+    # Note: All script logs are now shown by default during execution
+    # The --verbose flag is kept for backwards compatibility
 
 PIPELINE STAGES:
 ----------------
@@ -80,38 +80,38 @@ OUTPUT_DIRECTORIES = [
 
 LOAD_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
-        "fred_snapshots",
-        "Load_Data/fred_snapshots.py",
-        "Download NFP employment data from FRED (main target data)",
+        "fred_employment",
+        "Data_ETA_Pipeline/fred_employment_pipeline.py",
+        "Download FRED employment data, build snapshots, and prepare for modeling",
         [],  # Add ["--refresh"] if you want to force refresh
     ),
     (
         "fred_exogenous",
-        "Load_Data/load_fred_exogenous.py",
+        "Data_ETA_Pipeline/load_fred_exogenous.py",
         "Download exogenous economic indicators from FRED (VIX, claims, etc.)",
         [],
     ),
     (
         "adp",
-        "Load_Data/load_ADP_Employment_change.py",
-        "Load ADP employment data from historical CSV",
+        "Data_ETA_Pipeline/adp_pipeline.py",
+        "Load ADP employment data and create NFP-aligned snapshots",
         [],
     ),
     (
         "noaa",
-        "Load_Data/load_noaa_data.py",
-        "Download storm/weather event data from NOAA",
+        "Data_ETA_Pipeline/noaa_pipeline.py",
+        "Download NOAA storm data, create master file, and build weighted snapshots",
         [],
     ),
     (
         "prosper",
-        "Load_Data/load_prosper_data.py",
+        "Data_ETA_Pipeline/load_prosper_data.py",
         "Fetch prediction market data from Prosper Trading",
         [],
     ),
     (
         "unifier",
-        "Load_Data/load_unifier_data.py",
+        "Data_ETA_Pipeline/load_unifier_data.py",
         "Fetch ISM PMI, Consumer Confidence, JOLTS from Unifier API",
         [],
     ),
@@ -119,32 +119,8 @@ LOAD_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
 
 PREPARE_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
-        "adp_snapshots",
-        "Prepare_Data/create_adp_snapshots.py",
-        "Create monthly ADP snapshots aligned with NFP release dates",
-        [],
-    ),
-    (
-        "noaa_master",
-        "Prepare_Data/create_noaa_master.py",
-        "Aggregate raw NOAA data into master state-level files",
-        [],
-    ),
-    (
-        "noaa_weighted",
-        "Prepare_Data/create_noaa_weighted.py",
-        "Create employment-weighted NOAA national aggregates",
-        [],
-    ),
-    (
-        "fred_prepared",
-        "Prepare_Data/prepare_fred_snapshots.py",
-        "Preprocess FRED employment data (MoM changes, scaling)",
-        [],
-    ),
-    (
         "master_snapshots",
-        "Prepare_Data/create_master_snapshots.py",
+        "Data_ETA_Pipeline/create_master_snapshots.py",
         "Consolidate all exogenous data into master snapshots (main step)",
         [],  # Default is sequential; add ["--workers", "4"] for parallel
     ),
@@ -252,7 +228,7 @@ def run_script(
     Args:
         script_path: Path to the Python script (relative to project root)
         args: Additional command-line arguments to pass to the script
-        verbose: If True, stream output in real-time; otherwise capture it
+        verbose: Kept for backwards compatibility (logs always shown now)
         timeout: Optional timeout in seconds
 
     Returns:
@@ -270,36 +246,24 @@ def run_script(
     start_time = time.time()
 
     try:
-        if verbose:
-            # Stream output in real-time
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+        # Always stream output in real-time
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
-            output_lines = []
-            for line in process.stdout:
-                print(f"    {line}", end="")
-                output_lines.append(line)
+        output_lines = []
+        for line in process.stdout:
+            print(f"    {line}", end="")
+            output_lines.append(line)
 
-            process.wait(timeout=timeout)
-            output = "".join(output_lines)
-            returncode = process.returncode
-        else:
-            # Capture output silently
-            result = subprocess.run(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            output = result.stdout + result.stderr
-            returncode = result.returncode
+        process.wait(timeout=timeout)
+        output = "".join(output_lines)
+        returncode = process.returncode
 
         duration = time.time() - start_time
         success = returncode == 0
@@ -328,7 +292,7 @@ def run_stage(
         stage_name: Name of the stage (for display)
         steps: List of step definitions
         skip_steps: List of step names to skip
-        verbose: If True, show detailed output
+        verbose: Kept for backwards compatibility (logs always shown now)
         fresh: If True, this is a fresh run (may affect some step args)
 
     Returns:
@@ -351,9 +315,9 @@ def run_stage(
     for i, (name, script, description, args) in enumerate(active_steps, 1):
         print_step(i, len(active_steps), name, description)
 
-        # For fred_snapshots, add --refresh flag if doing fresh run
+        # For fred_employment, add --refresh flag if doing fresh run
         step_args = list(args)
-        if fresh and name == "fred_snapshots":
+        if fresh and name == "fred_employment":
             step_args.append("--refresh")
 
         success, duration, output = run_script(script, step_args, verbose=verbose)
@@ -364,13 +328,6 @@ def run_stage(
             successful += 1
         else:
             print_error(f"Failed after {format_duration(duration)}")
-            if not verbose:
-                # Show last few lines of output on failure
-                lines = output.strip().split('\n')
-                if lines:
-                    print("    Last output lines:")
-                    for line in lines[-5:]:
-                        print(f"      {line}")
             failed += 1
 
         print()
@@ -395,7 +352,7 @@ def run_full_pipeline(
         fresh: If True, delete existing data and re-download everything
         stage: If specified, run only this stage ('load', 'prepare', 'train')
         skip_steps: List of step names to skip
-        verbose: If True, show detailed output from each step
+        verbose: Kept for backwards compatibility (logs always shown now)
 
     Returns:
         True if all steps succeeded, False otherwise
@@ -530,9 +487,6 @@ Examples:
 
   # Skip slow data sources
   python run_full_project.py --skip noaa,prosper
-
-  # Verbose mode with real-time output
-  python run_full_project.py --verbose
         """
     )
 
@@ -558,7 +512,7 @@ Examples:
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
-        help="Show detailed output from each step in real-time"
+        help="(Kept for backwards compatibility - logs are now always shown)"
     )
 
     parser.add_argument(

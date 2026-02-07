@@ -1,27 +1,579 @@
+"""
+FRED Employment Pipeline
+========================
+Combined pipeline for FRED employment data: download vintage data, build
+point-in-time snapshots, create NFP target files, and prepare data for modeling.
+
+Also contains NFP timing utilities and BLS schedule scraping, which are
+used by other pipeline files (re-exported via Data_ETA_Pipeline/__init__.py).
+
+Merges:
+    - Prepare_Data/nfp_relative_timing.py  (NFP timing utilities)
+    - Load_Data/scrape_bls_schedule.py     (BLS release date scraping)
+    - Load_Data/fred_snapshots.py          (FRED download & snapshots)
+    - Prepare_Data/prepare_fred_snapshots.py (data preparation)
+
+Pipeline stages:
+    1. build_all_snapshots()       - Download FRED data, build monthly snapshots, create NFP targets
+    2. prepare_fred_snapshots()    - Convert levels to MoM changes, apply transforms, scale
+
+Output:
+    - FRED snapshots:    DATA_PATH/fred_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
+    - NFP targets:       DATA_PATH/NFP_target/total_nsa_first_release.parquet (and others)
+    - Prepared data:     DATA_PATH/fred_data_prepared/decades/{decade}s/{year}/{YYYY-MM}.parquet
+"""
 from __future__ import annotations
-import json, math, time
+
+import json
+import math
+import time
 import sys
 import argparse
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
+from datetime import datetime, timedelta
+
 import pandas as pd
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 from fredapi import Fred
 from pandas.tseries.offsets import MonthEnd, MonthBegin, DateOffset
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
 from settings import (
     DATA_PATH, START_DATE, END_DATE, FRED_API_KEY,
-    REFRESH_CACHE, TEMP_DIR, MODEL_TYPE, setup_logger
+    REFRESH_CACHE, TEMP_DIR, OUTPUT_DIR, MODEL_TYPE, setup_logger
 )
 from Train.pipeline_helpers import build_hierarchy_structure
-from Load_Data.scrape_bls_schedule import get_future_nfp_dates
 
 logger = setup_logger(__file__, TEMP_DIR)
 
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
+
+try:
+    from sklearn.preprocessing import RobustScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    logger.warning("sklearn not available. RobustScaler will be skipped.")
+    SKLEARN_AVAILABLE = False
+
+
+# =============================================================================
+# SECTION 1: NFP RELATIVE TIMING UTILITIES
+# (from Prepare_Data/nfp_relative_timing.py)
+# =============================================================================
+
+# Cache for NFP releases to avoid repeated file reads
+_NFP_RELEASES_CACHE: Optional[pd.DataFrame] = None
+
+
+def load_nfp_releases() -> pd.DataFrame:
+    """
+    Load NFP release dates from target file.
+    
+    Returns:
+        DataFrame with columns: ['ds', 'release_date']
+        - ds: Event month (e.g., 2020-01-01 for January 2020 NFP)
+        - release_date: When NFP for that month was released
+    """
+    global _NFP_RELEASES_CACHE
+    
+    if _NFP_RELEASES_CACHE is not None:
+        return _NFP_RELEASES_CACHE
+    
+    nfp_file = DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet"
+    
+    if not nfp_file.exists():
+        raise FileNotFoundError(f"NFP target file not found: {nfp_file}")
+    
+    df = pd.read_parquet(nfp_file)
+    
+    # Extract only needed columns
+    if 'ds' in df.columns and 'release_date' in df.columns:
+        nfp_releases = df[['ds', 'release_date']].copy()
+    else:
+        raise ValueError(f"NFP file missing required columns. Has: {df.columns.tolist()}")
+    
+    nfp_releases['ds'] = pd.to_datetime(nfp_releases['ds'])
+    nfp_releases['release_date'] = pd.to_datetime(nfp_releases['release_date'])
+    
+    # Remove duplicates if any
+    nfp_releases = nfp_releases.drop_duplicates(subset=['ds'])
+    
+    _NFP_RELEASES_CACHE = nfp_releases
+    
+    logger.info(f"Loaded {len(nfp_releases)} NFP release dates")
+    logger.info(f"  Range: {nfp_releases['ds'].min().date()} to {nfp_releases['ds'].max().date()}")
+    
+    return nfp_releases
+
+
+def get_nfp_release_for_month(event_month: pd.Timestamp) -> Optional[pd.Timestamp]:
+    """
+    Get the NFP release date for a specific event month.
+
+    Args:
+        event_month: Month for which NFP data refers (e.g., 2020-01-01)
+
+    Returns:
+        NFP release date, or None if not found
+    """
+    nfp_releases = load_nfp_releases()
+
+    # Normalize to month start
+    event_month = pd.Timestamp(event_month).replace(day=1)
+
+    match = nfp_releases[nfp_releases['ds'] == event_month]
+
+    if len(match) == 0:
+        return None
+
+    return match['release_date'].iloc[0]
+
+
+def get_nfp_release_map(start_date=None, end_date=None) -> Dict[pd.Timestamp, pd.Timestamp]:
+    """
+    Get dictionary mapping observation months to NFP release dates.
+
+    This is the format commonly used by data loaders for snapshot alignment.
+    Uses cached NFP releases to avoid redundant file reads.
+
+    Args:
+        start_date: Optional start date filter (inclusive)
+        end_date: Optional end date filter (inclusive)
+
+    Returns:
+        Dict mapping observation_month -> nfp_release_date
+    """
+    nfp_releases = load_nfp_releases()
+
+    df = nfp_releases.copy()
+
+    # Apply date filters if provided
+    if start_date is not None:
+        start_dt = pd.to_datetime(start_date)
+        df = df[df['ds'] >= start_dt]
+
+    if end_date is not None:
+        end_dt = pd.to_datetime(end_date)
+        df = df[df['ds'] <= end_dt]
+
+    return dict(zip(df['ds'], df['release_date']))
+
+
+def calculate_median_offset_from_nfp(
+    series_data: pd.DataFrame,
+    event_col: str = 'date',
+    release_col: str = 'release_date'
+) -> Tuple[float, int]:
+    """
+    Calculate the median offset (in days) of a series' release dates from NFP releases.
+    
+    Args:
+        series_data: DataFrame with event dates and actual release dates
+        event_col: Column name for event/observation month
+        release_col: Column name for actual release date
+    
+    Returns:
+        Tuple of (median_offset_days, num_observations)
+        - median_offset_days: Median days between NFP release and series release
+          (negative = series releases before NFP, positive = after NFP)
+        - num_observations: Number of observations used for calculation
+    
+    Example:
+        If ISM releases 1 day after month-end and NFP releases 5 days after month-end,
+        ISM is typically 4 days BEFORE NFP, so offset = -4.0
+    """
+    nfp_releases = load_nfp_releases()
+    
+    # Ensure columns exist
+    if event_col not in series_data.columns or release_col not in series_data.columns:
+        logger.warning(f"Missing columns. Has: {series_data.columns.tolist()}")
+        return 0.0, 0
+    
+    # Filter to rows with actual release dates (not backfilled)
+    has_release = series_data[series_data[release_col].notna()].copy()
+    
+    if len(has_release) == 0:
+        return 0.0, 0
+    
+    has_release[event_col] = pd.to_datetime(has_release[event_col])
+    has_release[release_col] = pd.to_datetime(has_release[release_col])
+    
+    # Normalize event month to month start
+    has_release['event_month'] = has_release[event_col].dt.to_period('M').dt.to_timestamp()
+    
+    # Merge with NFP releases
+    merged = has_release.merge(
+        nfp_releases,
+        left_on='event_month',
+        right_on='ds',
+        how='inner',
+        suffixes=('_series', '_nfp')
+    )
+    
+    if len(merged) == 0:
+        logger.warning("No matching NFP releases found for series data")
+        return 0.0, 0
+    
+    # Calculate offset: series_release - nfp_release (in days)
+    merged['offset_days'] = (
+        merged[f'{release_col}_series'] - merged['release_date_nfp']
+    ).dt.total_seconds() / 86400  # Convert to days
+    
+    # Remove outliers (>365 days suggests data error)
+    valid_offsets = merged[
+        (merged['offset_days'].abs() <= 365) &
+        (merged['offset_days'].notna())
+    ]
+    
+    if len(valid_offsets) == 0:
+        return 0.0, 0
+    
+    median_offset = valid_offsets['offset_days'].median()
+    num_obs = len(valid_offsets)
+    
+    return median_offset, num_obs
+
+
+def apply_nfp_relative_adjustment(
+    event_month: pd.Timestamp,
+    base_release_date: pd.Timestamp,
+    median_offset_days: float,
+    use_adjustment: bool = True
+) -> pd.Timestamp:
+    """
+    Adjust a backfilled release date to maintain consistent NFP-relative timing.
+    
+    Args:
+        event_month: Month the data refers to
+        base_release_date: Initial estimate (e.g., from median lag or fixed rule)
+        median_offset_days: Median offset from NFP (from calculate_median_offset_from_nfp)
+        use_adjustment: If False, return base_release_date unchanged
+    
+    Returns:
+        Adjusted release date
+    
+    Logic:
+        1. Find NFP release for this event month
+        2. Calculate target = NFP_release + median_offset
+        3. If target is reasonable, use it; otherwise keep base estimate
+    
+    Example:
+        - Event: January 2020
+        - Base estimate: Feb 10, 2020 (from median lag)
+        - NFP for Jan 2020: Feb 7, 2020
+        - Median offset: -4 days (series typically 4 days before NFP)
+        - Adjusted: Feb 3, 2020 (= Feb 7 - 4 days)
+    """
+    if not use_adjustment:
+        return base_release_date
+    
+    # Get NFP release for this event month
+    nfp_release = get_nfp_release_for_month(event_month)
+    
+    if nfp_release is None:
+        logger.debug(f"No NFP release found for {event_month.date()}, using base estimate")
+        return base_release_date
+    
+    # Calculate target date
+    adjusted_release = nfp_release + timedelta(days=median_offset_days)
+    
+    # Sanity checks:
+    # 1. Adjusted date should be after event month
+    # 2. Adjusted date should not be more than 1 year after event
+    # 3. Adjusted date should not be more than 180 days different from base estimate
+    
+    event_month_start = event_month.replace(day=1)
+    one_year_later = event_month_start + pd.DateOffset(years=1)
+    
+    checks_pass = (
+        (adjusted_release > event_month_start) and
+        (adjusted_release < one_year_later) and
+        (abs((adjusted_release - base_release_date).days) < 180)
+    )
+    
+    if checks_pass:
+        return adjusted_release
+    else:
+        logger.debug(
+            f"NFP-relative adjustment failed sanity checks for {event_month.date()}, "
+            f"using base estimate"
+        )
+        return base_release_date
+
+
+def get_series_timing_stats(
+    series_data: pd.DataFrame,
+    series_name: str,
+    event_col: str = 'date',
+    release_col: str = 'release_date'
+) -> Dict:
+    """
+    Get comprehensive timing statistics for a series relative to NFP.
+    
+    Useful for understanding and debugging release timing patterns.
+    
+    Returns:
+        Dictionary with timing statistics
+    """
+    median_offset, num_obs = calculate_median_offset_from_nfp(
+        series_data, event_col, release_col
+    )
+    
+    stats = {
+        'series_name': series_name,
+        'median_offset_days': median_offset,
+        'num_observations': num_obs,
+        'typically_before_nfp': median_offset < 0,
+        'typically_after_nfp': median_offset > 0,
+    }
+    
+    if num_obs > 0:
+        # Additional statistics
+        nfp_releases = load_nfp_releases()
+        has_release = series_data[series_data[release_col].notna()].copy()
+        has_release['event_month'] = pd.to_datetime(has_release[event_col]).dt.to_period('M').dt.to_timestamp()
+        
+        merged = has_release.merge(
+            nfp_releases,
+            left_on='event_month',
+            right_on='ds',
+            how='inner',
+            suffixes=('_series', '_nfp')
+        )
+        
+        if len(merged) > 0:
+            offsets = (merged[f'{release_col}_series'] - merged['release_date_nfp']).dt.total_seconds() / 86400
+            stats.update({
+                'min_offset_days': offsets.min(),
+                'max_offset_days': offsets.max(),
+                'std_offset_days': offsets.std(),
+                'pct_before_nfp': (offsets < 0).mean() * 100,
+            })
+    
+    return stats
+
+
+
+# =============================================================================
+# SECTION 2: BLS SCHEDULE SCRAPING
+# (from Load_Data/scrape_bls_schedule.py)
+# =============================================================================
+
+# =============================================================================
+# HARDCODED RELEASE DATES
+# =============================================================================
+# These dates are guaranteed to be included in results, regardless of BLS scraping.
+# Use this for dates that are known but may not be available on the BLS website
+# (e.g., during government shutdowns, website changes, or for confirmed future dates).
+#
+# Format: {observation_month: release_date}
+HARDCODED_RELEASE_DATES = {
+    pd.Timestamp("2026-01-01"): pd.Timestamp("2026-02-06"),  # January 2026 NFP -> Feb 6, 2026
+}
+
+
+
+
+def parse_bls_date(date_str: str) -> Optional[pd.Timestamp]:
+    """
+    Parse BLS date formats:
+    - "Nov. 01, 2024" (abbreviated month)
+    - "January 9, 2026" (full month)
+    - "Friday, January 9, 2026" (with day of week)
+
+    Args:
+        date_str: Date string from BLS website
+
+    Returns:
+        Timestamp or None if parsing fails
+    """
+    try:
+        # Remove day of week prefix if present (e.g., "Friday, January 9, 2026")
+        # Day of week would be at the start and followed by comma
+        parts = date_str.split(',')
+        if len(parts) == 3:
+            # Format: "Friday, January 9, 2026"
+            # Take everything after first comma
+            date_str = ','.join(parts[1:]).strip()
+        elif len(parts) == 2:
+            # Could be "Month Day, Year" or "Friday, Month..."
+            # Check if first part looks like a day of week
+            first_part = parts[0].strip()
+            days_of_week = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            if any(day in first_part for day in days_of_week):
+                # It's "Friday, ..." format, skip first part
+                date_str = parts[1].strip()
+            # else it's already "Month Day, Year" format
+
+        # Try parsing with abbreviated month first (Nov., Dec., etc.)
+        for fmt in ["%b. %d, %Y", "%B %d, %Y", "%b %d, %Y"]:
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                return pd.Timestamp(dt)
+            except:
+                continue
+
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to parse date '{date_str}': {e}")
+        return None
+
+
+def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
+    """
+    Scrape BLS website for NFP (Employment Situation) release dates.
+
+    The BLS publishes all Employment Situation release dates at a single URL.
+
+    Returns:
+        DataFrame with columns: ['observation_month', 'release_date']
+        - observation_month: Month being reported (e.g., 2025-12-01 for December 2025)
+        - release_date: Official release date (e.g., 2026-01-10)
+    """
+    url = "https://www.bls.gov/schedule/news_release/empsit.htm"
+
+    try:
+
+        # Add headers to avoid 403 errors - use macOS Safari user agent
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive'
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Find all tables on the page
+        tables = soup.find_all('table')
+
+        if not tables:
+            raise ValueError("No tables found on BLS Employment Situation page")
+
+        results = []
+
+        # The schedule is in the first table
+        # Structure: Row 0 = headers, Row 1+ = data
+        # Columns: Reference Month | Release Date | Release Time
+        for table in tables:
+            rows = table.find_all('tr')
+
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+
+                # Need at least 2 cells (Reference Month, Release Date)
+                if len(cells) < 2:
+                    continue
+
+                ref_month_text = cells[0].get_text(strip=True)
+                release_date_text = cells[1].get_text(strip=True)
+
+                # Skip header rows
+                if ref_month_text in ['Reference Month', 'BY MONTH'] or 'ENTIRE YEAR' in ref_month_text:
+                    continue
+
+                # Parse reference month: "December 2025" format
+                try:
+                    # Add day 1 to make it parseable
+                    obs_month = pd.to_datetime(ref_month_text + " 1")
+
+                    # Parse release date: "Jan. 09, 2026" format
+                    release_date = parse_bls_date(release_date_text)
+
+                    if release_date is not None:
+                        results.append({
+                            'observation_month': obs_month,
+                            'release_date': release_date
+                        })
+
+                except Exception as e:
+                    # Skip rows that don't parse (navigation, headers, etc.)
+                    continue
+
+        if not results:
+            raise ValueError("No Employment Situation releases parsed from BLS page")
+
+        df = pd.DataFrame(results)
+        # Remove duplicates (in case same month appears multiple times)
+        df = df.drop_duplicates(subset=['observation_month'])
+        df = df.sort_values('observation_month')
+
+        return df
+
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to fetch BLS Employment Situation schedule: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error scraping BLS schedule: {e}")
+
+
+def get_future_nfp_dates(
+    start_month: pd.Timestamp,
+    end_month: pd.Timestamp
+) -> pd.DataFrame:
+    """
+    Get NFP release dates for a date range by scraping BLS website.
+
+    Hardcoded release dates (HARDCODED_RELEASE_DATES) are always included and
+    take precedence over scraped dates if there's a conflict.
+
+    Args:
+        start_month: First observation month to get (e.g., 2025-11-01)
+        end_month: Last observation month to get (e.g., 2025-12-01)
+
+    Returns:
+        DataFrame with columns: ['observation_month', 'release_date']
+    """
+    # Scrape the Employment Situation schedule page
+    try:
+        all_dates = scrape_bls_employment_situation_schedule()
+    except Exception as e:
+        logger.warning(f"BLS scraping failed, using hardcoded dates: {e}")
+        all_dates = pd.DataFrame(columns=['observation_month', 'release_date'])
+
+    # Inject hardcoded release dates (these take precedence)
+    for obs_month, release_date in HARDCODED_RELEASE_DATES.items():
+        # Check if this month is already in scraped data
+        existing_mask = all_dates['observation_month'] == obs_month
+        if existing_mask.any():
+            # Update existing entry with hardcoded date
+            all_dates.loc[existing_mask, 'release_date'] = release_date
+        else:
+            # Add new entry
+            new_row = pd.DataFrame({
+                'observation_month': [obs_month],
+                'release_date': [release_date]
+            })
+            all_dates = pd.concat([all_dates, new_row], ignore_index=True)
+
+    # Filter to requested range
+    filtered = all_dates[
+        (all_dates['observation_month'] >= start_month) &
+        (all_dates['observation_month'] <= end_month)
+    ]
+
+    filtered = filtered.sort_values('observation_month').reset_index(drop=True)
+
+    return filtered
+
+
+
+
+
+
+# =============================================================================
+# SECTION 3: FRED EMPLOYMENT DATA DOWNLOAD & SNAPSHOTS
+# (from Load_Data/fred_snapshots.py)
+# =============================================================================
+
+# fmt: off
 FRED_EMPLOYMENT_CODES = {
     # LEVEL 0: TOTAL
     "total": "PAYEMS",  # Total Nonfarm Employment (SA)
@@ -447,6 +999,7 @@ FRED_EMPLOYMENT_CODES = {
     "total.government.local.excluding_education": "CES9093200001",  # Local Government excluding Education (SA)
     "total.government.local.excluding_education_nsa": "CEU9093200001",  # Local Government excluding Education (NSA)
     }
+# fmt: on
 
 TOTAL_UIDS = ["total_nsa", "total"]
 
@@ -1648,13 +2201,459 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
     build_nfp_target_files(audit, s, e, snapshot_date)
     logger.info("✓ FRED snapshots download complete")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build NFP Snapshots")
-    parser.add_argument(
-        "--refresh", 
-        action="store_true", 
-        help="If set, forces a refresh of existing snapshots."
-    )
-    
+
+# =============================================================================
+# SECTION 4: FRED DATA PREPARATION
+# (from Prepare_Data/prepare_fred_snapshots.py)
+# =============================================================================
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
+PREPARED_FRED_DIR = DATA_PATH / "fred_data_prepared" / "decades"
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Series that should have SymLog applied (high kurtosis MoM changes)
+# These series experience extreme values (like COVID crash/recovery)
+SYMLOG_TRANSFORM_SERIES = [
+    # All employment series have potential for extreme MoM swings
+    # Apply SymLog universally to MoM changes
+]
+
+# Apply SymLog to ALL MoM changes since employment data universally
+# shows high kurtosis due to recessions/recoveries
+# CHANGED: Set to False to preserve COVID-19 crash magnitude
+APPLY_SYMLOG_TO_ALL = False
+
+# =============================================================================
+# TRANSFORM FUNCTIONS
+# =============================================================================
+
+def apply_symlog(x):
+    """
+    Apply symmetric log transform: sign(x) * log1p(abs(x))
+
+    This transform:
+    - Handles negative values (unlike log)
+    - Compresses extreme values (reduces kurtosis)
+    - Preserves sign and relative magnitude
+    - Is invertible: sign(y) * (exp(abs(y)) - 1)
+
+    For NFP MoM changes, reduces:
+    - Skewness: -6.5 -> -1.1
+    - Kurtosis: 81 -> -0.7
+    """
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def inverse_symlog(y):
+    """Inverse of symlog transform for prediction recovery."""
+    return np.sign(y) * (np.exp(np.abs(y)) - 1)
+
+
+def calculate_mom_change(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert employment levels to Month-over-Month changes.
+
+    The raw FRED snapshots contain employment LEVELS (e.g., 150M jobs).
+    Our prediction target is the MoM CHANGE (e.g., +150K jobs).
+
+    This transformation:
+    1. Makes the series stationary (levels are non-stationary)
+    2. Matches what we're actually predicting
+
+    Args:
+        df: DataFrame with columns ['date', 'value', 'series_name', ...]
+            where 'value' contains employment levels
+
+    Returns:
+        DataFrame with MoM changes as 'value', original level stored in 'value_level'
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    result_parts = []
+
+    for series_name, group in df.groupby('series_name'):
+        group = group.sort_values('date').copy()
+
+        # Store original level for reference
+        group['value_level'] = group['value']
+
+        # Calculate MoM change (this is what we predict)
+        group['value'] = group['value'].diff()
+
+        # Keep track of raw change before any transforms
+        group['value_raw'] = group['value']
+
+        # Drop first row (NaN from diff)
+        group = group.dropna(subset=['value'])
+
+        result_parts.append(group)
+
+    if result_parts:
+        return pd.concat(result_parts, ignore_index=True)
+    return df
+
+
+def preprocess_transforms(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply SymLog transform to MoM changes.
+
+    This handles extreme values like:
+    - COVID crash: -20M jobs in April 2020
+    - Recovery months: +4M jobs
+
+    Without this transform:
+    - Skewness: -6.5 (highly negatively skewed)
+    - Kurtosis: 81 (extreme fat tails)
+
+    With SymLog:
+    - Skewness: -1.1 (much closer to normal)
+    - Kurtosis: -0.7 (normal-like tails)
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    if APPLY_SYMLOG_TO_ALL:
+        # Apply SymLog to all MoM changes
+        df['value'] = apply_symlog(df['value'])
+    else:
+        # Only apply to specified series
+        for pattern in SYMLOG_TRANSFORM_SERIES:
+            mask = df['series_name'].str.contains(pattern, regex=False)
+            if mask.any():
+                df.loc[mask, 'value'] = apply_symlog(df.loc[mask, 'value'])
+
+    return df
+
+
+def apply_robust_scaling_vintage(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Fit RobustScaler on historical data only (before current month).
+    Apply to all data to avoid look-ahead bias.
+
+    This is critical for proper backtesting - we can only use statistics
+    that would have been available at prediction time.
+
+    RobustScaler uses median and IQR, making it resistant to outliers.
+    This is important for employment data which has extreme COVID values.
+
+    Args:
+        df: DataFrame with 'date', 'series_name', 'value' columns
+        snapshot_date: Current snapshot date (e.g., 2020-01-31)
+
+    Returns:
+        DataFrame with scaled values (fitted on history, applied to all)
+    """
+    if df.empty or not SKLEARN_AVAILABLE:
+        return df
+
+    df = df.copy()
+
+    # Cutoff: Exclude current month from fitting
+    # If snapshot is 2020-01-31, only fit on data through 2019-12-31
+    cutoff_date = snapshot_date - pd.DateOffset(months=1)
+    cutoff_date = cutoff_date + pd.offsets.MonthEnd(0)
+
+    scaled_groups = []
+
+    for series_name, group in df.groupby('series_name'):
+        group = group.sort_values('date').copy()
+
+        if len(group) < 2:
+            scaled_groups.append(group)
+            continue
+
+        # Fit scaler only on historical data (before current month)
+        hist_mask = group['date'] <= cutoff_date
+        hist_data = group.loc[hist_mask, 'value']
+
+        if len(hist_data) < 2:
+            # Not enough history - skip scaling for this series
+            scaled_groups.append(group)
+            continue
+
+        # Skip if constant values (avoid division by zero)
+        if hist_data.std() < 1e-10:
+            scaled_groups.append(group)
+            continue
+
+        # Fit on history only
+        scaler = RobustScaler()
+        scaler.fit(hist_data.values.reshape(-1, 1))
+
+        # Transform all data (including current month)
+        group['value'] = scaler.transform(group['value'].values.reshape(-1, 1)).flatten()
+        scaled_groups.append(group)
+
+    if scaled_groups:
+        return pd.concat(scaled_groups, ignore_index=True)
+    return df
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def _prep_get_snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
+    """Get path to snapshot file for a given date."""
+    decade = f"{date_ts.year // 10 * 10}s"
+    year = str(date_ts.year)
+    filename = f"{date_ts.strftime('%Y-%m')}.parquet"
+    return base_dir / decade / year / filename
+
+
+def load_snapshot(base_dir: Path, date_ts: pd.Timestamp) -> pd.DataFrame:
+    """Load a snapshot file if it exists."""
+    path = _prep_get_snapshot_path(base_dir, date_ts)
+    if path.exists():
+        return pd.read_parquet(path)
+    return pd.DataFrame()
+
+
+def prepare_fred_snapshots(
+    apply_mom_conversion: bool = True,
+    apply_transforms: bool = True,
+    apply_scaling: bool = True
+):
+    """
+    Main pipeline to prepare FRED employment snapshots.
+
+    Processing steps:
+    1. Load raw snapshot (employment levels)
+    2. Convert to MoM changes (stationary target)
+    3. Apply SymLog transform (handle outliers)
+    4. Apply RobustScaler (normalize, history-only fit)
+
+    NOTE: This does NOT create lag features or rolling statistics.
+    Those are created in train_lightgbm_nfp.py to avoid redundancy.
+
+    Args:
+        apply_mom_conversion: Convert levels to MoM changes
+        apply_transforms: Apply SymLog to MoM changes
+        apply_scaling: Apply RobustScaler normalization
+    """
+    start_dt = pd.to_datetime(START_DATE)
+    end_dt = pd.to_datetime(END_DATE)
+    snapshot_dates = pd.date_range(start=start_dt, end=end_dt, freq='ME')
+
+    logger.info(f"Preparing FRED Snapshots from {start_dt.date()} to {end_dt.date()}")
+    logger.info(f"Options: mom_conversion={apply_mom_conversion}, transforms={apply_transforms}, scaling={apply_scaling}")
+
+    for i, snap_date in enumerate(snapshot_dates):
+        # 1. Load raw snapshot (employment LEVELS)
+        raw_df = load_snapshot(FRED_SNAPSHOTS_DIR, snap_date)
+
+        if raw_df.empty:
+            continue
+
+        raw_df['date'] = pd.to_datetime(raw_df['date'])
+        working_df = raw_df.copy()
+
+        # 2. Convert levels to MoM changes
+        if apply_mom_conversion:
+            working_df = calculate_mom_change(working_df)
+
+        if working_df.empty:
+            continue
+
+        # 3. Apply SymLog transform
+        if apply_transforms and apply_mom_conversion:
+            working_df = preprocess_transforms(working_df)
+
+        # 4. Apply RobustScaler (fit on history only)
+        if apply_scaling:
+            working_df = apply_robust_scaling_vintage(working_df, snap_date)
+
+        # Add snapshot date
+        working_df['snapshot_date'] = snap_date
+
+        # Save in same schema as input
+        decade_str = f"{snap_date.year // 10 * 10}s"
+        year_str = str(snap_date.year)
+        save_dir = PREPARED_FRED_DIR / decade_str / year_str
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"{snap_date.strftime('%Y-%m')}.parquet"
+
+        working_df.to_parquet(save_path, index=False)
+
+        if i % 12 == 0:
+            logger.info(f"Prepared snapshot for {snap_date.date()}")
+
+    logger.info("FRED Snapshots preparation complete.")
+
+
+# =============================================================================
+# VERIFICATION
+# =============================================================================
+
+def verify_prepared_snapshot():
+    """Verify the preprocessing worked correctly."""
+    logger.info("Verifying Prepared FRED Snapshots...")
+
+    # Check recent snapshot
+    test_date = pd.to_datetime(END_DATE)
+
+    # Try to find a valid snapshot
+    for _ in range(12):
+        decade_str = f"{test_date.year // 10 * 10}s"
+        year_str = str(test_date.year)
+        prepared_path = PREPARED_FRED_DIR / decade_str / year_str / f"{test_date.strftime('%Y-%m')}.parquet"
+
+        if prepared_path.exists():
+            break
+        test_date = test_date - pd.DateOffset(months=1)
+
+    if not prepared_path.exists():
+        logger.error(f"Verification failed: Could not find file at {prepared_path}")
+        return
+
+    df = pd.read_parquet(prepared_path)
+    series = df['series_name'].unique()
+
+    logger.info(f"--- Verification Report for {test_date.date()} ---")
+    logger.info(f"Total unique series: {len(series)}")
+    logger.info(f"Columns: {df.columns.tolist()}")
+
+    # Check that we DON'T have redundant lag/rolling features
+    lag_series = [s for s in series if '_lag' in s]
+    rolling_series = [s for s in series if '_rolling' in s]
+
+    if not lag_series:
+        logger.info("OK: No lag features (created downstream)")
+    else:
+        logger.warning(f"WARNING: Found lag features that may be redundant: {lag_series[:3]}...")
+
+    if not rolling_series:
+        logger.info("OK: No rolling features (created downstream)")
+    else:
+        logger.warning(f"WARNING: Found rolling features that may be redundant: {rolling_series[:3]}...")
+
+    # Check transforms were applied
+    if 'value_raw' in df.columns:
+        # Compare raw vs transformed
+        total_series = df[df['series_name'] == 'total']
+        if not total_series.empty:
+            raw_vals = total_series['value_raw'].dropna()
+            trans_vals = total_series['value'].dropna()
+
+            logger.info(f"\n'total' series statistics:")
+            logger.info(f"  Raw MoM - Skew: {raw_vals.skew():.3f}, Kurt: {raw_vals.kurtosis():.3f}")
+            logger.info(f"  Transformed - Skew: {trans_vals.skew():.3f}, Kurt: {trans_vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{trans_vals.min():.3f}, {trans_vals.max():.3f}]")
+
+    # Check schema matches expected format
+    expected_cols = ['date', 'value', 'series_name']
+    missing_cols = [c for c in expected_cols if c not in df.columns]
+    if missing_cols:
+        logger.error(f"Missing expected columns: {missing_cols}")
+    else:
+        logger.info("OK: Schema matches expected format")
+
+    logger.info("Verification Complete.")
+
+
+def compare_raw_vs_prepared():
+    """
+    Compare statistics of raw vs prepared data to validate transformations.
+    """
+    logger.info("Comparing Raw vs Prepared FRED Snapshots...")
+
+    test_date = pd.to_datetime(END_DATE)
+
+    # Find valid snapshots
+    for _ in range(12):
+        decade_str = f"{test_date.year // 10 * 10}s"
+        year_str = str(test_date.year)
+
+        raw_path = FRED_SNAPSHOTS_DIR / decade_str / year_str / f"{test_date.strftime('%Y-%m')}.parquet"
+        prepared_path = PREPARED_FRED_DIR / decade_str / year_str / f"{test_date.strftime('%Y-%m')}.parquet"
+
+        if raw_path.exists() and prepared_path.exists():
+            break
+        test_date = test_date - pd.DateOffset(months=1)
+
+    if not raw_path.exists():
+        logger.error("Could not find raw snapshot")
+        return
+
+    if not prepared_path.exists():
+        logger.error("Could not find prepared snapshot - run prepare_fred_snapshots() first")
+        return
+
+    raw_df = pd.read_parquet(raw_path)
+    prepared_df = pd.read_parquet(prepared_path)
+
+    logger.info(f"\n=== Comparison for {test_date.date()} ===")
+    logger.info(f"Raw: {len(raw_df)} rows, Prepared: {len(prepared_df)} rows")
+
+    # Compare 'total' series (main NFP)
+    for series_name in ['total', 'total_nsa']:
+        raw_series = raw_df[raw_df['series_name'] == series_name]['value'].dropna()
+        prep_series = prepared_df[prepared_df['series_name'] == series_name]['value'].dropna()
+
+        if raw_series.empty or prep_series.empty:
+            continue
+
+        # Raw is levels, prepared is transformed MoM changes
+        raw_mom = raw_series.diff().dropna()
+
+        logger.info(f"\n{series_name}:")
+        logger.info(f"  Raw Levels - Mean: {raw_series.mean():.0f}K")
+        logger.info(f"  Raw MoM    - Skew: {raw_mom.skew():.3f}, Kurt: {raw_mom.kurtosis():.3f}")
+        logger.info(f"  Prepared   - Skew: {prep_series.skew():.3f}, Kurt: {prep_series.kurtosis():.3f}")
+
+        skew_improvement = abs(raw_mom.skew()) - abs(prep_series.skew())
+        kurt_improvement = abs(raw_mom.kurtosis()) - abs(prep_series.kurtosis())
+
+        logger.info(f"  Improvement - Skew: {skew_improvement:+.3f}, Kurt: {kurt_improvement:+.3f}")
+
+
+
+# =============================================================================
+# SECTION 5: UNIFIED ENTRY POINT
+# =============================================================================
+
+def main():
+    """Run complete FRED employment pipeline: download + snapshot + prepare."""
+    # Parse combined arguments
+    import argparse
+    parser = argparse.ArgumentParser(description="FRED Employment Pipeline")
+    parser.add_argument('--refresh', action='store_true', help="Force refresh of existing snapshots")
+    parser.add_argument('--no-mom', action='store_true', help="Skip MoM conversion")
+    parser.add_argument('--no-transforms', action='store_true', help="Skip SymLog transform")
+    parser.add_argument('--no-scaling', action='store_true', help="Skip RobustScaler")
+    parser.add_argument('--verify-only', action='store_true', help="Only run verification")
+    parser.add_argument('--compare', action='store_true', help="Compare raw vs prepared")
     args = parser.parse_args()
+
+    if args.verify_only:
+        verify_prepared_snapshot()
+        return
+    if args.compare:
+        compare_raw_vs_prepared()
+        return
+
+    # Stage 1: Download FRED data and build snapshots + NFP targets
     build_all_snapshots(refresh_existing=args.refresh)
+
+    # Stage 2: Prepare snapshots (MoM conversion, transforms, scaling)
+    prepare_fred_snapshots(
+        apply_mom_conversion=not args.no_mom,
+        apply_transforms=not args.no_transforms,
+        apply_scaling=not args.no_scaling
+    )
+    verify_prepared_snapshot()
+
+
+if __name__ == "__main__":
+    main()

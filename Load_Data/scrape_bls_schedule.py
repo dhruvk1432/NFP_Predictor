@@ -94,7 +94,6 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
     url = "https://www.bls.gov/schedule/news_release/empsit.htm"
 
     try:
-        logger.info(f"Scraping BLS Employment Situation schedule: {url}")
 
         # Add headers to avoid 403 errors - use macOS Safari user agent
         headers = {
@@ -150,7 +149,6 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
                             'observation_month': obs_month,
                             'release_date': release_date
                         })
-                        logger.info(f"Found: {obs_month.strftime('%B %Y')} -> {release_date.strftime('%Y-%m-%d')}")
 
                 except Exception as e:
                     # Skip rows that don't parse (navigation, headers, etc.)
@@ -164,7 +162,6 @@ def scrape_bls_employment_situation_schedule() -> pd.DataFrame:
         df = df.drop_duplicates(subset=['observation_month'])
         df = df.sort_values('observation_month')
 
-        logger.info(f"Successfully scraped {len(df)} NFP release dates")
         return df
 
     except requests.RequestException as e:
@@ -194,7 +191,7 @@ def get_future_nfp_dates(
     try:
         all_dates = scrape_bls_employment_situation_schedule()
     except Exception as e:
-        logger.warning(f"BLS scraping failed: {e}. Using hardcoded dates only.")
+        logger.warning(f"BLS scraping failed, using hardcoded dates: {e}")
         all_dates = pd.DataFrame(columns=['observation_month', 'release_date'])
 
     # Inject hardcoded release dates (these take precedence)
@@ -204,7 +201,6 @@ def get_future_nfp_dates(
         if existing_mask.any():
             # Update existing entry with hardcoded date
             all_dates.loc[existing_mask, 'release_date'] = release_date
-            logger.info(f"Hardcoded override: {obs_month.strftime('%Y-%m')} -> {release_date.strftime('%Y-%m-%d')}")
         else:
             # Add new entry
             new_row = pd.DataFrame({
@@ -212,7 +208,6 @@ def get_future_nfp_dates(
                 'release_date': [release_date]
             })
             all_dates = pd.concat([all_dates, new_row], ignore_index=True)
-            logger.info(f"Hardcoded added: {obs_month.strftime('%Y-%m')} -> {release_date.strftime('%Y-%m-%d')}")
 
     # Filter to requested range
     filtered = all_dates[

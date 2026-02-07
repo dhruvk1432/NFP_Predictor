@@ -9,8 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Dict, List, Tuple, Optional
 
-# Add parent directory to path to import settings
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to FRONT of path so project-level packages (utils/, settings)
+# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, START_DATE, END_DATE
 from utils.transforms import apply_symlog, apply_log1p

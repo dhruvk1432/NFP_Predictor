@@ -149,7 +149,6 @@ def download_and_filter_year(
     and return the filtered DataFrame.
     """
     url = BASE_URL + filename
-    print(f"  Downloading {year}: {url}")
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
 
@@ -515,6 +514,7 @@ def aggregate_to_state_monthly(
 # ---------------------------------------------------------------------
 
 def load_noaa_data():
+    logger = setup_logger(__file__, TEMP_DIR)
     start_dt = parse_date(START_DATE)
     end_dt   = parse_date(END_DATE)
 
@@ -527,9 +527,10 @@ def load_noaa_data():
         existing_data = pd.read_parquet(us_data_path)
         print(f"✓ NOAA data already exists: {len(existing_data)} months", flush=True)
         print(f"  Date range: {existing_data.index.min().date()} to {existing_data.index.max().date()}", flush=True)
+        logger.info("NOAA data already exists, skipping")
         return
 
-    print("Fetching directory listing from NOAA...")
+    logger.info("Starting NOAA data download")
     filenames = get_directory_listing(BASE_URL)
     year_to_file = map_year_to_details_filename(filenames)
 
@@ -537,11 +538,9 @@ def load_noaa_data():
     max_year = end_dt.year
 
     dfs = []
-    print(f"Downloading and filtering years {min_year}–{max_year}...")
-    for year in tqdm(range(min_year, max_year + 1)):
+    for year in tqdm(range(min_year, max_year + 1), desc="Downloading years"):
         if year not in year_to_file:
-            # Not all years may be present (e.g., partial coverage near the end)
-            print(f"  WARNING: No details file found for year {year}, skipping.")
+            logger.warning(f"No file found for year {year}, skipping")
             continue
         fname = year_to_file[year]
         df_year = download_and_filter_year(year, fname, start_dt, end_dt)
@@ -549,7 +548,7 @@ def load_noaa_data():
             dfs.append(df_year)
 
     if not dfs:
-        print("No data found in the specified date range.")
+        logger.error("No data found in the specified date range")
         return
 
     full_df = pd.concat(dfs, ignore_index=True)
@@ -560,7 +559,6 @@ def load_noaa_data():
     # -----------------------------------------------------------------
     # Aggregate to monthly state-level features (real USD) on full grid
     # -----------------------------------------------------------------
-    print("Aggregating to monthly state-level features (real USD)...")
     state_monthly = aggregate_to_state_monthly(
         full_df,
         lag_months=LAG_MONTHS,
@@ -578,7 +576,6 @@ def load_noaa_data():
         fname = f"{state}_NOAA_data.parquet"
         out_path = os.path.join(OUTPUT_FOLDER, fname)
         df_state.to_parquet(out_path)
-        print(f"  Wrote {out_path} with {len(df_state)} rows")
 
     # -----------------------------------------------------------------
     # Also write aggregate US-level file (full month grid)
@@ -608,9 +605,8 @@ def load_noaa_data():
     us_agg = us_agg.set_index("event_month").sort_index()
     us_path = os.path.join(OUTPUT_FOLDER, "US_NOAA_data.parquet")
     us_agg.to_parquet(us_path)
-    print(f"  Wrote {us_path} with {len(us_agg)} rows")
 
-    print("Done.")
+    logger.info("✓ NOAA data download complete")
 
 if __name__ == "__main__":
     load_noaa_data()

@@ -36,6 +36,73 @@ class RateLimiter:
                 time.sleep(self.min_interval - elapsed)
             self.last_call = time.time()
 
+# VIF-selected features (53 of 144): pruned at threshold=10.0
+# From prosper_exog_selection.ipynb analysis
+SELECTED_FEATURES = {
+    # Consumer Mood Index (7 features)
+    'Consumer Mood Index | Consumer Mood Index | 18-34_diff',
+    'Consumer Mood Index | Consumer Mood Index | 18-34_diff_zscore_3m',
+    'Consumer Mood Index | Consumer Mood Index | Females',
+    'Consumer Mood Index | Consumer Mood Index | Females_diff',
+    'Consumer Mood Index | Consumer Mood Index | Females_diff_zscore_3m',
+    'Consumer Mood Index | Consumer Mood Index | Males',
+    'Consumer Mood Index | Consumer Mood Index | Males_diff_zscore_3m',
+    # Consumer Spending Forecast (4 features)
+    'Prosper Consumer Spending Forecast | Consumer Spending Forecast | 18-34',
+    'Prosper Consumer Spending Forecast | Consumer Spending Forecast | 18-34_diff_zscore_3m',
+    'Prosper Consumer Spending Forecast | Consumer Spending Forecast | Females_diff_zscore_3m',
+    'Prosper Consumer Spending Forecast | Consumer Spending Forecast | Males_diff_zscore_12m',
+    # Layoffs - Fewer (4 features)
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Fewer | 18-34_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Fewer | Females_diff_zscore_12m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Fewer | Females_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Fewer | Males_diff_zscore_3m',
+    # Layoffs - More (6 features)
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | 18-34_diff_zscore_12m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | 18-34_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | Females',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | Females_diff',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | Females_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | Males_diff_zscore_3m',
+    # Layoffs - Same (7 features)
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | 18-34_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | Females',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | Females_diff_zscore_12m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | Females_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | Males_diff_zscore_12m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | Males_diff_zscore_3m',
+    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Same | US 18+_diff_zscore_3m',
+    # Employment - Full-time (6 features)
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | 18-34_diff',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | 18-34_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | Females_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | Males',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | Males_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | US 18+_diff_zscore_3m',
+    # Employment - Employed (merged) (5 features)
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed | 18-34_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed | Females_diff',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed | Females_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed | Males_diff_zscore_12m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed | Males_diff_zscore_3m',
+    # Employment - Unemployed (7 features)
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | 18-34',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | 18-34_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | Females',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | Females_diff_zscore_12m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | Females_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | Males_diff',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | Males_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I am unemployed | US 18+_diff_zscore_3m',
+    # Employment - Know people laid off (6 features)
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | 18-34',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | 18-34_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | Females_diff',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | Females_diff_zscore_3m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | Males_diff_zscore_12m',
+    'Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | Males_diff_zscore_3m',
+}
+
 top_nfp_predictors = [
     'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present?',
     'Which of the following most accurately describes your employment environment? (Check all that apply)',
@@ -59,6 +126,61 @@ top_nfp_groups = [
     'Males', 
     'Females'
 ]
+
+def compute_mom_differences_and_zscores(df):
+    """
+    Keep original level values AND add MoM differences with z-scores.
+
+    For each series, produce 4 variants:
+    - level (original series_name)
+    - {series_name}_diff (MoM difference)
+    - {series_name}_diff_zscore_12m (12-month rolling z-score on diff)
+    - {series_name}_diff_zscore_3m (3-month rolling z-score on diff)
+    """
+    series_list = df['series_name'].unique()
+    result_list = []
+    base_cols = ['date', 'release_date', 'series_code', 'snapshot_date']
+
+    for series in series_list:
+        series_df = df[df['series_name'] == series].copy()
+        series_df = series_df.sort_values('date')
+
+        # Always keep the original level value
+        level_df = series_df[base_cols + ['value']].copy()
+        level_df['series_name'] = series
+        result_list.append(level_df)
+
+        # Compute MoM difference
+        series_df['value_diff'] = series_df['value'].diff()
+
+        # Compute z-scores on differences (12-month)
+        rolling_mean_12m = series_df['value_diff'].rolling(window=12, min_periods=6).mean()
+        rolling_std_12m = series_df['value_diff'].rolling(window=12, min_periods=6).std()
+        series_df['zscore_12m'] = (series_df['value_diff'] - rolling_mean_12m) / rolling_std_12m
+
+        # Compute z-scores on differences (3-month)
+        rolling_mean_3m = series_df['value_diff'].rolling(window=3, min_periods=2).mean()
+        rolling_std_3m = series_df['value_diff'].rolling(window=3, min_periods=2).std()
+        series_df['zscore_3m'] = (series_df['value_diff'] - rolling_mean_3m) / rolling_std_3m
+
+        diff_df = series_df[base_cols].copy()
+        diff_df['series_name'] = f"{series}_diff"
+        diff_df['value'] = series_df['value_diff'].values
+
+        zscore_12m_df = series_df[base_cols].copy()
+        zscore_12m_df['series_name'] = f"{series}_diff_zscore_12m"
+        zscore_12m_df['value'] = series_df['zscore_12m'].values
+
+        zscore_3m_df = series_df[base_cols].copy()
+        zscore_3m_df['series_name'] = f"{series}_diff_zscore_3m"
+        zscore_3m_df['value'] = series_df['zscore_3m'].values
+
+        result_list.extend([diff_df, zscore_12m_df, zscore_3m_df])
+
+    result = pd.concat(result_list, ignore_index=True)
+    result = result.dropna(subset=['value'])
+    return result
+
 
 def symbols_for_target(df: pd.DataFrame, target, *, contains: bool = False, case: bool = True):
     s = df["question_text"].astype(str)
@@ -364,6 +486,11 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
                 subset=['date', 'series_code'], keep='last'
             )
             snap_data['snapshot_date'] = snap_date
+
+            # Apply MoM differencing and z-score calculation
+            snap_data = compute_mom_differences_and_zscores(snap_data)
+            snap_data = snap_data[snap_data['series_name'].isin(SELECTED_FEATURES)]
+
             snap_data.to_parquet(save_path, index=False)
 
         if obs_month.month == 12:

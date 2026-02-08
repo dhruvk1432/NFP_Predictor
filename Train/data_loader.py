@@ -431,9 +431,9 @@ def pivot_snapshot_to_wide(
         return pd.DataFrame()
 
     features = {}
-    n_rows = len(wide_df)
 
-    # Vectorized feature generation for all series at once
+    # Simplified feature generation: latest value + 12-month percent change only
+    # Exogenous data is already pre-processed in the ETL pipelines
     for raw_series_name in wide_df.columns:
         series = wide_df[raw_series_name].dropna()
         n = len(series)
@@ -448,65 +448,11 @@ def pivot_snapshot_to_wide(
         latest = series.iloc[-1]
         features[f'{series_name}_latest'] = latest
 
-        # Short-term lags and changes
-        if n >= 2:
-            features[f'{series_name}_lag1'] = series.iloc[-2]
-            features[f'{series_name}_mom_change'] = latest - series.iloc[-2]
-
-        if n >= 3:
-            features[f'{series_name}_lag2'] = series.iloc[-3]
-
-        if n >= 4:
-            features[f'{series_name}_lag3'] = series.iloc[-4]
-
-        # Medium-term lag (6 months)
-        if n >= 7:
-            features[f'{series_name}_lag6'] = series.iloc[-7]
-            features[f'{series_name}_6m_change'] = latest - series.iloc[-7]
-
-        # Long-term lags
-        if n >= 13:
-            features[f'{series_name}_lag12'] = series.iloc[-13]
-            features[f'{series_name}_yoy_change'] = latest - series.iloc[-13]
-
-        if n >= 19:
-            features[f'{series_name}_lag18'] = series.iloc[-19]
-            features[f'{series_name}_18m_change'] = latest - series.iloc[-19]
-
-        if n >= 25:
-            features[f'{series_name}_lag24'] = series.iloc[-25]
-            features[f'{series_name}_2yr_change'] = latest - series.iloc[-25]
-
-        # Rolling means - use pre-computed slices
-        if n >= 3:
-            features[f'{series_name}_rolling_mean_3'] = series.iloc[-3:].mean()
-
-        if n >= 6:
-            features[f'{series_name}_rolling_mean_6'] = series.iloc[-6:].mean()
-
-        if n >= 12:
-            features[f'{series_name}_rolling_mean_12'] = series.iloc[-12:].mean()
-
-        if n >= 24:
-            features[f'{series_name}_rolling_mean_24'] = series.iloc[-24:].mean()
-
-        # Volatility features
-        if n >= 6:
-            features[f'{series_name}_volatility_6m'] = series.iloc[-6:].std()
-
-        if n >= 12:
-            features[f'{series_name}_volatility_12m'] = series.iloc[-12:].std()
-
-        # Trend features (12-month linear trend)
-        if n >= 12:
-            recent_values = series.iloc[-12:].values
-            if not np.isnan(recent_values).any():
-                try:
-                    x = np.arange(12)
-                    slope = np.polyfit(x, recent_values, 1)[0]
-                    features[f'{series_name}_trend_12m'] = slope
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+        # 12-month percent change
+        if n >= 13 and series.iloc[-13] != 0:
+            features[f'{series_name}_12m_pct_change'] = (
+                (latest - series.iloc[-13]) / abs(series.iloc[-13])
+            ) * 100
 
     if not features:
         return pd.DataFrame()
@@ -562,6 +508,7 @@ def pivot_snapshot_to_wide_batch(
 
         features = {'target_month': target_month}
 
+        # Simplified: latest value + 12-month percent change only
         for raw_series_name in available.columns:
             series = available[raw_series_name].dropna()
             n = len(series)
@@ -569,30 +516,16 @@ def pivot_snapshot_to_wide_batch(
             if n == 0:
                 continue
 
-            # Sanitize series name for LightGBM compatibility
             series_name = sanitize_feature_name(str(raw_series_name))
 
             latest = series.iloc[-1]
             features[f'{series_name}_latest'] = latest
 
-            # Lags and changes (simplified for batch processing)
-            if n >= 2:
-                features[f'{series_name}_lag1'] = series.iloc[-2]
-                features[f'{series_name}_mom_change'] = latest - series.iloc[-2]
-
-            if n >= 7:
-                features[f'{series_name}_lag6'] = series.iloc[-7]
-
-            if n >= 13:
-                features[f'{series_name}_lag12'] = series.iloc[-13]
-                features[f'{series_name}_yoy_change'] = latest - series.iloc[-13]
-
-            # Rolling means
-            if n >= 3:
-                features[f'{series_name}_rolling_mean_3'] = series.iloc[-3:].mean()
-
-            if n >= 12:
-                features[f'{series_name}_rolling_mean_12'] = series.iloc[-12:].mean()
+            # 12-month percent change
+            if n >= 13 and series.iloc[-13] != 0:
+                features[f'{series_name}_12m_pct_change'] = (
+                    (latest - series.iloc[-13]) / abs(series.iloc[-13])
+                ) * 100
 
         all_features.append(features)
 

@@ -2,10 +2,9 @@
 Feature Importance Analysis for NFP Predictor
 
 Analyzes feature importance across trained models to:
-1. Identify most predictive features
-2. Find redundant/correlated features
-3. Suggest features for removal
-4. Generate feature importance reports
+1. Identify most predictive features (LightGBM gain + SHAP)
+2. Generate feature importance reports
+3. Summarize importance by category
 """
 
 import pandas as pd
@@ -22,7 +21,6 @@ from Train.config import (
     MODEL_SAVE_DIR,
     PROTECTED_BINARY_FLAGS,
     LINEAR_BASELINE_PREDICTORS,
-    CORR_THRESHOLD,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -32,6 +30,12 @@ try:
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
 
 
 # =============================================================================
@@ -44,28 +48,28 @@ def load_trained_model(
 ) -> Tuple[Optional[lgb.Booster], Optional[Dict]]:
     """
     Load trained model and metadata.
-    
+
     Args:
         model_dir: Directory containing saved model
         target_type: 'nsa' or 'sa'
-        
+
     Returns:
         Tuple of (model, metadata) or (None, None) if not found
     """
     model_path = model_dir / f"lightgbm_{target_type}_model.txt"
     metadata_path = model_dir / f"lightgbm_{target_type}_metadata.pkl"
-    
+
     if not model_path.exists():
         logger.warning(f"Model not found: {model_path}")
         return None, None
-    
+
     import pickle
-    
+
     model = lgb.Booster(model_file=str(model_path))
-    
+
     with open(metadata_path, 'rb') as f:
         metadata = pickle.load(f)
-    
+
     return model, metadata
 
 
@@ -76,36 +80,75 @@ def get_feature_importance(
 ) -> pd.DataFrame:
     """
     Extract feature importance from trained model.
-    
+
     Args:
         model: Trained LightGBM model
         feature_names: List of feature column names
-        importance_type: 'gain' (default), 'split', or 'shap'
-        
+        importance_type: 'gain' (default) or 'split'
+
     Returns:
         DataFrame with feature names and importance scores
     """
     importance = model.feature_importance(importance_type=importance_type)
-    
+
     df = pd.DataFrame({
         'feature': feature_names,
         'importance': importance
     })
-    
+
     # Normalize to percentages
     total = df['importance'].sum()
     if total > 0:
         df['importance_pct'] = (df['importance'] / total) * 100
     else:
         df['importance_pct'] = 0
-    
+
     return df.sort_values('importance', ascending=False).reset_index(drop=True)
+
+
+def get_shap_importance(
+    model: lgb.Booster,
+    X: pd.DataFrame,
+    feature_names: List[str]
+) -> Optional[pd.DataFrame]:
+    """
+    Compute SHAP-based feature importance.
+
+    Args:
+        model: Trained LightGBM Booster
+        X: Feature DataFrame for computing SHAP values
+        feature_names: List of feature column names
+
+    Returns:
+        DataFrame with mean |SHAP| per feature, or None if SHAP unavailable
+    """
+    if not SHAP_AVAILABLE:
+        logger.warning("SHAP not available for importance analysis")
+        return None
+
+    try:
+        explainer = shap.TreeExplainer(model)
+        X_features = X[feature_names] if feature_names else X
+        shap_values = explainer.shap_values(X_features)
+
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+
+        shap_df = pd.DataFrame({
+            'feature': feature_names,
+            'mean_abs_shap': mean_abs_shap
+        }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
+
+        return shap_df
+
+    except Exception as e:
+        logger.warning(f"SHAP computation failed: {e}")
+        return None
 
 
 def categorize_features(importance_df: pd.DataFrame) -> pd.DataFrame:
     """
     Add feature category based on naming patterns.
-    
+
     Categories:
     - nfp_*: Past NFP values
     - emp_*: Employment sector data
@@ -115,7 +158,7 @@ def categorize_features(importance_df: pd.DataFrame) -> pd.DataFrame:
     """
     def get_category(feature: str) -> str:
         feature_lower = feature.lower()
-        
+
         if feature_lower.startswith('nfp_'):
             return 'NFP_History'
         elif feature_lower.startswith('emp_'):
@@ -142,98 +185,15 @@ def categorize_features(importance_df: pd.DataFrame) -> pd.DataFrame:
             return 'NOAA_Weather'
         else:
             return 'Other'
-    
+
     importance_df['category'] = importance_df['feature'].apply(get_category)
     return importance_df
-
-
-def identify_zero_importance_features(
-    importance_df: pd.DataFrame,
-    threshold: float = 0.01
-) -> List[str]:
-    """
-    Find features with near-zero importance.
-    
-    Args:
-        importance_df: Feature importance DataFrame
-        threshold: Minimum importance percentage to keep
-        
-    Returns:
-        List of features to potentially remove
-    """
-    # Exclude protected features
-    protected = set(PROTECTED_BINARY_FLAGS)
-    
-    low_importance = importance_df[
-        (importance_df['importance_pct'] < threshold) &
-        (~importance_df['feature'].str.contains('|'.join(protected), case=False, na=False))
-    ]
-    
-    return low_importance['feature'].tolist()
-
-
-def analyze_feature_correlations(
-    X: pd.DataFrame,
-    importance_df: pd.DataFrame,
-    top_n: int = 30
-) -> pd.DataFrame:
-    """
-    Find highly correlated feature pairs among top features.
-    
-    Args:
-        X: Feature DataFrame
-        importance_df: Feature importance DataFrame
-        top_n: Number of top features to analyze
-        
-    Returns:
-        DataFrame with correlated feature pairs and recommendation
-    """
-    # Get top N features
-    top_features = importance_df.head(top_n)['feature'].tolist()
-    
-    # Filter to available features
-    available = [f for f in top_features if f in X.columns]
-    
-    if len(available) < 2:
-        return pd.DataFrame()
-    
-    # Calculate correlation matrix
-    corr_matrix = X[available].corr().abs()
-    
-    # Find highly correlated pairs
-    pairs = []
-    for i in range(len(available)):
-        for j in range(i + 1, len(available)):
-            corr = corr_matrix.iloc[i, j]
-            if corr > CORR_THRESHOLD:
-                feat1 = available[i]
-                feat2 = available[j]
-                
-                # Get importance of each
-                imp1 = importance_df[importance_df['feature'] == feat1]['importance_pct'].values[0]
-                imp2 = importance_df[importance_df['feature'] == feat2]['importance_pct'].values[0]
-                
-                # Recommend keeping the more important one
-                if imp1 >= imp2:
-                    keep, remove = feat1, feat2
-                else:
-                    keep, remove = feat2, feat1
-                
-                pairs.append({
-                    'feature_1': feat1,
-                    'feature_2': feat2,
-                    'correlation': corr,
-                    'keep': keep,
-                    'remove': remove
-                })
-    
-    return pd.DataFrame(pairs)
 
 
 def summarize_by_category(importance_df: pd.DataFrame) -> pd.DataFrame:
     """
     Summarize feature importance by category.
-    
+
     Returns:
         DataFrame with category-level importance statistics
     """
@@ -246,7 +206,7 @@ def summarize_by_category(importance_df: pd.DataFrame) -> pd.DataFrame:
         'importance': 'total_importance',
         'importance_pct': 'total_pct'
     })
-    
+
     summary = summary.sort_values('total_importance', ascending=False)
     return summary
 
@@ -257,73 +217,83 @@ def generate_importance_report(
 ) -> Dict:
     """
     Generate comprehensive feature importance report.
-    
+
+    Includes LightGBM gain importance and SHAP importance if available.
+
     Args:
         target_type: 'nsa' or 'sa'
         save_dir: Directory to save report (default: OUTPUT_DIR/reports)
-        
+
     Returns:
         Dictionary with report content
     """
     if save_dir is None:
         save_dir = OUTPUT_DIR / "reports"
     save_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger.info(f"Generating feature importance report for {target_type.upper()} model")
-    
+
     # Load model
     model, metadata = load_trained_model(target_type=target_type)
-    
+
     if model is None:
         logger.error("Could not load model. Train a model first.")
         return {'error': 'Model not found'}
-    
+
     feature_cols = metadata.get('feature_cols', [])
-    importance_saved = metadata.get('importance', {})
-    
+
     # Get importance from model
     importance_df = get_feature_importance(model, feature_cols)
     importance_df = categorize_features(importance_df)
-    
-    # Find low-importance features
-    zero_importance = identify_zero_importance_features(importance_df)
-    
+
     # Category summary
     category_summary = summarize_by_category(importance_df)
-    
+
+    # Try to load SHAP importance if previously computed
+    shap_path = OUTPUT_DIR / "shap_analysis" / f"{target_type}_first" / f"shap_importance_{target_type}_first.csv"
+    shap_info = {}
+    if shap_path.exists():
+        shap_df = pd.read_csv(shap_path)
+        importance_df = importance_df.merge(shap_df[['feature', 'mean_abs_shap']], on='feature', how='left')
+        shap_info = {
+            'shap_top_20': shap_df.head(20)[['feature', 'mean_abs_shap']].to_dict('records'),
+            'shap_available': True
+        }
+        logger.info(f"Merged SHAP importance from {shap_path}")
+    else:
+        shap_info = {'shap_available': False}
+
     # Build report
     report = {
         'target_type': target_type,
         'total_features': len(feature_cols),
         'top_20_features': importance_df.head(20)[['feature', 'importance_pct', 'category']].to_dict('records'),
         'category_summary': category_summary.to_dict(),
-        'zero_importance_features': zero_importance,
-        'num_zero_importance': len(zero_importance),
+        **shap_info,
     }
-    
+
     # Save detailed CSV
     csv_path = save_dir / f"feature_importance_{target_type}.csv"
     importance_df.to_csv(csv_path, index=False)
     logger.info(f"Saved detailed importance to {csv_path}")
-    
+
     # Save summary JSON
     json_path = save_dir / f"feature_importance_summary_{target_type}.json"
     with open(json_path, 'w') as f:
         json.dump(report, f, indent=2, default=str)
     logger.info(f"Saved summary to {json_path}")
-    
+
     # Print summary
     print(f"\n{'='*60}")
     print(f"Feature Importance Report: {target_type.upper()}")
     print(f"{'='*60}")
     print(f"Total features: {len(feature_cols)}")
-    print(f"Zero-importance features: {len(zero_importance)}")
     print(f"\nTop 10 Features:")
     print(importance_df.head(10)[['feature', 'importance_pct', 'category']].to_string(index=False))
     print(f"\nCategory Summary:")
     print(category_summary.to_string())
     print(f"\nReports saved to {save_dir}")
-    
+
     return report
 
 
@@ -334,22 +304,22 @@ def generate_importance_report(
 def main():
     """Run feature importance analysis from command line."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Analyze feature importance for NFP models")
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
                         help="Target type (default: nsa)")
     parser.add_argument('--output', type=str, default=None,
                         help="Output directory for reports")
-    
+
     args = parser.parse_args()
-    
+
     save_dir = Path(args.output) if args.output else None
     report = generate_importance_report(target_type=args.target, save_dir=save_dir)
-    
+
     if 'error' in report:
         print(f"\nError: {report['error']}")
         return 1
-    
+
     return 0
 
 

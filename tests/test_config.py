@@ -17,10 +17,6 @@ from Train.config import (
     get_target_path,
     get_model_id,
     parse_model_id,
-    MAX_FEATURES,
-    VIF_THRESHOLD,
-    CORR_THRESHOLD,
-    MIN_TARGET_CORR,
     DEFAULT_LGBM_PARAMS,
     PROTECTED_BINARY_FLAGS,
     LINEAR_BASELINE_PREDICTORS,
@@ -46,12 +42,10 @@ class TestTargetConfiguration:
         assert len(VALID_RELEASE_TYPES) == 2
 
     def test_all_target_configs(self):
-        """Test that all 4 target configurations are defined."""
-        assert len(ALL_TARGET_CONFIGS) == 4
+        """Test that first release target configurations are defined."""
+        assert len(ALL_TARGET_CONFIGS) == 2
         assert ('nsa', 'first') in ALL_TARGET_CONFIGS
-        assert ('nsa', 'last') in ALL_TARGET_CONFIGS
         assert ('sa', 'first') in ALL_TARGET_CONFIGS
-        assert ('sa', 'last') in ALL_TARGET_CONFIGS
 
 
 class TestGetTargetPath:
@@ -128,29 +122,6 @@ class TestParseModelId:
         """Test that invalid target in model ID raises ValueError."""
         with pytest.raises(ValueError, match="Invalid target_type"):
             parse_model_id('invalid_first')
-
-
-class TestFeatureSelectionThresholds:
-    """Tests for feature selection thresholds."""
-
-    def test_max_features(self):
-        """Test that MAX_FEATURES is reasonable."""
-        assert MAX_FEATURES > 0
-        assert MAX_FEATURES <= 200
-
-    def test_vif_threshold(self):
-        """Test that VIF threshold is reasonable."""
-        assert VIF_THRESHOLD > 1.0  # VIF >= 1 always
-        assert VIF_THRESHOLD <= 20.0  # Common thresholds: 5-10
-
-    def test_correlation_threshold(self):
-        """Test that correlation threshold is reasonable."""
-        assert 0 < CORR_THRESHOLD <= 1.0
-        assert CORR_THRESHOLD >= 0.8  # Should be high
-
-    def test_min_target_correlation(self):
-        """Test that min target correlation is reasonable."""
-        assert 0 < MIN_TARGET_CORR <= 0.5
 
 
 class TestLightGBMParams:

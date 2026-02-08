@@ -132,6 +132,123 @@ def fetch_single_key(key: str, rate_limiter: RateLimiter) -> list:
         return []
 
 
+EMPLOYMENT_QUESTION = (
+    "Which of the following most accurately describes your employment environment? "
+    "(Check all that apply)"
+)
+
+
+def filter_unwanted_series(combined_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove unwanted employment-related series from prosper data.
+
+    Filters out:
+    - I am retired or disabled (last asked 3-2010)
+    - I am concerned with being laid off
+    - Someone in my family has been laid off
+    - I am disabled
+    - I am retired
+    """
+    unwanted_answers = [
+        'I am retired or disabled (last asked 3-2010)',
+        'I am concerned with being laid off',
+        'Someone in my family has been laid off',
+        'I am disabled',
+        'I am retired',
+    ]
+
+    # Filter out rows containing any of these answers in series_name
+    mask = pd.Series([True] * len(combined_df), index=combined_df.index)
+    for answer in unwanted_answers:
+        mask &= ~combined_df['series_name'].str.contains(answer, regex=False, na=False)
+
+    filtered_df = combined_df[mask].copy()
+
+    removed_count = len(combined_df) - len(filtered_df)
+    if removed_count > 0:
+        logger.info(f"Filtered out {removed_count} rows from unwanted series")
+
+    return filtered_df
+
+
+def merge_employment_series(combined_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge full-time + part-time employment as continuation of the legacy
+    'I am employed (last asked 9-2009)' series, then rename to 'I am employed'.
+
+    For each demographic group:
+    1. Rename legacy 'I am employed (last asked 9-2009)' → 'I am employed'
+    2. For dates after the legacy data ends, append rows with
+       value = full-time + part-time
+    3. Drop the part-time series entirely (avoid collinearity with full-time)
+    """
+    groups = ['US 18+', '18-34', 'Males', 'Females']
+    extension_rows = []
+
+    df = combined_df.copy()
+
+    for group in groups:
+        legacy_name = f"{EMPLOYMENT_QUESTION} | I am employed (last asked 9-2009) | {group}"
+        ft_name = f"{EMPLOYMENT_QUESTION} | I am employed full-time | {group}"
+        pt_name = f"{EMPLOYMENT_QUESTION} | I am employed part-time | {group}"
+        merged_name = f"{EMPLOYMENT_QUESTION} | I am employed | {group}"
+
+        legacy_data = df[df['series_name'] == legacy_name]
+        ft_data = df[df['series_name'] == ft_name]
+        pt_data = df[df['series_name'] == pt_name]
+
+        if legacy_data.empty:
+            logger.warning(f"No legacy 'I am employed' data for group={group}, skipping")
+            continue
+
+        legacy_code = legacy_data['series_code'].iloc[0]
+        legacy_last_date = legacy_data['date'].max()
+
+        # Rename legacy rows to the merged name
+        df.loc[df['series_name'] == legacy_name, 'series_name'] = merged_name
+
+        # Build extension: sum of full-time + part-time for dates after legacy ends
+        if not ft_data.empty and not pt_data.empty:
+            ft_agg = (ft_data.groupby('date')
+                      .agg(value=('value', 'last'), release_date=('release_date', 'last'))
+                      .reset_index())
+            pt_agg = (pt_data.groupby('date')
+                      .agg(value=('value', 'last'), release_date=('release_date', 'last'))
+                      .reset_index())
+
+            merged = ft_agg.merge(pt_agg, on='date', suffixes=('_ft', '_pt'))
+            merged['value'] = merged['value_ft'] + merged['value_pt']
+            merged['release_date'] = merged[['release_date_ft', 'release_date_pt']].max(axis=1)
+
+            ext = merged[merged['date'] > legacy_last_date]
+            if not ext.empty:
+                extension_rows.append(pd.DataFrame({
+                    'date': ext['date'].values,
+                    'release_date': ext['release_date'].values,
+                    'value': ext['value'].values,
+                    'series_name': merged_name,
+                    'series_code': legacy_code,
+                }))
+                logger.info(
+                    f"Merged employment for {group}: {len(legacy_data)} legacy rows + "
+                    f"{len(ext)} extension rows"
+                )
+        else:
+            logger.warning(f"Missing full-time or part-time data for group={group}")
+
+    # Drop all part-time rows
+    for group in groups:
+        pt_name = f"{EMPLOYMENT_QUESTION} | I am employed part-time | {group}"
+        df = df[df['series_name'] != pt_name]
+
+    # Append extension rows
+    if extension_rows:
+        df = pd.concat([df] + extension_rows, ignore_index=True)
+        df = df.sort_values('release_date').reset_index(drop=True)
+
+    return df
+
+
 def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers: int = 4):
     """
     Fetch Prosper survey data and create monthly snapshots.
@@ -222,6 +339,13 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
     # Combine all data
     combined_df = pd.concat(all_prosper_data, ignore_index=True)
     combined_df = combined_df.sort_values('release_date').reset_index(drop=True)
+
+    # Filter out unwanted series (retired, disabled, layoff concerns, etc.)
+    combined_df = filter_unwanted_series(combined_df)
+
+    # Merge employment series: legacy "I am employed (last asked 9-2009)" +
+    # (full-time + part-time) extension → "I am employed", drop part-time
+    combined_df = merge_employment_series(combined_df)
 
     # Now create monthly snapshots aligned with NFP release dates
     # Each snapshot contains ALL data with release_date < snapshot_date

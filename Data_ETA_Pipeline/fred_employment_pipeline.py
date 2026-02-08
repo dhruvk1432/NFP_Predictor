@@ -2063,8 +2063,8 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     - 4 multivariate files (leaf nodes, full matrix): y_nsa_first_release, y_nsa_last_release,
       y_sa_first_release, y_sa_last_release
 
-    When MODEL_TYPE = "multivariate": generates all 8 files
-    When MODEL_TYPE = "univariate": generates only 4 univariate files
+    When MODEL_TYPE = "multivariate": generates all 8 files (y_nsa/y_sa contain leaf nodes)
+    When MODEL_TYPE = "univariate": generates all 8 files (y_nsa/y_sa are copies of total)
     """
     _ensure_dir(NFP_target_DIR)
 
@@ -2127,8 +2127,15 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
             # "y_sa_last": NFP_target_DIR / "y_sa_last_release.parquet",  # DISABLED
         }
     else:
-        multivariate_targets = {}
-        multivariate_paths = {}
+        # In univariate mode, y_nsa/y_sa are identical to total targets
+        multivariate_targets = {
+            "y_nsa_first": total_nsa_first.copy(),
+            "y_sa_first": total_sa_first.copy(),
+        }
+        multivariate_paths = {
+            "y_nsa_first": NFP_target_DIR / "y_nsa_first_release.parquet",
+            "y_sa_first": NFP_target_DIR / "y_sa_first_release.parquet",
+        }
 
     # ========== PROCESS AND SAVE ALL FILES ==========
 
@@ -2140,13 +2147,13 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
         is_univariate=True
     )
 
-    # Process multivariate files (is_univariate=False, apply dropna)
+    # Process y_nsa/y_sa files (multivariate leaf nodes or univariate copies of total)
     if multivariate_targets:
-        logger.debug("Processing and saving MULTIVARIATE files...")
+        logger.debug("Processing and saving y_nsa/y_sa files...")
         _process_and_save_targets(
             multivariate_targets, multivariate_paths,
             window_start, window_end, end_date_setting, snapshot_date,
-            is_univariate=False
+            is_univariate=not is_multivariate
         )
 
     return {**univariate_paths, **multivariate_paths}

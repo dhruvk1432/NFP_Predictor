@@ -121,22 +121,17 @@ def fred_api_call_with_retry(fred_func, *args, max_retries: int = 3, base_delay:
     raise last_exception
 
 FRED_SERIES = {
-    #Daily Data - Financial Market Indicators
     "Credit_Spreads": "BAMLH0A0HYM2",
     "Yield_Curve": "T10Y2Y",
     "Oil_Prices": "DCOILWTICO",
-    "VIX": "VIXCLS",  # CBOE Volatility Index - Market fear gauge
-    "SP500": "SP500",  # S&P 500 Index - Market crashes & recoveries
-    # High-velocity economic indicators for extreme events
-    "Financial_Stress": "STLFSI4",  # St. Louis Fed Financial Stress Index (weekly)
-    "Weekly_Econ_Index": "WEI",  # Weekly Economic Index (real-time)
-    # NEW: Regional Fed Employment Indices (monthly)
-    "Empire_State_Emp": "USEPUINDX",  # Empire State Manufacturing Employment Index
-    # only data available before each NFP report is included in that month's features
+    "VIX": "VIXCLS",  
+    "SP500": "SP500", 
+    "Financial_Stress": "STLFSI4",  
+    "Weekly_Econ_Index": "WEI", 
     "ICNSA": "ICNSA", #Initial Claims Seasonally Adjusted
-    "ICSA": "ICNA",
+    "ICSA": "ICSA",
     "CCNSA": "CCNSA",  # Continued Claims Seasonally Adjusted (KEPT)
-    "CCSA": "CCN", 
+    "CCSA": "CCSA", 
 }
 
 # =============================================================================
@@ -1055,7 +1050,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
     DAILY_SERIES = ["Credit_Spreads", "Yield_Curve", "Oil_Prices", "VIX", "SP500"]
     # Dropped JOLTS_Openings and JOLTS_Hires due to multicollinearity
     # JOLTS_SERIES = ["JOLTS_Quits", "JOLTS_Layoffs"]
-    CLAIMS_SERIES = ["ICSA, ICNSA, CCNSA, CCSA"]
+    CLAIMS_SERIES = ["ICSA", "ICNSA", "CCNSA", "CCSA"]
 
     # PARALLELIZATION: Fetch all series concurrently with rate limiting
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

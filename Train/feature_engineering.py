@@ -18,11 +18,6 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from settings import TEMP_DIR, setup_logger
 from Train.config import (
     KEY_EMPLOYMENT_SERIES,
-    ALL_KEY_EMPLOYMENT_SERIES,
-    ALL_LAGS,
-    SHORT_TERM_LAGS,
-    MEDIUM_TERM_LAGS,
-    LONG_TERM_LAGS,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -183,15 +178,14 @@ def engineer_employment_features(
     """
     Engineer features from FRED employment snapshot data.
 
-    Separates NSA vs SA features based on target_type to avoid data leakage:
-    - When predicting NSA: Use SA series as features (different adjustment)
-    - When predicting SA: Use NSA series as features (raw data)
-    - Always include sector composition and momentum indicators
+    Uses ALL available series (both NSA and SA) from the FRED snapshot.
+    For each series, computes: latest, MoM, MoM%, 3m change, 6m change,
+    YoY change, 12m pct change, rolling 3m mean, and 6m volatility.
 
     Args:
         fred_df: FRED employment snapshot DataFrame
         target_month: Month being predicted
-        target_type: 'nsa' or 'sa' - determines which series to use as features
+        target_type: 'nsa' or 'sa' (kept for API compatibility, no longer filters series)
 
     Returns:
         Dictionary of engineered features
@@ -201,24 +195,16 @@ def engineer_employment_features(
 
     features = {}
 
-    # Determine which series to use based on target type
-    if target_type == 'nsa':
-        suffix = ''  # SA series don't have suffix
-        feature_prefix = 'emp_sa'
-    else:
-        suffix = '_nsa'
-        feature_prefix = 'emp_nsa'
-
     # Filter to data available before target_month (avoid look-ahead)
     available_df = fred_df[fred_df['date'] < target_month].copy()
 
     if available_df.empty:
         return features
 
-    # Get key employment series
-    for series_base in ALL_KEY_EMPLOYMENT_SERIES:
-        series_name = series_base + suffix if suffix else series_base
+    # Use ALL series from the FRED snapshot (both NSA and SA)
+    all_series = available_df['series_name'].unique()
 
+    for series_name in all_series:
         series_data = available_df[available_df['series_name'] == series_name].copy()
         series_data = series_data.sort_values('date')
 
@@ -226,46 +212,50 @@ def engineer_employment_features(
             continue
 
         # Clean series name for feature naming
-        clean_name = series_base.replace('.', '_').replace('total_', '')
+        clean_name = series_name.replace('.', '_').replace('total_', '')
+        prefix = f'emp_{clean_name}'
+
+        values = series_data['value']
+        n = len(values)
 
         # Latest value
-        if len(series_data) >= 1:
-            latest_value = series_data['value'].iloc[-1]
-            features[f'{feature_prefix}_{clean_name}_latest'] = latest_value
+        latest_value = values.iloc[-1]
+        features[f'{prefix}_latest'] = latest_value
 
-        # MoM change (lag 1)
-        if len(series_data) >= 2:
-            mom_change = series_data['value'].iloc[-1] - series_data['value'].iloc[-2]
-            features[f'{feature_prefix}_{clean_name}_mom'] = mom_change
+        # MoM change
+        if n >= 2:
+            mom_change = values.iloc[-1] - values.iloc[-2]
+            features[f'{prefix}_mom'] = mom_change
             # MoM percentage change
-            if series_data['value'].iloc[-2] != 0:
-                mom_pct = (mom_change / series_data['value'].iloc[-2]) * 100
-                features[f'{feature_prefix}_{clean_name}_mom_pct'] = mom_pct
+            if values.iloc[-2] != 0:
+                features[f'{prefix}_mom_pct'] = (mom_change / abs(values.iloc[-2])) * 100
 
         # 3-month change
-        if len(series_data) >= 4:
-            change_3m = series_data['value'].iloc[-1] - series_data['value'].iloc[-4]
-            features[f'{feature_prefix}_{clean_name}_3m_chg'] = change_3m
+        if n >= 4:
+            features[f'{prefix}_3m_chg'] = values.iloc[-1] - values.iloc[-4]
 
         # 6-month change
-        if len(series_data) >= 7:
-            change_6m = series_data['value'].iloc[-1] - series_data['value'].iloc[-7]
-            features[f'{feature_prefix}_{clean_name}_6m_chg'] = change_6m
+        if n >= 7:
+            features[f'{prefix}_6m_chg'] = values.iloc[-1] - values.iloc[-7]
 
         # YoY change
-        if len(series_data) >= 13:
-            yoy_change = series_data['value'].iloc[-1] - series_data['value'].iloc[-13]
-            features[f'{feature_prefix}_{clean_name}_yoy'] = yoy_change
+        if n >= 13:
+            features[f'{prefix}_yoy'] = values.iloc[-1] - values.iloc[-13]
+
+        # 12-month percent change
+        if n >= 13 and values.iloc[-13] != 0:
+            features[f'{prefix}_12m_pct'] = (
+                (values.iloc[-1] - values.iloc[-13]) / abs(values.iloc[-13])
+            ) * 100
 
         # Rolling mean (3-month smoothed)
-        if len(series_data) >= 3:
-            rolling_3m = series_data['value'].iloc[-3:].mean()
-            features[f'{feature_prefix}_{clean_name}_rolling_3m'] = rolling_3m
+        if n >= 3:
+            features[f'{prefix}_rolling_3m'] = values.iloc[-3:].mean()
 
         # Volatility (6-month std of changes)
-        if len(series_data) >= 7:
-            changes = series_data['value'].diff().iloc[-6:]
-            features[f'{feature_prefix}_{clean_name}_volatility'] = changes.std()
+        if n >= 7:
+            changes = values.diff().iloc[-6:]
+            features[f'{prefix}_volatility'] = changes.std()
 
     return features
 

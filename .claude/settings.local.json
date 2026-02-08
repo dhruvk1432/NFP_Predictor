@@ -30,7 +30,9 @@
       "Bash(conda info:*)",
       "Bash(pip3 list:*)",
       "Bash(pip3 show:*)",
-      "Bash(/opt/anaconda3/bin/python3:*)"
+      "Bash(/opt/anaconda3/bin/python3:*)",
+      "Bash(/opt/anaconda3/bin/python:*)",
+      "Bash(jupyter nbconvert:*)"
     ]
   }
 }

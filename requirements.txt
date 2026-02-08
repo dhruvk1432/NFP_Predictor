@@ -11,6 +11,7 @@ neuralforecast>=1.7
 xgboost>=2.0
 pytimetk>=0.1.5
 lightgbm >= 4.6
+shap >= 0.45
 
 # Plotting (optional, interactive)
 matplotlib>=3.8

@@ -120,6 +120,70 @@ def fred_api_call_with_retry(fred_func, *args, max_retries: int = 3, base_delay:
     logger.error(f"FRED API call failed after {max_retries} attempts")
     raise last_exception
 
+# Binary/regime indicator features - these are 0/1 flags that should NOT be differenced
+BINARY_REGIME_FEATURES = {
+    'VIX_panic_regime',
+    'VIX_high_regime',
+    'SP500_bear_market',
+    'SP500_crash_month',
+    'SP500_circuit_breaker',
+}
+
+# VIF-selected features (82 features, all VIF < 10)
+# Determined by within-group + cross-group VIF pruning on 2025-12 snapshot
+# See fred_exog_selection.ipynb for full analysis
+SELECTED_FEATURES = {
+    # --- Levels (18) ---
+    'CCNSA_weeks_high', 'CCSA_monthly_avg', 'CCSA_weeks_high',
+    'Credit_Spreads_accel_volatility', 'Credit_Spreads_acceleration', 'Credit_Spreads_avg',
+    'Oil_Prices_mean', 'Oil_Prices_volatility',
+    'SP500_consecutive_down_days', 'SP500_max_drawdown', 'SP500_monthly_return',
+    'VIX_max_5d_spike',
+    'Weekly_Econ_Index_monthly_min',
+    'Yield_Curve_acceleration', 'Yield_Curve_avg', 'Yield_Curve_monthly_chg', 'Yield_Curve_vol_of_changes',
+    # --- Binary regime flags (5) ---
+    'SP500_bear_market', 'SP500_circuit_breaker', 'SP500_crash_month',
+    'VIX_high_regime', 'VIX_panic_regime',
+    # --- MoM diffs (9) ---
+    'Credit_Spreads_avg_diff', 'Credit_Spreads_monthly_chg_diff',
+    'Oil_Prices_volatility_diff',
+    'SP500_best_day_diff',
+    'VIX_max_5d_spike_diff',
+    'Weekly_Econ_Index_monthly_max_diff',
+    'Yield_Curve_accel_volatility_diff',
+    # --- Diff z-score 12m (14) ---
+    'CCNSA_monthly_avg_diff_zscore_12m', 'CCSA_monthly_avg_diff_zscore_12m',
+    'Credit_Spreads_vol_of_changes_diff_zscore_12m',
+    'Financial_Stress_monthly_avg_diff_zscore_12m',
+    'Oil_Prices_mean_diff_zscore_12m', 'Oil_Prices_volatility_diff_zscore_12m',
+    'SP500_volatility_diff_zscore_12m',
+    'VIX_volatility_diff_zscore_12m',
+    'Weekly_Econ_Index_monthly_max_diff_zscore_12m', 'Weekly_Econ_Index_monthly_min_diff_zscore_12m',
+    'Yield_Curve_acceleration_diff_zscore_12m', 'Yield_Curve_avg_diff_zscore_12m',
+    'Yield_Curve_vol_of_changes_diff_zscore_12m',
+    # --- Diff z-score 3m (36) ---
+    'CCNSA_max_spike_diff_zscore_3m',
+    'CCSA_max_spike_diff_zscore_3m', 'CCSA_monthly_avg_diff_zscore_3m',
+    'Credit_Spreads_accel_volatility_diff_zscore_3m', 'Credit_Spreads_acceleration_diff_zscore_3m',
+    'Credit_Spreads_avg_diff_zscore_3m', 'Credit_Spreads_max_diff_zscore_3m',
+    'Credit_Spreads_monthly_chg_diff_zscore_3m',
+    'Financial_Stress_monthly_avg_diff_zscore_3m',
+    'Oil_Prices_30d_crash_diff_zscore_3m', 'Oil_Prices_mean_diff_zscore_3m',
+    'Oil_Prices_volatility_diff_zscore_3m', 'Oil_Prices_zscore_min_diff_zscore_3m',
+    'Oil_worst_day_pct_diff_zscore_3m',
+    'SP500_best_day_diff_zscore_3m', 'SP500_consecutive_down_days_diff_zscore_3m',
+    'SP500_max_5d_drop_diff_zscore_3m', 'SP500_max_drawdown_diff_zscore_3m',
+    'SP500_monthly_return_diff_zscore_3m', 'SP500_volatility_diff_zscore_3m',
+    'SP500_worst_day_diff_zscore_3m',
+    'VIX_30d_spike_diff_zscore_3m', 'VIX_max_5d_spike_diff_zscore_3m',
+    'VIX_max_diff_zscore_3m', 'VIX_mean_diff_zscore_3m',
+    'Weekly_Econ_Index_monthly_avg_diff_zscore_3m', 'Weekly_Econ_Index_monthly_max_diff_zscore_3m',
+    'Weekly_Econ_Index_monthly_min_diff_zscore_3m',
+    'Yield_Curve_accel_volatility_diff_zscore_3m', 'Yield_Curve_acceleration_diff_zscore_3m',
+    'Yield_Curve_avg_diff_zscore_3m', 'Yield_Curve_monthly_chg_diff_zscore_3m',
+    'Yield_Curve_zscore_max_diff_zscore_3m',
+}
+
 FRED_SERIES = {
     "Credit_Spreads": "BAMLH0A0HYM2",
     "Yield_Curve": "T10Y2Y",
@@ -128,9 +192,7 @@ FRED_SERIES = {
     "SP500": "SP500", 
     "Financial_Stress": "STLFSI4",  
     "Weekly_Econ_Index": "WEI", 
-    "ICNSA": "ICNSA", #Initial Claims Seasonally Adjusted
-    "ICSA": "ICSA",
-    "CCNSA": "CCNSA",  # Continued Claims Seasonally Adjusted (KEPT)
+    "CCNSA": "CCNSA",  
     "CCSA": "CCSA", 
 }
 
@@ -531,6 +593,72 @@ def calculate_weekly_spike_stats(weekly_df, nfp_schedule):
     return spike_stats
 
 
+def compute_mom_differences_and_zscores(df):
+    """
+    Keep original level values AND add MoM differences with z-scores.
+
+    For each series:
+    - Binary regime features (BINARY_REGIME_FEATURES): keep level only
+    - All other features: keep level + add _diff, _diff_zscore_12m, _diff_zscore_3m
+
+    Args:
+        df: DataFrame in long format with columns [date, series_name, value, release_date, series_code, snapshot_date]
+
+    Returns:
+        DataFrame in long format with levels, MoM differences, and z-scores
+    """
+    series_list = df['series_name'].unique()
+    result_list = []
+    base_cols = ['date', 'release_date', 'series_code', 'snapshot_date']
+
+    for series in series_list:
+        series_df = df[df['series_name'] == series].copy()
+        series_df = series_df.sort_values('date')
+
+        # Always keep the original level value
+        level_df = series_df[base_cols + ['value']].copy()
+        level_df['series_name'] = series
+        result_list.append(level_df)
+
+        # Skip MoM differencing for binary regime indicators
+        if series in BINARY_REGIME_FEATURES:
+            continue
+
+        # Compute MoM difference
+        series_df['value_diff'] = series_df['value'].diff()
+
+        # Compute z-scores on differences (12-month)
+        rolling_mean_12m = series_df['value_diff'].rolling(window=12, min_periods=6).mean()
+        rolling_std_12m = series_df['value_diff'].rolling(window=12, min_periods=6).std()
+        series_df['zscore_12m'] = (series_df['value_diff'] - rolling_mean_12m) / rolling_std_12m
+
+        # Compute z-scores on differences (3-month)
+        rolling_mean_3m = series_df['value_diff'].rolling(window=3, min_periods=2).mean()
+        rolling_std_3m = series_df['value_diff'].rolling(window=3, min_periods=2).std()
+        series_df['zscore_3m'] = (series_df['value_diff'] - rolling_mean_3m) / rolling_std_3m
+
+        diff_df = series_df[base_cols].copy()
+        diff_df['series_name'] = f"{series}_diff"
+        diff_df['value'] = series_df['value_diff'].values
+
+        zscore_12m_df = series_df[base_cols].copy()
+        zscore_12m_df['series_name'] = f"{series}_diff_zscore_12m"
+        zscore_12m_df['value'] = series_df['zscore_12m'].values
+
+        zscore_3m_df = series_df[base_cols].copy()
+        zscore_3m_df['series_name'] = f"{series}_diff_zscore_3m"
+        zscore_3m_df['value'] = series_df['zscore_3m'].values
+
+        result_list.extend([diff_df, zscore_12m_df, zscore_3m_df])
+
+    result = pd.concat(result_list, ignore_index=True)
+
+    # Drop rows with NaN values (from differencing and z-score calculation)
+    result = result.dropna(subset=['value'])
+
+    return result
+
+
 # =============================================================================
 # OPTIMIZATION: Pre-compute daily features for VIX, SP500, and other daily series
 # These functions compute all rolling/derived features on the full history ONCE,
@@ -552,10 +680,6 @@ def compute_vix_daily_features(df):
     # Daily change
     sub_df['daily_chg'] = sub_df['value'].diff()
 
-    # Rolling 52-week high/low for regime detection
-    sub_df['rolling_52w_high'] = sub_df['value'].rolling(window=252, min_periods=20).max()
-    sub_df['rolling_52w_low'] = sub_df['value'].rolling(window=252, min_periods=20).min()
-
     # 30-day spike detection
     sub_df['vix_30d_ago'] = sub_df['value'].shift(21)
     sub_df['vix_spike_ratio'] = sub_df['value'] / sub_df['vix_30d_ago']
@@ -563,16 +687,6 @@ def compute_vix_daily_features(df):
     # 5-day spike detection (rapid panic)
     sub_df['vix_5d_ago'] = sub_df['value'].shift(5)
     sub_df['vix_spike_5d'] = sub_df['value'] / sub_df['vix_5d_ago']
-
-    # 12-month z-scores
-    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
-    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
-    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
-
-    # 3-month z-scores
-    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
-    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
-    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
 
     return sub_df
 
@@ -588,13 +702,10 @@ def aggregate_vix_to_monthly(daily_df):
         DataFrame in long format with monthly aggregated features
     """
     monthly_agg = daily_df.resample('MS').agg({
-        'value': ['mean', 'max', lambda x: x.quantile(0.99)],
+        'value': ['mean', 'max'],
         'daily_chg': 'std',
         'vix_spike_ratio': 'max',
         'vix_spike_5d': 'max',
-        'rolling_52w_high': 'last',
-        'z_score_12m': ['mean', 'max', 'min'],
-        'z_score_3m': ['mean', 'max', 'min']
     })
 
     # Flatten MultiIndex columns
@@ -604,15 +715,8 @@ def aggregate_vix_to_monthly(daily_df):
     temp_df['VIX_mean'] = monthly_agg.get('value_mean', np.nan)
     temp_df['VIX_max'] = monthly_agg.get('value_max', np.nan)
     temp_df['VIX_volatility'] = monthly_agg.get('daily_chg_std', np.nan)
-    temp_df['VIX_p99'] = monthly_agg.get('value_<lambda_0>', np.nan)
     temp_df['VIX_30d_spike'] = monthly_agg.get('vix_spike_ratio_max', np.nan)
     temp_df['VIX_max_5d_spike'] = monthly_agg.get('vix_spike_5d_max', np.nan)
-    temp_df['VIX_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
-    temp_df['VIX_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
-    temp_df['VIX_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
-    temp_df['VIX_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
-    temp_df['VIX_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
-    temp_df['VIX_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
     temp_df['VIX_panic_regime'] = (temp_df['VIX_max'] > 50).astype(int)
     temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 40).astype(int)
 
@@ -664,16 +768,6 @@ def compute_sp500_daily_features(df):
     # Circuit breaker days (>5% drop)
     sub_df['circuit_breaker_day'] = (sub_df['daily_return'] < -0.05).astype(int)
 
-    # 12-month z-scores
-    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
-    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
-    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
-
-    # 3-month z-scores
-    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
-    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
-    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
-
     return sub_df
 
 
@@ -696,8 +790,6 @@ def aggregate_sp500_to_monthly(daily_df):
         'daily_return': ['std', 'min', 'max'],
         'consecutive_down': 'max',
         'circuit_breaker_day': 'sum',
-        'z_score_12m': ['mean', 'max', 'min'],
-        'z_score_3m': ['mean', 'max', 'min']
     })
 
     # Flatten MultiIndex columns
@@ -721,12 +813,6 @@ def aggregate_sp500_to_monthly(daily_df):
     temp_df['SP500_best_day'] = monthly_agg.get('daily_return_max', np.nan) * 100 if monthly_agg.get('daily_return_max') is not None else np.nan
     temp_df['SP500_consecutive_down_days'] = monthly_agg.get('consecutive_down_max', np.nan)
     temp_df['SP500_days_circuit_breaker'] = monthly_agg.get('circuit_breaker_day_sum', np.nan)
-    temp_df['SP500_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
-    temp_df['SP500_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
-    temp_df['SP500_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
-    temp_df['SP500_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
-    temp_df['SP500_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
-    temp_df['SP500_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
 
     # Regime indicators
     temp_df['SP500_bear_market'] = (temp_df['SP500_max_drawdown'] < -20).astype(int)
@@ -767,16 +853,6 @@ def compute_credit_yield_daily_features(df, name):
     # Acceleration
     sub_df['acceleration'] = sub_df['daily_chg'].diff()
 
-    # 12-month z-scores
-    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
-    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
-    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
-
-    # 3-month z-scores
-    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
-    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
-    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
-
     sub_df['series_name'] = name  # Store for later reference
 
     return sub_df
@@ -791,8 +867,6 @@ def aggregate_credit_yield_to_monthly(daily_df, name):
         'daily_chg': ['std', 'sum'],
         'z_score': 'max',
         'acceleration': ['mean', 'std'],
-        'z_score_12m': ['mean', 'max', 'min'],
-        'z_score_3m': ['mean', 'max', 'min']
     })
 
     monthly_agg = flatten_multiindex_columns(monthly_agg)
@@ -805,12 +879,6 @@ def aggregate_credit_yield_to_monthly(daily_df, name):
     temp_df[f'{name}_zscore_max'] = monthly_agg.get('z_score_max', np.nan)
     temp_df[f'{name}_acceleration'] = monthly_agg.get('acceleration_mean', np.nan)
     temp_df[f'{name}_accel_volatility'] = monthly_agg.get('acceleration_std', np.nan)
-    temp_df[f'{name}_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
-    temp_df[f'{name}_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
-    temp_df[f'{name}_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
-    temp_df[f'{name}_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
-    temp_df[f'{name}_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
-    temp_df[f'{name}_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
 
     result = temp_df.reset_index().melt(
         id_vars=['date'],
@@ -834,9 +902,6 @@ def compute_oil_daily_features(df):
     sub_df['value_30d_ago'] = sub_df['value'].shift(21)
     sub_df['crash_30d_pct'] = ((sub_df['value'] - sub_df['value_30d_ago']) / sub_df['value_30d_ago'].abs()) * 100
 
-    # Negative price indicator
-    sub_df['is_negative'] = (sub_df['value'] < 0).astype(int)
-
     # Daily percentage change
     sub_df['daily_pct'] = sub_df['value'].pct_change() * 100
 
@@ -844,16 +909,6 @@ def compute_oil_daily_features(df):
     sub_df['expanding_mean'] = sub_df['value'].expanding(min_periods=30).mean()
     sub_df['expanding_std'] = sub_df['value'].expanding(min_periods=30).std()
     sub_df['z_score'] = (sub_df['value'] - sub_df['expanding_mean']) / sub_df['expanding_std']
-
-    # 12-month z-scores
-    sub_df['rolling_12m_mean'] = sub_df['value'].rolling(window=252, min_periods=60).mean()
-    sub_df['rolling_12m_std'] = sub_df['value'].rolling(window=252, min_periods=60).std()
-    sub_df['z_score_12m'] = (sub_df['value'] - sub_df['rolling_12m_mean']) / sub_df['rolling_12m_std']
-
-    # 3-month z-scores
-    sub_df['rolling_3m_mean'] = sub_df['value'].rolling(window=63, min_periods=20).mean()
-    sub_df['rolling_3m_std'] = sub_df['value'].rolling(window=63, min_periods=20).std()
-    sub_df['z_score_3m'] = (sub_df['value'] - sub_df['rolling_3m_mean']) / sub_df['rolling_3m_std']
 
     return sub_df
 
@@ -863,14 +918,11 @@ def aggregate_oil_to_monthly(daily_df):
     Aggregate pre-computed Oil daily features to monthly.
     """
     monthly_agg = daily_df.resample('MS').agg({
-        'value': 'mean',
-        'daily_chg': 'std',
-        'crash_30d_pct': 'min',
-        'daily_pct': 'min',
-        'is_negative': ['max', 'sum'],
-        'z_score': 'min',
-        'z_score_12m': ['mean', 'max', 'min'],
-        'z_score_3m': ['mean', 'max', 'min']
+        'value': ['mean'],
+        'daily_chg': ['std'],
+        'crash_30d_pct': ['min'],
+        'daily_pct': ['min'],
+        'z_score': ['min'],
     })
 
     monthly_agg = flatten_multiindex_columns(monthly_agg)
@@ -879,16 +931,8 @@ def aggregate_oil_to_monthly(daily_df):
     temp_df['Oil_Prices_mean'] = monthly_agg.get('value_mean', np.nan)
     temp_df['Oil_Prices_volatility'] = monthly_agg.get('daily_chg_std', np.nan)
     temp_df['Oil_Prices_30d_crash'] = monthly_agg.get('crash_30d_pct_min', np.nan)
-    temp_df['Oil_Prices_went_negative'] = monthly_agg.get('is_negative_max', np.nan)
     temp_df['Oil_Prices_zscore_min'] = monthly_agg.get('z_score_min', np.nan)
     temp_df['Oil_worst_day_pct'] = monthly_agg.get('daily_pct_min', np.nan)
-    temp_df['Oil_days_negative'] = monthly_agg.get('is_negative_sum', np.nan)
-    temp_df['Oil_Prices_zscore_12m_mean'] = monthly_agg.get('z_score_12m_mean', np.nan)
-    temp_df['Oil_Prices_zscore_12m_max'] = monthly_agg.get('z_score_12m_max', np.nan)
-    temp_df['Oil_Prices_zscore_12m_min'] = monthly_agg.get('z_score_12m_min', np.nan)
-    temp_df['Oil_Prices_zscore_3m_mean'] = monthly_agg.get('z_score_3m_mean', np.nan)
-    temp_df['Oil_Prices_zscore_3m_max'] = monthly_agg.get('z_score_3m_max', np.nan)
-    temp_df['Oil_Prices_zscore_3m_min'] = monthly_agg.get('z_score_3m_min', np.nan)
 
     result = temp_df.reset_index().melt(
         id_vars=['date'],
@@ -946,7 +990,7 @@ def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, c
             df['realtime_start'] = df['date'] + pd.Timedelta(days=1)
 
         # ------------------------------------------------------------------
-        # 2) WEEKLY CLAIMS SERIES (ICSA, CCSA)
+        # 2) WEEKLY CLAIMS SERIES (CCSA)
         #    -> USE VINTAGES BUT WITH SHORT LAG (~1 WEEK) FOR MISSING GAPS
         #    -> CLEAN RELEASE DATES: Impute to next Thursday if missing/late (>14 days)
         # ------------------------------------------------------------------
@@ -1050,7 +1094,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
     DAILY_SERIES = ["Credit_Spreads", "Yield_Curve", "Oil_Prices", "VIX", "SP500"]
     # Dropped JOLTS_Openings and JOLTS_Hires due to multicollinearity
     # JOLTS_SERIES = ["JOLTS_Quits", "JOLTS_Layoffs"]
-    CLAIMS_SERIES = ["ICSA", "ICNSA", "CCNSA", "CCSA"]
+    CLAIMS_SERIES = ["CCNSA", "CCSA"]
 
     # PARALLELIZATION: Fetch all series concurrently with rate limiting
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1199,7 +1243,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
                 else:
                     continue
 
-            elif name in ["ICSA", "ICNSA", "CCNSA", "CCSA", "Financial_Stress", "Weekly_Econ_Index"]:
+            elif name in ["CCNSA", "CCSA", "Financial_Stress", "Weekly_Econ_Index"]:
                 # NFP-BASED AGGREGATION: Bucket weekly data by NFP release windows
                 # This ensures we only use data that would have been available before each NFP
 
@@ -1213,7 +1257,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
                     continue
 
                 # For claims data, calculate spike statistics
-                if name in ["ICSA", "CCSA", "ICNSA", "CCNSA"]:
+                if name in ["CCSA", "CCNSA"]:
                     # NEW: Calculate spike statistics per target month
                     monthly_spike_stats = calculate_weekly_spike_stats(weekly_data, nfp_schedule)
 
@@ -1289,6 +1333,12 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
         if snap_data_list:
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['date'] = full_snap['date'].dt.to_period('M').dt.to_timestamp()
+
+            # Apply MoM differencing and z-score calculation
+            full_snap = compute_mom_differences_and_zscores(full_snap)
+
+            # Filter to VIF-selected features only (82 features)
+            full_snap = full_snap[full_snap['series_name'].isin(SELECTED_FEATURES)]
 
             # CRITICAL: Filter out data not yet released at snapshot time
             # This prevents lookahead bias from including monthly aggregates

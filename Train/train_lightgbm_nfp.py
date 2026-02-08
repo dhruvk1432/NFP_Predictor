@@ -11,6 +11,7 @@ Key Features:
 - Survey interval features (4 vs 5 weeks logic)
 - Momentum/divergence and acceleration features
 - Cyclical month encoding (sin/cos)
+- SHAP-based feature importance analysis
 
 FIRST RELEASE MODELS ONLY:
 This model supports 2 target configurations (first release only):
@@ -44,10 +45,6 @@ from Train.backtest_results import generate_backtest_report
 
 # Import from modular components
 from Train.config import (
-    MAX_FEATURES,
-    VIF_THRESHOLD,
-    CORR_THRESHOLD,
-    MIN_TARGET_CORR,
     LINEAR_BASELINE_PREDICTORS,
     PROTECTED_BINARY_FLAGS,
     MODEL_SAVE_DIR,
@@ -56,14 +53,8 @@ from Train.config import (
     VALID_RELEASE_TYPES,
     get_model_id,
     get_target_path,
-    # New config for simplified feature selection and Huber loss
     USE_HUBER_LOSS_DEFAULT,
     HUBER_DELTA,
-    FEATURE_RECENCY_MONTHS,
-    MAX_NAN_RATIO,
-    WINSORIZE_FEATURES,
-    WINSORIZE_LOWER_PERCENTILE,
-    WINSORIZE_UPPER_PERCENTILE,
 )
 
 from Train.data_loader import (
@@ -93,25 +84,52 @@ logger = setup_logger(__file__, TEMP_DIR)
 
 try:
     import lightgbm as lgb
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.feature_selection import mutual_info_regression
     LIGHTGBM_AVAILABLE = True
 except ImportError:
-    logger.warning("LightGBM/sklearn not available. Install with: pip install lightgbm scikit-learn")
+    logger.warning("LightGBM not available. Install with: pip install lightgbm")
     LIGHTGBM_AVAILABLE = False
 
 try:
-    from statsmodels.stats.outliers_influence import variance_inflation_factor
-    VIF_AVAILABLE = True
+    import shap
+    SHAP_AVAILABLE = True
 except ImportError:
-    VIF_AVAILABLE = False
+    logger.warning("SHAP not available. Install with: pip install shap")
+    SHAP_AVAILABLE = False
 
 
-# NOTE: All core functionality is imported from modular components above.
-# Configuration constants from Train/config.py
-# Data loading functions from Train/data_loader.py
-# Feature engineering functions from Train/feature_engineering.py
-# Model training functions from Train/model.py
+def clean_features(X: pd.DataFrame, y: pd.Series, max_nan_ratio: float = 0.5) -> List[str]:
+    """
+    Basic feature cleaning: drop high-NaN and zero-variance columns.
+
+    NaN ratio is computed per-column based on its own non-NaN count,
+    so features that start later (e.g. ADP from 2010) are not penalized.
+
+    Args:
+        X: Feature DataFrame
+        y: Target series (unused, kept for API consistency)
+        max_nan_ratio: Maximum fraction of NaN values allowed per column
+
+    Returns:
+        List of cleaned feature column names
+    """
+    X_work = X.select_dtypes(include=[np.number]).copy()
+    X_work = X_work.drop(columns=['ds'], errors='ignore')
+    X_work = X_work.replace([np.inf, -np.inf], np.nan)
+
+    # Per-column NaN check
+    nan_pct = X_work.isna().mean()
+    high_nan_cols = nan_pct[nan_pct > max_nan_ratio].index.tolist()
+    X_work = X_work.drop(columns=high_nan_cols)
+
+    # Remove zero-variance columns
+    col_means = X_work.mean()
+    X_filled = X_work.fillna(col_means).fillna(0)
+    zero_var = X_filled.var()[X_filled.var() == 0].index.tolist()
+    X_work = X_work.drop(columns=zero_var)
+
+    logger.info(f"Feature cleaning: dropped {len(high_nan_cols)} high-NaN, {len(zero_var)} zero-variance, {len(X_work.columns)} remaining")
+
+    return list(X_work.columns)
 
 
 def build_training_dataset(
@@ -127,11 +145,6 @@ def build_training_dataset(
 
     Uses snapshot of month M to predict month M's MoM change.
     Includes lagged target features from BOTH NSA and SA data.
-
-    OPTIMIZED:
-    - Uses cached data loading to avoid redundant I/O
-    - Batch processes features where possible
-    - Progress logging every 12 months
 
     Args:
         target_df: Target DataFrame with y_mom column (the prediction target)
@@ -368,11 +381,6 @@ def impute_with_expanding_window(
     """
     Impute missing values using only data from the training window (no future leakage).
 
-    OPTIMIZED:
-    - Returns computed means for caching
-    - Accepts cached means to avoid redundant computation
-    - In-place fillna where possible
-
     Args:
         X: Full feature DataFrame
         train_idx: Indices of training data (expanding window)
@@ -397,272 +405,10 @@ def impute_with_expanding_window(
     return X_imputed, train_means
 
 
-def winsorize_features(
-    X: pd.DataFrame,
-    lower_pct: float = WINSORIZE_LOWER_PERCENTILE,
-    upper_pct: float = WINSORIZE_UPPER_PERCENTILE,
-    train_idx: Optional[np.ndarray] = None
-) -> Tuple[pd.DataFrame, Dict[str, Tuple[float, float]]]:
-    """
-    Winsorize features to reduce impact of COVID-like outliers.
-
-    Clips extreme values to specified percentiles, computed from training data only
-    to avoid look-ahead bias.
-
-    Args:
-        X: Feature DataFrame
-        lower_pct: Lower percentile for clipping (e.g., 1.0 = 1st percentile)
-        upper_pct: Upper percentile for clipping (e.g., 99.0 = 99th percentile)
-        train_idx: Indices to use for computing percentiles (to avoid leakage)
-
-    Returns:
-        Tuple of (winsorized DataFrame, dict of clip bounds per column)
-    """
-    if not WINSORIZE_FEATURES:
-        return X, {}
-
-    X_winsorized = X.copy()
-    numeric_cols = X_winsorized.select_dtypes(include=[np.number]).columns
-    numeric_cols = [c for c in numeric_cols if c != 'ds']
-
-    clip_bounds = {}
-
-    # Use training data only for computing percentiles
-    if train_idx is not None:
-        X_train = X_winsorized.iloc[train_idx]
-    else:
-        X_train = X_winsorized
-
-    for col in numeric_cols:
-        col_data = X_train[col].dropna()
-        if len(col_data) < 10:
-            continue
-
-        lower_bound = np.percentile(col_data, lower_pct)
-        upper_bound = np.percentile(col_data, upper_pct)
-
-        # Only clip if bounds are different (avoid constant columns)
-        if lower_bound < upper_bound:
-            X_winsorized[col] = X_winsorized[col].clip(lower=lower_bound, upper=upper_bound)
-            clip_bounds[col] = (lower_bound, upper_bound)
-
-    n_clipped = len(clip_bounds)
-    if n_clipped > 0:
-        logger.info(f"Winsorized {n_clipped} features to [{lower_pct}, {upper_pct}] percentiles")
-
-    return X_winsorized, clip_bounds
-
-
-def check_feature_recency(
-    X: pd.DataFrame,
-    dates: pd.Series,
-    recency_months: int = FEATURE_RECENCY_MONTHS
-) -> List[str]:
-    """
-    Check which features have data in the last N months.
-
-    Args:
-        X: Feature DataFrame
-        dates: Series of dates corresponding to X rows
-        recency_months: Require non-NaN data within this many months
-
-    Returns:
-        List of feature names that have recent data
-    """
-    if dates is None or len(dates) == 0:
-        return list(X.columns)
-
-    max_date = dates.max()
-    cutoff_date = max_date - pd.DateOffset(months=recency_months)
-    recent_mask = dates >= cutoff_date
-
-    if not recent_mask.any():
-        logger.warning(f"No data found in last {recency_months} months")
-        return list(X.columns)
-
-    X_recent = X.loc[recent_mask]
-    numeric_cols = X_recent.select_dtypes(include=[np.number]).columns
-    numeric_cols = [c for c in numeric_cols if c != 'ds']
-
-    # Features with at least one non-NaN value in recent period
-    recent_features = []
-    for col in numeric_cols:
-        if X_recent[col].notna().any():
-            recent_features.append(col)
-
-    n_removed = len(numeric_cols) - len(recent_features)
-    if n_removed > 0:
-        logger.info(f"Removed {n_removed} features without data in last {recency_months} months")
-
-    return recent_features
-
-
-def select_features_simplified(
-    X: pd.DataFrame,
-    y: pd.Series,
-    dates: Optional[pd.Series] = None,
-    max_features: int = MAX_FEATURES,
-    output_dir: Optional[Path] = None,
-    target_type: str = 'nsa'
-) -> Tuple[List[str], Dict]:
-    """
-    Simplified feature selection pipeline optimized for gradient boosting.
-
-    Steps:
-    1. Remove high-NaN columns (>50% missing)
-    2. Remove zero-variance columns
-    3. Filter by recency (must have data in last 12 months)
-    4. Apply winsorization to reduce outlier impact
-    5. VIF filtering to remove multicollinearity
-    6. Select top features by LightGBM importance (no multi-metric ranking)
-
-    This simplified approach works well for gradient boosting because:
-    - Tree models naturally handle irrelevant features
-    - VIF handles multicollinearity better than correlation filtering
-    - Recency ensures features are relevant to current predictions
-    - Winsorization reduces outlier dominance in feature data
-
-    Args:
-        X: Full feature DataFrame
-        y: Target series
-        dates: Date series for recency filtering
-        max_features: Maximum features to select
-        output_dir: Directory to save selection results
-        target_type: 'nsa' or 'sa' for labeling outputs
-
-    Returns:
-        Tuple of (selected feature list, selection metadata dict)
-    """
-    logger.info("=" * 60)
-    logger.info("SIMPLIFIED FEATURE SELECTION PIPELINE")
-    logger.info("=" * 60)
-    logger.info(f"Starting with {len(X.columns)} features, target: {max_features}")
-
-    # Identify protected binary flags
-    protected_set = set(PROTECTED_BINARY_FLAGS)
-    protected_features_present = [f for f in X.columns if f in protected_set]
-
-    if protected_features_present:
-        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal")
-
-    metadata = {
-        'initial_features': len(X.columns),
-        'target_features': max_features,
-        'protected_features': protected_features_present,
-        'steps': []
-    }
-
-    # Step 1: Basic cleaning
-    X_work = X.select_dtypes(include=[np.number]).copy()
-    X_work = X_work.drop(columns=['ds'], errors='ignore')
-    X_work = X_work.replace([np.inf, -np.inf], np.nan)
-
-    # Remove high-NaN columns
-    nan_pct = X_work.isna().mean()
-    high_nan_cols = nan_pct[nan_pct > MAX_NAN_RATIO].index.tolist()
-    high_nan_cols = [c for c in high_nan_cols if c not in protected_set]
-    X_work = X_work.drop(columns=high_nan_cols)
-
-    logger.info(f"Step 1: Removed {len(high_nan_cols)} high-NaN columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'high_nan_removal', 'removed': len(high_nan_cols), 'remaining': len(X_work.columns)})
-
-    # Step 2: Remove zero variance
-    col_means = X_work.mean()
-    X_work = X_work.fillna(col_means).fillna(0)
-
-    variances = X_work.var()
-    zero_var = variances[variances == 0].index.tolist()
-    zero_var = [c for c in zero_var if c not in protected_set]
-    X_work = X_work.drop(columns=zero_var)
-
-    logger.info(f"Step 2: Removed {len(zero_var)} zero-variance columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'zero_variance_removal', 'removed': len(zero_var), 'remaining': len(X_work.columns)})
-
-    # Step 3: Recency filter
-    if dates is not None:
-        recent_features = check_feature_recency(X_work, dates, FEATURE_RECENCY_MONTHS)
-        non_recent = [c for c in X_work.columns if c not in recent_features and c not in protected_set]
-        X_work = X_work.drop(columns=non_recent)
-
-        # Re-add protected features
-        for f in protected_features_present:
-            if f not in X_work.columns and f in X.columns:
-                X_work[f] = X[f]
-
-        logger.info(f"Step 3: Removed {len(non_recent)} stale features, {len(X_work.columns)} remaining")
-        metadata['steps'].append({'step': 'recency_filter', 'removed': len(non_recent), 'remaining': len(X_work.columns)})
-    else:
-        logger.info("Step 3: Skipping recency filter (no dates provided)")
-
-    # Step 4: Winsorization (compute bounds from full data for selection phase)
-    X_work, clip_bounds = winsorize_features(X_work)
-    metadata['winsorize_bounds'] = clip_bounds
-
-    # Step 5: VIF filtering
-    if VIF_AVAILABLE and len(X_work.columns) > 10:
-        logger.info("\nStep 5: VIF Filtering")
-        X_work, vif_removed = remove_high_vif_features(X_work, vif_threshold=VIF_THRESHOLD, max_iterations=30)
-
-        # Add back protected features if removed
-        for f in protected_features_present:
-            if f in vif_removed and f in X.columns:
-                X_work[f] = X[f]
-
-        if vif_removed:
-            logger.info(f"Removed {len(vif_removed)} high-VIF features, {len(X_work.columns)} remaining")
-            metadata['steps'].append({'step': 'vif_removal', 'removed': len(vif_removed), 'remaining': len(X_work.columns)})
-    else:
-        logger.info("Step 5: Skipping VIF (not available or too few features)")
-
-    # Step 6: LightGBM importance ranking (simplified - single metric)
-    logger.info("\nStep 6: Computing LightGBM Feature Importance")
-    lgbm_importance = compute_feature_importance_lgbm(X_work, y)
-
-    # Select top features by LightGBM importance
-    selected_features = lgbm_importance['feature'].head(max_features).tolist()
-
-    # Ensure all protected features are included
-    for f in protected_features_present:
-        if f not in selected_features and f in X_work.columns:
-            selected_features.append(f)
-            logger.info(f"Force-included protected feature: {f}")
-
-    logger.info(f"\nSelected {len(selected_features)} features by LightGBM importance")
-
-    # Finalize metadata
-    metadata['final_features'] = len(selected_features)
-    metadata['selected_features'] = selected_features
-
-    # Log top 20 features
-    logger.info("\n" + "=" * 40)
-    logger.info("TOP 20 SELECTED FEATURES:")
-    logger.info("=" * 40)
-    for i, row in lgbm_importance.head(20).iterrows():
-        logger.info(f"  {i+1:2d}. {row['feature']} (gain: {row['importance_gain']:.1f})")
-
-    # Save results
-    if output_dir:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        lgbm_importance.to_csv(output_dir / f"feature_ranking_{target_type}.csv", index=False)
-        lgbm_importance[lgbm_importance['feature'].isin(selected_features)].to_csv(
-            output_dir / f"selected_features_{target_type}.csv", index=False)
-
-        with open(output_dir / f"feature_selection_metadata_{target_type}.pkl", 'wb') as f:
-            pickle.dump(metadata, f)
-
-        logger.info(f"\nSaved feature selection results to {output_dir}")
-
-    return selected_features, metadata
-
-
 def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    use_feature_selection: bool = True,
-    feature_selection_interval: int = 6,  # Re-run feature selection every N months
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA
 ) -> pd.DataFrame:
@@ -670,23 +416,17 @@ def run_expanding_window_backtest(
     Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
 
     Critical Design Principles:
-    1. Feature selection is re-run inside the loop using only past data
-    2. NaN imputation uses only expanding window means (no future data)
-    3. Model is FULLY retrained from scratch at each step using only data available at that time
-    4. No information from future time periods leaks into predictions
-
-    OPTIMIZATIONS:
-    - Caches imputation means to avoid redundant computation
-    - Pre-computes valid train mask outside inner loop
-    - Reuses LightGBM Dataset where possible
-    - Reduced logging overhead
+    1. NaN imputation uses only expanding window means (no future data)
+    2. Model is FULLY retrained from scratch at each step
+    3. No information from future time periods leaks into predictions
+    4. No feature selection gates - all cleaned features are used
 
     Args:
         target_df: Target DataFrame with 'ds' and 'y_mom' columns
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        use_feature_selection: Whether to run feature selection
-        feature_selection_interval: How often to re-run feature selection (months)
+        use_huber_loss: Whether to use Huber loss
+        huber_delta: Huber delta parameter
 
     Returns:
         DataFrame with backtest results
@@ -696,7 +436,6 @@ def run_expanding_window_backtest(
     logger.info("=" * 60)
     logger.info(f"EXPANDING WINDOW BACKTEST [{model_id.upper()}] (No Time-Travel)")
     logger.info("=" * 60)
-    logger.info(f"Feature selection re-runs every {feature_selection_interval} months")
 
     # Determine backtest period
     backtest_start_idx = len(target_df) - BACKTEST_MONTHS
@@ -723,14 +462,16 @@ def run_expanding_window_backtest(
     results = []
     all_residuals = []
 
-    # Cache for feature selection and imputation
-    cached_features = None
+    # Cache for imputation
     cached_impute_means = None
-    last_feature_selection_idx = -feature_selection_interval  # Force first selection
-    last_train_idx_len = 0  # Track if training set changed significantly
+    last_train_idx_len = 0
 
     # Get LightGBM params once
     params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
+
+    # Run clean_features once on early data to get initial feature set
+    # (will be refined at each step)
+    cleaned_features = None
 
     logger.info(f"Running {len(backtest_months)} predictions...")
 
@@ -757,7 +498,7 @@ def run_expanding_window_backtest(
         if len(train_idx_valid) < 24:
             continue
 
-        # OPTIMIZATION: Only recompute imputation if training set grew significantly
+        # Recompute imputation if training set grew
         train_set_grew = len(train_idx) > last_train_idx_len
         if train_set_grew or cached_impute_means is None:
             X_train_imputed, cached_impute_means = impute_with_expanding_window(X_full, train_idx, None)
@@ -772,39 +513,11 @@ def run_expanding_window_backtest(
         X_train_valid = X_train.iloc[valid_local_idx].copy()
         y_train_valid = y_train[valid_train_mask].copy()
 
-        # WINSORIZATION: Apply to training data to reduce outlier impact
-        # Get dates for the training data
-        train_dates = X_full['ds'].iloc[train_idx_valid] if 'ds' in X_full.columns else None
+        # Basic feature cleaning (no feature selection gates)
+        if cleaned_features is None or i % 12 == 0:
+            cleaned_features = clean_features(X_train_valid, y_train_valid)
 
-        # Winsorize features using training data bounds
-        X_train_winsorized, _ = winsorize_features(
-            X_train_valid,
-            train_idx=np.arange(len(X_train_valid))  # Use all training data for bounds
-        )
-
-        # FEATURE SELECTION: Re-run periodically using simplified approach
-        if use_feature_selection and (i - last_feature_selection_idx >= feature_selection_interval or cached_features is None):
-            logger.info(f"[{target_month.strftime('%Y-%m')}] Feature selection on {len(train_idx_valid)} samples...")
-
-            selected_features, _ = select_features_simplified(
-                X=X_train_winsorized,
-                y=y_train_valid,
-                dates=train_dates,
-                max_features=MAX_FEATURES,
-                output_dir=None,
-                target_type=target_type
-            )
-            cached_features = selected_features
-            last_feature_selection_idx = i
-
-        # Use winsorized data for subsequent steps
-        X_train_valid = X_train_winsorized
-
-        # Get feature columns for this iteration
-        if use_feature_selection and cached_features:
-            feature_cols = [c for c in cached_features if c in X_train_valid.columns and c != 'ds']
-        else:
-            feature_cols = [c for c in X_train_valid.columns if c != 'ds']
+        feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
         # Train Linear Baseline and Add as Feature
         linear_model, linear_cols_used = train_linear_baseline(
@@ -822,7 +535,7 @@ def run_expanding_window_backtest(
             if 'linear_baseline_pred' not in feature_cols:
                 feature_cols.append('linear_baseline_pred')
 
-        # Prepare training data with selected features
+        # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
 
         # Train-validation split
@@ -946,10 +659,75 @@ def run_expanding_window_backtest(
     return results_df
 
 
+def compute_shap_importance(
+    model: lgb.Booster,
+    X_train: pd.DataFrame,
+    feature_cols: List[str],
+    model_id: str
+) -> Optional[pd.DataFrame]:
+    """
+    Compute SHAP feature importance and save results.
+
+    Args:
+        model: Trained LightGBM Booster
+        X_train: Training feature matrix
+        feature_cols: Feature column names
+        model_id: Model identifier for file naming
+
+    Returns:
+        DataFrame with mean |SHAP| per feature, or None if SHAP unavailable
+    """
+    if not SHAP_AVAILABLE:
+        logger.warning("SHAP not available, skipping SHAP analysis")
+        return None
+
+    logger.info("Computing SHAP values...")
+
+    try:
+        # Use TreeExplainer for LightGBM
+        explainer = shap.TreeExplainer(model)
+
+        # Get feature data
+        X_features = X_train[feature_cols] if feature_cols else X_train
+        shap_values = explainer.shap_values(X_features)
+
+        # Compute mean |SHAP| per feature
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+
+        shap_df = pd.DataFrame({
+            'feature': feature_cols,
+            'mean_abs_shap': mean_abs_shap
+        }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
+
+        # Save SHAP importance CSV
+        shap_dir = OUTPUT_DIR / "shap_analysis" / model_id
+        shap_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = shap_dir / f"shap_importance_{model_id}.csv"
+        shap_df.to_csv(csv_path, index=False)
+        logger.info(f"Saved SHAP importance to {csv_path}")
+
+        # Save raw SHAP values matrix as parquet
+        shap_matrix = pd.DataFrame(shap_values, columns=feature_cols)
+        parquet_path = shap_dir / f"shap_values_{model_id}.parquet"
+        shap_matrix.to_parquet(parquet_path, index=False)
+        logger.info(f"Saved raw SHAP values to {parquet_path}")
+
+        # Log top 20 features
+        logger.info("\nTop 20 Features by Mean |SHAP|:")
+        for i, row in shap_df.head(20).iterrows():
+            logger.info(f"  {i+1:2d}. {row['feature']}: {row['mean_abs_shap']:.4f}")
+
+        return shap_df
+
+    except Exception as e:
+        logger.warning(f"SHAP computation failed: {e}")
+        return None
+
+
 def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
-    use_feature_selection: bool = True,
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
     archive_results: bool = True
@@ -958,14 +736,13 @@ def train_and_evaluate(
     Main training and evaluation function using EXPANDING WINDOW methodology.
 
     This function ensures NO TIME-TRAVEL VIOLATIONS:
-    1. Feature selection is re-evaluated inside the expanding window loop
-    2. NaN imputation uses only past data (expanding window means)
-    3. Model training uses only data available at each prediction time
+    1. NaN imputation uses only past data (expanding window means)
+    2. Model training uses only data available at each prediction time
+    3. SHAP values are computed on the final production model
 
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised
-        use_feature_selection: If True, run comprehensive feature selection
         use_huber_loss: If True, use Huber loss function
         huber_delta: Huber delta parameter
         archive_results: If True, archive previous results (only for first model in batch)
@@ -973,7 +750,6 @@ def train_and_evaluate(
     model_id = get_model_id(target_type, release_type)
 
     # Archive previous backtest results before starting new run
-    # Only archive once per training session (controlled by archive_results flag)
     if archive_results:
         try:
             sys.path.append(str(Path(__file__).resolve().parent))
@@ -1002,13 +778,11 @@ def train_and_evaluate(
     logger.info(f"\nInitial training period: {target_df['ds'].min()} to {train_end}")
     logger.info(f"Backtest period: {train_end} to {target_df['ds'].max()}")
 
-    # Run expanding window backtest (feature selection happens INSIDE the loop)
+    # Run expanding window backtest
     backtest_results = run_expanding_window_backtest(
         target_df=target_df,
         target_type=target_type,
         release_type=release_type,
-        use_feature_selection=use_feature_selection,
-        feature_selection_interval=6,  # Re-select features every 6 months
         use_huber_loss=use_huber_loss,
         huber_delta=huber_delta
     )
@@ -1024,15 +798,14 @@ def train_and_evaluate(
 
     X_full, y_full = build_training_dataset(target_df, target_type=target_type, release_type=release_type)
 
-    # Filter out NaN targets for final model training (same as backtest logic)
-    # Keep future months in X_full for potential predictions but exclude from training
+    # Filter out NaN targets for final model training
     valid_mask = ~y_full.isna()
     X_full_valid = X_full[valid_mask].copy()
     y_full_valid = y_full[valid_mask].copy()
 
     logger.info(f"Total observations: {len(X_full)}, Valid for training: {len(X_full_valid)}")
 
-    # NEW: Train linear baseline on full training data BEFORE feature selection
+    # Train linear baseline on full training data
     logger.info("\nTraining Linear Baseline Model for Production...")
     linear_model_prod, linear_cols_prod = train_linear_baseline(
         X_full_valid,
@@ -1047,38 +820,19 @@ def train_and_evaluate(
             linear_cols_prod
         )
 
-    # WINSORIZATION: Apply to training data to reduce outlier impact (COVID, etc.)
-    logger.info("\nApplying Winsorization to Reduce Outlier Impact...")
-    train_dates = X_full_valid['ds'] if 'ds' in X_full_valid.columns else None
-    X_full_winsorized, winsorize_bounds = winsorize_features(
-        X_full_valid,
-        train_idx=np.arange(len(X_full_valid))
-    )
+    # Basic feature cleaning (no feature selection)
+    cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
+    feature_cols = cleaned_feature_cols
 
-    # Final feature selection on full training data (for production model only)
-    # Using simplified approach: VIF filtering + recency + LightGBM importance
-    if use_feature_selection:
-        feature_output_dir = OUTPUT_DIR / "feature_selection" / model_id
-        feature_output_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure linear_baseline_pred is included if available
+    if linear_model_prod is not None and 'linear_baseline_pred' not in feature_cols:
+        feature_cols.append('linear_baseline_pred')
 
-        selected_features, selection_metadata = select_features_simplified(
-            X=X_full_winsorized,
-            y=y_full_valid,
-            dates=train_dates,
-            max_features=MAX_FEATURES,
-            output_dir=feature_output_dir,
-            target_type=target_type
-        )
-        # Store winsorization bounds in metadata for use during prediction
-        selection_metadata['winsorize_bounds'] = winsorize_bounds
+    X_train = X_full_valid[['ds'] + [c for c in feature_cols if c in X_full_valid.columns]].copy()
 
-        feature_cols = selected_features
-        X_train = X_full_winsorized[['ds'] + [c for c in selected_features if c in X_full_winsorized.columns]].copy()
-    else:
-        feature_cols = [c for c in X_full_winsorized.columns if c != 'ds']
-        X_train = X_full_winsorized.copy()
+    logger.info(f"Training final model with {len(feature_cols)} features")
 
-    # Train final model (using only valid targets)
+    # Train final model
     model, importance, residuals = train_lightgbm_model(
         X_train,
         y_full_valid,
@@ -1088,6 +842,12 @@ def train_and_evaluate(
         use_huber_loss=use_huber_loss,
         huber_delta=huber_delta
     )
+
+    # Compute SHAP values on the final model
+    logger.info("\n" + "=" * 60)
+    logger.info("SHAP Feature Importance Analysis")
+    logger.info("=" * 60)
+    shap_df = compute_shap_importance(model, X_train, feature_cols, model_id)
 
     # Save production model
     save_model(
@@ -1169,7 +929,7 @@ def train_and_evaluate(
             output_dir=results_dir
         )
 
-        logger.info(f"✓ Generated {len(report_files)} report files")
+        logger.info(f"Generated {len(report_files)} report files")
 
     except Exception as e:
         logger.warning(f"Failed to generate backtest report: {e}")
@@ -1197,15 +957,7 @@ def predict_nfp_mom(
         release_type: 'first' or 'last' - determines which release model to load
 
     Returns:
-        Dictionary with:
-            - prediction: Point estimate of MoM change
-            - intervals: Confidence intervals (50%, 80%, 95%)
-            - std: Standard deviation of prediction error
-            - target_month: The month being predicted
-            - features_used: Number of features used
-            - target_type: Type of prediction (nsa or sa)
-            - release_type: Release type (first or last)
-            - model_id: Combined model identifier
+        Dictionary with prediction, intervals, and metadata
     """
     model_id = get_model_id(target_type, release_type)
 
@@ -1265,37 +1017,16 @@ def predict_nfp_mom(
     }
 
 
-# NOTE: train_linear_baseline and create_linear_baseline_feature are imported from Train/model.py
-
-
 def convert_mom_to_level(
     mom_prediction: float,
     previous_level: float
 ) -> float:
-    """
-    Convert MoM change prediction to level prediction.
-
-    Args:
-        mom_prediction: Month-on-month change prediction
-        previous_level: Previous month's level
-
-    Returns:
-        Predicted level for current month
-    """
+    """Convert MoM change prediction to level prediction."""
     return previous_level + mom_prediction
 
 
 def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first') -> Dict:
-    """
-    Get prediction for the most recent available month.
-
-    Args:
-        target_type: 'nsa' or 'sa'
-        release_type: 'first' or 'last'
-
-    Returns:
-        Prediction dictionary
-    """
+    """Get prediction for the most recent available month."""
     model_id = get_model_id(target_type, release_type)
 
     # Find latest snapshot available
@@ -1308,7 +1039,6 @@ def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first')
 
 
 def train_all_models(
-    use_feature_selection: bool = True,
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA
 ) -> Dict[str, Any]:
@@ -1319,13 +1049,9 @@ def train_all_models(
     - nsa_first: LightGBM model for NSA predictions
     - sa_first: SARIMA model for seasonal adjustment (applied to NSA predictions)
 
-    The SA model uses SARIMA to predict the seasonal adjustment factor
-    (SA - NSA) and adds it to the NSA predictions.
-
     NOTE: Last release models (nsa_last, sa_last) are disabled.
 
     Args:
-        use_feature_selection: If True, run comprehensive feature selection (for NSA)
         use_huber_loss: If True, use Huber loss function (for NSA)
         huber_delta: Huber delta parameter (for NSA)
 
@@ -1349,7 +1075,6 @@ def train_all_models(
         nsa_result = train_and_evaluate(
             target_type='nsa',
             release_type='first',
-            use_feature_selection=use_feature_selection,
             use_huber_loss=use_huber_loss,
             huber_delta=huber_delta,
             archive_results=True
@@ -1425,703 +1150,6 @@ def train_all_models(
     return results
 
 
-# =============================================================================
-# VIF AND CORRELATION ANALYSIS
-# =============================================================================
-
-def compute_vif(X: pd.DataFrame, max_features: int = 100) -> pd.DataFrame:
-    """
-    Compute Variance Inflation Factor (VIF) for feature multicollinearity analysis.
-
-    VIF > 5 indicates moderate multicollinearity
-    VIF > 10 indicates high multicollinearity (consider removing)
-
-    Args:
-        X: Feature DataFrame (numeric columns only)
-        max_features: Maximum features to analyze (for performance)
-
-    Returns:
-        DataFrame with feature names and their VIF values, sorted by VIF descending
-    """
-    if not VIF_AVAILABLE:
-        logger.warning("statsmodels not available for VIF calculation")
-        return pd.DataFrame()
-
-    # Select numeric columns only, exclude 'ds'
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c != 'ds']
-
-    # Handle inf/nan values
-    X_clean = X[numeric_cols].replace([np.inf, -np.inf], np.nan)
-    X_clean = X_clean.dropna(axis=1, how='any')
-
-    # Limit features for performance
-    if len(X_clean.columns) > max_features:
-        # Select features with highest variance (most informative)
-        variances = X_clean.var().sort_values(ascending=False)
-        selected_cols = variances.head(max_features).index.tolist()
-        X_clean = X_clean[selected_cols]
-        logger.info(f"VIF analysis limited to top {max_features} features by variance")
-
-    # Add constant for VIF calculation
-    X_with_const = X_clean.copy()
-    X_with_const['const'] = 1.0
-
-    vif_data = []
-    feature_cols = [c for c in X_with_const.columns if c != 'const']
-
-    logger.info(f"Computing VIF for {len(feature_cols)} features...")
-
-    for i, col in enumerate(feature_cols):
-        try:
-            vif_value = variance_inflation_factor(X_with_const.values, X_with_const.columns.get_loc(col))
-            vif_data.append({'feature': col, 'VIF': vif_value})
-        except Exception as e:
-            logger.debug(f"Could not compute VIF for {col}: {e}")
-            vif_data.append({'feature': col, 'VIF': np.nan})
-
-    vif_df = pd.DataFrame(vif_data)
-    vif_df = vif_df.sort_values('VIF', ascending=False).reset_index(drop=True)
-
-    # Summary statistics
-    high_vif = vif_df[vif_df['VIF'] > 10]
-    moderate_vif = vif_df[(vif_df['VIF'] > 5) & (vif_df['VIF'] <= 10)]
-
-    logger.info(f"\nVIF Analysis Summary:")
-    logger.info(f"  Total features analyzed: {len(vif_df)}")
-    logger.info(f"  High multicollinearity (VIF > 10): {len(high_vif)} features")
-    logger.info(f"  Moderate multicollinearity (VIF 5-10): {len(moderate_vif)} features")
-
-    if len(high_vif) > 0:
-        logger.info(f"\nTop 10 features with highest VIF:")
-        for idx, row in high_vif.head(10).iterrows():
-            logger.info(f"    {row['feature']}: {row['VIF']:.2f}")
-
-    return vif_df
-
-
-def compute_correlation_analysis(
-    X: pd.DataFrame,
-    y: pd.Series,
-    top_n: int = 30,
-    high_corr_threshold: float = 0.9
-) -> Dict:
-    """
-    Compute correlation analysis between features and target.
-
-    Also identifies highly correlated feature pairs (potential redundancy).
-
-    Args:
-        X: Feature DataFrame
-        y: Target Series
-        top_n: Number of top correlated features to report
-        high_corr_threshold: Threshold for identifying highly correlated pairs
-
-    Returns:
-        Dictionary with correlation analysis results
-    """
-    # Select numeric columns only
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c != 'ds']
-    X_numeric = X[numeric_cols].copy()
-
-    # Handle inf/nan
-    X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
-
-    # Feature-target correlations
-    target_correlations = {}
-    for col in X_numeric.columns:
-        valid_mask = X_numeric[col].notna() & y.notna()
-        if valid_mask.sum() > 10:  # Minimum samples
-            corr = X_numeric.loc[valid_mask, col].corr(y[valid_mask])
-            target_correlations[col] = corr
-
-    # Sort by absolute correlation
-    sorted_corrs = sorted(target_correlations.items(), key=lambda x: abs(x[1]) if pd.notna(x[1]) else 0, reverse=True)
-
-    logger.info(f"\nTop {top_n} Features by Target Correlation:")
-    for i, (feat, corr) in enumerate(sorted_corrs[:top_n], 1):
-        if pd.notna(corr):
-            logger.info(f"  {i}. {feat}: {corr:.4f}")
-
-    # Feature-feature correlations (identify redundancy)
-    logger.info(f"\nComputing feature-feature correlation matrix...")
-    corr_matrix = X_numeric.corr()
-
-    # Find highly correlated pairs
-    high_corr_pairs = []
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i + 1, len(corr_matrix.columns)):
-            corr_val = corr_matrix.iloc[i, j]
-            if abs(corr_val) > high_corr_threshold:
-                high_corr_pairs.append({
-                    'feature_1': corr_matrix.columns[i],
-                    'feature_2': corr_matrix.columns[j],
-                    'correlation': corr_val
-                })
-
-    high_corr_pairs = sorted(high_corr_pairs, key=lambda x: abs(x['correlation']), reverse=True)
-
-    if high_corr_pairs:
-        logger.info(f"\nHighly Correlated Feature Pairs (|r| > {high_corr_threshold}):")
-        for pair in high_corr_pairs[:20]:  # Show top 20
-            logger.info(f"  {pair['feature_1']} <-> {pair['feature_2']}: {pair['correlation']:.4f}")
-        logger.info(f"  Total highly correlated pairs: {len(high_corr_pairs)}")
-    else:
-        logger.info(f"\nNo feature pairs with |correlation| > {high_corr_threshold}")
-
-    return {
-        'target_correlations': dict(sorted_corrs),
-        'high_corr_pairs': high_corr_pairs,
-        'correlation_matrix': corr_matrix
-    }
-
-
-# =============================================================================
-# COMPREHENSIVE FEATURE SELECTION PIPELINE
-# =============================================================================
-
-def remove_high_vif_features(
-    X: pd.DataFrame,
-    vif_threshold: float = VIF_THRESHOLD,
-    max_iterations: int = 50
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Iteratively remove features with VIF above threshold.
-
-    Args:
-        X: Feature DataFrame
-        vif_threshold: VIF threshold for removal
-        max_iterations: Maximum iterations to prevent infinite loops
-
-    Returns:
-        Tuple of (reduced DataFrame, list of removed features)
-    """
-    if not VIF_AVAILABLE:
-        logger.warning("VIF not available, skipping VIF-based removal")
-        return X, []
-
-    X_clean = X.select_dtypes(include=[np.number]).copy()
-    X_clean = X_clean.drop(columns=['ds'], errors='ignore')
-    X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
-
-    # Drop columns with any NaN
-    X_clean = X_clean.dropna(axis=1, how='any')
-
-    # Also drop columns with zero variance
-    zero_var_cols = X_clean.columns[X_clean.var() == 0].tolist()
-    X_clean = X_clean.drop(columns=zero_var_cols)
-
-    removed_features = zero_var_cols.copy()
-
-    iteration = 0
-    while iteration < max_iterations:
-        iteration += 1
-
-        if len(X_clean.columns) <= 10:
-            break
-
-        # Add constant for VIF
-        X_with_const = X_clean.copy()
-        X_with_const['const'] = 1.0
-
-        # Calculate VIF for all features
-        vif_values = {}
-        for col in X_clean.columns:
-            try:
-                vif = variance_inflation_factor(X_with_const.values, X_with_const.columns.get_loc(col))
-                vif_values[col] = vif
-            except:
-                vif_values[col] = np.inf
-
-        # Find maximum VIF
-        max_vif_col = max(vif_values, key=vif_values.get)
-        max_vif = vif_values[max_vif_col]
-
-        if max_vif <= vif_threshold:
-            break
-
-        # Remove feature with highest VIF
-        X_clean = X_clean.drop(columns=[max_vif_col])
-        removed_features.append(max_vif_col)
-
-        # Log each removal to show iterative nature
-        logger.info(f"  VIF iter {iteration}: removed '{max_vif_col}' (VIF={max_vif:.1f}), {len(X_clean.columns)} features remaining")
-
-    logger.info(f"VIF removal complete: {len(removed_features)} features removed, {len(X_clean.columns)} remaining")
-    return X_clean, removed_features
-
-
-def remove_correlated_features(
-    X: pd.DataFrame,
-    y: pd.Series,
-    corr_threshold: float = CORR_THRESHOLD
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Remove highly correlated features, keeping the one with higher target correlation.
-
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        corr_threshold: Correlation threshold above which to remove
-
-    Returns:
-        Tuple of (reduced DataFrame, list of removed features)
-    """
-    X_clean = X.select_dtypes(include=[np.number]).copy()
-    X_clean = X_clean.drop(columns=['ds'], errors='ignore')
-
-    # Calculate target correlations
-    target_corrs = {}
-    for col in X_clean.columns:
-        valid_mask = X_clean[col].notna() & y.notna()
-        if valid_mask.sum() > 10:
-            target_corrs[col] = abs(X_clean.loc[valid_mask, col].corr(y[valid_mask]))
-        else:
-            target_corrs[col] = 0
-
-    # Calculate feature correlation matrix
-    corr_matrix = X_clean.corr().abs()
-
-    # Find pairs above threshold
-    removed_features = []
-    cols_to_keep = set(X_clean.columns)
-
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i + 1, len(corr_matrix.columns)):
-            col_i = corr_matrix.columns[i]
-            col_j = corr_matrix.columns[j]
-
-            if col_i not in cols_to_keep or col_j not in cols_to_keep:
-                continue
-
-            if corr_matrix.iloc[i, j] > corr_threshold:
-                # Remove the one with lower target correlation
-                if target_corrs.get(col_i, 0) >= target_corrs.get(col_j, 0):
-                    cols_to_keep.discard(col_j)
-                    removed_features.append(col_j)
-                else:
-                    cols_to_keep.discard(col_i)
-                    removed_features.append(col_i)
-
-    X_reduced = X_clean[list(cols_to_keep)]
-    logger.info(f"Correlation removal: {len(removed_features)} features removed, {len(X_reduced.columns)} remaining")
-    return X_reduced, removed_features
-
-
-def select_by_target_correlation(
-    X: pd.DataFrame,
-    y: pd.Series,
-    min_corr: float = MIN_TARGET_CORR
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Remove features with negligible correlation to target.
-
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        min_corr: Minimum absolute correlation required
-
-    Returns:
-        Tuple of (reduced DataFrame, list of removed features)
-    """
-    X_clean = X.select_dtypes(include=[np.number]).copy()
-    X_clean = X_clean.drop(columns=['ds'], errors='ignore')
-
-    target_corrs = {}
-    for col in X_clean.columns:
-        valid_mask = X_clean[col].notna() & y.notna()
-        if valid_mask.sum() > 10:
-            target_corrs[col] = X_clean.loc[valid_mask, col].corr(y[valid_mask])
-        else:
-            target_corrs[col] = 0
-
-    # Keep features with correlation above threshold
-    kept_cols = [col for col, corr in target_corrs.items() if abs(corr) >= min_corr]
-    removed_cols = [col for col in X_clean.columns if col not in kept_cols]
-
-    X_reduced = X_clean[kept_cols]
-    logger.info(f"Target correlation filter: {len(removed_cols)} features removed, {len(X_reduced.columns)} remaining")
-    return X_reduced, removed_cols
-
-
-def compute_feature_importance_lgbm(
-    X: pd.DataFrame,
-    y: pd.Series,
-    n_estimators: int = 100
-) -> pd.DataFrame:
-    """
-    Compute feature importance using a quick LightGBM model.
-
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        n_estimators: Number of estimators for quick training
-
-    Returns:
-        DataFrame with feature importance scores
-    """
-    if not LIGHTGBM_AVAILABLE:
-        return pd.DataFrame()
-
-    X_clean = X.select_dtypes(include=[np.number]).copy()
-    X_clean = X_clean.drop(columns=['ds'], errors='ignore')
-    X_clean = X_clean.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    # Quick LightGBM training
-    params = {
-        'objective': 'regression',
-        'boosting_type': 'gbdt',
-        'num_leaves': 31,
-        'learning_rate': 0.1,
-        'feature_fraction': 0.8,
-        'verbose': -1,
-        'seed': 42
-    }
-
-    train_data = lgb.Dataset(X_clean, label=y)
-    model = lgb.train(params, train_data, num_boost_round=n_estimators)
-
-    # Get importance
-    importance = pd.DataFrame({
-        'feature': X_clean.columns,
-        'importance_gain': model.feature_importance(importance_type='gain'),
-        'importance_split': model.feature_importance(importance_type='split')
-    })
-    importance = importance.sort_values('importance_gain', ascending=False).reset_index(drop=True)
-
-    return importance
-
-
-def compute_mutual_information(
-    X: pd.DataFrame,
-    y: pd.Series,
-    n_neighbors: int = 5
-) -> pd.DataFrame:
-    """
-    Compute mutual information between features and target.
-
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        n_neighbors: Number of neighbors for MI estimation
-
-    Returns:
-        DataFrame with MI scores
-    """
-    X_clean = X.select_dtypes(include=[np.number]).copy()
-    X_clean = X_clean.drop(columns=['ds'], errors='ignore')
-    X_clean = X_clean.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    # Standardize for better MI estimation
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_clean)
-
-    # Compute MI
-    mi_scores = mutual_info_regression(X_scaled, y, n_neighbors=n_neighbors, random_state=42)
-
-    mi_df = pd.DataFrame({
-        'feature': X_clean.columns,
-        'mutual_info': mi_scores
-    })
-    mi_df = mi_df.sort_values('mutual_info', ascending=False).reset_index(drop=True)
-
-    return mi_df
-
-
-def select_features_comprehensive(
-    X: pd.DataFrame,
-    y: pd.Series,
-    max_features: int = MAX_FEATURES,
-    output_dir: Optional[Path] = None,
-    target_type: str = 'nsa',
-    skip_vif: bool = False
-) -> Tuple[List[str], Dict]:
-    """
-    Comprehensive feature selection pipeline.
-
-    OPTIMIZED:
-    - Computes target correlations once and reuses
-    - Vectorized operations where possible
-    - Optional VIF skip for faster iteration
-
-    Steps:
-    1. Remove zero-variance and infinite features
-    2. Remove features with negligible target correlation
-    3. Remove highly correlated feature pairs (keep higher target correlation)
-    4. Compute multiple importance metrics (LightGBM, MI, target correlation)
-    5. Aggregate rankings and select top features
-    6. (Optional) VIF check on final set
-
-    Args:
-        X: Full feature DataFrame
-        y: Target series
-        max_features: Maximum features to select
-        output_dir: Directory to save selection results
-        target_type: 'nsa' or 'sa' for labeling outputs
-        skip_vif: If True, skip VIF check (faster)
-
-    Returns:
-        Tuple of (selected feature list, selection metadata dict)
-    """
-    logger.info("=" * 60)
-    logger.info("COMPREHENSIVE FEATURE SELECTION PIPELINE")
-    logger.info("=" * 60)
-    logger.info(f"Starting with {len(X.columns)} features, target: {max_features}")
-
-    # Identify protected binary flags present in dataset
-    protected_set = set(PROTECTED_BINARY_FLAGS)
-    protected_features_present = [f for f in X.columns if f in protected_set]
-
-    if protected_features_present:
-        logger.info(f"Protecting {len(protected_features_present)} binary regime flags from removal")
-
-    # Initialize metadata
-    metadata = {
-        'initial_features': len(X.columns),
-        'target_features': max_features,
-        'protected_features': protected_features_present,
-        'steps': []
-    }
-
-    # Step 1: Basic cleaning - vectorized
-    X_work = X.select_dtypes(include=[np.number]).copy()
-    X_work = X_work.drop(columns=['ds'], errors='ignore')
-    X_work = X_work.replace([np.inf, -np.inf], np.nan)
-
-    # Remove columns with too many NaN (>50%) - vectorized
-    nan_pct = X_work.isna().mean()
-    high_nan_cols = nan_pct[nan_pct > 0.5].index.tolist()
-    high_nan_cols = [c for c in high_nan_cols if c not in protected_set]
-
-    X_work = X_work.drop(columns=high_nan_cols)
-    logger.info(f"Step 1: Removed {len(high_nan_cols)} high-NaN columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'high_nan_removal', 'removed': len(high_nan_cols), 'remaining': len(X_work.columns)})
-
-    # Fill remaining NaN with column mean - vectorized
-    col_means = X_work.mean()
-    X_work = X_work.fillna(col_means).fillna(0)
-
-    # Remove zero variance - vectorized
-    variances = X_work.var()
-    zero_var = variances[variances == 0].index.tolist()
-    zero_var = [c for c in zero_var if c not in protected_set]
-
-    X_work = X_work.drop(columns=zero_var)
-    logger.info(f"Step 2: Removed {len(zero_var)} zero-variance columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'zero_variance_removal', 'removed': len(zero_var), 'remaining': len(X_work.columns)})
-
-    # OPTIMIZATION: Compute all target correlations ONCE
-    logger.info("\nComputing target correlations (vectorized)...")
-    valid_y = y.notna()
-    target_corrs = X_work.loc[valid_y].corrwith(y[valid_y]).abs().fillna(0).to_dict()
-
-    # Step 3: Target correlation filter - use pre-computed correlations
-    logger.info("\nStep 3: Target Correlation Filter")
-    low_corr_cols = [c for c in X_work.columns if target_corrs.get(c, 0) < MIN_TARGET_CORR and c not in protected_set]
-    X_work = X_work.drop(columns=low_corr_cols)
-
-    # Re-add protected features
-    for f in protected_features_present:
-        if f not in X_work.columns and f in X.columns:
-            X_work[f] = X[f]
-
-    logger.info(f"Removed {len(low_corr_cols)} low-correlation columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'target_correlation_filter', 'removed': len(low_corr_cols), 'remaining': len(X_work.columns)})
-
-    # Step 4: High correlation removal - use pre-computed target correlations
-    logger.info("\nStep 4: High Correlation Removal")
-    corr_matrix = X_work.corr().abs()
-    upper_tri = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-
-    to_drop = set()
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i + 1, len(corr_matrix.columns)):
-            if corr_matrix.iloc[i, j] > CORR_THRESHOLD:
-                col_i = corr_matrix.columns[i]
-                col_j = corr_matrix.columns[j]
-                # Keep the one with higher target correlation
-                if target_corrs.get(col_i, 0) >= target_corrs.get(col_j, 0):
-                    if col_j not in protected_set:
-                        to_drop.add(col_j)
-                else:
-                    if col_i not in protected_set:
-                        to_drop.add(col_i)
-
-    X_work = X_work.drop(columns=list(to_drop))
-
-    # Re-add protected features
-    for f in protected_features_present:
-        if f not in X_work.columns and f in X.columns:
-            X_work[f] = X[f]
-
-    logger.info(f"Removed {len(to_drop)} highly-correlated columns, {len(X_work.columns)} remaining")
-    metadata['steps'].append({'step': 'high_correlation_removal', 'removed': len(to_drop), 'remaining': len(X_work.columns)})
-
-    # Step 5: Compute importance metrics
-    logger.info("\nStep 5: Computing Feature Importance Metrics")
-
-    # LightGBM importance
-    logger.info("  Computing LightGBM importance...")
-    lgbm_importance = compute_feature_importance_lgbm(X_work, y)
-
-    # Mutual Information
-    logger.info("  Computing Mutual Information...")
-    mi_scores = compute_mutual_information(X_work, y)
-
-    # Target correlation DataFrame (using pre-computed values)
-    target_corr_df = pd.DataFrame([
-        {'feature': c, 'target_corr': target_corrs.get(c, 0)} for c in X_work.columns
-    ]).sort_values('target_corr', ascending=False).reset_index(drop=True)
-
-    # Step 6: Aggregate rankings
-    logger.info("\nStep 6: Aggregating Feature Rankings")
-
-    # Create ranking DataFrame - optimized merge
-    ranking_df = pd.DataFrame({'feature': list(X_work.columns)})
-
-    lgbm_importance['lgbm_rank'] = range(1, len(lgbm_importance) + 1)
-    mi_scores['mi_rank'] = range(1, len(mi_scores) + 1)
-    target_corr_df['corr_rank'] = range(1, len(target_corr_df) + 1)
-
-    ranking_df = (ranking_df
-                  .merge(lgbm_importance[['feature', 'importance_gain', 'lgbm_rank']], on='feature', how='left')
-                  .merge(mi_scores[['feature', 'mutual_info', 'mi_rank']], on='feature', how='left')
-                  .merge(target_corr_df[['feature', 'target_corr', 'corr_rank']], on='feature', how='left'))
-
-    # Compute average rank
-    ranking_df['avg_rank'] = ranking_df[['lgbm_rank', 'mi_rank', 'corr_rank']].mean(axis=1)
-    ranking_df = ranking_df.sort_values('avg_rank').reset_index(drop=True)
-
-    # Select top features
-    selected_features = ranking_df['feature'].head(max_features).tolist()
-
-    # Ensure all protected features are included
-    for f in protected_features_present:
-        if f not in selected_features and f in X_work.columns:
-            selected_features.append(f)
-            logger.info(f"Force-included protected feature: {f}")
-
-    logger.info(f"\nSelected {len(selected_features)} features based on aggregated ranking")
-
-    # Step 7: Optional VIF check
-    if not skip_vif and VIF_AVAILABLE and len(selected_features) > 10:
-        logger.info("\nStep 7: VIF Check on Selected Features")
-        X_selected = X_work[selected_features].copy()
-        X_selected, vif_removed = remove_high_vif_features(X_selected, vif_threshold=VIF_THRESHOLD, max_iterations=20)
-
-        # Add back protected features if removed
-        for f in protected_features_present:
-            if f in vif_removed and f in X_work.columns:
-                X_selected[f] = X_work[f]
-
-        if vif_removed:
-            selected_features = list(X_selected.columns)
-            logger.info(f"After VIF check: {len(selected_features)} features")
-            metadata['steps'].append({'step': 'vif_removal', 'removed': len(vif_removed), 'remaining': len(selected_features)})
-
-    # Finalize
-    metadata['final_features'] = len(selected_features)
-    metadata['selected_features'] = selected_features
-
-    # Log top 20 selected features (condensed)
-    logger.info("\n" + "=" * 40)
-    logger.info("TOP 20 SELECTED FEATURES:")
-    logger.info("=" * 40)
-    for i, feat in enumerate(selected_features[:20], 1):
-        row = ranking_df[ranking_df['feature'] == feat]
-        if not row.empty:
-            row = row.iloc[0]
-            logger.info(f"  {i:2d}. {feat} (LGBM:{row['lgbm_rank']:.0f}, MI:{row['mi_rank']:.0f}, Corr:{row['corr_rank']:.0f})")
-
-    # Save results if output_dir specified
-    if output_dir:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        ranking_df.to_csv(output_dir / f"feature_ranking_{target_type}.csv", index=False)
-        ranking_df[ranking_df['feature'].isin(selected_features)].to_csv(
-            output_dir / f"selected_features_{target_type}.csv", index=False)
-
-        with open(output_dir / f"feature_selection_metadata_{target_type}.pkl", 'wb') as f:
-            pickle.dump(metadata, f)
-
-        logger.info(f"\nSaved feature selection results to {output_dir}")
-
-    return selected_features, metadata
-
-
-def run_feature_diagnostics(target_type: str = 'nsa') -> Dict:
-    """
-    Run comprehensive feature diagnostics including VIF and correlation analysis.
-
-    Args:
-        target_type: 'nsa' or 'sa'
-
-    Returns:
-        Dictionary with diagnostic results
-    """
-    logger.info("=" * 60)
-    logger.info(f"Running Feature Diagnostics for {target_type.upper()} Model")
-    logger.info("=" * 60)
-
-    # Load target data
-    target_df = load_target_data(target_type=target_type)
-
-    # Build training dataset
-    X, y = build_training_dataset(target_df, target_type=target_type)
-
-    if X.empty:
-        logger.error("Could not build training dataset for diagnostics")
-        return {}
-
-    logger.info(f"\nDataset: {len(X)} samples, {len(X.columns)} features")
-
-    # VIF Analysis
-    logger.info("\n" + "=" * 40)
-    logger.info("VIF (Multicollinearity) Analysis")
-    logger.info("=" * 40)
-    vif_df = compute_vif(X)
-
-    # Correlation Analysis
-    logger.info("\n" + "=" * 40)
-    logger.info("Correlation Analysis")
-    logger.info("=" * 40)
-    corr_results = compute_correlation_analysis(X, y)
-
-    # Save results
-    results_dir = MODEL_SAVE_DIR / target_type / "diagnostics"
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    if not vif_df.empty:
-        vif_path = results_dir / f"vif_analysis_{target_type}.csv"
-        vif_df.to_csv(vif_path, index=False)
-        logger.info(f"\nSaved VIF analysis to {vif_path}")
-
-    # Save target correlations
-    corr_df = pd.DataFrame([
-        {'feature': k, 'target_correlation': v}
-        for k, v in corr_results['target_correlations'].items()
-    ])
-    corr_path = results_dir / f"target_correlations_{target_type}.csv"
-    corr_df.to_csv(corr_path, index=False)
-    logger.info(f"Saved target correlations to {corr_path}")
-
-    # Save high correlation pairs
-    if corr_results['high_corr_pairs']:
-        pairs_df = pd.DataFrame(corr_results['high_corr_pairs'])
-        pairs_path = results_dir / f"high_corr_pairs_{target_type}.csv"
-        pairs_df.to_csv(pairs_path, index=False)
-        logger.info(f"Saved high correlation pairs to {pairs_path}")
-
-    return {
-        'vif': vif_df,
-        'correlations': corr_results,
-        'num_features': len(X.columns),
-        'num_samples': len(X)
-    }
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -2150,17 +1178,12 @@ NOTE: Only first release models are supported. Last release models are disabled.
                         help='Train all first release model variants (nsa_first, sa_first)')
     parser.add_argument('--train-both', action='store_true',
                         help='Train both NSA and SA models (first release)')
-    # DISABLED: --train-both-releases - last release models are not supported
-    # parser.add_argument('--train-both-releases', action='store_true',
-    #                     help='Train both first and last release models (same target type)')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
                         help='Target type: nsa (non-seasonally adjusted) or sa (seasonally adjusted)')
     parser.add_argument('--release', type=str, default='first', choices=['first', 'last'],
                         help='Release type: first (initial) or last (final revised)')
-    parser.add_argument('--diagnostics', action='store_true',
-                        help='Run feature diagnostics (VIF, correlations)')
     parser.add_argument('--no-huber-loss', action='store_true',
                         help='Disable Huber loss (uses MSE instead). Huber is enabled by default for outlier robustness.')
     parser.add_argument('--huber-delta', type=float, default=HUBER_DELTA,
@@ -2169,16 +1192,11 @@ NOTE: Only first release models are supported. Last release models are disabled.
     args = parser.parse_args()
 
     # Convert --no-huber-loss to use_huber_loss boolean
-    # Huber loss is enabled by default (USE_HUBER_LOSS_DEFAULT = True)
     use_huber_loss = not args.no_huber_loss
 
     model_id = get_model_id(args.target, args.release)
 
-    if args.diagnostics:
-        # Run feature diagnostics (VIF and correlation analysis)
-        run_feature_diagnostics(target_type=args.target)
-
-    elif args.train_all:
+    if args.train_all:
         # Train all first release model variants
         logger.info("Training all first release model variants (nsa_first, sa_first)...")
         train_all_models(
@@ -2186,28 +1204,8 @@ NOTE: Only first release models are supported. Last release models are disabled.
             huber_delta=args.huber_delta
         )
 
-    # DISABLED: --train-both-releases - last release models are not supported
-    # elif args.train_both_releases:
-    #     # Train both first and last release for a single target type
-    #     logger.info(f"Training both release types for {args.target.upper()}...")
-    #     train_and_evaluate(
-    #         target_type=args.target,
-    #         release_type='first',
-    #         use_huber_loss=use_huber_loss,
-    #         huber_delta=args.huber_delta,
-    #         archive_results=True
-    #     )
-    #     train_and_evaluate(
-    #         target_type=args.target,
-    #         release_type='last',
-    #         use_huber_loss=use_huber_loss,
-    #         huber_delta=args.huber_delta,
-    #         archive_results=False
-    #     )
-
     elif args.train_both:
         # Train both NSA and SA models (first release)
-        # NSA uses LightGBM, SA uses SARIMA
         logger.info(f"Training both NSA and SA models (first release)...")
         logger.info("NSA: LightGBM, SA: SARIMA")
 

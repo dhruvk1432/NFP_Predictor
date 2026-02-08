@@ -44,30 +44,6 @@ ALL_TARGET_CONFIGS = [
 
 
 # =============================================================================
-# FEATURE SELECTION THRESHOLDS
-# =============================================================================
-
-MAX_FEATURES = 80  # Maximum number of features to use in final model
-VIF_THRESHOLD = 10.0  # Remove features with VIF above this (handles multicollinearity)
-CORR_THRESHOLD = 0.95  # Remove one of a pair with correlation above this
-MIN_TARGET_CORR = 0.05  # Minimum absolute correlation with target
-
-# Simplified feature selection (new approach)
-# - Require features to have data in the last N months
-FEATURE_RECENCY_MONTHS = 12  # Features must have non-NaN data within last 12 months
-MAX_NAN_RATIO = 0.5  # Remove features with >50% missing values
-
-# =============================================================================
-# FEATURE OUTLIER HANDLING (Winsorization)
-# =============================================================================
-
-# Winsorize features to reduce impact of COVID-like outliers in feature data
-WINSORIZE_FEATURES = True  # Enable feature winsorization
-WINSORIZE_LOWER_PERCENTILE = 1.0  # Clip values below 1st percentile
-WINSORIZE_UPPER_PERCENTILE = 99.0  # Clip values above 99th percentile
-
-
-# =============================================================================
 # PATH CONFIGURATION
 # =============================================================================
 
@@ -414,9 +390,6 @@ EARLY_STOPPING_ROUNDS = 50
 
 # Training weights for extreme events
 PANIC_REGIME_WEIGHT = 5.0  # 5x weight for VIX_panic_regime or SP500_crash_month
-
-# Feature selection interval (months)
-FEATURE_SELECTION_INTERVAL = 6
 
 
 # =============================================================================

@@ -181,6 +181,8 @@ def build_training_dataset(
     for i, (idx, row) in enumerate(filtered_df.iterrows()):
         target_month = row['ds']
         target_value = row['y_mom']
+        release_date = row.get('release_date', pd.NaT)
+        cutoff_date = release_date if pd.notna(release_date) else target_month
 
         # Get snapshot for this month (month-end date)
         snapshot_date = target_month + pd.offsets.MonthEnd(0)
@@ -192,7 +194,7 @@ def build_training_dataset(
             continue
 
         # Convert to wide format (exogenous features)
-        features = pivot_snapshot_to_wide(snapshot_df, target_month)
+        features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
 
         if features.empty:
             continue
@@ -301,6 +303,8 @@ def run_backtest(
 
     for idx, row in backtest_df.iterrows():
         target_month = row['ds']
+        release_date = row.get('release_date', pd.NaT)
+        cutoff_date = release_date if pd.notna(release_date) else target_month
         actual = row['y_mom']
 
         # Get snapshot and create features
@@ -310,7 +314,7 @@ def run_backtest(
         if snapshot_df is None or snapshot_df.empty:
             continue
 
-        features = pivot_snapshot_to_wide(snapshot_df, target_month)
+        features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
         if features.empty:
             continue
 
@@ -978,8 +982,22 @@ def predict_nfp_mom(
     if snapshot_df is None or snapshot_df.empty:
         raise FileNotFoundError(f"No snapshot available for {snapshot_date}")
 
+    # Load target data for lagged features - use same release_type
+    nsa_target_full = load_target_data('nsa', release_type=release_type)
+    sa_target_full = load_target_data('sa', release_type=release_type)
+
+    # Use NFP release date as strict cutoff when available
+    target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
+    cutoff_date = target_month
+    if 'release_date' in target_ref.columns:
+        match = target_ref[target_ref['ds'] == target_month]
+        if not match.empty:
+            rd = match['release_date'].iloc[0]
+            if pd.notna(rd):
+                cutoff_date = rd
+
     # Create features
-    features = pivot_snapshot_to_wide(snapshot_df, target_month)
+    features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
 
     if features.empty:
         raise ValueError(f"Could not create features for {target_month}")
@@ -987,8 +1005,6 @@ def predict_nfp_mom(
     features = add_calendar_features(features, target_month)
 
     # Add lagged target features - use same release_type
-    nsa_target_full = load_target_data('nsa', release_type=release_type)
-    sa_target_full = load_target_data('sa', release_type=release_type)
     nsa_target_features = get_lagged_target_features(nsa_target_full, target_month, 'nfp_nsa')
     sa_target_features = get_lagged_target_features(sa_target_full, target_month, 'nfp_sa')
     for k, v in {**nsa_target_features, **sa_target_features}.items():

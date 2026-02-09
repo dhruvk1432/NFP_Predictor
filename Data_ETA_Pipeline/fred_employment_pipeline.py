@@ -2159,22 +2159,26 @@ def build_nfp_target_files(audit, window_start, window_end, snapshot_date):
     return {**univariate_paths, **multivariate_paths}
 
 def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_existing, limit_months):
-    sched = month_ends(start_date, end_date)
-    if limit_months: sched = sched[:int(limit_months)]
-    
-    for i, as_of in enumerate(sched, 1):
-        out = month_file_path(as_of)
-        if out.exists() and not refresh_existing: 
-            logger.debug(f"[{i}/{len(sched)}] {as_of.date()} exists.")
+    nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+    sched = sorted(nfp_release_map.items(), key=lambda x: x[0])
+    if limit_months:
+        sched = sched[:int(limit_months)]
+
+    for i, (obs_month, snap_date) in enumerate(sched, 1):
+        out = month_file_path(obs_month)
+        if out.exists() and not refresh_existing:
+            logger.debug(f"[{i}/{len(sched)}] {obs_month.date()} exists.")
             continue
         
         # Pass median_lags removed; logic is now self-contained in calculate_complex_release_date
-        collapsed = collapse_latest_asof(audit, as_of)
+        collapsed = collapse_latest_asof(audit, snap_date)
         
         if not collapsed.empty:
             _write_parquet(collapsed, out, dict_cols=["series_name", "series_code"])
             
-    return sched[0], sched[-1]
+    if not sched:
+        return None, None
+    return sched[0][0], sched[-1][0]
 
 def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existing=False):
     as_of = pd.to_datetime(end_date).strftime("%Y-%m-%d")
@@ -2182,8 +2186,9 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
 
     # Skip-if-exists check: verify if all data already exists
     if not refresh_existing:
-        sched = month_ends(start_date, end_date)
-        all_snapshots_exist = all(month_file_path(m).exists() for m in sched)
+        nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+        obs_months = sorted(nfp_release_map.keys())
+        all_snapshots_exist = all(month_file_path(m).exists() for m in obs_months)
 
         # Check NFP target files
         nfp_target_files = [
@@ -2192,9 +2197,9 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
         ]
         all_targets_exist = all(f.exists() for f in nfp_target_files)
 
-        if audit_file.exists() and all_snapshots_exist and all_targets_exist:
-            print(f"✓ FRED data already exists: {len(sched)} monthly snapshots", flush=True)
-            print(f"  Date range: {sched[0].date()} to {sched[-1].date()}", flush=True)
+        if audit_file.exists() and all_snapshots_exist and all_targets_exist and obs_months:
+            print(f"✓ FRED data already exists: {len(obs_months)} monthly snapshots", flush=True)
+            print(f"  Date range: {obs_months[0].date()} to {obs_months[-1].date()}", flush=True)
             logger.info(f"FRED snapshot data already exists, skipping")
             return
 
@@ -2453,14 +2458,19 @@ def prepare_fred_snapshots(
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
-    snapshot_dates = pd.date_range(start=start_dt, end=end_dt, freq='ME')
+    nfp_release_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
+    snapshot_pairs = sorted(nfp_release_map.items(), key=lambda x: x[0])
 
-    logger.info(f"Preparing FRED Snapshots from {start_dt.date()} to {end_dt.date()}")
+    if not snapshot_pairs:
+        logger.info("No NFP release dates found for FRED snapshot preparation.")
+        return
+
+    logger.info(f"Preparing FRED Snapshots from {snapshot_pairs[0][0].date()} to {snapshot_pairs[-1][0].date()}")
     logger.info(f"Options: mom_conversion={apply_mom_conversion}, transforms={apply_transforms}, scaling={apply_scaling}")
 
-    for i, snap_date in enumerate(snapshot_dates):
+    for i, (obs_month, snap_date) in enumerate(snapshot_pairs):
         # 1. Load raw snapshot (employment LEVELS)
-        raw_df = load_snapshot(FRED_SNAPSHOTS_DIR, snap_date)
+        raw_df = load_snapshot(FRED_SNAPSHOTS_DIR, obs_month)
 
         if raw_df.empty:
             continue
@@ -2487,16 +2497,16 @@ def prepare_fred_snapshots(
         working_df['snapshot_date'] = snap_date
 
         # Save in same schema as input
-        decade_str = f"{snap_date.year // 10 * 10}s"
-        year_str = str(snap_date.year)
+        decade_str = f"{obs_month.year // 10 * 10}s"
+        year_str = str(obs_month.year)
         save_dir = PREPARED_FRED_DIR / decade_str / year_str
         save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{snap_date.strftime('%Y-%m')}.parquet"
+        save_path = save_dir / f"{obs_month.strftime('%Y-%m')}.parquet"
 
         working_df.to_parquet(save_path, index=False)
 
         if i % 12 == 0:
-            logger.info(f"Prepared snapshot for {snap_date.date()}")
+            logger.info(f"Prepared snapshot for {obs_month.date()} (snapshot={snap_date.date()})")
 
     logger.info("FRED Snapshots preparation complete.")
 

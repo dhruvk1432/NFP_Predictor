@@ -390,7 +390,8 @@ def get_lagged_target_features(
 
 def pivot_snapshot_to_wide(
     snapshot_df: pd.DataFrame,
-    target_month: pd.Timestamp
+    target_month: pd.Timestamp,
+    cutoff_date: Optional[pd.Timestamp] = None
 ) -> pd.DataFrame:
     """
     Convert long-format snapshot to wide format, taking the latest value for target month.
@@ -401,6 +402,7 @@ def pivot_snapshot_to_wide(
     Args:
         snapshot_df: Long-format snapshot DataFrame
         target_month: Month we're predicting (format: YYYY-MM-01)
+        cutoff_date: Strict cutoff for data availability (e.g., NFP release date)
 
     Returns:
         Single-row DataFrame with features as columns
@@ -412,8 +414,9 @@ def pivot_snapshot_to_wide(
     df = snapshot_df.copy()
     df['date'] = pd.to_datetime(df['date'])
 
-    # Filter to data available before/on target month (no look-ahead bias)
-    df = df[df['date'] <= target_month]
+    # Strict cutoff to avoid same-day leakage (use NFP release date when provided)
+    cutoff = pd.to_datetime(cutoff_date) if cutoff_date is not None else pd.to_datetime(target_month)
+    df = df[df['date'] < cutoff]
 
     if df.empty:
         return pd.DataFrame()
@@ -462,7 +465,8 @@ def pivot_snapshot_to_wide(
 
 def pivot_snapshot_to_wide_batch(
     snapshot_df: pd.DataFrame,
-    target_months: List[pd.Timestamp]
+    target_months: List[pd.Timestamp],
+    cutoff_dates: Optional[Dict[pd.Timestamp, pd.Timestamp]] = None
 ) -> pd.DataFrame:
     """
     Batch version of pivot_snapshot_to_wide for multiple target months.
@@ -474,6 +478,7 @@ def pivot_snapshot_to_wide_batch(
     Args:
         snapshot_df: Long-format snapshot DataFrame
         target_months: List of target months to generate features for
+        cutoff_dates: Optional mapping of target_month -> cutoff_date (e.g., NFP release date)
 
     Returns:
         DataFrame with one row per target month, features as columns
@@ -499,8 +504,12 @@ def pivot_snapshot_to_wide_batch(
     all_features = []
 
     for target_month in target_months:
-        # Filter to available data for this target month
-        available = wide_df[wide_df.index <= target_month]
+        # Strict cutoff to avoid same-day leakage (use release date when provided)
+        if cutoff_dates is not None and target_month in cutoff_dates:
+            cutoff = pd.to_datetime(cutoff_dates[target_month])
+        else:
+            cutoff = pd.to_datetime(target_month)
+        available = wide_df[wide_df.index < cutoff]
 
         if available.empty:
             all_features.append({'target_month': target_month})

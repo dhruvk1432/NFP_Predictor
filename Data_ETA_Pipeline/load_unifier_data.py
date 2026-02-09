@@ -5,46 +5,18 @@ import sys
 from pathlib import Path
 from unifier import unifier
 
-# Add parent directory to path to import settings
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to FRONT of path so project-level packages (utils/, settings)
+# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UNIFIER_TOKEN, UNIFIER_USER
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map, calculate_median_offset_from_nfp, apply_nfp_relative_adjustment
 # OPTIMIZATION: Use shared utility for snapshot path
 from Data_ETA_Pipeline.utils import get_snapshot_path
+from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
-
-# VIF-selected features (41 features, all VIF < 10)
-# Determined by iterative VIF pruning on 2025-12 snapshot
-# See unifier_exog_selection.ipynb for full analysis
-SELECTED_FEATURES = {
-    # --- AHE_Private (4/4 kept) ---
-    'AHE_Private', 'AHE_Private_diff', 'AHE_Private_diff_zscore_12m', 'AHE_Private_diff_zscore_3m',
-    # --- AWH_All_Private (3/4 kept, z12 removed) ---
-    'AWH_All_Private', 'AWH_All_Private_diff', 'AWH_All_Private_diff_zscore_3m',
-    # --- AWH_Manufacturing (3/4 kept, diff removed) ---
-    'AWH_Manufacturing', 'AWH_Manufacturing_diff_zscore_12m', 'AWH_Manufacturing_diff_zscore_3m',
-    # --- CB_Consumer_Confidence (2/4 kept, level + z12 removed) ---
-    'CB_Consumer_Confidence_diff', 'CB_Consumer_Confidence_diff_zscore_3m',
-    # --- Challenger_Job_Cuts (4/4 kept) ---
-    'Challenger_Job_Cuts', 'Challenger_Job_Cuts_diff', 'Challenger_Job_Cuts_diff_zscore_12m', 'Challenger_Job_Cuts_diff_zscore_3m',
-    # --- Empire_State_Mfg (4/4 kept) ---
-    'Empire_State_Mfg', 'Empire_State_Mfg_diff', 'Empire_State_Mfg_diff_zscore_12m', 'Empire_State_Mfg_diff_zscore_3m',
-    # --- Housing_Starts (4/4 kept) ---
-    'Housing_Starts', 'Housing_Starts_diff', 'Housing_Starts_diff_zscore_12m', 'Housing_Starts_diff_zscore_3m',
-    # --- ISM_Manufacturing_Index (3/4 kept, z12 removed) ---
-    'ISM_Manufacturing_Index', 'ISM_Manufacturing_Index_diff', 'ISM_Manufacturing_Index_diff_zscore_3m',
-    # --- ISM_NonManufacturing_Index (3/4 kept, diff removed) ---
-    'ISM_NonManufacturing_Index', 'ISM_NonManufacturing_Index_diff_zscore_12m', 'ISM_NonManufacturing_Index_diff_zscore_3m',
-    # --- Industrial_Production (4/4 kept) ---
-    'Industrial_Production', 'Industrial_Production_diff', 'Industrial_Production_diff_zscore_12m', 'Industrial_Production_diff_zscore_3m',
-    # --- Retail_Sales (4/4 kept) ---
-    'Retail_Sales', 'Retail_Sales_diff', 'Retail_Sales_diff_zscore_12m', 'Retail_Sales_diff_zscore_3m',
-    # --- UMich_Expectations (3/4 kept, diff removed) ---
-    'UMich_Expectations', 'UMich_Expectations_diff_zscore_12m', 'UMich_Expectations_diff_zscore_3m',
-}
 
 UNIFIER_SERIES = {
     # Existing series
@@ -69,70 +41,6 @@ UNIFIER_SERIES = {
     # NEW: Industrial activity
     "Industrial_Production": "USIPTOT.G",      # Manufacturing activity
 }
-
-
-def compute_mom_differences_and_zscores(df):
-    """
-    Keep original level values AND add MoM differences with z-scores.
-
-    For each series, produce 4 variants:
-    - level (original series_name)
-    - {series_name}_diff (MoM difference)
-    - {series_name}_diff_zscore_12m (12-month rolling z-score on diff)
-    - {series_name}_diff_zscore_3m (3-month rolling z-score on diff)
-
-    Args:
-        df: DataFrame in long format with columns [date, series_name, value, release_date, series_code, snapshot_date]
-
-    Returns:
-        DataFrame in long format with levels, MoM differences, and z-scores
-    """
-    series_list = df['series_name'].unique()
-    result_list = []
-    base_cols = ['date', 'release_date', 'series_code', 'snapshot_date']
-
-    for series in series_list:
-        series_df = df[df['series_name'] == series].copy()
-        series_df = series_df.sort_values('date')
-
-        # Always keep the original level value
-        level_df = series_df[base_cols + ['value']].copy()
-        level_df['series_name'] = series
-        result_list.append(level_df)
-
-        # Compute MoM difference
-        series_df['value_diff'] = series_df['value'].diff()
-
-        # Compute z-scores on differences (12-month)
-        rolling_mean_12m = series_df['value_diff'].rolling(window=12, min_periods=6).mean()
-        rolling_std_12m = series_df['value_diff'].rolling(window=12, min_periods=6).std()
-        series_df['zscore_12m'] = (series_df['value_diff'] - rolling_mean_12m) / rolling_std_12m
-
-        # Compute z-scores on differences (3-month)
-        rolling_mean_3m = series_df['value_diff'].rolling(window=3, min_periods=2).mean()
-        rolling_std_3m = series_df['value_diff'].rolling(window=3, min_periods=2).std()
-        series_df['zscore_3m'] = (series_df['value_diff'] - rolling_mean_3m) / rolling_std_3m
-
-        diff_df = series_df[base_cols].copy()
-        diff_df['series_name'] = f"{series}_diff"
-        diff_df['value'] = series_df['value_diff'].values
-
-        zscore_12m_df = series_df[base_cols].copy()
-        zscore_12m_df['series_name'] = f"{series}_diff_zscore_12m"
-        zscore_12m_df['value'] = series_df['zscore_12m'].values
-
-        zscore_3m_df = series_df[base_cols].copy()
-        zscore_3m_df['series_name'] = f"{series}_diff_zscore_3m"
-        zscore_3m_df['value'] = series_df['zscore_3m'].values
-
-        result_list.extend([diff_df, zscore_12m_df, zscore_3m_df])
-
-    result = pd.concat(result_list, ignore_index=True)
-
-    # Drop rows with NaN values (from differencing and z-score calculation)
-    result = result.dropna(subset=['value'])
-
-    return result
 
 
 def calculate_series_lag(df, series_name):
@@ -446,6 +354,14 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             # Remove duplicates (keep last by date)
             series_df = series_df.sort_values('date').drop_duplicates(subset=['date'], keep='last')
 
+            # Data quality fix: Housing_Starts scale normalization
+            # Early data appears in units ~1s while later is ~1000s.
+            # Normalize by dividing only extreme values (>1000) by 1,000.
+            if name == "Housing_Starts" and not series_df.empty:
+                mask = series_df['value'] > 1000
+                if mask.any():
+                    series_df.loc[mask, 'value'] = series_df.loc[mask, 'value'] / 1_000
+
             if not series_df.empty:
                 snap_data_list.append(series_df)
 
@@ -453,11 +369,10 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['snapshot_date'] = snap_date
 
-            # Apply MoM differencing and z-score calculation
-            full_snap = compute_mom_differences_and_zscores(full_snap)
-
-            # Filter to VIF-selected features only (41 features)
-            full_snap = full_snap[full_snap['series_name'].isin(SELECTED_FEATURES)]
+            # Branch-and-Expand: create 3 base variants, then compute all features
+            full_snap = add_symlog_copies(full_snap)
+            full_snap = add_pct_change_copies(full_snap)
+            full_snap = compute_all_features(full_snap)
 
             full_snap.to_parquet(save_path)
 

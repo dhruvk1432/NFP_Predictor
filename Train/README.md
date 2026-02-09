@@ -146,8 +146,8 @@ def load_target_data(target_type='nsa', release_type='first'):
 def get_lagged_target_features(target_df, target_month, prefix='nfp'):
     """Get lagged NFP features (lag1, lag12, rolling means)."""
 
-def pivot_snapshot_to_wide(snapshot_df, target_month):
-    """Convert long-format snapshot to wide format features."""
+def pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=None):
+    """Convert long-format snapshot to wide format features using strict cutoff."""
 ```
 
 **Caching:**

@@ -9,8 +9,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
-# Add parent directory to path to import settings
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to FRONT of path so project-level packages (utils/, settings)
+# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
@@ -18,6 +19,7 @@ from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE
 from Data_ETA_Pipeline.fred_employment_pipeline import load_nfp_releases, get_nfp_release_map, apply_nfp_relative_adjustment
 # OPTIMIZATION: Use shared utilities for snapshot path and MultiIndex flattening
 from Data_ETA_Pipeline.utils import get_snapshot_path, flatten_multiindex_columns
+from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -121,68 +123,13 @@ def fred_api_call_with_retry(fred_func, *args, max_retries: int = 3, base_delay:
     raise last_exception
 
 # Binary/regime indicator features - these are 0/1 flags that should NOT be differenced
-BINARY_REGIME_FEATURES = {
+BINARY_REGIME_FEATURES = frozenset({
     'VIX_panic_regime',
     'VIX_high_regime',
     'SP500_bear_market',
     'SP500_crash_month',
     'SP500_circuit_breaker',
-}
-
-# VIF-selected features (82 features, all VIF < 10)
-# Determined by within-group + cross-group VIF pruning on 2025-12 snapshot
-# See fred_exog_selection.ipynb for full analysis
-SELECTED_FEATURES = {
-    # --- Levels (18) ---
-    'CCNSA_weeks_high', 'CCSA_monthly_avg', 'CCSA_weeks_high',
-    'Credit_Spreads_accel_volatility', 'Credit_Spreads_acceleration', 'Credit_Spreads_avg',
-    'Oil_Prices_mean', 'Oil_Prices_volatility',
-    'SP500_consecutive_down_days', 'SP500_max_drawdown', 'SP500_monthly_return',
-    'VIX_max_5d_spike',
-    'Weekly_Econ_Index_monthly_min',
-    'Yield_Curve_acceleration', 'Yield_Curve_avg', 'Yield_Curve_monthly_chg', 'Yield_Curve_vol_of_changes',
-    # --- Binary regime flags (5) ---
-    'SP500_bear_market', 'SP500_circuit_breaker', 'SP500_crash_month',
-    'VIX_high_regime', 'VIX_panic_regime',
-    # --- MoM diffs (9) ---
-    'Credit_Spreads_avg_diff', 'Credit_Spreads_monthly_chg_diff',
-    'Oil_Prices_volatility_diff',
-    'SP500_best_day_diff',
-    'VIX_max_5d_spike_diff',
-    'Weekly_Econ_Index_monthly_max_diff',
-    'Yield_Curve_accel_volatility_diff',
-    # --- Diff z-score 12m (14) ---
-    'CCNSA_monthly_avg_diff_zscore_12m', 'CCSA_monthly_avg_diff_zscore_12m',
-    'Credit_Spreads_vol_of_changes_diff_zscore_12m',
-    'Financial_Stress_monthly_avg_diff_zscore_12m',
-    'Oil_Prices_mean_diff_zscore_12m', 'Oil_Prices_volatility_diff_zscore_12m',
-    'SP500_volatility_diff_zscore_12m',
-    'VIX_volatility_diff_zscore_12m',
-    'Weekly_Econ_Index_monthly_max_diff_zscore_12m', 'Weekly_Econ_Index_monthly_min_diff_zscore_12m',
-    'Yield_Curve_acceleration_diff_zscore_12m', 'Yield_Curve_avg_diff_zscore_12m',
-    'Yield_Curve_vol_of_changes_diff_zscore_12m',
-    # --- Diff z-score 3m (36) ---
-    'CCNSA_max_spike_diff_zscore_3m',
-    'CCSA_max_spike_diff_zscore_3m', 'CCSA_monthly_avg_diff_zscore_3m',
-    'Credit_Spreads_accel_volatility_diff_zscore_3m', 'Credit_Spreads_acceleration_diff_zscore_3m',
-    'Credit_Spreads_avg_diff_zscore_3m', 'Credit_Spreads_max_diff_zscore_3m',
-    'Credit_Spreads_monthly_chg_diff_zscore_3m',
-    'Financial_Stress_monthly_avg_diff_zscore_3m',
-    'Oil_Prices_30d_crash_diff_zscore_3m', 'Oil_Prices_mean_diff_zscore_3m',
-    'Oil_Prices_volatility_diff_zscore_3m', 'Oil_Prices_zscore_min_diff_zscore_3m',
-    'Oil_worst_day_pct_diff_zscore_3m',
-    'SP500_best_day_diff_zscore_3m', 'SP500_consecutive_down_days_diff_zscore_3m',
-    'SP500_max_5d_drop_diff_zscore_3m', 'SP500_max_drawdown_diff_zscore_3m',
-    'SP500_monthly_return_diff_zscore_3m', 'SP500_volatility_diff_zscore_3m',
-    'SP500_worst_day_diff_zscore_3m',
-    'VIX_30d_spike_diff_zscore_3m', 'VIX_max_5d_spike_diff_zscore_3m',
-    'VIX_max_diff_zscore_3m', 'VIX_mean_diff_zscore_3m',
-    'Weekly_Econ_Index_monthly_avg_diff_zscore_3m', 'Weekly_Econ_Index_monthly_max_diff_zscore_3m',
-    'Weekly_Econ_Index_monthly_min_diff_zscore_3m',
-    'Yield_Curve_accel_volatility_diff_zscore_3m', 'Yield_Curve_acceleration_diff_zscore_3m',
-    'Yield_Curve_avg_diff_zscore_3m', 'Yield_Curve_monthly_chg_diff_zscore_3m',
-    'Yield_Curve_zscore_max_diff_zscore_3m',
-}
+})
 
 FRED_SERIES = {
     "Credit_Spreads": "BAMLH0A0HYM2",
@@ -591,72 +538,6 @@ def calculate_weekly_spike_stats(weekly_df, nfp_schedule):
     spike_stats['weeks_above_p95'] = spike_stats['weeks_above_p95'].fillna(0)
 
     return spike_stats
-
-
-def compute_mom_differences_and_zscores(df):
-    """
-    Keep original level values AND add MoM differences with z-scores.
-
-    For each series:
-    - Binary regime features (BINARY_REGIME_FEATURES): keep level only
-    - All other features: keep level + add _diff, _diff_zscore_12m, _diff_zscore_3m
-
-    Args:
-        df: DataFrame in long format with columns [date, series_name, value, release_date, series_code, snapshot_date]
-
-    Returns:
-        DataFrame in long format with levels, MoM differences, and z-scores
-    """
-    series_list = df['series_name'].unique()
-    result_list = []
-    base_cols = ['date', 'release_date', 'series_code', 'snapshot_date']
-
-    for series in series_list:
-        series_df = df[df['series_name'] == series].copy()
-        series_df = series_df.sort_values('date')
-
-        # Always keep the original level value
-        level_df = series_df[base_cols + ['value']].copy()
-        level_df['series_name'] = series
-        result_list.append(level_df)
-
-        # Skip MoM differencing for binary regime indicators
-        if series in BINARY_REGIME_FEATURES:
-            continue
-
-        # Compute MoM difference
-        series_df['value_diff'] = series_df['value'].diff()
-
-        # Compute z-scores on differences (12-month)
-        rolling_mean_12m = series_df['value_diff'].rolling(window=12, min_periods=6).mean()
-        rolling_std_12m = series_df['value_diff'].rolling(window=12, min_periods=6).std()
-        series_df['zscore_12m'] = (series_df['value_diff'] - rolling_mean_12m) / rolling_std_12m
-
-        # Compute z-scores on differences (3-month)
-        rolling_mean_3m = series_df['value_diff'].rolling(window=3, min_periods=2).mean()
-        rolling_std_3m = series_df['value_diff'].rolling(window=3, min_periods=2).std()
-        series_df['zscore_3m'] = (series_df['value_diff'] - rolling_mean_3m) / rolling_std_3m
-
-        diff_df = series_df[base_cols].copy()
-        diff_df['series_name'] = f"{series}_diff"
-        diff_df['value'] = series_df['value_diff'].values
-
-        zscore_12m_df = series_df[base_cols].copy()
-        zscore_12m_df['series_name'] = f"{series}_diff_zscore_12m"
-        zscore_12m_df['value'] = series_df['zscore_12m'].values
-
-        zscore_3m_df = series_df[base_cols].copy()
-        zscore_3m_df['series_name'] = f"{series}_diff_zscore_3m"
-        zscore_3m_df['value'] = series_df['zscore_3m'].values
-
-        result_list.extend([diff_df, zscore_12m_df, zscore_3m_df])
-
-    result = pd.concat(result_list, ignore_index=True)
-
-    # Drop rows with NaN values (from differencing and z-score calculation)
-    result = result.dropna(subset=['value'])
-
-    return result
 
 
 # =============================================================================
@@ -1274,6 +1155,8 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
                     weeks_high_series = monthly_spike_stats[['date', 'weeks_above_p95', 'release_date']].copy()
                     weeks_high_series = weeks_high_series.rename(columns={'weeks_above_p95': 'value'})
                     weeks_high_series['series_name'] = f"{name}_weeks_high"
+                    # Data quality guard: drop first 2 months for weeks_high series
+                    weeks_high_series = weeks_high_series.sort_values('date').iloc[2:].copy()
 
                     # Combine all series for this claims indicator
                     sub_df = pd.concat([avg_series, spike_series, weeks_high_series], ignore_index=True)
@@ -1334,11 +1217,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['date'] = full_snap['date'].dt.to_period('M').dt.to_timestamp()
 
-            # Apply MoM differencing and z-score calculation
-            full_snap = compute_mom_differences_and_zscores(full_snap)
-
-            # Filter to VIF-selected features only (82 features)
-            full_snap = full_snap[full_snap['series_name'].isin(SELECTED_FEATURES)]
+            # Branch-and-Expand: create 3 base variants, then compute all features
+            full_snap = add_symlog_copies(full_snap, skip_series=BINARY_REGIME_FEATURES)
+            full_snap = add_pct_change_copies(full_snap, skip_series=BINARY_REGIME_FEATURES)
+            full_snap = compute_all_features(full_snap, skip_series=BINARY_REGIME_FEATURES)
 
             # CRITICAL: Filter out data not yet released at snapshot time
             # This prevents lookahead bias from including monthly aggregates

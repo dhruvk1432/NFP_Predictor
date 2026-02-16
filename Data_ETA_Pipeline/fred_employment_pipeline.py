@@ -55,12 +55,7 @@ logger = setup_logger(__file__, TEMP_DIR)
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-try:
-    from sklearn.preprocessing import RobustScaler
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    logger.warning("sklearn not available. RobustScaler will be skipped.")
-    SKLEARN_AVAILABLE = False
+from utils.transforms import apply_symlog as _apply_symlog
 
 
 # =============================================================================
@@ -204,26 +199,31 @@ def calculate_median_offset_from_nfp(
     
     has_release[event_col] = pd.to_datetime(has_release[event_col])
     has_release[release_col] = pd.to_datetime(has_release[release_col])
-    
+
     # Normalize event month to month start
     has_release['event_month'] = has_release[event_col].dt.to_period('M').dt.to_timestamp()
-    
+
+    # Rename release column to a known name before merge to avoid suffix ambiguity.
+    # pandas only applies suffixes to overlapping column names, so when release_col
+    # differs from nfp_releases' 'release_date' (e.g. 'first_release_date' from Unifier),
+    # no suffix is applied and f'{release_col}_series' would be a KeyError.
+    has_release = has_release.rename(columns={release_col: '_series_release_date'})
+
     # Merge with NFP releases
     merged = has_release.merge(
         nfp_releases,
         left_on='event_month',
         right_on='ds',
-        how='inner',
-        suffixes=('_series', '_nfp')
+        how='inner'
     )
-    
+
     if len(merged) == 0:
         logger.warning("No matching NFP releases found for series data")
         return 0.0, 0
-    
+
     # Calculate offset: series_release - nfp_release (in days)
     merged['offset_days'] = (
-        merged[f'{release_col}_series'] - merged['release_date_nfp']
+        merged['_series_release_date'] - merged['release_date']
     ).dt.total_seconds() / 86400  # Convert to days
     
     # Remove outliers (>365 days suggests data error)
@@ -2228,65 +2228,33 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
 PREPARED_FRED_DIR = DATA_PATH / "fred_data_prepared" / "decades"
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
 # Series that should have SymLog applied (high kurtosis MoM changes)
 # These series experience extreme values (like COVID crash/recovery)
-SYMLOG_TRANSFORM_SERIES = [
-    # All employment series have potential for extreme MoM swings
-    # Apply SymLog universally to MoM changes
-]
 
-# Apply SymLog to ALL MoM changes since employment data universally
-# shows high kurtosis due to recessions/recoveries
-# CHANGED: Set to False to preserve COVID-19 crash magnitude
-APPLY_SYMLOG_TO_ALL = False
+# Employment lag periods (months)
+_EMPLOYMENT_LAGS = [1, 3, 6, 12]
 
 # =============================================================================
 # TRANSFORM FUNCTIONS
 # =============================================================================
 
-def apply_symlog(x):
-    """
-    Apply symmetric log transform: sign(x) * log1p(abs(x))
-
-    This transform:
-    - Handles negative values (unlike log)
-    - Compresses extreme values (reduces kurtosis)
-    - Preserves sign and relative magnitude
-    - Is invertible: sign(y) * (exp(abs(y)) - 1)
-
-    For NFP MoM changes, reduces:
-    - Skewness: -6.5 -> -1.1
-    - Kurtosis: 81 -> -0.7
-    """
-    return np.sign(x) * np.log1p(np.abs(x))
-
-
-def inverse_symlog(y):
-    """Inverse of symlog transform for prediction recovery."""
-    return np.sign(y) * (np.exp(np.abs(y)) - 1)
-
-
 def calculate_mom_change(df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert employment levels to Month-over-Month changes.
 
+    For each employment series, produces:
+    - Raw MoM change: levels.diff()  (series: "{name}")
+    - Symlog MoM change: symlog(levels).diff()  (series: "{name}_symlog")
+
     The raw FRED snapshots contain employment LEVELS (e.g., 150M jobs).
     Our prediction target is the MoM CHANGE (e.g., +150K jobs).
-
-    This transformation:
-    1. Makes the series stationary (levels are non-stationary)
-    2. Matches what we're actually predicting
 
     Args:
         df: DataFrame with columns ['date', 'value', 'series_name', ...]
             where 'value' contains employment levels
 
     Returns:
-        DataFrame with MoM changes as 'value', original level stored in 'value_level'
+        DataFrame with raw MoM and symlog MoM series, original level in 'value_level'
     """
     if df.empty:
         return df
@@ -2300,117 +2268,61 @@ def calculate_mom_change(df: pd.DataFrame) -> pd.DataFrame:
         # Store original level for reference
         group['value_level'] = group['value']
 
-        # Calculate MoM change (this is what we predict)
-        group['value'] = group['value'].diff()
+        # --- Raw MoM change ---
+        raw_mom = group.copy()
+        raw_mom['value'] = group['value_level'].diff()
+        raw_mom['value_raw'] = raw_mom['value']  # Keep raw for reference
+        raw_mom = raw_mom.dropna(subset=['value'])
+        result_parts.append(raw_mom)
 
-        # Keep track of raw change before any transforms
-        group['value_raw'] = group['value']
-
-        # Drop first row (NaN from diff)
-        group = group.dropna(subset=['value'])
-
-        result_parts.append(group)
+        # --- Symlog MoM change: diff(symlog(level)) ---
+        symlog_mom = group.copy()
+        symlog_mom['value'] = _apply_symlog(group['value_level']).diff()
+        symlog_mom['value_raw'] = symlog_mom['value']
+        symlog_mom['series_name'] = series_name + '_symlog'
+        if 'series_code' in symlog_mom.columns:
+            symlog_mom['series_code'] = symlog_mom['series_code'].astype(str) + '_symlog'
+        symlog_mom = symlog_mom.dropna(subset=['value'])
+        result_parts.append(symlog_mom)
 
     if result_parts:
         return pd.concat(result_parts, ignore_index=True)
     return df
 
 
-def preprocess_transforms(df: pd.DataFrame) -> pd.DataFrame:
+def create_employment_lags(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply SymLog transform to MoM changes.
+    Create lagged versions of all MoM change series.
 
-    This handles extreme values like:
-    - COVID crash: -20M jobs in April 2020
-    - Recovery months: +4M jobs
+    For each series (both raw MoM and symlog MoM), creates lag 1, 3, 6, 12
+    month versions.
 
-    Without this transform:
-    - Skewness: -6.5 (highly negatively skewed)
-    - Kurtosis: 81 (extreme fat tails)
+    Args:
+        df: DataFrame with MoM changes from calculate_mom_change()
 
-    With SymLog:
-    - Skewness: -1.1 (much closer to normal)
-    - Kurtosis: -0.7 (normal-like tails)
+    Returns:
+        DataFrame with original series + lag series appended
     """
     if df.empty:
         return df
 
-    df = df.copy()
-
-    if APPLY_SYMLOG_TO_ALL:
-        # Apply SymLog to all MoM changes
-        df['value'] = apply_symlog(df['value'])
-    else:
-        # Only apply to specified series
-        for pattern in SYMLOG_TRANSFORM_SERIES:
-            mask = df['series_name'].str.contains(pattern, regex=False)
-            if mask.any():
-                df.loc[mask, 'value'] = apply_symlog(df.loc[mask, 'value'])
-
-    return df
-
-
-def apply_robust_scaling_vintage(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    Fit RobustScaler on historical data only (before current month).
-    Apply to all data to avoid look-ahead bias.
-
-    This is critical for proper backtesting - we can only use statistics
-    that would have been available at prediction time.
-
-    RobustScaler uses median and IQR, making it resistant to outliers.
-    This is important for employment data which has extreme COVID values.
-
-    Args:
-        df: DataFrame with 'date', 'series_name', 'value' columns
-        snapshot_date: Current snapshot date (e.g., 2020-01-31)
-
-    Returns:
-        DataFrame with scaled values (fitted on history, applied to all)
-    """
-    if df.empty or not SKLEARN_AVAILABLE:
-        return df
-
-    df = df.copy()
-
-    # Cutoff: Exclude current month from fitting
-    # If snapshot is 2020-01-31, only fit on data through 2019-12-31
-    cutoff_date = snapshot_date - pd.DateOffset(months=1)
-    cutoff_date = cutoff_date + pd.offsets.MonthEnd(0)
-
-    scaled_groups = []
+    lag_parts = []
 
     for series_name, group in df.groupby('series_name'):
-        group = group.sort_values('date').copy()
+        group = group.sort_values('date')
 
-        if len(group) < 2:
-            scaled_groups.append(group)
-            continue
+        for lag in _EMPLOYMENT_LAGS:
+            lag_group = group.copy()
+            lag_group['value'] = group['value'].shift(lag)
+            lag_group['series_name'] = f"{series_name}_lag_{lag}m"
+            if 'series_code' in lag_group.columns:
+                lag_group['series_code'] = lag_group['series_code'].astype(str) + f'_lag_{lag}m'
+            # Drop rows where lag produced NaN
+            lag_group = lag_group.dropna(subset=['value'])
+            lag_parts.append(lag_group)
 
-        # Fit scaler only on historical data (before current month)
-        hist_mask = group['date'] <= cutoff_date
-        hist_data = group.loc[hist_mask, 'value']
-
-        if len(hist_data) < 2:
-            # Not enough history - skip scaling for this series
-            scaled_groups.append(group)
-            continue
-
-        # Skip if constant values (avoid division by zero)
-        if hist_data.std() < 1e-10:
-            scaled_groups.append(group)
-            continue
-
-        # Fit on history only
-        scaler = RobustScaler()
-        scaler.fit(hist_data.values.reshape(-1, 1))
-
-        # Transform all data (including current month)
-        group['value'] = scaler.transform(group['value'].values.reshape(-1, 1)).flatten()
-        scaled_groups.append(group)
-
-    if scaled_groups:
-        return pd.concat(scaled_groups, ignore_index=True)
+    if lag_parts:
+        return pd.concat([df] + lag_parts, ignore_index=True)
     return df
 
 
@@ -2436,25 +2348,17 @@ def load_snapshot(base_dir: Path, date_ts: pd.Timestamp) -> pd.DataFrame:
 
 def prepare_fred_snapshots(
     apply_mom_conversion: bool = True,
-    apply_transforms: bool = True,
-    apply_scaling: bool = True
 ):
     """
     Main pipeline to prepare FRED employment snapshots.
 
     Processing steps:
     1. Load raw snapshot (employment levels)
-    2. Convert to MoM changes (stationary target)
-    3. Apply SymLog transform (handle outliers)
-    4. Apply RobustScaler (normalize, history-only fit)
-
-    NOTE: This does NOT create lag features or rolling statistics.
-    Those are created in train_lightgbm_nfp.py to avoid redundancy.
+    2. Convert to MoM changes + SymLog MoM changes
+    3. Create lag features (1, 3, 6, 12 months) for both variants
 
     Args:
-        apply_mom_conversion: Convert levels to MoM changes
-        apply_transforms: Apply SymLog to MoM changes
-        apply_scaling: Apply RobustScaler normalization
+        apply_mom_conversion: Convert levels to MoM changes and create enriched features
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
@@ -2466,7 +2370,7 @@ def prepare_fred_snapshots(
         return
 
     logger.info(f"Preparing FRED Snapshots from {snapshot_pairs[0][0].date()} to {snapshot_pairs[-1][0].date()}")
-    logger.info(f"Options: mom_conversion={apply_mom_conversion}, transforms={apply_transforms}, scaling={apply_scaling}")
+    logger.info(f"Options: mom_conversion={apply_mom_conversion}")
 
     for i, (obs_month, snap_date) in enumerate(snapshot_pairs):
         # 1. Load raw snapshot (employment LEVELS)
@@ -2478,20 +2382,16 @@ def prepare_fred_snapshots(
         raw_df['date'] = pd.to_datetime(raw_df['date'])
         working_df = raw_df.copy()
 
-        # 2. Convert levels to MoM changes
+        # 2. Convert to MoM changes (raw + symlog)
         if apply_mom_conversion:
             working_df = calculate_mom_change(working_df)
 
         if working_df.empty:
             continue
 
-        # 3. Apply SymLog transform
-        if apply_transforms and apply_mom_conversion:
-            working_df = preprocess_transforms(working_df)
-
-        # 4. Apply RobustScaler (fit on history only)
-        if apply_scaling:
-            working_df = apply_robust_scaling_vintage(working_df, snap_date)
+        # 3. Create lag features for all series
+        if apply_mom_conversion:
+            working_df = create_employment_lags(working_df)
 
         # Add snapshot date
         working_df['snapshot_date'] = snap_date
@@ -2506,7 +2406,7 @@ def prepare_fred_snapshots(
         working_df.to_parquet(save_path, index=False)
 
         if i % 12 == 0:
-            logger.info(f"Prepared snapshot for {obs_month.date()} (snapshot={snap_date.date()})")
+            logger.info(f"Prepared snapshot for {obs_month.date()} (snapshot={snap_date.date()}) — {working_df['series_name'].nunique()} series")
 
     logger.info("FRED Snapshots preparation complete.")
 
@@ -2537,38 +2437,47 @@ def verify_prepared_snapshot():
         return
 
     df = pd.read_parquet(prepared_path)
-    series = df['series_name'].unique()
+    series = sorted(df['series_name'].unique())
 
     logger.info(f"--- Verification Report for {test_date.date()} ---")
     logger.info(f"Total unique series: {len(series)}")
     logger.info(f"Columns: {df.columns.tolist()}")
 
-    # Check that we DON'T have redundant lag/rolling features
-    lag_series = [s for s in series if '_lag' in s]
-    rolling_series = [s for s in series if '_rolling' in s]
+    # Count series by type
+    base_mom = [s for s in series if '_lag_' not in s and '_symlog' not in s]
+    symlog_mom = [s for s in series if '_symlog' in s and '_lag_' not in s]
+    raw_lags = [s for s in series if '_lag_' in s and '_symlog' not in s]
+    symlog_lags = [s for s in series if '_symlog' in s and '_lag_' in s]
 
-    if not lag_series:
-        logger.info("OK: No lag features (created downstream)")
-    else:
-        logger.warning(f"WARNING: Found lag features that may be redundant: {lag_series[:3]}...")
+    logger.info(f"  Raw MoM series: {len(base_mom)}")
+    logger.info(f"  Symlog MoM series: {len(symlog_mom)}")
+    logger.info(f"  Raw lag series: {len(raw_lags)}")
+    logger.info(f"  Symlog lag series: {len(symlog_lags)}")
 
-    if not rolling_series:
-        logger.info("OK: No rolling features (created downstream)")
+    # Verify completeness: each base should have a symlog + 8 lags
+    expected_per_base = 1 + 1 + 4 + 4  # raw + symlog + 4 raw lags + 4 symlog lags
+    expected_total = len(base_mom) * expected_per_base
+    actual_total = len(series)
+    if actual_total == expected_total:
+        logger.info(f"OK: {actual_total} series = {len(base_mom)} base × {expected_per_base} variants")
     else:
-        logger.warning(f"WARNING: Found rolling features that may be redundant: {rolling_series[:3]}...")
+        logger.warning(f"MISMATCH: Expected {expected_total} series, got {actual_total}")
 
     # Check transforms were applied
     if 'value_raw' in df.columns:
-        # Compare raw vs transformed
         total_series = df[df['series_name'] == 'total']
         if not total_series.empty:
             raw_vals = total_series['value_raw'].dropna()
-            trans_vals = total_series['value'].dropna()
+            logger.info(f"\n'total' series (raw MoM):")
+            logger.info(f"  Skew: {raw_vals.skew():.3f}, Kurt: {raw_vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{raw_vals.min():.1f}, {raw_vals.max():.1f}]")
 
-            logger.info(f"\n'total' series statistics:")
-            logger.info(f"  Raw MoM - Skew: {raw_vals.skew():.3f}, Kurt: {raw_vals.kurtosis():.3f}")
-            logger.info(f"  Transformed - Skew: {trans_vals.skew():.3f}, Kurt: {trans_vals.kurtosis():.3f}")
-            logger.info(f"  Range: [{trans_vals.min():.3f}, {trans_vals.max():.3f}]")
+        total_symlog = df[df['series_name'] == 'total_symlog']
+        if not total_symlog.empty:
+            symlog_vals = total_symlog['value'].dropna()
+            logger.info(f"\n'total_symlog' series (symlog MoM):")
+            logger.info(f"  Skew: {symlog_vals.skew():.3f}, Kurt: {symlog_vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{symlog_vals.min():.3f}, {symlog_vals.max():.3f}]")
 
     # Check schema matches expected format
     expected_cols = ['date', 'value', 'series_name']
@@ -2613,28 +2522,29 @@ def compare_raw_vs_prepared():
     prepared_df = pd.read_parquet(prepared_path)
 
     logger.info(f"\n=== Comparison for {test_date.date()} ===")
-    logger.info(f"Raw: {len(raw_df)} rows, Prepared: {len(prepared_df)} rows")
+    logger.info(f"Raw: {len(raw_df)} rows ({raw_df['series_name'].nunique()} series)")
+    logger.info(f"Prepared: {len(prepared_df)} rows ({prepared_df['series_name'].nunique()} series)")
 
     # Compare 'total' series (main NFP)
     for series_name in ['total', 'total_nsa']:
         raw_series = raw_df[raw_df['series_name'] == series_name]['value'].dropna()
-        prep_series = prepared_df[prepared_df['series_name'] == series_name]['value'].dropna()
 
-        if raw_series.empty or prep_series.empty:
+        if raw_series.empty:
             continue
 
-        # Raw is levels, prepared is transformed MoM changes
+        # Raw is levels, prepared has raw MoM + symlog MoM
         raw_mom = raw_series.diff().dropna()
+
+        prep_raw = prepared_df[prepared_df['series_name'] == series_name]['value'].dropna()
+        prep_symlog = prepared_df[prepared_df['series_name'] == f"{series_name}_symlog"]['value'].dropna()
 
         logger.info(f"\n{series_name}:")
         logger.info(f"  Raw Levels - Mean: {raw_series.mean():.0f}K")
         logger.info(f"  Raw MoM    - Skew: {raw_mom.skew():.3f}, Kurt: {raw_mom.kurtosis():.3f}")
-        logger.info(f"  Prepared   - Skew: {prep_series.skew():.3f}, Kurt: {prep_series.kurtosis():.3f}")
-
-        skew_improvement = abs(raw_mom.skew()) - abs(prep_series.skew())
-        kurt_improvement = abs(raw_mom.kurtosis()) - abs(prep_series.kurtosis())
-
-        logger.info(f"  Improvement - Skew: {skew_improvement:+.3f}, Kurt: {kurt_improvement:+.3f}")
+        if not prep_raw.empty:
+            logger.info(f"  Prepared Raw MoM - Skew: {prep_raw.skew():.3f}, Kurt: {prep_raw.kurtosis():.3f}")
+        if not prep_symlog.empty:
+            logger.info(f"  Prepared Symlog MoM - Skew: {prep_symlog.skew():.3f}, Kurt: {prep_symlog.kurtosis():.3f}")
 
 
 
@@ -2649,8 +2559,6 @@ def main():
     parser = argparse.ArgumentParser(description="FRED Employment Pipeline")
     parser.add_argument('--refresh', action='store_true', help="Force refresh of existing snapshots")
     parser.add_argument('--no-mom', action='store_true', help="Skip MoM conversion")
-    parser.add_argument('--no-transforms', action='store_true', help="Skip SymLog transform")
-    parser.add_argument('--no-scaling', action='store_true', help="Skip RobustScaler")
     parser.add_argument('--verify-only', action='store_true', help="Only run verification")
     parser.add_argument('--compare', action='store_true', help="Compare raw vs prepared")
     args = parser.parse_args()
@@ -2665,11 +2573,9 @@ def main():
     # Stage 1: Download FRED data and build snapshots + NFP targets
     build_all_snapshots(refresh_existing=args.refresh)
 
-    # Stage 2: Prepare snapshots (MoM conversion, transforms, scaling)
+    # Stage 2: Prepare snapshots (MoM conversion + symlog + lags)
     prepare_fred_snapshots(
         apply_mom_conversion=not args.no_mom,
-        apply_transforms=not args.no_transforms,
-        apply_scaling=not args.no_scaling
     )
     verify_prepared_snapshot()
 

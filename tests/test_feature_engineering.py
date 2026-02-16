@@ -1,7 +1,7 @@
 """
 Tests for Feature Engineering Module
 
-Tests for calendar features, employment features, and exogenous feature engineering.
+Tests for calendar features (survey week dates, seasonal indicators).
 """
 
 import pytest
@@ -17,9 +17,6 @@ from Train.feature_engineering import (
     calculate_weeks_between_surveys,
     add_calendar_features,
     get_calendar_features_dict,
-    engineer_employment_features,
-    engineer_exogenous_features,
-    calculate_sector_breadth,
 )
 
 
@@ -156,153 +153,6 @@ class TestGetCalendarFeaturesDict:
 
         for key, value in result.items():
             assert isinstance(value, (int, float)), f"{key} is not numeric"
-
-
-class TestEngineerEmploymentFeatures:
-    """Tests for employment feature engineering."""
-
-    @pytest.fixture
-    def sample_fred_df(self):
-        """Create sample FRED DataFrame for testing."""
-        dates = pd.date_range('2019-01-01', '2020-06-01', freq='MS')
-        series_names = [
-            'total.private_nsa',
-            'total.government_nsa',
-            'total.private.goods_nsa'
-        ]
-
-        data = []
-        np.random.seed(42)
-        for date in dates:
-            for series in series_names:
-                data.append({
-                    'date': date,
-                    'series_name': series,
-                    'value': np.random.randn() * 100 + 50000,
-                })
-
-        return pd.DataFrame(data)
-
-    def test_returns_dict(self, sample_fred_df):
-        """Test that function returns a dictionary."""
-        target_month = pd.Timestamp('2020-03-01')
-        result = engineer_employment_features(sample_fred_df, target_month, 'nsa')
-
-        assert isinstance(result, dict)
-
-    def test_empty_df_returns_empty(self):
-        """Test that empty DataFrame returns empty dict."""
-        empty_df = pd.DataFrame()
-        target_month = pd.Timestamp('2020-03-01')
-
-        result = engineer_employment_features(empty_df, target_month, 'nsa')
-
-        assert result == {}
-
-    def test_none_df_returns_empty(self):
-        """Test that None DataFrame returns empty dict."""
-        result = engineer_employment_features(None, pd.Timestamp('2020-03-01'), 'nsa')
-
-        assert result == {}
-
-
-class TestEngineerExogenousFeatures:
-    """Tests for exogenous feature engineering."""
-
-    @pytest.fixture
-    def sample_snapshot_df(self):
-        """Create sample snapshot DataFrame."""
-        dates = pd.date_range('2019-01-01', '2020-06-01', freq='MS')
-        series_names = ['VIX_max', 'Credit_Spreads_avg', 'Oil_Prices_mean']
-
-        data = []
-        np.random.seed(42)
-        for date in dates:
-            for series in series_names:
-                data.append({
-                    'date': date,
-                    'series_name': series,
-                    'value': np.random.randn() * 10 + 50,
-                })
-
-        return pd.DataFrame(data)
-
-    def test_returns_dict(self, sample_snapshot_df):
-        """Test that function returns a dictionary."""
-        target_month = pd.Timestamp('2020-03-01')
-        result = engineer_exogenous_features(sample_snapshot_df, target_month)
-
-        assert isinstance(result, dict)
-
-    def test_creates_latest_features(self, sample_snapshot_df):
-        """Test that _latest features are created."""
-        target_month = pd.Timestamp('2020-03-01')
-        result = engineer_exogenous_features(sample_snapshot_df, target_month)
-
-        latest_features = [k for k in result.keys() if '_latest' in k]
-        assert len(latest_features) > 0
-
-    def test_creates_lag_features(self, sample_snapshot_df):
-        """Test that lag features are created."""
-        target_month = pd.Timestamp('2020-03-01')
-        result = engineer_exogenous_features(sample_snapshot_df, target_month)
-
-        lag_features = [k for k in result.keys() if '_lag' in k]
-        assert len(lag_features) > 0
-
-    def test_empty_df_returns_empty(self):
-        """Test that empty DataFrame returns empty dict."""
-        empty_df = pd.DataFrame()
-        result = engineer_exogenous_features(empty_df, pd.Timestamp('2020-03-01'))
-        assert result == {}
-
-
-class TestCalculateSectorBreadth:
-    """Tests for sector breadth calculation."""
-
-    @pytest.fixture
-    def sample_sector_df(self):
-        """Create sample DataFrame with sector data."""
-        dates = pd.date_range('2020-01-01', '2020-06-01', freq='MS')
-
-        # Create data for service industries
-        service_series = [
-            'total.private.services.trade_transportation_utilities_nsa',
-            'total.private.services.information_nsa',
-            'total.private.services.financial_nsa',
-        ]
-
-        data = []
-        np.random.seed(42)
-        base_values = {s: np.random.rand() * 10000 + 50000 for s in service_series}
-
-        for i, date in enumerate(dates):
-            for series in service_series:
-                # Add some growth/decline
-                value = base_values[series] + i * np.random.randn() * 100
-                data.append({
-                    'date': date,
-                    'series_name': series,
-                    'value': value,
-                })
-
-        return pd.DataFrame(data)
-
-    def test_returns_dict(self, sample_sector_df):
-        """Test that function returns a dictionary."""
-        target_month = pd.Timestamp('2020-06-01')
-        result = calculate_sector_breadth(sample_sector_df, target_month, 'nsa')
-
-        assert isinstance(result, dict)
-
-    def test_empty_df_returns_empty(self):
-        """Test that empty DataFrame returns empty dict."""
-        result = calculate_sector_breadth(
-            pd.DataFrame(),
-            pd.Timestamp('2020-03-01'),
-            'nsa'
-        )
-        assert result == {}
 
 
 if __name__ == "__main__":

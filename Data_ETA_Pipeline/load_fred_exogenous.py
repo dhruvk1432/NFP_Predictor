@@ -599,7 +599,7 @@ def aggregate_vix_to_monthly(daily_df):
     temp_df['VIX_30d_spike'] = monthly_agg.get('vix_spike_ratio_max', np.nan)
     temp_df['VIX_max_5d_spike'] = monthly_agg.get('vix_spike_5d_max', np.nan)
     temp_df['VIX_panic_regime'] = (temp_df['VIX_max'] > 50).astype(int)
-    temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 40).astype(int)
+    temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 20).astype(int)
 
     result = temp_df.reset_index().melt(
         id_vars=['date'],
@@ -744,8 +744,8 @@ def aggregate_credit_yield_to_monthly(daily_df, name):
     Aggregate pre-computed Credit/Yield daily features to monthly.
     """
     monthly_agg = daily_df.resample('MS').agg({
-        'value': ['mean', 'max'],
-        'daily_chg': ['std', 'sum'],
+        'value': ['mean', 'max', 'first', 'last'],
+        'daily_chg': ['std'],
         'z_score': 'max',
         'acceleration': ['mean', 'std'],
     })
@@ -756,7 +756,10 @@ def aggregate_credit_yield_to_monthly(daily_df, name):
     temp_df[f'{name}_avg'] = monthly_agg.get('value_mean', np.nan)
     temp_df[f'{name}_max'] = monthly_agg.get('value_max', np.nan)
     temp_df[f'{name}_vol_of_changes'] = monthly_agg.get('daily_chg_std', np.nan)
-    temp_df[f'{name}_monthly_chg'] = monthly_agg.get('daily_chg_sum', np.nan)
+    # Monthly change: last trading day value minus first trading day value
+    temp_df[f'{name}_monthly_chg'] = (
+        monthly_agg.get('value_last', np.nan) - monthly_agg.get('value_first', np.nan)
+    )
     temp_df[f'{name}_zscore_max'] = monthly_agg.get('z_score_max', np.nan)
     temp_df[f'{name}_acceleration'] = monthly_agg.get('acceleration_mean', np.nan)
     temp_df[f'{name}_accel_volatility'] = monthly_agg.get('acceleration_std', np.nan)
@@ -1180,9 +1183,20 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
                     # Combine all series for Weekly_Econ_Index
                     sub_df = pd.concat([avg_series, max_series, min_series], ignore_index=True)
                 else:
-                    # For Financial_Stress, just use monthly average
-                    monthly_avg['series_name'] = f"{name}_monthly_avg"
-                    sub_df = monthly_avg.copy()
+                    # For Financial_Stress, calculate monthly average, max, and min
+                    monthly_max = aggregate_weekly_to_monthly_nfp_based_custom(weekly_data, nfp_schedule, agg_func='max')
+                    monthly_min = aggregate_weekly_to_monthly_nfp_based_custom(weekly_data, nfp_schedule, agg_func='min')
+
+                    avg_series = monthly_avg.copy()
+                    avg_series['series_name'] = f"{name}_monthly_avg"
+
+                    max_series = monthly_max.copy()
+                    max_series['series_name'] = f"{name}_monthly_max"
+
+                    min_series = monthly_min.copy()
+                    min_series['series_name'] = f"{name}_monthly_min"
+
+                    sub_df = pd.concat([avg_series, max_series, min_series], ignore_index=True)
                 
             else:
                 # Regional Fed and other monthly data (JOLTS commented out)
@@ -1212,14 +1226,19 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
             sub_df['snapshot_date'] = snap_date
             
             snap_data_list.append(sub_df)
-            
         if snap_data_list:
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['date'] = full_snap['date'].dt.to_period('M').dt.to_timestamp()
 
+            # Dynamic exclusion for pct_change: Exclude problematic features
+            # - acceleration: often oscillates around 0 -> inf pct_change
+            # - weeks_high: sparse (mostly 0) -> inf/nan pct_change
+            problematic_features = {s for s in full_snap['series_name'].unique() if 'acceleration' in s or 'weeks_high' in s}
+            pct_change_skip = BINARY_REGIME_FEATURES | problematic_features
+
             # Branch-and-Expand: create 3 base variants, then compute all features
             full_snap = add_symlog_copies(full_snap, skip_series=BINARY_REGIME_FEATURES)
-            full_snap = add_pct_change_copies(full_snap, skip_series=BINARY_REGIME_FEATURES)
+            full_snap = add_pct_change_copies(full_snap, skip_series=pct_change_skip)
             full_snap = compute_all_features(full_snap, skip_series=BINARY_REGIME_FEATURES)
 
             # CRITICAL: Filter out data not yet released at snapshot time

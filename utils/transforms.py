@@ -90,6 +90,8 @@ def add_symlog_copies(
     df: pd.DataFrame,
     skip_series: frozenset = frozenset()
 ) -> pd.DataFrame:
+    # IMPORTANT: This must run BEFORE add_pct_change_copies() to prevent
+    # creating symlog copies of derived series (pct_chg, symlog_pct_chg).
     """
     Create symlog-transformed copies of all series and concatenate with originals.
 
@@ -133,9 +135,12 @@ def add_pct_change_copies(
     skip_series: frozenset = frozenset()
 ) -> pd.DataFrame:
     """
-    Create pct-change-transformed copies of raw series and concatenate with originals.
+    Create pct-change-transformed copies of raw AND symlog series.
 
-    Only applies to raw series (not _symlog or already _pct_chg).
+    Creates two sets of pct_change copies:
+    - From raw series X → X_pct_chg
+    - From symlog series X_symlog → X_symlog_pct_chg
+
     Applied AFTER add_symlog_copies and BEFORE compute_all_features so that
     pct_change variants get z-scores, rolling stats, and lags.
 
@@ -145,16 +150,16 @@ def add_pct_change_copies(
             (e.g. binary regime indicators where pct_change is meaningless).
 
     Returns:
-        DataFrame with original rows + pct_change copies (series_name suffixed
-        with '_pct_chg').
+        DataFrame with original rows + pct_change copies (suffixed
+        with '_pct_chg' or '_symlog_pct_chg').
     """
     if df.empty:
         return df
 
-    # Only create pct_change for raw series (not symlog, not already pct_chg)
+    # Create pct_change for raw AND symlog series (not already pct_chg)
+    # Note: _symlog_pct_chg ends with _pct_chg so the guard catches both
     mask = (
         ~df['series_name'].isin(skip_series)
-        & ~df['series_name'].str.endswith('_symlog')
         & ~df['series_name'].str.endswith('_pct_chg')
     )
     base_df = df[mask]
@@ -167,6 +172,7 @@ def add_pct_change_copies(
         group = group.sort_values('date')
         pct_group = group.copy()
         pct_group['value'] = group['value'].pct_change() * 100
+        # Raw series X → X_pct_chg, Symlog series X_symlog → X_symlog_pct_chg
         pct_group['series_name'] = series_name + '_pct_chg'
         if 'series_code' in pct_group.columns:
             pct_group['series_code'] = pct_group['series_code'].astype(str) + '_pct_chg'
@@ -223,10 +229,15 @@ def compute_all_features(
     if df.empty:
         return df
 
+    if df.empty:
+        return df
+
     base_cols = [c for c in ['date', 'release_date', 'series_code', 'snapshot_date']
                  if c in df.columns]
-    series_list = df['series_name'].unique()
-    result_list = []
+    series_list = sorted(df['series_name'].unique())  # Sort for determinism
+    
+    # Collect all base (un-lagged) features first
+    base_features_list = []
 
     for series in series_list:
         sdf = df[df['series_name'] == series].copy().sort_values('date')
@@ -234,10 +245,10 @@ def compute_all_features(
         vals = sdf['value']
 
         is_binary = series in skip_series
-        is_pct_chg = series.endswith('_pct_chg')
+        is_pct_chg = series.endswith('_pct_chg') or series.endswith('_symlog_pct_chg')
 
         # Level (always emitted)
-        _emit(result_list, meta, series, vals)
+        _emit(base_features_list, meta, series, vals)
 
         if is_binary:
             continue
@@ -245,35 +256,59 @@ def compute_all_features(
         # --- MoM diff (raw + symlog only) ---
         if not is_pct_chg:
             diff = vals.diff()
-            _emit(result_list, meta, f"{series}_diff", diff)
-            _emit(result_list, meta, f"{series}_diff_zscore_3m",
+            _emit(base_features_list, meta, f"{series}_diff", diff)
+            _emit(base_features_list, meta, f"{series}_diff_zscore_3m",
                   _rolling_zscore(diff, 3, 2))
-            _emit(result_list, meta, f"{series}_diff_zscore_12m",
+            _emit(base_features_list, meta, f"{series}_diff_zscore_12m",
                   _rolling_zscore(diff, 12, 6))
 
         # --- Level z-scores (all non-binary) ---
-        _emit(result_list, meta, f"{series}_zscore_3m",
+        _emit(base_features_list, meta, f"{series}_zscore_3m",
               _rolling_zscore(vals, 3, 2))
-        _emit(result_list, meta, f"{series}_zscore_12m",
+        _emit(base_features_list, meta, f"{series}_zscore_12m",
               _rolling_zscore(vals, 12, 6))
 
         # --- Rolling stats (all non-binary) ---
-        _emit(result_list, meta, f"{series}_rolling_mean_3m",
+        _emit(base_features_list, meta, f"{series}_rolling_mean_3m",
               vals.rolling(3, min_periods=2).mean())
-        _emit(result_list, meta, f"{series}_rolling_std_6m",
+        _emit(base_features_list, meta, f"{series}_rolling_std_6m",
               vals.rolling(6, min_periods=3).std())
 
-        # --- Lags (all non-binary) ---
-        for lag in [1, 3, 6, 12]:
-            _emit(result_list, meta, f"{series}_lag_{lag}m", vals.shift(lag))
+        # (Old lag loop removed here - lags are applied globally below)
 
         # --- Multi-period changes (raw + symlog only) ---
         if not is_pct_chg:
             for period in [3, 6, 12]:
-                _emit(result_list, meta, f"{series}_chg_{period}m",
+                _emit(base_features_list, meta, f"{series}_chg_{period}m",
                       vals.diff(period))
 
-    result = pd.concat(result_list, ignore_index=True)
+    # --- Global Lag Application ---
+    # Apply lags to EVERY feature generated above
+    # Lags: 1, 3, 6, 12, 18 months
+    lags = [1, 3, 6, 12, 18]
+    final_output_list = []
+    
+    for feature_block in base_features_list:
+        # Add the un-lagged feature itself
+        final_output_list.append(feature_block)
+        
+        # Add lagged variants
+        # Note: feature_block is sorted by date because it comes from sorted sdf
+        # and operations preserve order. shift() works correctly on value column.
+        for lag in lags:
+            lag_block = feature_block.copy()
+            lag_block['value'] = lag_block['value'].shift(lag)
+            
+            # Suffix name and code
+            lag_suffix = f"_lag_{lag}m"
+            lag_block['series_name'] = lag_block['series_name'] + lag_suffix
+            
+            if 'series_code' in lag_block.columns:
+                 lag_block['series_code'] = lag_block['series_code'].astype(str) + lag_suffix
+            
+            final_output_list.append(lag_block)
+
+    result = pd.concat(final_output_list, ignore_index=True)
     result = result.dropna(subset=['value'])
     return result
 
@@ -321,19 +356,20 @@ def generate_pct_chg_feature_names(
     """
     Generate pct_chg-equivalent feature names from diff-based feature names.
 
-    For each feature with a _diff suffix, creates the corresponding _pct_chg variant.
-    Level-only features (no _diff) are skipped since pct_chg is a derivative.
+    For each feature with a _diff suffix, creates both:
+    - _pct_chg variant (from raw series)
+    - _symlog_pct_chg variant (from symlog series)
 
     Args:
         features: Original feature name set.
         skip: Feature names to exclude (e.g. binary regime indicators).
 
     Returns:
-        Set of pct_chg-equivalent feature names.
+        Set of pct_chg and symlog_pct_chg feature names.
 
     Example:
         >>> generate_pct_chg_feature_names({'AHE_Private_diff_zscore_3m'})
-        {'AHE_Private_pct_chg_zscore_3m'}
+        {'AHE_Private_pct_chg_zscore_3m', 'AHE_Private_symlog_pct_chg_zscore_3m'}
     """
     result = set()
     for f in features:
@@ -347,6 +383,7 @@ def generate_pct_chg_feature_names(
             if f.endswith(diff_suffix):
                 base = f[:-len(diff_suffix)]
                 result.add(f"{base}{pct_suffix}")
+                result.add(f"{base}_symlog{pct_suffix}")
                 break
     return result
 
@@ -393,6 +430,55 @@ def winsorize(
     upper = series.quantile(upper_percentile)
     
     return series.clip(lower=lower, upper=upper)
+
+
+def winsorize_covid_period(
+    data: pd.DataFrame | pd.Series,
+    covid_start: str = '2020-03-01',
+    covid_end: str = '2020-05-01',
+    lower_percentile: float = 0.01,
+    upper_percentile: float = 0.99,
+) -> pd.DataFrame | pd.Series:
+    """
+    Winsorize values during the COVID period by clipping them to quantile
+    boundaries computed from the non-COVID portion of the data.
+
+    This keeps the same number of rows (preserving time-series continuity)
+    while neutralizing extreme COVID-era outliers that would otherwise
+    distort correlations and other statistical measures.
+
+    Args:
+        data: Wide-format DataFrame (DatetimeIndex, columns = series) or
+              a Series with DatetimeIndex.
+        covid_start: First month of the COVID shock (inclusive).
+        covid_end:   Last month of the COVID shock (inclusive).
+        lower_percentile: Lower quantile for clipping (default 1%).
+        upper_percentile: Upper quantile for clipping (default 99%).
+
+    Returns:
+        Copy of *data* with COVID-period values clipped per-column.
+    """
+    data = data.copy()
+    covid_mask = (data.index >= pd.Timestamp(covid_start)) & \
+                 (data.index <= pd.Timestamp(covid_end))
+
+    if isinstance(data, pd.DataFrame):
+        non_covid = data.loc[~covid_mask]
+        for col in data.columns:
+            lower = non_covid[col].quantile(lower_percentile)
+            upper = non_covid[col].quantile(upper_percentile)
+            data.loc[covid_mask, col] = data.loc[covid_mask, col].clip(
+                lower=lower, upper=upper
+            )
+    else:  # pd.Series
+        non_covid = data.loc[~covid_mask]
+        lower = non_covid.quantile(lower_percentile)
+        upper = non_covid.quantile(upper_percentile)
+        data.loc[covid_mask] = data.loc[covid_mask].clip(
+            lower=lower, upper=upper
+        )
+
+    return data
 
 
 def calculate_mom_pct_change(

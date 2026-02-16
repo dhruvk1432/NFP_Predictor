@@ -17,7 +17,7 @@ from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UN
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map
 # OPTIMIZATION: Use shared utility for snapshot path
 from Data_ETA_Pipeline.utils import get_snapshot_path
-from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
+from utils.transforms import add_symlog_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -379,9 +379,10 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
             )
             snap_data['snapshot_date'] = snap_date
 
-            # Branch-and-Expand: create 3 base variants, then compute all features
+            # Branch-and-Expand: create symlog variants, then compute all features
+            # NOTE: pct_change skipped entirely — Prosper data is already in percentages,
+            # so diff already captures the change in percentage points
             snap_data = add_symlog_copies(snap_data)
-            snap_data = add_pct_change_copies(snap_data)
             snap_data = compute_all_features(snap_data)
 
             snap_data.to_parquet(save_path, index=False)

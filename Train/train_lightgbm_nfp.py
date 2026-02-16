@@ -67,7 +67,6 @@ from Train.data_loader import (
 
 from Train.feature_engineering import (
     add_calendar_features,
-    engineer_employment_features,
 )
 
 from Train.model import (
@@ -211,12 +210,13 @@ def build_training_dataset(
         for k, v in {**nsa_target_features, **sa_target_features}.items():
             features[k] = v
 
-        # Add FRED employment features (endogenous data) - cached
+        # Add FRED employment features (pre-enriched snapshots with symlog + lags)
         fred_df = load_fred_snapshot(snapshot_date)
         if fred_df is not None and not fred_df.empty:
-            employment_features = engineer_employment_features(fred_df, target_month, target_type)
-            for k, v in employment_features.items():
-                features[k] = v
+            fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
+            if not fred_features.empty:
+                for col in fred_features.columns:
+                    features[col] = fred_features[col].iloc[0]
 
         all_features.append(features)
         all_targets.append(target_value)
@@ -326,12 +326,13 @@ def run_backtest(
         for k, v in {**nsa_target_features, **sa_target_features}.items():
             features[k] = v
 
-        # Add FRED employment features
+        # Add FRED employment features (pre-enriched snapshots with symlog + lags)
         fred_df = load_fred_snapshot(snapshot_date)
         if fred_df is not None and not fred_df.empty:
-            employment_features = engineer_employment_features(fred_df, target_month, target_type)
-            for k, v in employment_features.items():
-                features[k] = v
+            fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
+            if not fred_features.empty:
+                for col in fred_features.columns:
+                    features[col] = fred_features[col].iloc[0]
 
         # Make prediction with intervals
         pred_result = predict_with_intervals(model, features, residuals, feature_cols)
@@ -1010,12 +1011,13 @@ def predict_nfp_mom(
     for k, v in {**nsa_target_features, **sa_target_features}.items():
         features[k] = v
 
-    # Add FRED employment features
+    # Add FRED employment features (pre-enriched snapshots with symlog + lags)
     fred_df = load_fred_snapshot(snapshot_date)
     if fred_df is not None and not fred_df.empty:
-        employment_features = engineer_employment_features(fred_df, target_month, target_type)
-        for k, v in employment_features.items():
-            features[k] = v
+        fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
+        if not fred_features.empty:
+            for col in fred_features.columns:
+                features[col] = fred_features[col].iloc[0]
 
     # Make prediction with intervals
     pred_result = predict_with_intervals(model, features, residuals, feature_cols)

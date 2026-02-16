@@ -435,27 +435,17 @@ def pivot_snapshot_to_wide(
 
     features = {}
 
-    # Simplified feature generation: latest value + 12-month percent change only
-    # Exogenous data is already pre-processed in the ETL pipelines
+    # Snapshots are pre-enriched with all derived features.
+    # Just take the latest available value per series.
     for raw_series_name in wide_df.columns:
         series = wide_df[raw_series_name].dropna()
-        n = len(series)
 
-        if n == 0:
+        if len(series) == 0:
             continue
 
         # Sanitize series name for LightGBM compatibility
         series_name = sanitize_feature_name(str(raw_series_name))
-
-        # Latest value
-        latest = series.iloc[-1]
-        features[f'{series_name}_latest'] = latest
-
-        # 12-month percent change
-        if n >= 13 and series.iloc[-13] != 0:
-            features[f'{series_name}_12m_pct_change'] = (
-                (latest - series.iloc[-13]) / abs(series.iloc[-13])
-            ) * 100
+        features[series_name] = series.iloc[-1]
 
     if not features:
         return pd.DataFrame()
@@ -517,24 +507,15 @@ def pivot_snapshot_to_wide_batch(
 
         features = {'target_month': target_month}
 
-        # Simplified: latest value + 12-month percent change only
+        # Snapshots are pre-enriched: just take latest value per series
         for raw_series_name in available.columns:
             series = available[raw_series_name].dropna()
-            n = len(series)
 
-            if n == 0:
+            if len(series) == 0:
                 continue
 
             series_name = sanitize_feature_name(str(raw_series_name))
-
-            latest = series.iloc[-1]
-            features[f'{series_name}_latest'] = latest
-
-            # 12-month percent change
-            if n >= 13 and series.iloc[-13] != 0:
-                features[f'{series_name}_12m_pct_change'] = (
-                    (latest - series.iloc[-13]) / abs(series.iloc[-13])
-                ) * 100
+            features[series_name] = series.iloc[-1]
 
         all_features.append(features)
 

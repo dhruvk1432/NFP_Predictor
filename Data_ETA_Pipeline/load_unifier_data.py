@@ -18,6 +18,14 @@ from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_a
 
 logger = setup_logger(__file__, TEMP_DIR)
 
+# Series where pct_change is meaningless due to zero-centered or near-zero values
+# - Empire_State_Mfg: diffusion index centered at 0, frequently crosses zero
+# - Challenger_Job_Cuts: count data that can be very low, producing noisy pct_change
+ZERO_CENTERED_SERIES = frozenset({
+    'Empire_State_Mfg',
+    'Challenger_Job_Cuts',
+})
+
 UNIFIER_SERIES = {
     # Existing series
     "Challenger_Job_Cuts": "USCGJCUTP",
@@ -369,9 +377,14 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             full_snap = pd.concat(snap_data_list, ignore_index=True)
             full_snap['snapshot_date'] = snap_date
 
+            # Dynamic exclusion for pct_change: series that oscillate around zero
+            # Match both raw and _symlog variants (e.g. Empire_State_Mfg_symlog)
+            problematic_features = {s for s in full_snap['series_name'].unique()
+                                    if any(p in s for p in ZERO_CENTERED_SERIES)}
+
             # Branch-and-Expand: create 3 base variants, then compute all features
             full_snap = add_symlog_copies(full_snap)
-            full_snap = add_pct_change_copies(full_snap)
+            full_snap = add_pct_change_copies(full_snap, skip_series=problematic_features)
             full_snap = compute_all_features(full_snap)
 
             full_snap.to_parquet(save_path)

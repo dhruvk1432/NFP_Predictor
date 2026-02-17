@@ -34,7 +34,20 @@
       "Bash(/opt/anaconda3/bin/python:*)",
       "Bash(jupyter nbconvert:*)",
       "Bash(git stash:*)",
-      "Bash(git stash pop:*)"
+      "Bash(git stash pop:*)",
+      "Bash(pip:*)",
+      "Bash(/Applications/Google\\\\ Chrome.app/Contents/MacOS/Google\\\\ Chrome:*)",
+      "Bash(for y in 2010 2014 2018 2022)",
+      "Bash(do)",
+      "Bash(f=\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/prosper/decades/$y:0:30s/$y/$y-12.parquet\")",
+      "Bash(if [ -f \"$f\" ])",
+      "Bash(then echo \"$y-12: EXISTS\")",
+      "Bash(else echo \"$y-12: MISSING\")",
+      "Bash(fi)",
+      "Bash(done)",
+      "Bash(f=\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/exogenous_noaa_snapshots/decades/$y:0:30s/$y/$y-12.parquet\")",
+      "Bash(python3.11:*)",
+      "Bash(f=\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/exogenous_fred_data/decades/$y:0:30s/$y/$y-12.parquet\")"
     ]
   }
 }

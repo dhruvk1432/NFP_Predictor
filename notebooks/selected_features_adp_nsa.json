@@ -1,0 +1,11 @@
+[
+    "ADP_actual_diff_zscore_12m",
+    "ADP_actual_pct_chg_zscore_12m_lag_18m",
+    "ADP_actual_rolling_std_6m_lag_18m",
+    "ADP_actual_symlog_chg_12m_lag_18m",
+    "ADP_actual_symlog_chg_3m_lag_12m",
+    "ADP_actual_symlog_chg_3m_lag_18m",
+    "ADP_actual_symlog_diff_zscore_12m_lag_12m",
+    "ADP_actual_symlog_pct_chg_rolling_mean_3m_lag_1m",
+    "ADP_actual_symlog_zscore_12m_lag_1m"
+]

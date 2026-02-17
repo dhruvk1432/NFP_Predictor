@@ -192,7 +192,16 @@ def _rolling_zscore(series: pd.Series, window: int, min_periods: int) -> pd.Seri
     """Compute rolling z-score: (x - rolling_mean) / rolling_std."""
     rmean = series.rolling(window=window, min_periods=min_periods).mean()
     rstd = series.rolling(window=window, min_periods=min_periods).std()
-    return (series - rmean) / rstd
+    
+    z = (series - rmean) / rstd
+    
+    # Handle constant sequences (std=0) -> Z-score should be 0 (value exactly equals mean)
+    # Only replace if mean is valid (i.e. enough data exists), preventing backfill of missing data
+    is_constant = (rstd == 0) & rmean.notna()
+    if is_constant.any():
+        z = z.mask(is_constant, 0.0)
+        
+    return z
 
 
 def _emit(result_list: list, meta: pd.DataFrame, name: str, values: pd.Series):
@@ -311,6 +320,143 @@ def compute_all_features(
     result = pd.concat(final_output_list, ignore_index=True)
     result = result.dropna(subset=['value'])
     return result
+
+
+# =============================================================================
+# WIDE-FORMAT VECTORIZED FEATURE COMPUTATION
+# =============================================================================
+
+def _rolling_zscore_wide(df: pd.DataFrame, window: int, min_periods: int) -> pd.DataFrame:
+    """Vectorized rolling z-score across all columns at once."""
+    rmean = df.rolling(window=window, min_periods=min_periods).mean()
+    rstd = df.rolling(window=window, min_periods=min_periods).std()
+    z = (df - rmean) / rstd
+    # Handle constant sequences (std=0) -> z-score = 0
+    z = z.where(rstd != 0, 0.0)
+    # Restore NaN where mean was NaN (not enough data)
+    z = z.where(rmean.notna(), np.nan)
+    return z
+
+
+def compute_features_wide(
+    long_df: pd.DataFrame,
+    apply_mom: bool = True,
+) -> pd.DataFrame:
+    """
+    Vectorized wide-format feature computation for FRED employment snapshots.
+
+    Replaces the sequential long-format pipeline of:
+        convert_levels_to_mom → add_symlog_copies → add_pct_change_copies → compute_all_features
+
+    All operations are vectorized across columns (no Python loops over series).
+
+    Args:
+        long_df: Long-format DataFrame with columns [date, value, series_name, ...].
+        apply_mom: If True, convert levels to MoM changes first.
+
+    Returns:
+        Wide-format DataFrame with DatetimeIndex (date) and feature columns.
+        Each column is a feature name (e.g. 'total', 'total_symlog', 'total_diff_lag_3m').
+    """
+    if long_df.empty:
+        return pd.DataFrame()
+
+    df = long_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Convert categorical columns to string for pivot
+    for col in ['series_name', 'series_code']:
+        if col in df.columns and hasattr(df[col], 'cat'):
+            df[col] = df[col].astype(str)
+
+    # --- Pivot to wide: rows=date, columns=series_name ---
+    wide = df.pivot_table(index='date', columns='series_name', values='value', aggfunc='first')
+    wide = wide.sort_index()
+
+    # --- MoM conversion (diff of levels) ---
+    if apply_mom:
+        wide = wide.diff()
+        wide = wide.iloc[1:]  # drop first row (NaN from diff)
+
+    # --- Build all feature columns in wide format ---
+    feature_frames = []  # list of DataFrames, all same index
+
+    base_cols = list(wide.columns)  # original ~160 series (MoM values)
+
+    # 1. Symlog of base
+    symlog_wide = np.sign(wide) * np.log1p(np.abs(wide))
+    symlog_wide.columns = [f"{c}_symlog" for c in base_cols]
+    symlog_cols = list(symlog_wide.columns)
+
+    # 2. Pct change of base and symlog
+    pct_base = wide.pct_change() * 100
+    pct_base = pct_base.replace([np.inf, -np.inf], np.nan)
+    pct_base.columns = [f"{c}_pct_chg" for c in base_cols]
+    pct_base_cols = list(pct_base.columns)
+
+    pct_symlog = symlog_wide.pct_change() * 100
+    pct_symlog = pct_symlog.replace([np.inf, -np.inf], np.nan)
+    pct_symlog.columns = [f"{c}_symlog_pct_chg" for c in base_cols]
+    pct_symlog_cols = list(pct_symlog.columns)
+
+    # Combine all base series into one wide DataFrame
+    all_wide = pd.concat([wide, symlog_wide, pct_base, pct_symlog], axis=1)
+
+    # Identify column categories for feature generation
+    raw_symlog_cols = base_cols + symlog_cols  # get diff + multi-period
+    pct_chg_cols = pct_base_cols + pct_symlog_cols  # no diff, no multi-period
+    all_series_cols = raw_symlog_cols + pct_chg_cols
+
+    # --- Generate features (all vectorized) ---
+    # Level (the base values themselves)
+    feature_frames.append(all_wide)
+
+    # Diff (raw + symlog only)
+    diff_df = all_wide[raw_symlog_cols].diff()
+    diff_df.columns = [f"{c}_diff" for c in raw_symlog_cols]
+    feature_frames.append(diff_df)
+
+    # Diff z-scores (raw + symlog only)
+    for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
+        dz = _rolling_zscore_wide(diff_df, window, min_p)
+        dz.columns = [f"{c}_diff_zscore_{suffix}" for c in raw_symlog_cols]
+        feature_frames.append(dz)
+
+    # Level z-scores (all non-binary)
+    for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
+        lz = _rolling_zscore_wide(all_wide[all_series_cols], window, min_p)
+        lz.columns = [f"{c}_zscore_{suffix}" for c in all_series_cols]
+        feature_frames.append(lz)
+
+    # Rolling stats (all non-binary)
+    rm3 = all_wide[all_series_cols].rolling(3, min_periods=2).mean()
+    rm3.columns = [f"{c}_rolling_mean_3m" for c in all_series_cols]
+    feature_frames.append(rm3)
+
+    rs6 = all_wide[all_series_cols].rolling(6, min_periods=3).std()
+    rs6.columns = [f"{c}_rolling_std_6m" for c in all_series_cols]
+    feature_frames.append(rs6)
+
+    # Multi-period changes (raw + symlog only)
+    for period in [3, 6, 12]:
+        mc = all_wide[raw_symlog_cols].diff(period)
+        mc.columns = [f"{c}_chg_{period}m" for c in raw_symlog_cols]
+        feature_frames.append(mc)
+
+    # --- Combine all base features ---
+    all_features = pd.concat(feature_frames, axis=1)
+
+    # --- Apply lags to ALL feature columns ---
+    lag_frames = [all_features]  # include un-lagged
+    for lag in [1, 3, 6, 12, 18]:
+        lagged = all_features.shift(lag)
+        lagged.columns = [f"{c}_lag_{lag}m" for c in all_features.columns]
+        lag_frames.append(lagged)
+
+    final_wide = pd.concat(lag_frames, axis=1)
+    final_wide.index.name = 'date'
+
+    return final_wide
 
 
 def generate_symlog_feature_names(

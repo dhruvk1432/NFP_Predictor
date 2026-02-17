@@ -394,13 +394,16 @@ def pivot_snapshot_to_wide(
     cutoff_date: Optional[pd.Timestamp] = None
 ) -> pd.DataFrame:
     """
-    Convert long-format snapshot to wide format, taking the latest value for target month.
+    Convert snapshot to wide format, taking the latest value for target month.
 
-    OPTIMIZED: Uses vectorized pandas operations instead of per-series loops.
-    Pivots data first, then computes features in batches.
+    Supports both formats:
+    - Wide-format (from compute_features_wide): DatetimeIndex + feature columns.
+      Skips the expensive pivot and just takes the last valid row per column.
+    - Long-format (legacy): columns [date, series_name, value, ...].
+      Pivots first, then takes the last valid row per column.
 
     Args:
-        snapshot_df: Long-format snapshot DataFrame
+        snapshot_df: Snapshot DataFrame (wide or long format)
         target_month: Month we're predicting (format: YYYY-MM-01)
         cutoff_date: Strict cutoff for data availability (e.g., NFP release date)
 
@@ -410,19 +413,46 @@ def pivot_snapshot_to_wide(
     if snapshot_df is None or snapshot_df.empty:
         return pd.DataFrame()
 
-    # Ensure date is datetime
+    # Detect format: wide-format has no 'series_name' column
+    is_wide = 'series_name' not in snapshot_df.columns
+
+    if is_wide:
+        # Wide-format: index=date (or 'date' column), columns=feature names
+        wide_df = snapshot_df.copy()
+        if 'date' in wide_df.columns:
+            wide_df['date'] = pd.to_datetime(wide_df['date'])
+            wide_df = wide_df.set_index('date')
+        wide_df.index = pd.to_datetime(wide_df.index)
+        wide_df = wide_df.sort_index()
+
+        # Apply cutoff
+        cutoff = pd.to_datetime(cutoff_date) if cutoff_date is not None else pd.to_datetime(target_month)
+        wide_df = wide_df[wide_df.index < cutoff]
+
+        if wide_df.empty:
+            return pd.DataFrame()
+
+        # Take last valid value per column (vectorized)
+        last_valid = wide_df.apply(lambda col: col.dropna().iloc[-1] if col.dropna().any() else np.nan)
+        last_valid = last_valid.dropna()
+
+        if last_valid.empty:
+            return pd.DataFrame()
+
+        # Sanitize feature names for LightGBM compatibility
+        features = {sanitize_feature_name(str(k)): v for k, v in last_valid.items()}
+        return pd.DataFrame([features])
+
+    # Long-format path (legacy)
     df = snapshot_df.copy()
     df['date'] = pd.to_datetime(df['date'])
 
-    # Strict cutoff to avoid same-day leakage (use NFP release date when provided)
     cutoff = pd.to_datetime(cutoff_date) if cutoff_date is not None else pd.to_datetime(target_month)
     df = df[df['date'] < cutoff]
 
     if df.empty:
         return pd.DataFrame()
 
-    # Pivot to wide format: rows = dates, columns = series_name
-    # Use 'first' aggregation in case of duplicates
     wide_df = df.pivot_table(
         index='date',
         columns='series_name',
@@ -435,15 +465,12 @@ def pivot_snapshot_to_wide(
 
     features = {}
 
-    # Snapshots are pre-enriched with all derived features.
-    # Just take the latest available value per series.
     for raw_series_name in wide_df.columns:
         series = wide_df[raw_series_name].dropna()
 
         if len(series) == 0:
             continue
 
-        # Sanitize series name for LightGBM compatibility
         series_name = sanitize_feature_name(str(raw_series_name))
         features[series_name] = series.iloc[-1]
 
@@ -461,12 +488,12 @@ def pivot_snapshot_to_wide_batch(
     """
     Batch version of pivot_snapshot_to_wide for multiple target months.
 
-    HIGHLY OPTIMIZED for building training datasets. Instead of loading
-    and pivoting the same snapshot multiple times, this processes all
-    target months in a single pass.
+    Supports both wide-format (from compute_features_wide) and long-format
+    (legacy) snapshots. Instead of loading and pivoting the same snapshot
+    multiple times, this processes all target months in a single pass.
 
     Args:
-        snapshot_df: Long-format snapshot DataFrame
+        snapshot_df: Snapshot DataFrame (wide or long format)
         target_months: List of target months to generate features for
         cutoff_dates: Optional mapping of target_month -> cutoff_date (e.g., NFP release date)
 
@@ -476,17 +503,25 @@ def pivot_snapshot_to_wide_batch(
     if snapshot_df is None or snapshot_df.empty or not target_months:
         return pd.DataFrame()
 
-    # Pre-process snapshot once
-    df = snapshot_df.copy()
-    df['date'] = pd.to_datetime(df['date'])
+    # Detect format and get wide_df
+    is_wide = 'series_name' not in snapshot_df.columns
 
-    # Pivot to wide format once
-    wide_df = df.pivot_table(
-        index='date',
-        columns='series_name',
-        values='value',
-        aggfunc='first'
-    ).sort_index()
+    if is_wide:
+        wide_df = snapshot_df.copy()
+        if 'date' in wide_df.columns:
+            wide_df['date'] = pd.to_datetime(wide_df['date'])
+            wide_df = wide_df.set_index('date')
+        wide_df.index = pd.to_datetime(wide_df.index)
+        wide_df = wide_df.sort_index()
+    else:
+        df = snapshot_df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        wide_df = df.pivot_table(
+            index='date',
+            columns='series_name',
+            values='value',
+            aggfunc='first'
+        ).sort_index()
 
     if wide_df.empty:
         return pd.DataFrame()
@@ -494,7 +529,6 @@ def pivot_snapshot_to_wide_batch(
     all_features = []
 
     for target_month in target_months:
-        # Strict cutoff to avoid same-day leakage (use release date when provided)
         if cutoff_dates is not None and target_month in cutoff_dates:
             cutoff = pd.to_datetime(cutoff_dates[target_month])
         else:
@@ -507,7 +541,6 @@ def pivot_snapshot_to_wide_batch(
 
         features = {'target_month': target_month}
 
-        # Snapshots are pre-enriched: just take latest value per series
         for raw_series_name in available.columns:
             series = available[raw_series_name].dropna()
 

@@ -1,8 +1,8 @@
 """
-Training Pipeline for Hierarchical NFP Forecasting
+LightGBM NFP Training Pipeline
 
-This package implements the training infrastructure for multi-series
-NBEATSx model training on employment data.
+Trains a LightGBM model to predict Non-Farm Payroll month-on-month changes
+using point-in-time snapshots of FRED employment and exogenous macro data.
 """
 
 __version__ = "1.0.0"

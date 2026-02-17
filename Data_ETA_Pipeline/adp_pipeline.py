@@ -1,26 +1,26 @@
 """
 ADP Employment Pipeline
 =======================
-Loads ADP employment data from historical CSV, converts to MoM changes,
-and creates monthly snapshots aligned with NFP release dates.
+Loads ADP employment data from investing.com REST API and creates monthly
+snapshots aligned with NFP release dates.
 
-Merges: Load_Data/load_ADP_Employment_change.py + Prepare_Data/create_adp_snapshots.py
+Data Source:
+    investing.com REST API (ADP_actual only, back to 2001)
 
 Output:
     - Intermediate: DATA_PATH/Exogenous_data/ADP_data/ADP_Employment_Change.parquet
     - Final:        DATA_PATH/Exogenous_data/ADP_snapshots/decades/{decade}s/{year}/{YYYY-MM}.parquet
-
-Requires:
-    pip install pandas pyarrow
 """
 
 import pandas as pd
+import requests
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, START_DATE, END_DATE, TEMP_DIR, setup_logger
+from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -32,97 +32,141 @@ EXOG_ADP_DIR = DATA_PATH / "Exogenous_data" / "ADP_data"
 EXOG_ADP_DIR.mkdir(parents=True, exist_ok=True)
 
 CLEAN_ADP_PARQUET = EXOG_ADP_DIR / "ADP_Employment_Change.parquet"
-HISTORICAL_CSV = DATA_PATH.parent / "us-private-employment.csv"
 
 ADP_SNAPSHOTS_BASE = DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades"
 NFP_TARGET_PATH = DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet"
 
+# investing.com API endpoint for ADP event occurrences (event_id=1)
+ADP_API_URL = "https://endpoints.investing.com/pd-instruments/v1/calendars/economic/events/1/occurrences"
+
 
 # =============================================================================
-# SECTION 1: ADP DATA LOADING (from load_ADP_Employment_change.py)
+# SECTION 1: API FETCHING
 # =============================================================================
 
-def get_first_wednesday(date: pd.Timestamp) -> pd.Timestamp:
-    """Get the first Wednesday of the month following the given date.
-
-    ADP typically releases employment data on the first Wednesday after month-end.
+def fetch_adp_from_api() -> pd.DataFrame:
     """
-    next_month = date + pd.DateOffset(months=1)
-    first_day = next_month.replace(day=1)
-    days_until_wed = (2 - first_day.dayofweek + 7) % 7  # Wednesday = 2
-    if days_until_wed == 0:
-        days_until_wed = 7  # If 1st is Wednesday, use that day
-    return first_day + pd.Timedelta(days=days_until_wed - (7 if days_until_wed == 7 else 0))
+    Fetch ADP employment data from investing.com REST API.
 
-
-def load_adp_from_csv() -> pd.DataFrame:
-    """
-    Load ADP private employment levels from CSV and convert to MoM changes.
-
-    The CSV contains employment LEVELS (e.g., 134,588,000). We calculate the
-    month-over-month change to get the ADP employment change figure.
+    The API returns historical ADP occurrences with actual, forecast, and previous values.
+    Only actual values are kept (forecast excluded).
+    Values are already in thousands (K), matching NFP target units.
 
     Returns:
         DataFrame with columns: date, series_name, value, release_date, series_type
+        Empty DataFrame on failure.
     """
-    if not HISTORICAL_CSV.exists():
-        logger.error(f"Historical CSV not found: {HISTORICAL_CSV}")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Origin': 'https://www.investing.com',
+        'Referer': 'https://www.investing.com/',
+    }
+    params = {'domain_id': 1, 'limit': 1000}
+
+    try:
+        logger.info(f"Fetching ADP data from API: {ADP_API_URL}")
+        resp = requests.get(ADP_API_URL, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+
+        data = resp.json()
+        items = data.get('occurrences', [])
+        logger.info(f"API returned {len(items)} occurrences")
+
+        if not items:
+            logger.warning("API returned empty occurrences list")
+            return pd.DataFrame()
+
+        rows = []
+        for item in items:
+            occurrence_time = item.get('occurrence_time')
+            ref_period = item.get('reference_period')  # e.g. "Jan", "Feb"
+            actual = item.get('actual')
+
+            if not occurrence_time or not ref_period:
+                continue
+
+            # Parse release date from occurrence_time (strip tz for consistency)
+            release_dt = pd.to_datetime(occurrence_time).tz_localize(None)
+
+            # Derive reference date (first of the reference month)
+            ref_month_num = pd.to_datetime(ref_period, format='%b').month
+            release_year = release_dt.year
+
+            # Handle year boundary: Jan/Feb release for Nov/Dec data → previous year
+            if release_dt.month <= 2 and ref_month_num >= 11:
+                ref_year = release_year - 1
+            else:
+                ref_year = release_year
+
+            reference_date = pd.Timestamp(year=ref_year, month=ref_month_num, day=1)
+
+            # ADP_actual (API values already in thousands, matching NFP target units)
+            if actual is not None:
+                rows.append({
+                    'date': reference_date,
+                    'series_name': 'ADP_actual',
+                    'value': float(actual),
+                    'release_date': release_dt,
+                    'series_type': 'adp'
+                })
+
+        if not rows:
+            logger.warning("No valid rows parsed from API response")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values(['date', 'series_name']).reset_index(drop=True)
+
+        logger.info(f"Parsed {len(df)} ADP data points from API")
+        logger.info(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
+        logger.info(f"Series: {df['series_name'].unique().tolist()}")
+        return df
+
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error processing API data: {e}")
         return pd.DataFrame()
 
-    df = pd.read_csv(HISTORICAL_CSV)
-    df['DateTime'] = pd.to_datetime(df['DateTime'])
-    df = df.sort_values('DateTime')
 
-    # Calculate MoM change
-    df['change'] = df['Private Employment'].diff()
-
-    # First row has no change (NaN), drop it
-    df = df.dropna(subset=['change'])
-
-    # Impute release date: first Wednesday of following month
-    df['release_date'] = df['DateTime'].apply(get_first_wednesday)
-
-    # Format to match existing ADP data structure
-    result = pd.DataFrame({
-        'date': df['DateTime'],
-        'series_name': 'ADP_actual',
-        'value': df['change'],  # Raw employment change (not divided by 1000)
-        'release_date': df['release_date'],
-        'series_type': 'adp'
-    })
-
-    return result
-
+# =============================================================================
+# SECTION 2: DATA LOADING
+# =============================================================================
 
 def load_adp_data() -> None:
     """
-    Load ADP employment data from historical CSV file.
-    Saves intermediate parquet for downstream snapshot creation.
+    Fetch ADP data from investing.com API and save to parquet.
+    Skips if data already exists.
     """
     logger.info("Starting ADP data load")
 
-    # Check if data already exists
     if CLEAN_ADP_PARQUET.exists():
         existing_data = pd.read_parquet(CLEAN_ADP_PARQUET)
         print(f"\u2713 ADP data already exists: {len(existing_data)} rows", flush=True)
         print(f"  Date range: {existing_data['date'].min().date()} to {existing_data['date'].max().date()}", flush=True)
-        logger.info(f"ADP data already exists, skipping")
+        print(f"  Series: {existing_data['series_name'].unique().tolist()}", flush=True)
+        logger.info("ADP data already exists, skipping")
         return
 
-    csv_data = load_adp_from_csv()
-    if csv_data.empty:
-        logger.error("No CSV data available")
-        raise RuntimeError("ADP data unavailable: CSV file not found or empty")
+    print("Fetching ADP data from investing.com API...", flush=True)
+    api_data = fetch_adp_from_api()
 
-    csv_data.to_parquet(CLEAN_ADP_PARQUET, index=False)
-    print(f"\u2713 Saved {len(csv_data)} rows from historical CSV", flush=True)
-    print(f"  Date range: {csv_data['date'].min().date()} to {csv_data['date'].max().date()}", flush=True)
+    if api_data.empty:
+        raise RuntimeError("ADP data unavailable: API fetch failed")
+
+    api_data.to_parquet(CLEAN_ADP_PARQUET, index=False)
+
+    print(f"\u2713 Saved {len(api_data)} ADP rows", flush=True)
+    print(f"  Date range: {api_data['date'].min().date()} to {api_data['date'].max().date()}", flush=True)
+    print(f"  Series: {api_data['series_name'].unique().tolist()}", flush=True)
 
     logger.info("\u2713 ADP data load complete")
 
 
 # =============================================================================
-# SECTION 2: ADP SNAPSHOT CREATION (from create_adp_snapshots.py)
+# SECTION 3: ADP SNAPSHOT CREATION
 # =============================================================================
 
 def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:
@@ -177,6 +221,7 @@ def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE)
     logger.info(f"Loaded {len(df)} raw ADP rows")
     logger.info(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
     logger.info(f"Release range: {df['release_date'].min().date()} to {df['release_date'].max().date()}")
+    logger.info(f"Series: {df['series_name'].unique().tolist()}")
 
     # Load NFP release dates
     nfp_releases = load_nfp_release_dates(start_date, end_date)
@@ -203,6 +248,11 @@ def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE)
 
         # Reorder columns
         snapshot_df = snapshot_df[['date', 'series_name', 'value', 'snapshot_date', 'release_date']]
+
+        # Apply feature transforms (symlog -> pct_change -> all derived features)
+        snapshot_df = add_symlog_copies(snapshot_df)
+        snapshot_df = add_pct_change_copies(snapshot_df)
+        snapshot_df = compute_all_features(snapshot_df)
 
         # Determine file path
         year = event_date.year
@@ -279,8 +329,9 @@ def validate_snapshots():
 def main():
     """
     Run the complete ADP pipeline:
-    1. Load ADP data from CSV and compute MoM changes
-    2. Create NFP-aligned snapshots
+    1. Fetch ADP data from API
+    2. Create NFP-aligned snapshots with feature transforms
+    3. Validate snapshots
     """
     logger.info("=" * 70)
     logger.info("ADP EMPLOYMENT PIPELINE")

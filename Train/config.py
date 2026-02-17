@@ -131,48 +131,6 @@ TARGET_PATH_SA = get_target_path('sa', 'first')
 
 
 # =============================================================================
-# LINEAR BASELINE PREDICTORS
-# =============================================================================
-
-# These have strong linear relationships with NFP and can extrapolate beyond
-# training ranges (unlike trees which are bounded by training leaves).
-
-LINEAR_BASELINE_PREDICTORS = [
-    # Weekly Claims - PRIMARY EXTRAPOLATION SIGNAL
-    'CCSA_monthly_avg_latest',       # Current month average
-    'CCSA_max_spike',                 # Maximum spike
-    'CCSA_weeks_high',                # Persistence metric (weeks above 95th percentile)
-    'CCSA_monthly_avg_lag1',          # Previous month
-    'CCSA_monthly_avg_mom_change',    # Month-over-month change
-
-    # NEW: Average Weekly Hours - HOURS LEAD JOBS
-    # Employers cut hours before cutting headcount - critical recession signal
-    'AWH_All_Private_latest',         # Current hours level
-    'AWH_All_Private_mom',            # MoM change (negative = layoffs coming)
-    'AWH_Manufacturing_latest',       # Manufacturing hours (more volatile)
-    'AWH_Manufacturing_mom',          # Manufacturing MoM change
-
-    # High-velocity shock signals for extreme events
-    'Financial_Stress_zscore_3m_max',  # Peak stress shock (3-month Z-score)
-    'Oil_Prices_zscore_3m_min',        # Peak price collapse (3-month Z-score)
-    'SP500_zscore_3m_min',             # Peak market crash (3-month Z-score)
-    'Weekly_Econ_Index_latest',        # Real-time GDP signal
-
-    # Oil Prices - Economic stress indicator
-    'Oil_Prices_mean_latest',         # Current level
-    'Oil_Prices_30d_crash',           # Crash magnitude
-
-    # Yield Curve - Leading indicator (12-month lag)
-    'Yield_Curve_avg_lag12',          # Signal from year ago
-    'Yield_Curve_monthly_chg_lag12',  # Change from year ago
-
-    # Past NFP as autoregressive component
-    'nfp_nsa_mom_lag1',               # Previous NFP MoM
-    'nfp_sa_mom_lag1',                # Previous SA NFP MoM
-]
-
-
-# =============================================================================
 # PROTECTED BINARY FLAGS (Never removed by feature selection)
 # =============================================================================
 

@@ -15,7 +15,7 @@ Merges:
 
 Pipeline stages:
     1. build_all_snapshots()       - Download FRED data, build monthly snapshots, create NFP targets
-    2. prepare_fred_snapshots()    - Convert levels to MoM changes, apply transforms, scale
+    2. prepare_fred_snapshots()    - Convert levels to MoM changes, apply full transform chain (symlog, pct_chg, features, lags)
 
 Output:
     - FRED snapshots:    DATA_PATH/fred_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
@@ -36,7 +36,9 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 from datetime import datetime, timedelta
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to FRONT of path so project-level packages (utils/, settings)
+# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 import numpy as np
@@ -49,13 +51,59 @@ from settings import (
     DATA_PATH, START_DATE, END_DATE, FRED_API_KEY,
     REFRESH_CACHE, TEMP_DIR, OUTPUT_DIR, MODEL_TYPE, setup_logger
 )
-from Train.pipeline_helpers import build_hierarchy_structure
+def build_hierarchy_structure(series_list, include_nsa=True):
+    """Filter series by NSA/SA suffix and return (hierarchy, ordered, bottom_series)."""
+    if include_nsa:
+        filtered = [s for s in series_list if s.endswith("_nsa")]
+    else:
+        filtered = [s for s in series_list if not s.endswith("_nsa")]
+
+    series_set = set(filtered)
+
+    def strip_suffix(s):
+        if s.endswith("_nsa"): return s[:-4]
+        if s.endswith("_sa"):  return s[:-3]
+        return s
+
+    def add_suffix(base, suffix):
+        return base + suffix if suffix else base
+
+    hierarchy = {}
+    for s in filtered:
+        base = strip_suffix(s)
+        if "." not in base:
+            continue
+        parent_base = base.rsplit(".", 1)[0]
+        suffix = "_nsa" if s.endswith("_nsa") else "_sa" if s.endswith("_sa") else ""
+        parent = add_suffix(parent_base, suffix)
+        if parent in series_set:
+            hierarchy.setdefault(parent, []).append(s)
+
+    child_set = {c for children in hierarchy.values() for c in children}
+    roots = [s for s in series_set if s not in child_set]
+
+    ordered = []
+    def dfs(node):
+        if node in ordered:
+            return
+        ordered.append(node)
+        for child in sorted(hierarchy.get(node, [])):
+            dfs(child)
+
+    for r in sorted(roots):
+        dfs(r)
+    for s in sorted(series_set):
+        if s not in ordered:
+            dfs(s)
+
+    bottom_series = [s for s in filtered if s not in hierarchy]
+    return hierarchy, ordered, bottom_series
 
 logger = setup_logger(__file__, TEMP_DIR)
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-from utils.transforms import apply_symlog as _apply_symlog
+from utils.transforms import compute_features_wide
 
 
 # =============================================================================
@@ -2186,16 +2234,21 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
 
     # Skip-if-exists check: verify if all data already exists
     if not refresh_existing:
-        nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
-        obs_months = sorted(nfp_release_map.keys())
-        all_snapshots_exist = all(month_file_path(m).exists() for m in obs_months)
-
-        # Check NFP target files
+        # Check NFP target files first (needed by get_nfp_release_map)
         nfp_target_files = [
             NFP_target_DIR / "total_nsa_first_release.parquet",
             NFP_target_DIR / "total_sa_first_release.parquet",
         ]
         all_targets_exist = all(f.exists() for f in nfp_target_files)
+
+        # Can only check snapshot completeness if targets exist (provides release map)
+        if all_targets_exist:
+            nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+            obs_months = sorted(nfp_release_map.keys())
+            all_snapshots_exist = all(month_file_path(m).exists() for m in obs_months)
+        else:
+            obs_months = []
+            all_snapshots_exist = False
 
         if audit_file.exists() and all_snapshots_exist and all_targets_exist and obs_months:
             print(f"✓ FRED data already exists: {len(obs_months)} monthly snapshots", flush=True)
@@ -2208,11 +2261,16 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
     else:
         audit = pd.read_parquet(audit_file)
 
-    s, e = build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_existing, None)
-
-    # Use end_date as snapshot_date since audit was downloaded "as of" this date
+    # Build NFP target files FIRST — build_monthly_snapshots_from_audit needs
+    # the NFP release map (derived from target files) to determine snapshot dates
     snapshot_date = pd.to_datetime(end_date)
-    build_nfp_target_files(audit, s, e, snapshot_date)
+    build_nfp_target_files(audit, pd.to_datetime(start_date), pd.to_datetime(end_date), snapshot_date)
+
+    # Clear cached NFP releases so the freshly-built target file gets loaded
+    global _NFP_RELEASES_CACHE
+    _NFP_RELEASES_CACHE = None
+
+    s, e = build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_existing, None)
     logger.info("✓ FRED snapshots download complete")
 
 
@@ -2231,30 +2289,28 @@ PREPARED_FRED_DIR = DATA_PATH / "fred_data_prepared" / "decades"
 # Series that should have SymLog applied (high kurtosis MoM changes)
 # These series experience extreme values (like COVID crash/recovery)
 
-# Employment lag periods (months)
-_EMPLOYMENT_LAGS = [1, 3, 6, 12]
-
 # =============================================================================
 # TRANSFORM FUNCTIONS
 # =============================================================================
 
-def calculate_mom_change(df: pd.DataFrame) -> pd.DataFrame:
+def convert_levels_to_mom(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert employment levels to Month-over-Month changes.
-
-    For each employment series, produces:
-    - Raw MoM change: levels.diff()  (series: "{name}")
-    - Symlog MoM change: symlog(levels).diff()  (series: "{name}_symlog")
+    Convert employment levels to Month-over-Month changes (simple diff).
 
     The raw FRED snapshots contain employment LEVELS (e.g., 150M jobs).
-    Our prediction target is the MoM CHANGE (e.g., +150K jobs).
+    This converts them to MoM CHANGES (e.g., +150K jobs) which are the
+    base series for the full transform chain (symlog, pct_change, features).
+
+    Symlog and other transforms are handled downstream by the shared
+    utilities in utils/transforms.py (add_symlog_copies, add_pct_change_copies,
+    compute_all_features).
 
     Args:
         df: DataFrame with columns ['date', 'value', 'series_name', ...]
             where 'value' contains employment levels
 
     Returns:
-        DataFrame with raw MoM and symlog MoM series, original level in 'value_level'
+        DataFrame with MoM changes in 'value', original level in 'value_level'
     """
     if df.empty:
         return df
@@ -2268,61 +2324,13 @@ def calculate_mom_change(df: pd.DataFrame) -> pd.DataFrame:
         # Store original level for reference
         group['value_level'] = group['value']
 
-        # --- Raw MoM change ---
-        raw_mom = group.copy()
-        raw_mom['value'] = group['value_level'].diff()
-        raw_mom['value_raw'] = raw_mom['value']  # Keep raw for reference
-        raw_mom = raw_mom.dropna(subset=['value'])
-        result_parts.append(raw_mom)
-
-        # --- Symlog MoM change: diff(symlog(level)) ---
-        symlog_mom = group.copy()
-        symlog_mom['value'] = _apply_symlog(group['value_level']).diff()
-        symlog_mom['value_raw'] = symlog_mom['value']
-        symlog_mom['series_name'] = series_name + '_symlog'
-        if 'series_code' in symlog_mom.columns:
-            symlog_mom['series_code'] = symlog_mom['series_code'].astype(str) + '_symlog'
-        symlog_mom = symlog_mom.dropna(subset=['value'])
-        result_parts.append(symlog_mom)
+        # MoM change: simple diff of levels
+        group['value'] = group['value_level'].diff()
+        group = group.dropna(subset=['value'])
+        result_parts.append(group)
 
     if result_parts:
         return pd.concat(result_parts, ignore_index=True)
-    return df
-
-
-def create_employment_lags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create lagged versions of all MoM change series.
-
-    For each series (both raw MoM and symlog MoM), creates lag 1, 3, 6, 12
-    month versions.
-
-    Args:
-        df: DataFrame with MoM changes from calculate_mom_change()
-
-    Returns:
-        DataFrame with original series + lag series appended
-    """
-    if df.empty:
-        return df
-
-    lag_parts = []
-
-    for series_name, group in df.groupby('series_name'):
-        group = group.sort_values('date')
-
-        for lag in _EMPLOYMENT_LAGS:
-            lag_group = group.copy()
-            lag_group['value'] = group['value'].shift(lag)
-            lag_group['series_name'] = f"{series_name}_lag_{lag}m"
-            if 'series_code' in lag_group.columns:
-                lag_group['series_code'] = lag_group['series_code'].astype(str) + f'_lag_{lag}m'
-            # Drop rows where lag produced NaN
-            lag_group = lag_group.dropna(subset=['value'])
-            lag_parts.append(lag_group)
-
-    if lag_parts:
-        return pd.concat([df] + lag_parts, ignore_index=True)
     return df
 
 
@@ -2346,20 +2354,70 @@ def load_snapshot(base_dir: Path, date_ts: pd.Timestamp) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _process_one_snapshot(args):
+    """
+    Process a single snapshot: load raw → compute features (wide-format) → save.
+
+    Designed as a top-level function for multiprocessing compatibility.
+
+    Args:
+        args: Tuple of (obs_month, apply_mom, snapshots_dir, prepared_dir)
+
+    Returns:
+        Tuple of (obs_month_str, n_features) or (obs_month_str, 0) on failure/skip.
+    """
+    obs_month, apply_mom, snapshots_dir, prepared_dir = args
+    obs_str = obs_month.strftime('%Y-%m')
+
+    try:
+        raw_df = load_snapshot(Path(snapshots_dir), obs_month)
+        if raw_df.empty:
+            return (obs_str, 0)
+
+        # Compute all features in vectorized wide format
+        # Returns wide DataFrame: index=date, columns=feature_names
+        wide_df = compute_features_wide(raw_df, apply_mom=apply_mom)
+
+        if wide_df.empty:
+            return (obs_str, 0)
+
+        # Save wide-format parquet (index=date, columns=features)
+        decade_str = f"{obs_month.year // 10 * 10}s"
+        year_str = str(obs_month.year)
+        save_dir = Path(prepared_dir) / decade_str / year_str
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"{obs_str}.parquet"
+        wide_df.to_parquet(save_path)
+
+        n_features = len(wide_df.columns)
+        return (obs_str, n_features)
+    except Exception as e:
+        return (obs_str, -1, str(e))
+
+
 def prepare_fred_snapshots(
     apply_mom_conversion: bool = True,
+    max_workers: int = 0,
 ):
     """
     Main pipeline to prepare FRED employment snapshots.
 
-    Processing steps:
+    Uses vectorized wide-format feature computation (compute_features_wide)
+    and optional multiprocessing for massive speedup over the old long-format path.
+
+    Processing steps per snapshot:
     1. Load raw snapshot (employment levels)
-    2. Convert to MoM changes + SymLog MoM changes
-    3. Create lag features (1, 3, 6, 12 months) for both variants
+    2. Pivot to wide format, apply MoM diff, symlog, pct_change, all features + lags
+       (all vectorized, zero Python loops over series)
+    3. Melt back to long format and save
 
     Args:
-        apply_mom_conversion: Convert levels to MoM changes and create enriched features
+        apply_mom_conversion: Convert levels to MoM changes and create enriched features.
+        max_workers: Number of parallel workers. 0 = auto (cpu_count), 1 = sequential.
     """
+    import multiprocessing as mp
+    import os
+
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
     nfp_release_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
@@ -2369,46 +2427,49 @@ def prepare_fred_snapshots(
         logger.info("No NFP release dates found for FRED snapshot preparation.")
         return
 
-    logger.info(f"Preparing FRED Snapshots from {snapshot_pairs[0][0].date()} to {snapshot_pairs[-1][0].date()}")
+    n_snapshots = len(snapshot_pairs)
+    logger.info(f"Preparing {n_snapshots} FRED Snapshots from {snapshot_pairs[0][0].date()} to {snapshot_pairs[-1][0].date()}")
     logger.info(f"Options: mom_conversion={apply_mom_conversion}")
 
-    for i, (obs_month, snap_date) in enumerate(snapshot_pairs):
-        # 1. Load raw snapshot (employment LEVELS)
-        raw_df = load_snapshot(FRED_SNAPSHOTS_DIR, obs_month)
+    # Build argument tuples (must be picklable for multiprocessing)
+    task_args = [
+        (obs_month, apply_mom_conversion,
+         str(FRED_SNAPSHOTS_DIR), str(PREPARED_FRED_DIR))
+        for obs_month, _snap_date in snapshot_pairs
+    ]
 
-        if raw_df.empty:
-            continue
+    if max_workers == 0:
+        max_workers = min(os.cpu_count() or 4, 8)
 
-        raw_df['date'] = pd.to_datetime(raw_df['date'])
-        working_df = raw_df.copy()
+    t0 = time.time()
 
-        # 2. Convert to MoM changes (raw + symlog)
-        if apply_mom_conversion:
-            working_df = calculate_mom_change(working_df)
+    if max_workers == 1:
+        # Sequential (useful for debugging)
+        results = []
+        for i, args in enumerate(task_args):
+            result = _process_one_snapshot(args)
+            results.append(result)
+            if (i + 1) % 12 == 0:
+                logger.info(f"  [{i+1}/{n_snapshots}] processed {result[0]}")
+    else:
+        # Parallel with multiprocessing
+        logger.info(f"Using {max_workers} parallel workers")
+        with mp.Pool(processes=max_workers) as pool:
+            results = []
+            for i, result in enumerate(pool.imap_unordered(_process_one_snapshot, task_args)):
+                results.append(result)
+                if (i + 1) % 50 == 0:
+                    elapsed = time.time() - t0
+                    logger.info(f"  [{i+1}/{n_snapshots}] {elapsed:.1f}s elapsed")
 
-        if working_df.empty:
-            continue
+    elapsed = time.time() - t0
+    processed = sum(1 for r in results if len(r) >= 2 and r[1] > 0)
+    errors = [r for r in results if len(r) >= 3]
+    if errors:
+        for err in errors[:5]:
+            logger.warning(f"  Error processing {err[0]}: {err[2]}")
 
-        # 3. Create lag features for all series
-        if apply_mom_conversion:
-            working_df = create_employment_lags(working_df)
-
-        # Add snapshot date
-        working_df['snapshot_date'] = snap_date
-
-        # Save in same schema as input
-        decade_str = f"{obs_month.year // 10 * 10}s"
-        year_str = str(obs_month.year)
-        save_dir = PREPARED_FRED_DIR / decade_str / year_str
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{obs_month.strftime('%Y-%m')}.parquet"
-
-        working_df.to_parquet(save_path, index=False)
-
-        if i % 12 == 0:
-            logger.info(f"Prepared snapshot for {obs_month.date()} (snapshot={snap_date.date()}) — {working_df['series_name'].nunique()} series")
-
-    logger.info("FRED Snapshots preparation complete.")
+    logger.info(f"FRED Snapshots preparation complete: {processed}/{n_snapshots} snapshots in {elapsed:.1f}s")
 
 
 # =============================================================================
@@ -2416,7 +2477,10 @@ def prepare_fred_snapshots(
 # =============================================================================
 
 def verify_prepared_snapshot():
-    """Verify the preprocessing worked correctly."""
+    """Verify the preprocessing worked correctly.
+
+    Supports both wide-format (new) and long-format (legacy) prepared snapshots.
+    """
     logger.info("Verifying Prepared FRED Snapshots...")
 
     # Check recent snapshot
@@ -2437,55 +2501,87 @@ def verify_prepared_snapshot():
         return
 
     df = pd.read_parquet(prepared_path)
-    series = sorted(df['series_name'].unique())
+
+    # Detect format: wide-format has no 'series_name' column
+    is_wide = 'series_name' not in df.columns
+
+    if is_wide:
+        # Wide-format: columns are feature names, index/column is date
+        features = sorted(df.columns.tolist())
+        # Remove 'date' if it's a regular column (not index)
+        features = [f for f in features if f != 'date']
+    else:
+        features = sorted(df['series_name'].unique())
 
     logger.info(f"--- Verification Report for {test_date.date()} ---")
-    logger.info(f"Total unique series: {len(series)}")
-    logger.info(f"Columns: {df.columns.tolist()}")
+    logger.info(f"Format: {'wide' if is_wide else 'long'}")
+    logger.info(f"Total unique features: {len(features)}")
+    if is_wide:
+        logger.info(f"Rows (dates): {len(df)}")
 
-    # Count series by type
-    base_mom = [s for s in series if '_lag_' not in s and '_symlog' not in s]
-    symlog_mom = [s for s in series if '_symlog' in s and '_lag_' not in s]
-    raw_lags = [s for s in series if '_lag_' in s and '_symlog' not in s]
-    symlog_lags = [s for s in series if '_symlog' in s and '_lag_' in s]
+    # Count features by type
+    lag_features = [s for s in features if '_lag_' in s]
+    symlog_features = [s for s in features if '_symlog' in s]
+    pct_chg_features = [s for s in features if '_pct_chg' in s]
+    diff_features = [s for s in features if '_diff' in s]
+    zscore_features = [s for s in features if '_zscore_' in s]
+    rolling_features = [s for s in features if '_rolling_' in s]
 
-    logger.info(f"  Raw MoM series: {len(base_mom)}")
-    logger.info(f"  Symlog MoM series: {len(symlog_mom)}")
-    logger.info(f"  Raw lag series: {len(raw_lags)}")
-    logger.info(f"  Symlog lag series: {len(symlog_lags)}")
+    logger.info(f"  Symlog variants: {len(symlog_features)}")
+    logger.info(f"  Pct change variants: {len(pct_chg_features)}")
+    logger.info(f"  Diff features: {len(diff_features)}")
+    logger.info(f"  Z-score features: {len(zscore_features)}")
+    logger.info(f"  Rolling features: {len(rolling_features)}")
+    logger.info(f"  Lag features: {len(lag_features)}")
 
-    # Verify completeness: each base should have a symlog + 8 lags
-    expected_per_base = 1 + 1 + 4 + 4  # raw + symlog + 4 raw lags + 4 symlog lags
-    expected_total = len(base_mom) * expected_per_base
-    actual_total = len(series)
-    if actual_total == expected_total:
-        logger.info(f"OK: {actual_total} series = {len(base_mom)} base × {expected_per_base} variants")
-    else:
-        logger.warning(f"MISMATCH: Expected {expected_total} series, got {actual_total}")
+    # Check key features exist for a known series
+    test_series = 'total'
+    expected_patterns = [
+        f'{test_series}_symlog', f'{test_series}_pct_chg',
+        f'{test_series}_diff', f'{test_series}_zscore_3m',
+        f'{test_series}_rolling_mean_3m', f'{test_series}_lag_18m',
+    ]
+    for pattern in expected_patterns:
+        found = any(pattern in s for s in features)
+        status = "OK" if found else "MISSING"
+        logger.info(f"  {status}: {pattern}")
 
     # Check transforms were applied
-    if 'value_raw' in df.columns:
+    if is_wide:
+        if 'total' in df.columns:
+            vals = df['total'].dropna()
+            logger.info(f"\n'total' series (raw MoM):")
+            logger.info(f"  Skew: {vals.skew():.3f}, Kurt: {vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{vals.min():.1f}, {vals.max():.1f}]")
+
+        if 'total_symlog' in df.columns:
+            symlog_vals = df['total_symlog'].dropna()
+            logger.info(f"\n'total_symlog' series (symlog of MoM):")
+            logger.info(f"  Skew: {symlog_vals.skew():.3f}, Kurt: {symlog_vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{symlog_vals.min():.3f}, {symlog_vals.max():.3f}]")
+
+        logger.info("OK: Wide-format schema")
+    else:
         total_series = df[df['series_name'] == 'total']
         if not total_series.empty:
-            raw_vals = total_series['value_raw'].dropna()
+            vals = total_series['value'].dropna()
             logger.info(f"\n'total' series (raw MoM):")
-            logger.info(f"  Skew: {raw_vals.skew():.3f}, Kurt: {raw_vals.kurtosis():.3f}")
-            logger.info(f"  Range: [{raw_vals.min():.1f}, {raw_vals.max():.1f}]")
+            logger.info(f"  Skew: {vals.skew():.3f}, Kurt: {vals.kurtosis():.3f}")
+            logger.info(f"  Range: [{vals.min():.1f}, {vals.max():.1f}]")
 
         total_symlog = df[df['series_name'] == 'total_symlog']
         if not total_symlog.empty:
             symlog_vals = total_symlog['value'].dropna()
-            logger.info(f"\n'total_symlog' series (symlog MoM):")
+            logger.info(f"\n'total_symlog' series (symlog of MoM):")
             logger.info(f"  Skew: {symlog_vals.skew():.3f}, Kurt: {symlog_vals.kurtosis():.3f}")
             logger.info(f"  Range: [{symlog_vals.min():.3f}, {symlog_vals.max():.3f}]")
 
-    # Check schema matches expected format
-    expected_cols = ['date', 'value', 'series_name']
-    missing_cols = [c for c in expected_cols if c not in df.columns]
-    if missing_cols:
-        logger.error(f"Missing expected columns: {missing_cols}")
-    else:
-        logger.info("OK: Schema matches expected format")
+        expected_cols = ['date', 'value', 'series_name']
+        missing_cols = [c for c in expected_cols if c not in df.columns]
+        if missing_cols:
+            logger.error(f"Missing expected columns: {missing_cols}")
+        else:
+            logger.info("OK: Long-format schema")
 
     logger.info("Verification Complete.")
 
@@ -2493,6 +2589,8 @@ def verify_prepared_snapshot():
 def compare_raw_vs_prepared():
     """
     Compare statistics of raw vs prepared data to validate transformations.
+
+    Supports both wide-format (new) and long-format (legacy) prepared snapshots.
     """
     logger.info("Comparing Raw vs Prepared FRED Snapshots...")
 
@@ -2521,9 +2619,14 @@ def compare_raw_vs_prepared():
     raw_df = pd.read_parquet(raw_path)
     prepared_df = pd.read_parquet(prepared_path)
 
+    is_wide = 'series_name' not in prepared_df.columns
+
     logger.info(f"\n=== Comparison for {test_date.date()} ===")
     logger.info(f"Raw: {len(raw_df)} rows ({raw_df['series_name'].nunique()} series)")
-    logger.info(f"Prepared: {len(prepared_df)} rows ({prepared_df['series_name'].nunique()} series)")
+    if is_wide:
+        logger.info(f"Prepared: {len(prepared_df)} rows x {len(prepared_df.columns)} feature columns (wide format)")
+    else:
+        logger.info(f"Prepared: {len(prepared_df)} rows ({prepared_df['series_name'].nunique()} series)")
 
     # Compare 'total' series (main NFP)
     for series_name in ['total', 'total_nsa']:
@@ -2532,11 +2635,16 @@ def compare_raw_vs_prepared():
         if raw_series.empty:
             continue
 
-        # Raw is levels, prepared has raw MoM + symlog MoM
         raw_mom = raw_series.diff().dropna()
 
-        prep_raw = prepared_df[prepared_df['series_name'] == series_name]['value'].dropna()
-        prep_symlog = prepared_df[prepared_df['series_name'] == f"{series_name}_symlog"]['value'].dropna()
+        if is_wide:
+            prep_raw = prepared_df[series_name].dropna() if series_name in prepared_df.columns else pd.Series(dtype=float)
+            prep_symlog = prepared_df[f"{series_name}_symlog"].dropna() if f"{series_name}_symlog" in prepared_df.columns else pd.Series(dtype=float)
+            prep_pct_chg = prepared_df[f"{series_name}_pct_chg"].dropna() if f"{series_name}_pct_chg" in prepared_df.columns else pd.Series(dtype=float)
+        else:
+            prep_raw = prepared_df[prepared_df['series_name'] == series_name]['value'].dropna()
+            prep_symlog = prepared_df[prepared_df['series_name'] == f"{series_name}_symlog"]['value'].dropna()
+            prep_pct_chg = prepared_df[prepared_df['series_name'] == f"{series_name}_pct_chg"]['value'].dropna()
 
         logger.info(f"\n{series_name}:")
         logger.info(f"  Raw Levels - Mean: {raw_series.mean():.0f}K")
@@ -2545,6 +2653,8 @@ def compare_raw_vs_prepared():
             logger.info(f"  Prepared Raw MoM - Skew: {prep_raw.skew():.3f}, Kurt: {prep_raw.kurtosis():.3f}")
         if not prep_symlog.empty:
             logger.info(f"  Prepared Symlog MoM - Skew: {prep_symlog.skew():.3f}, Kurt: {prep_symlog.kurtosis():.3f}")
+        if not prep_pct_chg.empty:
+            logger.info(f"  Prepared Pct Change - Skew: {prep_pct_chg.skew():.3f}, Kurt: {prep_pct_chg.kurtosis():.3f}")
 
 
 

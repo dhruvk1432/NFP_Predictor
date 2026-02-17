@@ -1,9 +1,8 @@
 """
 LightGBM NFP Prediction Model
 
-Predicts NSA/SA NFP month-on-month change using master snapshots.
+Predicts NSA NFP month-on-month change using master snapshots.
 Uses snapshot of month M to predict month M (no look-ahead bias).
-Outputs predictions with confidence intervals/error bounds.
 
 Key Features:
 - Handles data with varying start dates (some series start 1948, others 2008)
@@ -11,16 +10,6 @@ Key Features:
 - Survey interval features (4 vs 5 weeks logic)
 - Momentum/divergence and acceleration features
 - Cyclical month encoding (sin/cos)
-- SHAP-based feature importance analysis
-
-FIRST RELEASE MODELS ONLY:
-This model supports 2 target configurations (first release only):
-- nsa_first: Non-seasonally adjusted, first release
-- sa_first: Seasonally adjusted, first release
-
-NOTE: Last release models (nsa_last, sa_last) are disabled.
-
-Use --train-all to train both first release models efficiently.
 
 MODULAR ARCHITECTURE:
 This file is the main entry point. Core functionality is split into:
@@ -35,20 +24,16 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import sys
-import pickle
 import warnings
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS
-from Train.backtest_results import generate_backtest_report
 
 # Import from modular components
 from Train.config import (
-    LINEAR_BASELINE_PREDICTORS,
     PROTECTED_BINARY_FLAGS,
     MODEL_SAVE_DIR,
-    ALL_TARGET_CONFIGS,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
     get_model_id,
@@ -75,8 +60,6 @@ from Train.model import (
     predict_with_intervals,
     save_model,
     load_model,
-    train_linear_baseline,
-    create_linear_baseline_feature,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -87,13 +70,6 @@ try:
 except ImportError:
     logger.warning("LightGBM not available. Install with: pip install lightgbm")
     LIGHTGBM_AVAILABLE = False
-
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    logger.warning("SHAP not available. Install with: pip install shap")
-    SHAP_AVAILABLE = False
 
 
 def clean_features(X: pd.DataFrame, y: pd.Series, max_nan_ratio: float = 0.5) -> List[str]:
@@ -265,119 +241,6 @@ def build_training_dataset(
 # BACKTEST FUNCTIONS
 # =============================================================================
 
-def run_backtest(
-    model: lgb.Booster,
-    target_df: pd.DataFrame,
-    feature_cols: List[str],
-    residuals: List[float],
-    backtest_start: pd.Timestamp,
-    backtest_end: Optional[pd.Timestamp] = None,
-    target_type: str = 'nsa',
-    release_type: str = 'first'
-) -> pd.DataFrame:
-    """
-    Run out-of-sample backtest on the model.
-
-    Args:
-        model: Trained LightGBM model
-        target_df: Full target DataFrame
-        feature_cols: Feature column names
-        residuals: Historical residuals for intervals
-        backtest_start: Start date for backtest
-        backtest_end: End date for backtest
-        target_type: 'nsa' or 'sa' - determines which employment features to use
-        release_type: 'first' or 'last' - determines which release to use
-
-    Returns:
-        DataFrame with backtest results
-    """
-    backtest_df = target_df[target_df['ds'] >= backtest_start]
-    if backtest_end:
-        backtest_df = backtest_df[backtest_df['ds'] <= backtest_end]
-
-    # Load target data for lagged features - use same release_type
-    nsa_target_full = load_target_data('nsa', release_type=release_type)
-    sa_target_full = load_target_data('sa', release_type=release_type)
-
-    results = []
-
-    for idx, row in backtest_df.iterrows():
-        target_month = row['ds']
-        release_date = row.get('release_date', pd.NaT)
-        cutoff_date = release_date if pd.notna(release_date) else target_month
-        actual = row['y_mom']
-
-        # Get snapshot and create features
-        snapshot_date = target_month + pd.offsets.MonthEnd(0)
-        snapshot_df = load_master_snapshot(snapshot_date)
-
-        if snapshot_df is None or snapshot_df.empty:
-            continue
-
-        features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
-        if features.empty:
-            continue
-
-        features = add_calendar_features(features, target_month)
-
-        # Add lagged target features
-        nsa_target_features = get_lagged_target_features(nsa_target_full, target_month, 'nfp_nsa')
-        sa_target_features = get_lagged_target_features(sa_target_full, target_month, 'nfp_sa')
-        for k, v in {**nsa_target_features, **sa_target_features}.items():
-            features[k] = v
-
-        # Add FRED employment features (pre-enriched snapshots with symlog + lags)
-        fred_df = load_fred_snapshot(snapshot_date)
-        if fred_df is not None and not fred_df.empty:
-            fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
-            if not fred_features.empty:
-                for col in fred_features.columns:
-                    features[col] = fred_features[col].iloc[0]
-
-        # Make prediction with intervals
-        pred_result = predict_with_intervals(model, features, residuals, feature_cols)
-
-        results.append({
-            'ds': target_month,
-            'actual': actual,
-            'predicted': pred_result['prediction'],
-            'error': actual - pred_result['prediction'],
-            'lower_50': pred_result['intervals']['50%'][0],
-            'upper_50': pred_result['intervals']['50%'][1],
-            'lower_80': pred_result['intervals']['80%'][0],
-            'upper_80': pred_result['intervals']['80%'][1],
-            'lower_95': pred_result['intervals']['95%'][0],
-            'upper_95': pred_result['intervals']['95%'][1],
-            'in_50_interval': pred_result['intervals']['50%'][0] <= actual <= pred_result['intervals']['50%'][1],
-            'in_80_interval': pred_result['intervals']['80%'][0] <= actual <= pred_result['intervals']['80%'][1],
-            'in_95_interval': pred_result['intervals']['95%'][0] <= actual <= pred_result['intervals']['95%'][1]
-        })
-
-    results_df = pd.DataFrame(results)
-
-    if not results_df.empty:
-        # Calculate metrics
-        rmse = np.sqrt(np.mean(results_df['error'] ** 2))
-        mae = np.mean(np.abs(results_df['error']))
-        mape = np.mean(np.abs(results_df['error'] / results_df['actual'])) * 100
-
-        # Coverage rates
-        coverage_50 = results_df['in_50_interval'].mean() * 100
-        coverage_80 = results_df['in_80_interval'].mean() * 100
-        coverage_95 = results_df['in_95_interval'].mean() * 100
-
-        logger.info(f"\nBacktest Results ({len(results_df)} predictions):")
-        logger.info(f"  RMSE: {rmse:.2f}")
-        logger.info(f"  MAE: {mae:.2f}")
-        logger.info(f"  MAPE: {mape:.2f}%")
-        logger.info(f"\nInterval Coverage:")
-        logger.info(f"  50% CI: {coverage_50:.1f}% (target: 50%)")
-        logger.info(f"  80% CI: {coverage_80:.1f}% (target: 80%)")
-        logger.info(f"  95% CI: {coverage_95:.1f}% (target: 95%)")
-
-    return results_df
-
-
 def impute_with_expanding_window(
     X: pd.DataFrame,
     train_idx: np.ndarray,
@@ -524,22 +387,6 @@ def run_expanding_window_backtest(
 
         feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
-        # Train Linear Baseline and Add as Feature
-        linear_model, linear_cols_used = train_linear_baseline(
-            X_train_valid,
-            y_train_valid,
-            LINEAR_BASELINE_PREDICTORS
-        )
-
-        if linear_model is not None:
-            X_train_valid['linear_baseline_pred'] = create_linear_baseline_feature(
-                X_train_valid,
-                linear_model,
-                linear_cols_used
-            )
-            if 'linear_baseline_pred' not in feature_cols:
-                feature_cols.append('linear_baseline_pred')
-
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
 
@@ -575,13 +422,6 @@ def run_expanding_window_backtest(
 
         # PREDICTION: Get features for target month
         X_pred = X_train_imputed.iloc[[target_idx]].copy()
-
-        if linear_model is not None:
-            X_pred['linear_baseline_pred'] = create_linear_baseline_feature(
-                X_pred,
-                linear_model,
-                linear_cols_used
-            )
 
         X_pred = X_pred[feature_cols]
 
@@ -664,78 +504,11 @@ def run_expanding_window_backtest(
     return results_df
 
 
-def compute_shap_importance(
-    model: lgb.Booster,
-    X_train: pd.DataFrame,
-    feature_cols: List[str],
-    model_id: str
-) -> Optional[pd.DataFrame]:
-    """
-    Compute SHAP feature importance and save results.
-
-    Args:
-        model: Trained LightGBM Booster
-        X_train: Training feature matrix
-        feature_cols: Feature column names
-        model_id: Model identifier for file naming
-
-    Returns:
-        DataFrame with mean |SHAP| per feature, or None if SHAP unavailable
-    """
-    if not SHAP_AVAILABLE:
-        logger.warning("SHAP not available, skipping SHAP analysis")
-        return None
-
-    logger.info("Computing SHAP values...")
-
-    try:
-        # Use TreeExplainer for LightGBM
-        explainer = shap.TreeExplainer(model)
-
-        # Get feature data
-        X_features = X_train[feature_cols] if feature_cols else X_train
-        shap_values = explainer.shap_values(X_features)
-
-        # Compute mean |SHAP| per feature
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-
-        shap_df = pd.DataFrame({
-            'feature': feature_cols,
-            'mean_abs_shap': mean_abs_shap
-        }).sort_values('mean_abs_shap', ascending=False).reset_index(drop=True)
-
-        # Save SHAP importance CSV
-        shap_dir = OUTPUT_DIR / "shap_analysis" / model_id
-        shap_dir.mkdir(parents=True, exist_ok=True)
-
-        csv_path = shap_dir / f"shap_importance_{model_id}.csv"
-        shap_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved SHAP importance to {csv_path}")
-
-        # Save raw SHAP values matrix as parquet
-        shap_matrix = pd.DataFrame(shap_values, columns=feature_cols)
-        parquet_path = shap_dir / f"shap_values_{model_id}.parquet"
-        shap_matrix.to_parquet(parquet_path, index=False)
-        logger.info(f"Saved raw SHAP values to {parquet_path}")
-
-        # Log top 20 features
-        logger.info("\nTop 20 Features by Mean |SHAP|:")
-        for i, row in shap_df.head(20).iterrows():
-            logger.info(f"  {i+1:2d}. {row['feature']}: {row['mean_abs_shap']:.4f}")
-
-        return shap_df
-
-    except Exception as e:
-        logger.warning(f"SHAP computation failed: {e}")
-        return None
-
-
 def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
-    archive_results: bool = True
 ):
     """
     Main training and evaluation function using EXPANDING WINDOW methodology.
@@ -743,31 +516,14 @@ def train_and_evaluate(
     This function ensures NO TIME-TRAVEL VIOLATIONS:
     1. NaN imputation uses only past data (expanding window means)
     2. Model training uses only data available at each prediction time
-    3. SHAP values are computed on the final production model
 
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised
         use_huber_loss: If True, use Huber loss function
         huber_delta: Huber delta parameter
-        archive_results: If True, archive previous results (only for first model in batch)
     """
     model_id = get_model_id(target_type, release_type)
-
-    # Archive previous backtest results before starting new run
-    if archive_results:
-        try:
-            sys.path.append(str(Path(__file__).resolve().parent))
-            from backtest_archiver import prepare_new_backtest_run
-
-            archive_path = prepare_new_backtest_run()
-            if archive_path:
-                logger.info(f"Archived previous backtest to: {archive_path.name}")
-            else:
-                logger.info("No previous backtest results to archive")
-        except Exception as e:
-            logger.warning(f"Failed to archive backtest results: {e}")
-            logger.info("Continuing with training...")
 
     logger.info("=" * 60)
     logger.info(f"LightGBM NFP Prediction Model - Training [{model_id.upper()}]")
@@ -810,28 +566,9 @@ def train_and_evaluate(
 
     logger.info(f"Total observations: {len(X_full)}, Valid for training: {len(X_full_valid)}")
 
-    # Train linear baseline on full training data
-    logger.info("\nTraining Linear Baseline Model for Production...")
-    linear_model_prod, linear_cols_prod = train_linear_baseline(
-        X_full_valid,
-        y_full_valid,
-        LINEAR_BASELINE_PREDICTORS
-    )
-
-    if linear_model_prod is not None:
-        X_full_valid['linear_baseline_pred'] = create_linear_baseline_feature(
-            X_full_valid,
-            linear_model_prod,
-            linear_cols_prod
-        )
-
     # Basic feature cleaning (no feature selection)
     cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
     feature_cols = cleaned_feature_cols
-
-    # Ensure linear_baseline_pred is included if available
-    if linear_model_prod is not None and 'linear_baseline_pred' not in feature_cols:
-        feature_cols.append('linear_baseline_pred')
 
     X_train = X_full_valid[['ds'] + [c for c in feature_cols if c in X_full_valid.columns]].copy()
 
@@ -848,12 +585,6 @@ def train_and_evaluate(
         huber_delta=huber_delta
     )
 
-    # Compute SHAP values on the final model
-    logger.info("\n" + "=" * 60)
-    logger.info("SHAP Feature Importance Analysis")
-    logger.info("=" * 60)
-    shap_df = compute_shap_importance(model, X_train, feature_cols, model_id)
-
     # Save production model
     save_model(
         model,
@@ -862,82 +593,7 @@ def train_and_evaluate(
         importance,
         target_type=target_type,
         release_type=release_type,
-        linear_model=linear_model_prod,
-        linear_cols=linear_cols_prod
     )
-
-    # Save backtest results
-    results_dir = OUTPUT_DIR / "backtest_results" / model_id
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    if not backtest_results.empty:
-        results_path = results_dir / f"backtest_results_{model_id}.parquet"
-        backtest_results.to_parquet(results_path, index=False)
-        logger.info(f"\nSaved backtest results to {results_path}")
-
-        # Also save as CSV for easy viewing
-        csv_path = results_dir / f"backtest_results_{model_id}.csv"
-        backtest_results.to_csv(csv_path, index=False)
-        logger.info(f"Saved backtest CSV to {csv_path}")
-
-        # Save summary statistics
-        summary = {
-            'target_type': target_type,
-            'release_type': release_type,
-            'model_id': model_id,
-            'n_predictions': len(backtest_results),
-            'rmse': np.sqrt(np.mean(backtest_results['error'] ** 2)),
-            'mae': np.mean(np.abs(backtest_results['error'])),
-            'mape': np.mean(np.abs(backtest_results['error'] / backtest_results['actual'])) * 100,
-            'coverage_50': backtest_results['in_50_interval'].mean() * 100,
-            'coverage_80': backtest_results['in_80_interval'].mean() * 100,
-            'coverage_95': backtest_results['in_95_interval'].mean() * 100,
-            'n_features': len(feature_cols),
-            'train_end': str(train_end.date()),
-            'backtest_start': str((train_end + pd.DateOffset(months=1)).date()),
-            'backtest_end': str(target_df['ds'].max().date())
-        }
-
-        summary_path = results_dir / f"model_summary_{model_id}.csv"
-        pd.DataFrame([summary]).to_csv(summary_path, index=False)
-        logger.info(f"Saved model summary to {summary_path}")
-
-    # Save feature importance to output
-    importance_dir = OUTPUT_DIR / "feature_importance" / model_id
-    importance_dir.mkdir(parents=True, exist_ok=True)
-
-    importance_df = pd.DataFrame([
-        {'feature': k, 'importance': v} for k, v in importance.items()
-    ]).sort_values('importance', ascending=False)
-
-    importance_path = importance_dir / f"feature_importance_{model_id}.csv"
-    importance_df.to_csv(importance_path, index=False)
-    logger.info(f"Saved feature importance to {importance_path}")
-
-    # Generate comprehensive backtest report using dedicated module
-    logger.info("\n" + "=" * 60)
-    logger.info("Generating Backtest Report")
-    logger.info("=" * 60)
-
-    try:
-        # Prepare data for backtest report
-        report_df = backtest_results.copy()
-        report_df = report_df.rename(columns={
-            'ds': 'date',
-            'predicted': 'pred'
-        })
-
-        # Generate comprehensive report (visualizations, metrics, tables)
-        report_files = generate_backtest_report(
-            predictions_df=report_df,
-            selected_features=feature_cols,
-            output_dir=results_dir
-        )
-
-        logger.info(f"Generated {len(report_files)} report files")
-
-    except Exception as e:
-        logger.warning(f"Failed to generate backtest report: {e}")
 
     return model, feature_cols, residuals, backtest_results
 
@@ -1056,146 +712,28 @@ def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first')
     return predict_nfp_mom(latest_target, target_type=target_type, release_type=release_type)
 
 
-def train_all_models(
-    use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
-    huber_delta: float = HUBER_DELTA
-) -> Dict[str, Any]:
-    """
-    Train all first release model variants efficiently.
-
-    Model architecture:
-    - nsa_first: LightGBM model for NSA predictions
-    - sa_first: SARIMA model for seasonal adjustment (applied to NSA predictions)
-
-    NOTE: Last release models (nsa_last, sa_last) are disabled.
-
-    Args:
-        use_huber_loss: If True, use Huber loss function (for NSA)
-        huber_delta: Huber delta parameter (for NSA)
-
-    Returns:
-        Dictionary with results for each model_id
-    """
-    logger.info("=" * 70)
-    logger.info("TRAINING ALL FIRST RELEASE MODEL VARIANTS")
-    logger.info("=" * 70)
-    logger.info("Model 1: NSA (LightGBM)")
-    logger.info("Model 2: SA (SARIMA on seasonal adjustment)")
-
-    results = {}
-
-    # Step 1: Train NSA model with LightGBM (archives previous results)
-    logger.info("\n" + "=" * 70)
-    logger.info("MODEL 1/2: NSA_FIRST (LightGBM)")
-    logger.info("=" * 70)
-
-    try:
-        nsa_result = train_and_evaluate(
-            target_type='nsa',
-            release_type='first',
-            use_huber_loss=use_huber_loss,
-            huber_delta=huber_delta,
-            archive_results=True
-        )
-
-        results['nsa_first'] = {
-            'status': 'success',
-            'model': nsa_result[0] if nsa_result else None,
-            'feature_cols': nsa_result[1] if nsa_result else None,
-            'residuals': nsa_result[2] if nsa_result else None,
-            'backtest_results': nsa_result[3] if nsa_result else None,
-        }
-
-        logger.info("Successfully trained NSA_FIRST")
-
-    except Exception as e:
-        logger.error(f"Failed to train NSA_FIRST: {e}")
-        results['nsa_first'] = {
-            'status': 'failed',
-            'error': str(e)
-        }
-
-    # Step 2: Train SA model with SARIMA (uses NSA predictions)
-    logger.info("\n" + "=" * 70)
-    logger.info("MODEL 2/2: SA_FIRST (SARIMA)")
-    logger.info("=" * 70)
-
-    try:
-        # Import SARIMA training function
-        from Train.train_sarima_sa import train_and_evaluate_sarima
-
-        # Train SARIMA model (uses NSA predictions from step 1)
-        sa_result = train_and_evaluate_sarima(archive_results=False)
-
-        results['sa_first'] = {
-            'status': 'success',
-            'model_type': 'SARIMA',
-            'backtest_results': sa_result if sa_result is not None else None,
-        }
-
-        logger.info("Successfully trained SA_FIRST (SARIMA)")
-
-    except Exception as e:
-        logger.error(f"Failed to train SA_FIRST: {e}")
-        results['sa_first'] = {
-            'status': 'failed',
-            'error': str(e)
-        }
-
-    # Summary
-    logger.info("\n" + "=" * 70)
-    logger.info("TRAINING COMPLETE - SUMMARY")
-    logger.info("=" * 70)
-
-    for model_id, result in results.items():
-        status = result['status']
-        if status == 'success':
-            backtest = result.get('backtest_results')
-            if backtest is not None and isinstance(backtest, pd.DataFrame) and not backtest.empty:
-                valid_rows = backtest[~backtest['error'].isna()]
-                if not valid_rows.empty:
-                    rmse = np.sqrt(np.mean(valid_rows['error'] ** 2))
-                    mae = np.mean(np.abs(valid_rows['error']))
-                    model_type = result.get('model_type', 'LightGBM')
-                    logger.info(f"  {model_id.upper()} ({model_type}): RMSE={rmse:.1f}, MAE={mae:.1f}")
-                else:
-                    logger.info(f"  {model_id.upper()}: Success (no backtest metrics)")
-            else:
-                logger.info(f"  {model_id.upper()}: Success (no backtest results)")
-        else:
-            logger.info(f"  {model_id.upper()}: {status.upper()}")
-
-    return results
-
-
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='LightGBM NFP Prediction Model - First Release Only',
+        description='LightGBM NFP Prediction Model',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train single model (default: nsa_first)
+  # Train model (default: nsa_first)
   python Train/train_lightgbm_nfp.py --train
 
-  # Train all first release model variants (nsa_first, sa_first)
-  python Train/train_lightgbm_nfp.py --train-all
+  # Train with specific target/release
+  python Train/train_lightgbm_nfp.py --train --target nsa --release first
 
-  # Train both NSA and SA models (first release)
-  python Train/train_lightgbm_nfp.py --train-both
+  # Predict for a specific month
+  python Train/train_lightgbm_nfp.py --predict 2024-12 --target nsa
 
-  # Predict with specific model
-  python Train/train_lightgbm_nfp.py --predict 2024-12 --target sa --release first
-
-NOTE: Only first release models are supported. Last release models are disabled.
+  # Get latest prediction
+  python Train/train_lightgbm_nfp.py --latest --target nsa
         """
     )
-    parser.add_argument('--train', action='store_true', help='Train a single model')
-    parser.add_argument('--train-all', action='store_true',
-                        help='Train all first release model variants (nsa_first, sa_first)')
-    parser.add_argument('--train-both', action='store_true',
-                        help='Train both NSA and SA models (first release)')
+    parser.add_argument('--train', action='store_true', help='Train model')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
@@ -1214,47 +752,13 @@ NOTE: Only first release models are supported. Last release models are disabled.
 
     model_id = get_model_id(args.target, args.release)
 
-    if args.train_all:
-        # Train all first release model variants
-        logger.info("Training all first release model variants (nsa_first, sa_first)...")
-        train_all_models(
+    if args.train:
+        train_and_evaluate(
+            target_type=args.target,
+            release_type=args.release,
             use_huber_loss=use_huber_loss,
             huber_delta=args.huber_delta
         )
-
-    elif args.train_both:
-        # Train both NSA and SA models (first release)
-        logger.info(f"Training both NSA and SA models (first release)...")
-        logger.info("NSA: LightGBM, SA: SARIMA")
-
-        # Train NSA with LightGBM
-        train_and_evaluate(
-            target_type='nsa',
-            release_type='first',
-            use_huber_loss=use_huber_loss,
-            huber_delta=args.huber_delta,
-            archive_results=True
-        )
-
-        # Train SA with SARIMA
-        from Train.train_sarima_sa import train_and_evaluate_sarima
-        train_and_evaluate_sarima(archive_results=False)
-
-    elif args.train:
-        # Train single model
-        if args.target == 'sa':
-            # SA uses SARIMA (requires NSA predictions to exist)
-            logger.info("Training SA model with SARIMA (requires NSA predictions)...")
-            from Train.train_sarima_sa import train_and_evaluate_sarima
-            train_and_evaluate_sarima(archive_results=True)
-        else:
-            # NSA uses LightGBM
-            train_and_evaluate(
-                target_type=args.target,
-                release_type=args.release,
-                use_huber_loss=use_huber_loss,
-                huber_delta=args.huber_delta
-            )
 
     elif args.predict:
         target_month = pd.Timestamp(args.predict + '-01')

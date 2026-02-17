@@ -40,7 +40,6 @@ logger = setup_logger(__file__, TEMP_DIR)
 try:
     import lightgbm as lgb
     from sklearn.model_selection import TimeSeriesSplit
-    from sklearn.linear_model import LinearRegression
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     logger.warning("LightGBM/sklearn not available")
@@ -405,8 +404,6 @@ def save_model(
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    linear_model: Optional[Any] = None,
-    linear_cols: Optional[List[str]] = None
 ) -> None:
     """
     Save model and associated metadata.
@@ -419,8 +416,6 @@ def save_model(
         save_dir: Base directory for model storage
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        linear_model: Optional linear baseline model
-        linear_cols: Optional columns used by linear model
     """
     model_id = get_model_id(target_type, release_type)
 
@@ -439,8 +434,6 @@ def save_model(
         'target_type': target_type,
         'release_type': release_type,
         'model_id': model_id,
-        'linear_model': linear_model,
-        'linear_cols': linear_cols,
     }
 
     with open(model_dir / f"lightgbm_{model_id}_metadata.pkl", 'wb') as f:
@@ -492,106 +485,3 @@ def load_model(
     logger.info(f"Model {model_id.upper()} loaded from {model_dir}")
 
     return model, metadata
-
-
-def list_available_models(save_dir: Path = MODEL_SAVE_DIR) -> List[str]:
-    """
-    List all available trained models.
-
-    Args:
-        save_dir: Base directory for model storage
-
-    Returns:
-        List of model_ids that have trained models
-    """
-    available = []
-
-    for target_type in VALID_TARGET_TYPES:
-        for release_type in VALID_RELEASE_TYPES:
-            model_id = get_model_id(target_type, release_type)
-            model_dir = save_dir / model_id
-
-            model_path = model_dir / f"lightgbm_{model_id}_model.txt"
-            if model_path.exists():
-                available.append(model_id)
-
-    return available
-
-
-# =============================================================================
-# LINEAR BASELINE
-# =============================================================================
-
-def train_linear_baseline(
-    X: pd.DataFrame,
-    y: pd.Series,
-    predictor_cols: List[str]
-) -> Tuple[Any, List[str]]:
-    """
-    Train simple OLS baseline using key predictors for extrapolation.
-
-    This linear model can extrapolate beyond training data ranges,
-    unlike tree-based models which are bounded by training leaves.
-
-    Args:
-        X: Feature DataFrame
-        y: Target Series
-        predictor_cols: Columns to use for linear model
-
-    Returns:
-        Tuple of (trained LinearRegression model, actual columns used)
-    """
-    # Find available columns
-    available_cols = [c for c in predictor_cols if c in X.columns]
-    
-    if len(available_cols) < 3:
-        logger.warning(f"Only {len(available_cols)} linear baseline predictors available")
-        return None, []
-    
-    # Get clean data
-    X_linear = X[available_cols].copy()
-    valid_mask = ~(X_linear.isna().any(axis=1) | y.isna())
-    
-    X_fit = X_linear[valid_mask]
-    y_fit = y[valid_mask]
-    
-    if len(X_fit) < 20:
-        logger.warning("Not enough samples for linear baseline")
-        return None, []
-    
-    # Fit model
-    linear_model = LinearRegression()
-    linear_model.fit(X_fit, y_fit)
-    
-    logger.info(f"Trained linear baseline with {len(available_cols)} predictors")
-    
-    return linear_model, available_cols
-
-
-def create_linear_baseline_feature(
-    X: pd.DataFrame,
-    linear_model: Any,
-    predictor_cols: List[str]
-) -> pd.Series:
-    """
-    Generate predictions from linear baseline model as a feature.
-
-    Args:
-        X: Feature DataFrame
-        linear_model: Trained LinearRegression model
-        predictor_cols: Column names used by linear model
-
-    Returns:
-        Series of linear baseline predictions
-    """
-    if linear_model is None or not predictor_cols:
-        return pd.Series(np.nan, index=X.index)
-    
-    X_linear = X[predictor_cols].copy()
-    
-    # Handle missing values
-    X_linear = X_linear.fillna(X_linear.median())
-    
-    predictions = linear_model.predict(X_linear)
-    
-    return pd.Series(predictions, index=X.index, name='linear_baseline_pred')

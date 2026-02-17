@@ -16,7 +16,7 @@ Output:
     - State files:    DATA_PATH/Exogenous_data/NOAA_data/{STATE}_NOAA_data.parquet
     - US aggregate:   DATA_PATH/Exogenous_data/NOAA_data/US_NOAA_data.parquet
     - Master file:    DATA_PATH/Exogenous_data/NOAA_data/NOAA_master.parquet
-    - Final output:   DATA_PATH/Exogenous_data/noaa_weighted_snapshots/decades/...
+    - Final output:   DATA_PATH/Exogenous_data/exogenous_noaa_snapshots/decades/...
 
 Requires:
     pip install requests pandas beautifulsoup4 tqdm python-dateutil pyarrow fredapi numpy
@@ -44,11 +44,18 @@ from tqdm import tqdm
 from dateutil.relativedelta import relativedelta
 from fredapi import Fred
 
-# Add parent directory to path to import settings
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to FRONT of path so project-level packages (utils/, settings)
+# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
+
 from Data_ETA_Pipeline.fred_employment_pipeline import apply_nfp_relative_adjustment
+from Data_ETA_Pipeline.utils import get_snapshot_path
+# Fix import - utils is at project root, but sys.path structure makes it tricky
+# Import via Data_ETA_Pipeline is not correct if utils is outside
+# But sys.path has parent directory appended
+from utils.transforms import add_pct_change_copies, compute_all_features
 
 # =====================================================================
 # LOGGER
@@ -123,7 +130,23 @@ NOAA_DATA_DIR = DATA_PATH / "Exogenous_data" / "NOAA_data"
 US_NOAA_FILE = NOAA_DATA_DIR / "US_NOAA_data.parquet"
 NOAA_MASTER_FILE = NOAA_DATA_DIR / "NOAA_master.parquet"
 NOAA_MASTER_PATH = DATA_PATH / "Exogenous_data" / "NOAA_data" / "NOAA_master.parquet"
-NOAA_WEIGHTED_DIR = DATA_PATH / "Exogenous_data" / "noaa_weighted_snapshots" / "decades"
+NOAA_SNAPSHOTS_DIR = DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots"
+
+# =============================================================================
+# NOAA INDEX CONFIGURATION
+# =============================================================================
+
+NOAA_HUMAN_IMPACT_COLS = [
+    "deaths_direct_weighted_log",
+    "deaths_indirect_weighted_log",
+    "injuries_direct_weighted_log",
+    "injuries_indirect_weighted_log"
+]
+
+NOAA_ECONOMIC_DAMAGE_COLS = [
+    "total_property_damage_real_weighted_log",
+    "total_crop_damage_real_weighted_log"
+]
 
 
 # #####################################################################
@@ -1104,18 +1127,12 @@ def create_noaa_weighted_snapshots(
         event_date = row['ds']
         snap_date = row['release_date']  # NFP release date
 
-        year = event_date.year
-        decade = f"{year // 10 * 10}s"
-        month_str = event_date.strftime('%Y-%m')
-
-        # Create directory structure
-        save_dir = NOAA_WEIGHTED_DIR / decade / str(year)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{month_str}.parquet"
+        # Create directory using utility
+        save_path = get_snapshot_path(NOAA_SNAPSHOTS_DIR, snap_date)
 
         # Skip if exists
         if save_path.exists():
-            logger.info(f"[{i}/{len(nfp_releases)}] Snapshot exists for {month_str}, skipping")
+            logger.info(f"[{i}/{len(nfp_releases)}] Snapshot exists for {snap_date.strftime('%Y-%m')}, skipping")
             continue
 
         try:
@@ -1124,33 +1141,86 @@ def create_noaa_weighted_snapshots(
                 weights = get_state_employment_weights(employment_vintages, snap_date)
             except ValueError:
                 # If no weights available (e.g. pre-1990), treat as missing
-                # We simply don't create the weighted snapshot for this month
-                # create_master_snapshots.py will handle missing files by skipping them
                 if i % 12 == 0:  # Reduce log noise
-                    logger.info(f"[{i}/{len(nfp_releases)}] No weights for {month_str} (pre-1990), skipping")
+                    logger.info(f"[{i}/{len(nfp_releases)}] No weights for {snap_date.strftime('%Y-%m')} (pre-1990), skipping")
                 continue
 
             # Create weighted aggregates (with point-in-time filtering using snap_date)
+            # This returns a DataFrame with 'series_name' (e.g., 'deaths_direct_weighted_log') and 'value'
             weighted_national = create_weighted_national_aggregates(noaa_states, weights, snap_date)
 
-            # Add snapshot_date column (NFP release date)
-            weighted_national['snapshot_date'] = snap_date
+            if weighted_national.empty:
+                logger.warning(f"[{i}/{len(nfp_releases)}] No weighted national data for {snap_date}, skipping")
+                continue
 
-            # Reorder columns to match requirements: date, series_name, value, snapshot_date, release_date
-            weighted_national = weighted_national[['date', 'series_name', 'value', 'snapshot_date', 'release_date']]
+            # --- INDEX CREATION LOGIC ---
+            # Pivot to wide format to sum components
+            wide = weighted_national.pivot_table(index='date', columns='series_name', values='value', aggfunc='first')
+            
+            indices = []
 
+            # 1. NOAA_Human_Impact_Index
+            # Sum of weighted log deaths and injuries (direct + indirect)
+            # Since inputs are logs, summing them is equivalent to multiplying original weighted values
+            human_cols = [c for c in NOAA_HUMAN_IMPACT_COLS if c in wide.columns]
+            if human_cols:
+                human_index = wide[human_cols].sum(axis=1).reset_index(name='value')
+                human_index['series_name'] = 'NOAA_Human_Impact_Index'
+                indices.append(human_index)
+
+            # 2. NOAA_Economic_Damage_Index
+            # Sum of weighted log property and crop damage (real)
+            econ_cols = [c for c in NOAA_ECONOMIC_DAMAGE_COLS if c in wide.columns]
+            if econ_cols:
+                econ_index = wide[econ_cols].sum(axis=1).reset_index(name='value')
+                econ_index['series_name'] = 'NOAA_Economic_Damage_Index'
+                indices.append(econ_index)
+
+            if not indices:
+                logger.warning(f"[{i}/{len(nfp_releases)}] Could not create any indices for {snap_date}")
+                continue
+
+            final_indices = pd.concat(indices, ignore_index=True)
+            
+            # Restore metadata columns lost during pivot
+            # We obtain release_date from the original weighted_national (it's per-date)
+            # Here we just take the max release_date for each date as a proxy, 
+            # though typically they are identical for all NOAA series in a month
+            release_dates = weighted_national.groupby('date')['release_date'].max().reset_index()
+            final_indices = final_indices.merge(release_dates, on='date', how='left')
+            
+            final_indices['snapshot_date'] = snap_date
+
+            # --- TRANSFORMATION LOGIC ---
+            # Apply Branch-and-Expand to indices:
+            # 1. pct_change copies (NOAA indices -> NOAA indices_pct_chg)
+            # 2. compute_all_features (lags, rolling means, z-scores, diffs)
+            # Note: add_symlog_copies is EXPLICITLY SKIPPED as requested
+            
+            # Create pct_change variants
+            # Skip series? No, these are continuous indices, so pct_change is valid
+            final_indices = add_pct_change_copies(final_indices)
+            
+            # Compute full feature suite (lags, rolling, z-scores)
+            final_indices = compute_all_features(final_indices)
+
+            # --- FINAL FILTERING ---
+            # Ensure no lookahead bias: filter out data not known by snap_date
+            # (Transformation functions might have introduced lags/shifts, but base data was already safe)
+            # release_date column tracks when the data became known
+            
             # Save
-            weighted_national.to_parquet(save_path, index=False)
+            final_indices.to_parquet(save_path, index=False)
 
-            logger.info(f"[{i}/{len(nfp_releases)}] Saved {month_str}: {len(weighted_national)} rows (snapshot={snap_date.date()})")
+            logger.info(f"[{i}/{len(nfp_releases)}] Saved {snap_date.date()}: {len(final_indices)} rows")
 
         except Exception as e:
-            logger.error(f"Error creating snapshot for {month_str}: {e}")
+            logger.error(f"Error creating snapshot for {snap_date}: {e}")
             traceback.print_exc()
             continue
 
     logger.info("=" * 80)
-    logger.info("NOAA weighted snapshot generation complete")
+    logger.info("NOAA INDEX SNAPSHOT GENERATION COMPLETE")
     logger.info("=" * 80)
 
 

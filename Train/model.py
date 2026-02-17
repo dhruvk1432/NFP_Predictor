@@ -29,7 +29,6 @@ from Train.config import (
     PANIC_REGIME_WEIGHT,
     CONFIDENCE_LEVELS,
     MODEL_SAVE_DIR,
-    PROTECTED_BINARY_FLAGS,
     get_model_id,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
@@ -154,7 +153,8 @@ def train_lightgbm_model(
     num_boost_round: int = NUM_BOOST_ROUND,
     early_stopping_rounds: int = EARLY_STOPPING_ROUNDS,
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
-    huber_delta: float = HUBER_DELTA
+    huber_delta: float = HUBER_DELTA,
+    params_override: Optional[Dict] = None,
 ) -> Tuple[lgb.Booster, Dict, List[float]]:
     """
     Train LightGBM model with time-series cross-validation.
@@ -167,6 +167,8 @@ def train_lightgbm_model(
         early_stopping_rounds: Early stopping patience
         use_huber_loss: If True, use Huber objective
         huber_delta: Huber delta parameter
+        params_override: If provided, use these LightGBM params instead of defaults.
+            Typically from Optuna hyperparameter tuning.
 
     Returns:
         Tuple of (trained model, feature importance dict, residuals list)
@@ -181,24 +183,28 @@ def train_lightgbm_model(
 
     logger.info(f"Training LightGBM on {len(X_train)} samples with {len(feature_cols)} features")
 
-    # Remove any remaining NaN/Inf from features
+    # Replace inf with NaN (LightGBM handles NaN natively but not inf)
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
 
-    # Drop rows with any NaN in features or target
-    valid_mask = ~(X_train.isna().any(axis=1) | y.isna())
+    # Only drop rows where the target is NaN (LightGBM handles NaN features natively)
+    valid_mask = ~y.isna()
     X_clean = X_train[valid_mask].copy()
     y_clean = y[valid_mask].copy()
 
     if len(X_clean) < 50:
         raise ValueError(f"Not enough valid training samples: {len(X_clean)}")
 
-    logger.info(f"After cleaning: {len(X_clean)} valid samples")
+    logger.info(f"After cleaning: {len(X_clean)} valid samples (dropped {(~valid_mask).sum()} NaN targets)")
 
     # Calculate sample weights based on regime indicators
     weights = calculate_sample_weights(X[valid_mask])
 
-    # LightGBM parameters
-    params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
+    # LightGBM parameters (use tuned params if provided, else static defaults)
+    if params_override is not None:
+        params = params_override.copy()
+        logger.info("Using Optuna-tuned hyperparameters")
+    else:
+        params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
     # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -285,7 +291,12 @@ def train_lightgbm_model(
     for i, (feat, imp) in enumerate(list(importance.items())[:15], 1):
         logger.info(f"  {i}. {feat}: {imp:.1f}")
 
-    return final_model, importance, cv_residuals
+    # Use the final model's validation residuals (not CV residuals from earlier models)
+    # These are OOS residuals from the 15% holdout of the final model
+    final_val_preds = final_model.predict(X_final_val)
+    final_residuals = (y_final_val.values - final_val_preds).tolist()
+
+    return final_model, importance, final_residuals
 
 
 # =============================================================================
@@ -356,13 +367,15 @@ def predict_with_intervals(
         - std: Standard deviation of residuals
         - mean_residual_bias: Mean bias from residuals
     """
-    # Handle missing feature columns gracefully
+    # Ensure correct feature alignment: reindex to match training column order,
+    # filling missing columns with NaN (LightGBM handles NaN natively).
+    # This prevents column-shift bugs when some features are absent at predict time.
     available_cols = [c for c in feature_cols if c in features.columns]
     if len(available_cols) < len(feature_cols):
         missing = set(feature_cols) - set(available_cols)
-        logger.warning(f"Missing {len(missing)} feature columns: {list(missing)[:5]}...")
+        logger.warning(f"Missing {len(missing)} feature columns (filled with NaN): {list(missing)[:5]}...")
 
-    X = features[available_cols].values.reshape(1, -1)
+    X = features.reindex(columns=feature_cols).values.reshape(1, -1)
     prediction = model.predict(X)[0]
 
     intervals_numeric = calculate_prediction_intervals(residuals, prediction)

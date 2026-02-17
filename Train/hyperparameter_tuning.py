@@ -155,6 +155,12 @@ def tune_hyperparameters(
     # Suppress Optuna's verbose logging
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    import time as _time
+    _tune_t0 = _time.time()
+    logger.info(f"Starting Optuna: {n_trials} trials, timeout={timeout}s, "
+                f"{len(X)} samples, {len(X.columns)} features, "
+                f"{n_inner_splits}-fold inner CV")
+
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -162,6 +168,9 @@ def tune_hyperparameters(
     )
 
     study.optimize(objective, n_trials=n_trials, timeout=timeout)
+
+    _tune_elapsed = _time.time() - _tune_t0
+    _tune_str = f"{_tune_elapsed/60:.1f}m" if _tune_elapsed >= 60 else f"{_tune_elapsed:.0f}s"
 
     # Build final param dict from best trial
     best = study.best_trial
@@ -179,7 +188,7 @@ def tune_hyperparameters(
     if 'huber_delta' in best_params:
         best_params['alpha'] = best_params.pop('huber_delta')
 
-    logger.info(f"Optuna tuning complete: {len(study.trials)} trials, "
+    logger.info(f"Optuna tuning complete in {_tune_str}: {len(study.trials)} trials, "
                 f"best MAE={best.value:.2f}")
     logger.info(f"Best params: lr={best_params.get('learning_rate', '?'):.4f}, "
                 f"leaves={best_params.get('num_leaves', '?')}, "

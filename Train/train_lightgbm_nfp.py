@@ -2,7 +2,7 @@
 LightGBM NFP Prediction Model
 
 Predicts NSA NFP month-on-month change using master snapshots.
-Uses snapshot of month M to predict month M (no look-ahead bias).
+Uses release_date cutoff (not target_month) to match inference behavior.
 
 Key Features:
 - Handles data with varying start dates (some series start 1948, others 2008)
@@ -48,14 +48,100 @@ from Train.data_loader import (
     load_master_snapshot,
     load_target_data,
     get_lagged_target_features,
-    pivot_snapshot_to_wide,
+    pivot_snapshot_to_wide
 )
+
+from joblib import Parallel, delayed
+
+def _process_single_month_task(
+    target_month: pd.Timestamp,
+    target_value: float,
+    cutoff_date: pd.Timestamp,
+    snapshot_date: pd.Timestamp,
+    target_type: str,
+    release_type: str,
+    nsa_target_full: pd.DataFrame,
+    sa_target_full: pd.DataFrame,
+    selected_features: Optional[List[str]] = None
+) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
+    """
+    Helper function to process a single month in parallel.
+    Disables caching to avoid memory bloat in worker processes.
+    """
+    # Initialize dictionary for features
+    features = {'ds': target_month}
+
+    # 1. Add Calendar Features
+    cal_features = get_calendar_features_dict(target_month)
+    features.update(cal_features)
+
+    # 2. Add Lagged Target Features (NSA & SA)
+    nsa_lags = get_lagged_target_features(nsa_target_full, target_month, prefix='nfp_nsa')
+    sa_lags = get_lagged_target_features(sa_target_full, target_month, prefix='nfp_sa')
+    features.update(nsa_lags)
+    features.update(sa_lags)
+
+    # 3. Load and process Master Snapshot
+    snapshot_df = load_master_snapshot(snapshot_date, use_cache=False)
+    
+    if snapshot_df is None or snapshot_df.empty:
+        # Expected behavior for early months or missing data
+        # If primary data is missing, we likely skip this sample
+        return None, None
+        
+    features_wide = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
+    if not features_wide.empty:
+        features.update(features_wide.iloc[0].to_dict())
+
+    # 4. Load and process FRED Snapshot
+    fred_df = load_fred_snapshot(snapshot_date, use_cache=False)
+    if fred_df is not None and not fred_df.empty:
+        fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
+        if not fred_features.empty:
+            features.update(fred_features.iloc[0].to_dict())
+
+    # 5. Compute Revisions (Master & FRED)
+    # Compare "What we know now (snapshot M)" vs "What we knew last month (snapshot M-1)"
+    # Revisions are computed regarding the PREVIOUS month (target_month - 1)
+    prev_month_target = target_month - pd.DateOffset(months=1)
+    
+    # Load previous snapshot (M-1)
+    prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
+    prev_snapshot = load_master_snapshot(prev_snapshot_date, use_cache=False)
+    
+    # Master Revisions
+    if prev_snapshot is not None and not prev_snapshot.empty:
+        # View of PREV MONTH from CURRENT snapshot
+        view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
+        # View of PREV MONTH from PREV snapshot
+        view_prev = pivot_snapshot_to_wide(prev_snapshot, prev_month_target, cutoff_date=cutoff_date)
+        
+        revs = compute_revision_features(view_curr, view_prev, prefix='rev_master')
+        if not revs.empty:
+            features.update(revs.iloc[0].to_dict())
+
+    # FRED Revisions
+    prev_fred = load_fred_snapshot(prev_snapshot_date, use_cache=False)
+    if fred_df is not None and not fred_df.empty and prev_fred is not None and not prev_fred.empty:
+        f_view_curr = pivot_snapshot_to_wide(fred_df, prev_month_target, cutoff_date=cutoff_date)
+        f_view_prev = pivot_snapshot_to_wide(prev_fred, prev_month_target, cutoff_date=cutoff_date)
+        
+        f_revs = compute_revision_features(f_view_curr, f_view_prev, prefix='rev_fred', per_series=True)
+        if not f_revs.empty:
+            features.update(f_revs.iloc[0].to_dict())
+
+    return features, target_value
+
 
 from Train.feature_engineering import (
     add_calendar_features,
+    get_calendar_features_dict,
 )
 
-from Train.revision_features import get_revision_features_for_month
+from Train.revision_features import (
+    get_revision_features_for_month,
+    compute_revision_features,
+)
 from utils.transforms import winsorize_covid_period
 from Train.hyperparameter_tuning import tune_hyperparameters
 
@@ -78,17 +164,18 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 
-def clean_features(X: pd.DataFrame, y: pd.Series, max_nan_ratio: float = 0.5) -> List[str]:
+def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> List[str]:
     """
-    Basic feature cleaning: drop high-NaN and zero-variance columns.
+    Basic feature cleaning: drop columns with too few data points or zero variance.
 
-    NaN ratio is computed per-column based on its own non-NaN count,
-    so features that start later (e.g. ADP from 2010) are not penalized.
+    LightGBM handles NaN natively, so NaN ratio is irrelevant. The only reason
+    to drop a feature is if it has fewer than min_non_nan non-NaN observations
+    (not enough signal to learn from) or zero variance.
 
     Args:
         X: Feature DataFrame
         y: Target series (unused, kept for API consistency)
-        max_nan_ratio: Maximum fraction of NaN values allowed per column
+        min_non_nan: Minimum number of non-NaN values required to keep a column
 
     Returns:
         List of cleaned feature column names
@@ -97,17 +184,18 @@ def clean_features(X: pd.DataFrame, y: pd.Series, max_nan_ratio: float = 0.5) ->
     X_work = X_work.drop(columns=['ds'], errors='ignore')
     X_work = X_work.replace([np.inf, -np.inf], np.nan)
 
-    # Per-column NaN check
-    nan_pct = X_work.isna().mean()
-    high_nan_cols = nan_pct[nan_pct > max_nan_ratio].index.tolist()
-    X_work = X_work.drop(columns=high_nan_cols)
+    # Drop columns with fewer than min_non_nan non-NaN data points
+    non_nan_counts = X_work.notna().sum()
+    sparse_cols = non_nan_counts[non_nan_counts < min_non_nan].index.tolist()
+    X_work = X_work.drop(columns=sparse_cols)
 
     # Remove zero-variance columns (pandas var() skips NaN by default)
     variances = X_work.var()
     zero_var = variances[variances == 0].index.tolist()
     X_work = X_work.drop(columns=zero_var)
 
-    logger.info(f"Feature cleaning: dropped {len(high_nan_cols)} high-NaN, {len(zero_var)} zero-variance, {len(X_work.columns)} remaining")
+    logger.info(f"Feature cleaning: dropped {len(sparse_cols)} sparse (<{min_non_nan} non-NaN), "
+                f"{len(zero_var)} zero-variance, {len(X_work.columns)} remaining")
 
     return list(X_work.columns)
 
@@ -124,7 +212,8 @@ def build_training_dataset(
     """
     Build training dataset by joining snapshots with targets.
 
-    Uses snapshot of month M to predict month M's MoM change.
+    Uses the NFP release_date as the data cutoff (e.g., May 3rd for April NFP),
+    matching inference behavior so the model learns from intra-month data.
     Includes lagged target features from BOTH NSA and SA data.
 
     Args:
@@ -161,72 +250,65 @@ def build_training_dataset(
     n_months = len(filtered_df)
     logger.info(f"Building features for {n_months} target months...")
 
-    for i, (idx, row) in enumerate(filtered_df.iterrows()):
+    import time as _time
+    _build_t0 = _time.time()
+
+    # Build release_date lookup from target data to align training cutoffs
+    # with inference (which uses the NFP release date, not the target month).
+    target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
+    release_date_map = {}
+    if 'release_date' in target_ref.columns:
+        for _, r in target_ref.iterrows():
+            if pd.notna(r.get('release_date')):
+                release_date_map[r['ds']] = r['release_date']
+
+    # Prepare arguments for parallel execution
+    tasks = []
+    ordered_target_months = []
+    
+    for idx, row in filtered_df.iterrows():
         target_month = row['ds']
         target_value = row['y_mom']
-        cutoff_date = target_month
-
+        
+        # Use NFP release_date as cutoff (matches inference behavior).
+        cutoff_date = release_date_map.get(target_month, target_month)
+        
         # Get snapshot for this month (month-end date)
         snapshot_date = target_month + pd.offsets.MonthEnd(0)
+        
+        tasks.append((
+            target_month, target_value, cutoff_date, snapshot_date,
+            target_type, release_type, nsa_target_full, sa_target_full, selected_features
+        ))
+        ordered_target_months.append(target_month)
 
-        # Load and process snapshot (cached)
-        snapshot_df = load_master_snapshot(snapshot_date)
+    logger.info(f"Starting parallel feature engineering for {len(tasks)} months using all processors...")
+    
+    # Execute in parallel
+    results = Parallel(n_jobs=-1, verbose=5)(
+        delayed(_process_single_month_task)(*args) for args in tasks
+    )
+    
+    # Filter out None results (skipped months)
+    valid_results = [r for r in results if r[0] is not None]
+    
+    if not valid_results:
+         logger.warning("No valid training samples generated!")
+         return pd.DataFrame(), pd.Series(dtype=float)
 
-        if snapshot_df is None or snapshot_df.empty:
-            continue
-
-        # Convert to wide format (exogenous features)
-        features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
-
-        if features.empty:
-            continue
-
-        # Add calendar features (including survey interval)
-        features = add_calendar_features(features, target_month)
-
-        # Add lagged target features from BOTH NSA and SA data
-        # These use only data BEFORE target_month to avoid look-ahead bias
-        nsa_target_features = get_lagged_target_features(nsa_target_full, target_month, 'nfp_nsa')
-        sa_target_features = get_lagged_target_features(sa_target_full, target_month, 'nfp_sa')
-
-        # Merge target features into features DataFrame
-        for k, v in {**nsa_target_features, **sa_target_features}.items():
-            features[k] = v
-
-        # Add FRED employment features (pre-enriched snapshots with symlog + lags)
-        fred_df = load_fred_snapshot(snapshot_date)
-        if fred_df is not None and not fred_df.empty:
-            fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
-            if not fred_features.empty:
-                for col in fred_features.columns:
-                    features[col] = fred_features[col].iloc[0]
-
-        # Add cross-snapshot revision features (compare snapshot M vs M-1)
-        prev_month = target_month - pd.DateOffset(months=1)
-        prev_cutoff = prev_month
-
-        revision_feats = get_revision_features_for_month(
-            target_month, prev_cutoff,
-            selected_features=selected_features, include_fred=True,
-        )
-        if not revision_feats.empty:
-            for col in revision_feats.columns:
-                features[col] = revision_feats[col].iloc[0]
-
-        all_features.append(features)
-        all_targets.append(target_value)
-        valid_dates.append(target_month)
-
-        # Progress logging
-        if show_progress and (i + 1) % 24 == 0:
-            logger.info(f"  Processed {i + 1}/{n_months} months...")
+    all_features_dicts, all_targets_list = zip(*valid_results)
+    
+    # Create final lists for DataFrame construction
+    all_features = list(all_features_dicts)
+    all_targets = list(all_targets_list)
+    valid_dates = [f['ds'] for f in all_features]
 
     if not all_features:
         logger.error("No valid training samples created")
         return pd.DataFrame(), pd.Series(dtype=float)
 
     # Combine all features efficiently
-    X = pd.concat(all_features, ignore_index=True)
+    X = pd.DataFrame(all_features)
     y = pd.Series(all_targets, name='y_mom')
 
     # Add date index for reference
@@ -364,6 +446,9 @@ def run_expanding_window_backtest(
     logger.info(f"Running {len(backtest_months)} predictions "
                 f"({'with' if tune else 'without'} hyperparameter tuning)...")
 
+    import time as _time
+    _backtest_t0 = _time.time()
+
     for i, target_month in enumerate(backtest_months):
         # Get index of this target month in the full dataset
         target_idx = date_to_idx.get(target_month)
@@ -495,12 +580,23 @@ def run_expanding_window_backtest(
             'n_features': len(feature_cols)
         })
 
-        # Progress logging (every 12 months or first/last)
-        if (i + 1) % 12 == 0 or i == 0 or i == len(backtest_months) - 1:
-            if is_future:
-                logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: Pred={prediction:.0f} (FUTURE)")
-            else:
-                logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: Actual={actual:.0f}, Pred={prediction:.0f}, Err={error:.0f}")
+        # Progress logging — every prediction with elapsed/ETA
+        _elapsed = _time.time() - _backtest_t0
+        _avg_per_step = _elapsed / (i + 1)
+        _eta = _avg_per_step * (len(backtest_months) - i - 1)
+        _eta_str = f"{_eta/60:.1f}m" if _eta >= 60 else f"{_eta:.0f}s"
+        _elapsed_str = f"{_elapsed/60:.1f}m" if _elapsed >= 60 else f"{_elapsed:.0f}s"
+
+        if is_future:
+            logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
+                        f"Pred={prediction:.0f} (FUTURE) | "
+                        f"train={len(train_idx_valid)}, feats={len(feature_cols)} | "
+                        f"elapsed={_elapsed_str}, ETA={_eta_str}")
+        else:
+            logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
+                        f"Actual={actual:.0f}, Pred={prediction:.0f}, Err={error:+.0f} | "
+                        f"train={len(train_idx_valid)}, feats={len(feature_cols)} | "
+                        f"elapsed={_elapsed_str}, ETA={_eta_str}")
 
     results_df = pd.DataFrame(results)
 

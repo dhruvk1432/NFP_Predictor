@@ -32,7 +32,6 @@ from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MON
 
 # Import from modular components
 from Train.config import (
-    PROTECTED_BINARY_FLAGS,
     MODEL_SAVE_DIR,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
@@ -40,6 +39,8 @@ from Train.config import (
     get_target_path,
     USE_HUBER_LOSS_DEFAULT,
     HUBER_DELTA,
+    load_selected_features,
+    TUNE_EVERY_N_MONTHS,
 )
 
 from Train.data_loader import (
@@ -54,12 +55,17 @@ from Train.feature_engineering import (
     add_calendar_features,
 )
 
+from Train.revision_features import get_revision_features_for_month
+from utils.transforms import winsorize_covid_period
+from Train.hyperparameter_tuning import tune_hyperparameters
+
 from Train.model import (
     get_lgbm_params,
     train_lightgbm_model,
     predict_with_intervals,
     save_model,
     load_model,
+    calculate_sample_weights,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -96,10 +102,9 @@ def clean_features(X: pd.DataFrame, y: pd.Series, max_nan_ratio: float = 0.5) ->
     high_nan_cols = nan_pct[nan_pct > max_nan_ratio].index.tolist()
     X_work = X_work.drop(columns=high_nan_cols)
 
-    # Remove zero-variance columns
-    col_means = X_work.mean()
-    X_filled = X_work.fillna(col_means).fillna(0)
-    zero_var = X_filled.var()[X_filled.var() == 0].index.tolist()
+    # Remove zero-variance columns (pandas var() skips NaN by default)
+    variances = X_work.var()
+    zero_var = variances[variances == 0].index.tolist()
     X_work = X_work.drop(columns=zero_var)
 
     logger.info(f"Feature cleaning: dropped {len(high_nan_cols)} high-NaN, {len(zero_var)} zero-variance, {len(X_work.columns)} remaining")
@@ -113,7 +118,8 @@ def build_training_dataset(
     release_type: str = 'first',
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
-    show_progress: bool = True
+    show_progress: bool = True,
+    selected_features: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Build training dataset by joining snapshots with targets.
@@ -128,6 +134,8 @@ def build_training_dataset(
         start_date: Start date for training data
         end_date: End date for training data
         show_progress: Whether to show progress logging
+        selected_features: Pre-selected feature names to keep (from load_selected_features).
+            Calendar and lagged NFP features are always included regardless.
 
     Returns:
         Tuple of (features DataFrame, target Series)
@@ -156,8 +164,7 @@ def build_training_dataset(
     for i, (idx, row) in enumerate(filtered_df.iterrows()):
         target_month = row['ds']
         target_value = row['y_mom']
-        release_date = row.get('release_date', pd.NaT)
-        cutoff_date = release_date if pd.notna(release_date) else target_month
+        cutoff_date = target_month
 
         # Get snapshot for this month (month-end date)
         snapshot_date = target_month + pd.offsets.MonthEnd(0)
@@ -194,6 +201,18 @@ def build_training_dataset(
                 for col in fred_features.columns:
                     features[col] = fred_features[col].iloc[0]
 
+        # Add cross-snapshot revision features (compare snapshot M vs M-1)
+        prev_month = target_month - pd.DateOffset(months=1)
+        prev_cutoff = prev_month
+
+        revision_feats = get_revision_features_for_month(
+            target_month, prev_cutoff,
+            selected_features=selected_features, include_fred=True,
+        )
+        if not revision_feats.empty:
+            for col in revision_feats.columns:
+                features[col] = revision_feats[col].iloc[0]
+
         all_features.append(features)
         all_targets.append(target_value)
         valid_dates.append(target_month)
@@ -213,26 +232,54 @@ def build_training_dataset(
     # Add date index for reference
     X['ds'] = valid_dates
 
-    # Handle missing values - vectorized fill
-    numeric_cols = X.select_dtypes(include=[np.number]).columns
-    col_means = X[numeric_cols].mean()
-    X[numeric_cols] = X[numeric_cols].fillna(col_means)
-    X = X.fillna(0)
+    # Winsorize COVID period (clip extreme values to non-COVID quantile bounds)
+    X_indexed = X.set_index('ds')
+    numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
+    X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
+    y_indexed = pd.Series(y.values, index=X_indexed.index, name='y_mom')
+    y = winsorize_covid_period(y_indexed).reset_index(drop=True)
+    covid_rows = ((X_indexed.index >= pd.Timestamp('2020-03-01')) &
+                  (X_indexed.index <= pd.Timestamp('2020-05-01'))).sum()
+    X = X_indexed.reset_index(names='ds')
+    logger.info(f"COVID winsorization: clipped {covid_rows} rows to [1%, 99%] non-COVID quantiles")
 
-    # Count feature categories
+    # Replace inf with NaN (LightGBM handles NaN natively but not inf)
+    numeric_cols = X.select_dtypes(include=[np.number]).columns
+    X[numeric_cols] = X[numeric_cols].replace([np.inf, -np.inf], np.nan)
+
+    # Drop duplicate columns (can occur if FRED and master snapshots share series names)
+    dupes = X.columns.duplicated()
+    if dupes.any():
+        n_dupes = dupes.sum()
+        logger.warning(f"Dropping {n_dupes} duplicate columns")
+        X = X.loc[:, ~dupes]
+
+    # Filter to pre-selected features (calendar + NFP lags always included)
     calendar_features = ['month_sin', 'month_cos', 'quarter_sin', 'quarter_cos',
                          'weeks_since_last_survey', 'is_5_week_month', 'is_jan',
                          'is_july', 'year', 'is_summer', 'is_holiday_season', 'is_december']
-    target_features = [c for c in X.columns if c.startswith('nfp_')]
-    employment_features = [c for c in X.columns if c.startswith('emp_')]
-    exog_features = [c for c in X.columns if not c.startswith('nfp_') and
-                     not c.startswith('emp_') and c not in calendar_features and c != 'ds']
+    target_lag_features = [c for c in X.columns if c.startswith('nfp_')]
 
-    logger.info(f"Built training dataset: {len(X)} samples, {len(X.columns)} total features")
-    logger.info(f"  - Exogenous (macro) features: {len([c for c in exog_features if c in X.columns])}")
-    logger.info(f"  - Employment (FRED) features: {len([c for c in employment_features if c in X.columns])}")
-    logger.info(f"  - Calendar features: {len([c for c in calendar_features if c in X.columns])}")
-    logger.info(f"  - Target (NFP) lag features: {len([c for c in target_features if c in X.columns])}")
+    if selected_features is not None:
+        revision_cols = [c for c in X.columns if c.startswith('rev_') or c.endswith('_rev')]
+        always_keep = set(calendar_features) | set(target_lag_features) | set(revision_cols) | {'ds'}
+        allowed = set(selected_features) | always_keep
+        available = [c for c in X.columns if c in allowed]
+
+        n_before = len(X.columns)
+        X = X[available]
+
+        # Check for missing selected features
+        missing = set(selected_features) - set(X.columns)
+        if missing:
+            logger.warning(f"  {len(missing)} selected features not found in data: {sorted(list(missing))[:10]}...")
+
+        logger.info(f"Feature selection: {len(X.columns)} of {n_before} columns kept "
+                    f"({len([c for c in X.columns if c in set(selected_features)])} selected + "
+                    f"{len([c for c in X.columns if c in set(calendar_features)])} calendar + "
+                    f"{len(target_lag_features)} NFP lags)")
+    else:
+        logger.info(f"Built training dataset: {len(X)} samples, {len(X.columns)} total features")
 
     return X, y
 
@@ -241,53 +288,24 @@ def build_training_dataset(
 # BACKTEST FUNCTIONS
 # =============================================================================
 
-def impute_with_expanding_window(
-    X: pd.DataFrame,
-    train_idx: np.ndarray,
-    cached_means: Optional[pd.Series] = None
-) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Impute missing values using only data from the training window (no future leakage).
-
-    Args:
-        X: Full feature DataFrame
-        train_idx: Indices of training data (expanding window)
-        cached_means: Pre-computed means to reuse (optional)
-
-    Returns:
-        Tuple of (imputed DataFrame, computed means for caching)
-    """
-    X_imputed = X.copy()
-    numeric_cols = X_imputed.select_dtypes(include=[np.number]).columns
-
-    # Calculate or reuse means
-    if cached_means is not None:
-        train_means = cached_means
-    else:
-        train_means = X_imputed.iloc[train_idx][numeric_cols].mean()
-
-    # Fill NaN using training window means - vectorized
-    X_imputed[numeric_cols] = X_imputed[numeric_cols].fillna(train_means)
-    X_imputed = X_imputed.fillna(0)  # Fallback for remaining NaN
-
-    return X_imputed, train_means
-
-
 def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
-    huber_delta: float = HUBER_DELTA
+    huber_delta: float = HUBER_DELTA,
+    selected_features: Optional[List[str]] = None,
+    tune: bool = True,
 ) -> pd.DataFrame:
     """
     Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
 
     Critical Design Principles:
-    1. NaN imputation uses only expanding window means (no future data)
+    1. LightGBM handles NaN natively - no imputation needed
     2. Model is FULLY retrained from scratch at each step
     3. No information from future time periods leaks into predictions
-    4. No feature selection gates - all cleaned features are used
+    4. Features are pre-selected per target_type (NSA or SA)
+    5. Hyperparameters tuned via inner CV every TUNE_EVERY_N_MONTHS months
 
     Args:
         target_df: Target DataFrame with 'ds' and 'y_mom' columns
@@ -295,6 +313,8 @@ def run_expanding_window_backtest(
         release_type: 'first' or 'last'
         use_huber_loss: Whether to use Huber loss
         huber_delta: Huber delta parameter
+        selected_features: Pre-selected feature names to use
+        tune: If True, run Optuna hyperparameter tuning periodically
 
     Returns:
         DataFrame with backtest results
@@ -317,7 +337,10 @@ def run_expanding_window_backtest(
 
     # Build FULL feature dataset once
     logger.info("Building full feature dataset...")
-    X_full, y_full = build_training_dataset(target_df, target_type=target_type, release_type=release_type, show_progress=False)
+    X_full, y_full = build_training_dataset(
+        target_df, target_type=target_type, release_type=release_type,
+        show_progress=False, selected_features=selected_features
+    )
 
     if X_full.empty:
         logger.error("Failed to build training dataset")
@@ -330,18 +353,16 @@ def run_expanding_window_backtest(
     results = []
     all_residuals = []
 
-    # Cache for imputation
-    cached_impute_means = None
-    last_train_idx_len = 0
-
-    # Get LightGBM params once
-    params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
+    # Static fallback params (used when tune=False)
+    static_params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
     # Run clean_features once on early data to get initial feature set
     # (will be refined at each step)
     cleaned_features = None
+    tuned_params = None  # Cached tuned hyperparameters
 
-    logger.info(f"Running {len(backtest_months)} predictions...")
+    logger.info(f"Running {len(backtest_months)} predictions "
+                f"({'with' if tune else 'without'} hyperparameter tuning)...")
 
     for i, target_month in enumerate(backtest_months):
         # Get index of this target month in the full dataset
@@ -366,29 +387,30 @@ def run_expanding_window_backtest(
         if len(train_idx_valid) < 24:
             continue
 
-        # Recompute imputation if training set grew
-        train_set_grew = len(train_idx) > last_train_idx_len
-        if train_set_grew or cached_impute_means is None:
-            X_train_imputed, cached_impute_means = impute_with_expanding_window(X_full, train_idx, None)
-            last_train_idx_len = len(train_idx)
-        else:
-            X_train_imputed, _ = impute_with_expanding_window(X_full, train_idx, cached_impute_means)
-
-        X_train = X_train_imputed.iloc[train_idx]
-
-        # Get valid training data
-        valid_local_idx = [j for j in range(len(train_idx)) if valid_train_mask.iloc[j]]
-        X_train_valid = X_train.iloc[valid_local_idx].copy()
+        # Get valid training data (LightGBM handles NaN natively)
+        X_train_valid = X_full.iloc[train_idx_valid].copy()
         y_train_valid = y_train[valid_train_mask].copy()
 
         # Basic feature cleaning (no feature selection gates)
-        if cleaned_features is None or i % 12 == 0:
+        if cleaned_features is None or i % TUNE_EVERY_N_MONTHS == 0:
             cleaned_features = clean_features(X_train_valid, y_train_valid)
 
         feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
+
+        # Tune hyperparameters periodically (same cadence as feature cleaning)
+        if tune and (tuned_params is None or i % TUNE_EVERY_N_MONTHS == 0):
+            logger.info(f"[{i+1}/{len(backtest_months)}] Tuning hyperparameters on "
+                        f"{len(X_train_selected)} samples, {len(feature_cols)} features...")
+            weights = calculate_sample_weights(X_train_valid)
+            tuned_params = tune_hyperparameters(
+                X_train_selected, y_train_valid, weights,
+                use_huber_loss=use_huber_loss,
+            )
+
+        params = tuned_params if tune and tuned_params is not None else static_params
 
         # Train-validation split
         train_size = int(len(X_train_selected) * 0.85)
@@ -415,13 +437,10 @@ def run_expanding_window_backtest(
             callbacks=callbacks
         )
 
-        # Calculate residuals for prediction intervals
-        train_preds = model.predict(X_train_selected)
-        train_residuals = (y_train_valid.values - train_preds).tolist()
-        all_residuals.extend(train_residuals[-12:])
+        # OOS residuals accumulated after prediction below (not in-sample)
 
         # PREDICTION: Get features for target month
-        X_pred = X_train_imputed.iloc[[target_idx]].copy()
+        X_pred = X_full.iloc[[target_idx]].copy()
 
         X_pred = X_pred[feature_cols]
 
@@ -439,7 +458,10 @@ def run_expanding_window_backtest(
             lower_95 = prediction + np.percentile(residual_array, 2.5)
             upper_95 = prediction + np.percentile(residual_array, 97.5)
         else:
-            std_est = np.std(train_residuals) if train_residuals else 50
+            # Not enough OOS residuals yet; use validation-set residuals as initial estimate
+            val_preds = model.predict(X_val)
+            val_residuals = (y_val.values - val_preds).tolist()
+            std_est = np.std(val_residuals) if val_residuals else 50
             lower_50, upper_50 = prediction - 0.67*std_est, prediction + 0.67*std_est
             lower_80, upper_80 = prediction - 1.28*std_est, prediction + 1.28*std_est
             lower_95, upper_95 = prediction - 1.96*std_est, prediction + 1.96*std_est
@@ -447,6 +469,10 @@ def run_expanding_window_backtest(
         # Handle NaN actuals (future predictions)
         is_future = pd.isna(actual)
         error = np.nan if is_future else actual - prediction
+
+        # Accumulate OOS residuals for calibrated prediction intervals
+        if not is_future:
+            all_residuals.append(error)
         in_50 = np.nan if is_future else (lower_50 <= actual <= upper_50)
         in_80 = np.nan if is_future else (lower_80 <= actual <= upper_80)
         in_95 = np.nan if is_future else (lower_95 <= actual <= upper_95)
@@ -509,26 +535,33 @@ def train_and_evaluate(
     release_type: str = 'first',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
+    tune: bool = True,
 ):
     """
     Main training and evaluation function using EXPANDING WINDOW methodology.
 
     This function ensures NO TIME-TRAVEL VIOLATIONS:
-    1. NaN imputation uses only past data (expanding window means)
+    1. LightGBM handles NaN natively - no imputation needed
     2. Model training uses only data available at each prediction time
+    3. Hyperparameters tuned via inner CV (no future leakage)
 
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised
         use_huber_loss: If True, use Huber loss function
         huber_delta: Huber delta parameter
+        tune: If True, run Optuna hyperparameter tuning
     """
     model_id = get_model_id(target_type, release_type)
 
     logger.info("=" * 60)
     logger.info(f"LightGBM NFP Prediction Model - Training [{model_id.upper()}]")
     logger.info("=" * 60)
-    logger.info("Using EXPANDING WINDOW methodology (no time-travel)")
+    logger.info(f"Using EXPANDING WINDOW methodology (no time-travel, tune={tune})")
+
+    # Load pre-selected features for this target type
+    selected_features = load_selected_features(target_type)
+    logger.info(f"Loaded {len(selected_features)} pre-selected features for {target_type.upper()}")
 
     # Load target data
     target_df = load_target_data(target_type=target_type, release_type=release_type)
@@ -545,7 +578,9 @@ def train_and_evaluate(
         target_type=target_type,
         release_type=release_type,
         use_huber_loss=use_huber_loss,
-        huber_delta=huber_delta
+        huber_delta=huber_delta,
+        selected_features=selected_features,
+        tune=tune,
     )
 
     if backtest_results.empty:
@@ -557,7 +592,10 @@ def train_and_evaluate(
     logger.info(f"TRAINING FINAL PRODUCTION MODEL [{model_id.upper()}]")
     logger.info("=" * 60)
 
-    X_full, y_full = build_training_dataset(target_df, target_type=target_type, release_type=release_type)
+    X_full, y_full = build_training_dataset(
+        target_df, target_type=target_type, release_type=release_type,
+        selected_features=selected_features
+    )
 
     # Filter out NaN targets for final model training
     valid_mask = ~y_full.isna()
@@ -574,6 +612,17 @@ def train_and_evaluate(
 
     logger.info(f"Training final model with {len(feature_cols)} features")
 
+    # Tune hyperparameters on all available data for the production model
+    final_params = None
+    if tune:
+        logger.info("Tuning hyperparameters for final production model...")
+        feature_only_cols = [c for c in feature_cols if c in X_train.columns and c != 'ds']
+        weights = calculate_sample_weights(X_train)
+        final_params = tune_hyperparameters(
+            X_train[feature_only_cols], y_full_valid, weights,
+            use_huber_loss=use_huber_loss,
+        )
+
     # Train final model
     model, importance, residuals = train_lightgbm_model(
         X_train,
@@ -582,7 +631,8 @@ def train_and_evaluate(
         num_boost_round=1000,
         early_stopping_rounds=50,
         use_huber_loss=use_huber_loss,
-        huber_delta=huber_delta
+        huber_delta=huber_delta,
+        params_override=final_params,
     )
 
     # Save production model
@@ -595,7 +645,7 @@ def train_and_evaluate(
         release_type=release_type,
     )
 
-    return model, feature_cols, residuals, backtest_results
+    return model, feature_cols, residuals, backtest_results, X_full
 
 
 def predict_nfp_mom(
@@ -675,6 +725,25 @@ def predict_nfp_mom(
             for col in fred_features.columns:
                 features[col] = fred_features[col].iloc[0]
 
+    # Add cross-snapshot revision features
+    prev_month = target_month - pd.DateOffset(months=1)
+    target_ref_df = nsa_target_full if target_type == 'nsa' else sa_target_full
+    prev_row = target_ref_df[target_ref_df['ds'] == prev_month]
+    if not prev_row.empty and 'release_date' in prev_row.columns:
+        prev_release = prev_row.iloc[0]['release_date']
+        prev_cutoff = prev_release if pd.notna(prev_release) else prev_month
+    else:
+        prev_cutoff = prev_month
+
+    selected_features = load_selected_features(target_type)
+    revision_feats = get_revision_features_for_month(
+        target_month, prev_cutoff,
+        selected_features=selected_features, include_fred=True,
+    )
+    if not revision_feats.empty:
+        for col in revision_feats.columns:
+            features[col] = revision_feats[col].iloc[0]
+
     # Make prediction with intervals
     pred_result = predict_with_intervals(model, features, residuals, feature_cols)
 
@@ -744,21 +813,61 @@ Examples:
                         help='Disable Huber loss (uses MSE instead). Huber is enabled by default for outlier robustness.')
     parser.add_argument('--huber-delta', type=float, default=HUBER_DELTA,
                         help=f'Huber delta parameter (default: {HUBER_DELTA}). Lower = more robust to outliers.')
+    parser.add_argument('--no-tune', action='store_true',
+                        help='Skip Optuna hyperparameter tuning (use static defaults). Faster for debugging.')
 
     args = parser.parse_args()
 
-    # Convert --no-huber-loss to use_huber_loss boolean
+    # Convert --no-* flags to booleans
     use_huber_loss = not args.no_huber_loss
+    tune = not args.no_tune
 
     model_id = get_model_id(args.target, args.release)
 
     if args.train:
-        train_and_evaluate(
+        result = train_and_evaluate(
             target_type=args.target,
             release_type=args.release,
             use_huber_loss=use_huber_loss,
-            huber_delta=args.huber_delta
+            huber_delta=args.huber_delta,
+            tune=tune,
         )
+
+        if result is not None:
+            model, feature_cols, residuals, backtest_results, X_full = result
+            metadata = {
+                'feature_cols': feature_cols,
+                'importance': dict(zip(feature_cols, model.feature_importance(importance_type='gain'))),
+            }
+
+            # If training NSA (default), also train SA and generate combined output
+            if args.target == 'nsa':
+                logger.info("\nNow training SA model to generate combined output...")
+                sa_result = train_and_evaluate(
+                    target_type='sa',
+                    release_type=args.release,
+                    use_huber_loss=use_huber_loss,
+                    huber_delta=args.huber_delta,
+                    tune=tune,
+                )
+                if sa_result is not None:
+                    sa_model, sa_feature_cols, sa_residuals, sa_backtest, sa_X_full = sa_result
+                    sa_metadata = {
+                        'feature_cols': sa_feature_cols,
+                        'importance': dict(zip(sa_feature_cols, sa_model.feature_importance(importance_type='gain'))),
+                    }
+
+                    from Train.Output_code.generate_output import generate_all_output
+                    generate_all_output(
+                        nsa_results=backtest_results,
+                        sa_results=sa_backtest,
+                        nsa_model=model,
+                        sa_model=sa_model,
+                        nsa_metadata=metadata,
+                        sa_metadata=sa_metadata,
+                        nsa_X_full=X_full,
+                        sa_X_full=sa_X_full,
+                    )
 
     elif args.predict:
         target_month = pd.Timestamp(args.predict + '-01')

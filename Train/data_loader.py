@@ -163,9 +163,24 @@ def load_fred_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> O
 
     path = get_fred_snapshot_path(snapshot_date)
     if not path.exists():
+        if use_cache:
+            _snapshot_cache[cache_key] = None
         return None
 
-    df = pd.read_parquet(path)
+    # Check for empty or corrupt file
+    if path.stat().st_size == 0:
+        logger.warning(f"Skipping empty FRED snapshot: {path}")
+        if use_cache:
+            _snapshot_cache[cache_key] = None
+        return None
+
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        logger.error(f"Failed to read FRED snapshot {path}: {e}")
+        if use_cache:
+            _snapshot_cache[cache_key] = None
+        return None
 
     if use_cache:
         _snapshot_cache[cache_key] = df
@@ -191,10 +206,25 @@ def load_master_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) ->
 
     path = get_master_snapshot_path(snapshot_date)
     if not path.exists():
-        logger.warning(f"Master snapshot not found: {path}")
+        if use_cache:
+            _snapshot_cache[cache_key] = None
+        # logger.warning(f"Master snapshot not found: {path}") # Suppressed as expected for early history
         return None
 
-    df = pd.read_parquet(path)
+    # Check for empty or corrupt file
+    if path.stat().st_size == 0:
+        logger.warning(f"Skipping empty Master snapshot: {path}")
+        if use_cache:
+            _snapshot_cache[cache_key] = None
+        return None
+
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        logger.error(f"Failed to read Master snapshot {path}: {e}")
+        if use_cache:
+            _snapshot_cache[cache_key] = None
+        return None
 
     if use_cache:
         _snapshot_cache[cache_key] = df
@@ -245,6 +275,8 @@ def load_target_data(
     logger.info(f"Loading {target_type.upper()} {release_type} release target data")
 
     if not target_path.exists():
+        if use_cache:
+            _target_cache[cache_key] = None
         raise FileNotFoundError(f"Target file not found: {target_path}")
 
     df = pd.read_parquet(target_path)
@@ -433,7 +465,11 @@ def pivot_snapshot_to_wide(
             return pd.DataFrame()
 
         # Take last valid value per column (vectorized)
-        last_valid = wide_df.apply(lambda col: col.dropna().iloc[-1] if col.dropna().any() else np.nan)
+        # standard "as-of" join logic: fill forward, then take latest
+        if wide_df.empty:
+             return pd.DataFrame()
+             
+        last_valid = wide_df.ffill().iloc[-1]
         last_valid = last_valid.dropna()
 
         if last_valid.empty:

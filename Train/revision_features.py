@@ -62,16 +62,17 @@ def compute_revision_features(
     current_cols = set(features_current.columns) if not features_current.empty else set()
     prev_cols = set(features_prev.columns) if not features_prev.empty else set()
 
-    # Overlapping series for revision computation
-    overlap = current_cols & prev_cols
+    # Overlapping series for revision computation (vectorized subtraction)
+    overlap = sorted(current_cols & prev_cols)
 
-    # Compute revisions for overlapping columns
-    revisions = {}
-    for col in overlap:
-        val_curr = features_current[col].iloc[0]
-        val_prev = features_prev[col].iloc[0]
-        if pd.notna(val_curr) and pd.notna(val_prev):
-            revisions[col] = val_curr - val_prev
+    if overlap:
+        curr_vals = features_current[overlap].iloc[0]
+        prev_vals = features_prev[overlap].iloc[0]
+        diffs = curr_vals - prev_vals
+        diffs = diffs.dropna()
+        revisions = diffs.to_dict()
+    else:
+        revisions = {}
 
     rev_values = np.array(list(revisions.values())) if revisions else np.array([])
 

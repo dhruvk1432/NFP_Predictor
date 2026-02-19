@@ -41,6 +41,8 @@ from Train.config import (
     HUBER_DELTA,
     load_selected_features,
     TUNE_EVERY_N_MONTHS,
+    NUM_BOOST_ROUND,
+    EARLY_STOPPING_ROUNDS,
 )
 
 from Train.data_loader import (
@@ -48,7 +50,9 @@ from Train.data_loader import (
     load_master_snapshot,
     load_target_data,
     get_lagged_target_features,
-    pivot_snapshot_to_wide
+    batch_lagged_target_features,
+    pivot_snapshot_to_wide,
+    prefilter_snapshot,
 )
 
 from joblib import Parallel, delayed
@@ -60,13 +64,17 @@ def _process_single_month_task(
     snapshot_date: pd.Timestamp,
     target_type: str,
     release_type: str,
-    nsa_target_full: pd.DataFrame,
-    sa_target_full: pd.DataFrame,
+    nsa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
+    sa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
     selected_features: Optional[List[str]] = None
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """
     Helper function to process a single month in parallel.
     Disables caching to avoid memory bloat in worker processes.
+
+    Accepts pre-computed lag lookups (from batch_lagged_target_features) instead
+    of full target DataFrames to avoid redundant per-worker filtering/sorting
+    and reduce joblib serialization overhead.
     """
     # Initialize dictionary for features
     features = {'ds': target_month}
@@ -75,57 +83,80 @@ def _process_single_month_task(
     cal_features = get_calendar_features_dict(target_month)
     features.update(cal_features)
 
-    # 2. Add Lagged Target Features (NSA & SA)
-    nsa_lags = get_lagged_target_features(nsa_target_full, target_month, prefix='nfp_nsa')
-    sa_lags = get_lagged_target_features(sa_target_full, target_month, prefix='nfp_sa')
-    features.update(nsa_lags)
-    features.update(sa_lags)
+    # 2. Add Lagged Target Features (NSA & SA) — O(1) dict lookup
+    features.update(nsa_lags_lookup.get(target_month, {}))
+    features.update(sa_lags_lookup.get(target_month, {}))
 
     # 3. Load and process Master Snapshot
+    #    Pre-filter to selected features ONCE so all subsequent pivots work on smaller data
     snapshot_df = load_master_snapshot(snapshot_date, use_cache=False)
-    
+
     if snapshot_df is None or snapshot_df.empty:
-        # Expected behavior for early months or missing data
-        # If primary data is missing, we likely skip this sample
         return None, None
-        
-    features_wide = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
+
+    if selected_features is not None:
+        snapshot_df = prefilter_snapshot(snapshot_df, selected_features)
+        if snapshot_df.empty:
+            return None, None
+
+    features_wide = pivot_snapshot_to_wide(
+        snapshot_df, target_month, cutoff_date=cutoff_date,
+        selected_features=selected_features
+    )
     if not features_wide.empty:
         features.update(features_wide.iloc[0].to_dict())
 
-    # 4. Load and process FRED Snapshot
+    # 4. Load and process FRED Snapshot (pre-filtered)
     fred_df = load_fred_snapshot(snapshot_date, use_cache=False)
+    if fred_df is not None and not fred_df.empty and selected_features is not None:
+        fred_df = prefilter_snapshot(fred_df, selected_features)
+
     if fred_df is not None and not fred_df.empty:
-        fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
+        fred_features = pivot_snapshot_to_wide(
+            fred_df, target_month, cutoff_date=cutoff_date,
+            selected_features=selected_features
+        )
         if not fred_features.empty:
             features.update(fred_features.iloc[0].to_dict())
 
     # 5. Compute Revisions (Master & FRED)
-    # Compare "What we know now (snapshot M)" vs "What we knew last month (snapshot M-1)"
-    # Revisions are computed regarding the PREVIOUS month (target_month - 1)
+    #    Compare snapshot M vs snapshot M-1 for the PREVIOUS month
     prev_month_target = target_month - pd.DateOffset(months=1)
-    
-    # Load previous snapshot (M-1)
     prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
+
+    # Load & pre-filter previous master snapshot
     prev_snapshot = load_master_snapshot(prev_snapshot_date, use_cache=False)
-    
+    if prev_snapshot is not None and not prev_snapshot.empty and selected_features is not None:
+        prev_snapshot = prefilter_snapshot(prev_snapshot, selected_features)
+
     # Master Revisions
     if prev_snapshot is not None and not prev_snapshot.empty:
-        # View of PREV MONTH from CURRENT snapshot
-        view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
-        # View of PREV MONTH from PREV snapshot
-        view_prev = pivot_snapshot_to_wide(prev_snapshot, prev_month_target, cutoff_date=cutoff_date)
-        
+        view_curr = pivot_snapshot_to_wide(
+            snapshot_df, prev_month_target, cutoff_date=cutoff_date,
+            selected_features=selected_features
+        )
+        view_prev = pivot_snapshot_to_wide(
+            prev_snapshot, prev_month_target, cutoff_date=cutoff_date,
+            selected_features=selected_features
+        )
         revs = compute_revision_features(view_curr, view_prev, prefix='rev_master')
         if not revs.empty:
             features.update(revs.iloc[0].to_dict())
 
-    # FRED Revisions
+    # Load & pre-filter previous FRED snapshot
     prev_fred = load_fred_snapshot(prev_snapshot_date, use_cache=False)
+    if prev_fred is not None and not prev_fred.empty and selected_features is not None:
+        prev_fred = prefilter_snapshot(prev_fred, selected_features)
+
     if fred_df is not None and not fred_df.empty and prev_fred is not None and not prev_fred.empty:
-        f_view_curr = pivot_snapshot_to_wide(fred_df, prev_month_target, cutoff_date=cutoff_date)
-        f_view_prev = pivot_snapshot_to_wide(prev_fred, prev_month_target, cutoff_date=cutoff_date)
-        
+        f_view_curr = pivot_snapshot_to_wide(
+            fred_df, prev_month_target, cutoff_date=cutoff_date,
+            selected_features=selected_features
+        )
+        f_view_prev = pivot_snapshot_to_wide(
+            prev_fred, prev_month_target, cutoff_date=cutoff_date,
+            selected_features=selected_features
+        )
         f_revs = compute_revision_features(f_view_curr, f_view_prev, prefix='rev_fred', per_series=True)
         if not f_revs.empty:
             features.update(f_revs.iloc[0].to_dict())
@@ -166,11 +197,10 @@ except ImportError:
 
 def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> List[str]:
     """
-    Basic feature cleaning: drop columns with too few data points or zero variance.
+    Basic feature cleaning: only drop columns with too few data points.
 
-    LightGBM handles NaN natively, so NaN ratio is irrelevant. The only reason
-    to drop a feature is if it has fewer than min_non_nan non-NaN observations
-    (not enough signal to learn from) or zero variance.
+    Data is already cleaned upstream so no other filtering is needed.
+    LightGBM handles NaN natively, so NaN ratio is irrelevant.
 
     Args:
         X: Feature DataFrame
@@ -189,13 +219,8 @@ def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> Lis
     sparse_cols = non_nan_counts[non_nan_counts < min_non_nan].index.tolist()
     X_work = X_work.drop(columns=sparse_cols)
 
-    # Remove zero-variance columns (pandas var() skips NaN by default)
-    variances = X_work.var()
-    zero_var = variances[variances == 0].index.tolist()
-    X_work = X_work.drop(columns=zero_var)
-
     logger.info(f"Feature cleaning: dropped {len(sparse_cols)} sparse (<{min_non_nan} non-NaN), "
-                f"{len(zero_var)} zero-variance, {len(X_work.columns)} remaining")
+                f"{len(X_work.columns)} remaining")
 
     return list(X_work.columns)
 
@@ -240,6 +265,12 @@ def build_training_dataset(
     nsa_target_full = load_target_data('nsa', release_type=release_type)
     sa_target_full = load_target_data('sa', release_type=release_type)
 
+    # Pre-compute ALL lagged target features vectorized (shift/rolling) instead
+    # of per-worker filtering. Produces lightweight dicts for O(1) worker lookup.
+    logger.info("Pre-computing vectorized lagged target features...")
+    nsa_lags_lookup = batch_lagged_target_features(nsa_target_full, prefix='nfp_nsa')
+    sa_lags_lookup = batch_lagged_target_features(sa_target_full, prefix='nfp_sa')
+
     # Filter target data by date range
     filtered_df = target_df.copy()
     if start_date:
@@ -253,37 +284,32 @@ def build_training_dataset(
     import time as _time
     _build_t0 = _time.time()
 
-    # Build release_date lookup from target data to align training cutoffs
-    # with inference (which uses the NFP release date, not the target month).
+    # Build release_date lookup (vectorized — no iterrows)
     target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
     release_date_map = {}
     if 'release_date' in target_ref.columns:
-        for _, r in target_ref.iterrows():
-            if pd.notna(r.get('release_date')):
-                release_date_map[r['ds']] = r['release_date']
-
-    # Prepare arguments for parallel execution
-    tasks = []
-    ordered_target_months = []
-    
-    for idx, row in filtered_df.iterrows():
-        target_month = row['ds']
-        target_value = row['y_mom']
-        
-        # Use NFP release_date as cutoff (matches inference behavior).
-        cutoff_date = release_date_map.get(target_month, target_month)
-        
-        # Get snapshot for this month (month-end date)
-        snapshot_date = target_month + pd.offsets.MonthEnd(0)
-        
-        tasks.append((
-            target_month, target_value, cutoff_date, snapshot_date,
-            target_type, release_type, nsa_target_full, sa_target_full, selected_features
+        valid_mask = target_ref['release_date'].notna()
+        release_date_map = dict(zip(
+            target_ref.loc[valid_mask, 'ds'],
+            target_ref.loc[valid_mask, 'release_date'],
         ))
-        ordered_target_months.append(target_month)
+
+    # Prepare arguments for parallel execution (vectorized — no iterrows)
+    target_months = filtered_df['ds'].values
+    target_values = filtered_df['y_mom'].values
+    tasks = []
+    for i in range(len(filtered_df)):
+        tm = pd.Timestamp(target_months[i])
+        tasks.append((
+            tm, target_values[i],
+            release_date_map.get(tm, tm),
+            tm + pd.offsets.MonthEnd(0),
+            target_type, release_type,
+            nsa_lags_lookup, sa_lags_lookup, selected_features,
+        ))
 
     logger.info(f"Starting parallel feature engineering for {len(tasks)} months using all processors...")
-    
+
     # Execute in parallel
     results = Parallel(n_jobs=-1, verbose=5)(
         delayed(_process_single_month_task)(*args) for args in tasks
@@ -314,16 +340,8 @@ def build_training_dataset(
     # Add date index for reference
     X['ds'] = valid_dates
 
-    # Winsorize COVID period (clip extreme values to non-COVID quantile bounds)
-    X_indexed = X.set_index('ds')
-    numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
-    X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
-    y_indexed = pd.Series(y.values, index=X_indexed.index, name='y_mom')
-    y = winsorize_covid_period(y_indexed).reset_index(drop=True)
-    covid_rows = ((X_indexed.index >= pd.Timestamp('2020-03-01')) &
-                  (X_indexed.index <= pd.Timestamp('2020-05-01'))).sum()
-    X = X_indexed.reset_index(names='ds')
-    logger.info(f"COVID winsorization: clipped {covid_rows} rows to [1%, 99%] non-COVID quantiles")
+    # NOTE: COVID winsorization moved to backtest loop (per-fold) to avoid future data leakage.
+    # Previously computed quantile bounds on full dataset including test months.
 
     # Replace inf with NaN (LightGBM handles NaN natively but not inf)
     numeric_cols = X.select_dtypes(include=[np.number]).columns
@@ -399,7 +417,8 @@ def run_expanding_window_backtest(
         tune: If True, run Optuna hyperparameter tuning periodically
 
     Returns:
-        DataFrame with backtest results
+        Tuple of (results_df, X_full, y_full) where X_full and y_full are the
+        pre-built feature matrix and target series (reusable for production model).
     """
     model_id = get_model_id(target_type, release_type)
 
@@ -426,7 +445,7 @@ def run_expanding_window_backtest(
 
     if X_full.empty:
         logger.error("Failed to build training dataset")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
 
     # Pre-compute indices for faster lookup
     date_to_idx = {d: i for i, d in enumerate(X_full['ds'])}
@@ -476,11 +495,27 @@ def run_expanding_window_backtest(
         X_train_valid = X_full.iloc[train_idx_valid].copy()
         y_train_valid = y_train[valid_train_mask].copy()
 
+        # Sort by date to ensure time-ordered train/val split
+        sort_order = X_train_valid['ds'].argsort()
+        X_train_valid = X_train_valid.iloc[sort_order].reset_index(drop=True)
+        y_train_valid = y_train_valid.iloc[sort_order].reset_index(drop=True)
+
+        # COVID winsorization on training data only (no future leakage)
+        X_indexed = X_train_valid.set_index('ds')
+        numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
+        X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
+        y_indexed = pd.Series(y_train_valid.values, index=X_indexed.index, name='y_mom')
+        y_train_valid = winsorize_covid_period(y_indexed).reset_index(drop=True)
+        X_train_valid = X_indexed.reset_index(names='ds')
+
         # Basic feature cleaning (no feature selection gates)
         if cleaned_features is None or i % TUNE_EVERY_N_MONTHS == 0:
             cleaned_features = clean_features(X_train_valid, y_train_valid)
 
         feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
+
+        # Compute sample weights for panic regime upweighting
+        weights = calculate_sample_weights(X_train_valid)
 
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
@@ -489,7 +524,6 @@ def run_expanding_window_backtest(
         if tune and (tuned_params is None or i % TUNE_EVERY_N_MONTHS == 0):
             logger.info(f"[{i+1}/{len(backtest_months)}] Tuning hyperparameters on "
                         f"{len(X_train_selected)} samples, {len(feature_cols)} features...")
-            weights = calculate_sample_weights(X_train_valid)
             tuned_params = tune_hyperparameters(
                 X_train_selected, y_train_valid, weights,
                 use_huber_loss=use_huber_loss,
@@ -497,18 +531,19 @@ def run_expanding_window_backtest(
 
         params = tuned_params if tune and tuned_params is not None else static_params
 
-        # Train-validation split
+        # Train-validation split (data already sorted by date above)
         train_size = int(len(X_train_selected) * 0.85)
         X_tr = X_train_selected.iloc[:train_size]
         X_val = X_train_selected.iloc[train_size:]
         y_tr = y_train_valid.iloc[:train_size]
         y_val = y_train_valid.iloc[train_size:]
+        weights_tr = weights[:train_size]
 
-        train_data = lgb.Dataset(X_tr, label=y_tr, free_raw_data=False)
+        train_data = lgb.Dataset(X_tr, label=y_tr, weight=weights_tr, free_raw_data=False)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, free_raw_data=False)
 
         callbacks = [
-            lgb.early_stopping(stopping_rounds=30),
+            lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS),
             lgb.log_evaluation(period=0)
         ]
 
@@ -516,7 +551,7 @@ def run_expanding_window_backtest(
         model = lgb.train(
             params,
             train_data,
-            num_boost_round=500,
+            num_boost_round=NUM_BOOST_ROUND,
             valid_sets=[train_data, val_data],
             valid_names=['train', 'valid'],
             callbacks=callbacks
@@ -623,7 +658,7 @@ def run_expanding_window_backtest(
             for _, row in future_rows.iterrows():
                 logger.info(f"  {row['ds'].strftime('%Y-%m')}: {row['predicted']:.0f} [{row['lower_80']:.0f}, {row['upper_80']:.0f}]")
 
-    return results_df
+    return results_df, X_full, y_full
 
 
 def train_and_evaluate(
@@ -668,8 +703,8 @@ def train_and_evaluate(
     logger.info(f"\nInitial training period: {target_df['ds'].min()} to {train_end}")
     logger.info(f"Backtest period: {train_end} to {target_df['ds'].max()}")
 
-    # Run expanding window backtest
-    backtest_results = run_expanding_window_backtest(
+    # Run expanding window backtest (also returns pre-built X_full, y_full)
+    backtest_results, X_full, y_full = run_expanding_window_backtest(
         target_df=target_df,
         target_type=target_type,
         release_type=release_type,
@@ -684,14 +719,10 @@ def train_and_evaluate(
         return
 
     # Train final production model on ALL data (for future predictions)
+    # Reuses X_full/y_full from backtest to avoid redundant ~5min feature build
     logger.info("\n" + "=" * 60)
     logger.info(f"TRAINING FINAL PRODUCTION MODEL [{model_id.upper()}]")
     logger.info("=" * 60)
-
-    X_full, y_full = build_training_dataset(
-        target_df, target_type=target_type, release_type=release_type,
-        selected_features=selected_features
-    )
 
     # Filter out NaN targets for final model training
     valid_mask = ~y_full.isna()
@@ -741,7 +772,7 @@ def train_and_evaluate(
         release_type=release_type,
     )
 
-    return model, feature_cols, residuals, backtest_results, X_full
+    return model, feature_cols, residuals, backtest_results, X_full, y_full
 
 
 def predict_nfp_mom(
@@ -930,7 +961,7 @@ Examples:
         )
 
         if result is not None:
-            model, feature_cols, residuals, backtest_results, X_full = result
+            model, feature_cols, residuals, backtest_results, X_full, y_full = result
             metadata = {
                 'feature_cols': feature_cols,
                 'importance': dict(zip(feature_cols, model.feature_importance(importance_type='gain'))),
@@ -947,7 +978,7 @@ Examples:
                     tune=tune,
                 )
                 if sa_result is not None:
-                    sa_model, sa_feature_cols, sa_residuals, sa_backtest, sa_X_full = sa_result
+                    sa_model, sa_feature_cols, sa_residuals, sa_backtest, sa_X_full, sa_y_full = sa_result
                     sa_metadata = {
                         'feature_cols': sa_feature_cols,
                         'importance': dict(zip(sa_feature_cols, sa_model.feature_importance(importance_type='gain'))),
@@ -963,6 +994,10 @@ Examples:
                         sa_metadata=sa_metadata,
                         nsa_X_full=X_full,
                         sa_X_full=sa_X_full,
+                        nsa_y_full=y_full,
+                        sa_y_full=sa_y_full,
+                        nsa_residuals=residuals,
+                        sa_residuals=sa_residuals,
                     )
 
     elif args.predict:

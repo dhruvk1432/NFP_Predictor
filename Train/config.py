@@ -193,8 +193,8 @@ DEFAULT_LGBM_PARAMS = {
     'metric': 'mae',
     'boosting_type': 'gbdt',
     'learning_rate': 0.03,
-    'num_leaves': 63,  # Tuned for extreme events
-    'min_data_in_leaf': 1,  # Allow single-sample leaves for rare events
+    'num_leaves': 31,
+    'min_data_in_leaf': 5,
     'max_depth': 6,
     'feature_fraction': 0.8,
     'bagging_fraction': 0.8,
@@ -205,8 +205,8 @@ DEFAULT_LGBM_PARAMS = {
 }
 
 # Huber loss parameters - ENABLED BY DEFAULT for outlier robustness
-USE_HUBER_LOSS_DEFAULT = True  # Huber loss is more robust to COVID-like outliers
-HUBER_DELTA = 1.0  # Transition point between L1 and L2 loss (lower = more robust)
+USE_HUBER_LOSS_DEFAULT = False  # Disabled: COVID outliers already handled by winsorize_covid_period()
+HUBER_DELTA = 100.0  # Transition point between L1 and L2 loss; must match target scale (NFP MoM ~100-300)
 
 
 # =============================================================================
@@ -224,7 +224,7 @@ EARLY_STOPPING_ROUNDS = 50
 PANIC_REGIME_WEIGHT = 5.0  # 5x weight for VIX_panic_regime or SP500_crash_month
 
 # Optuna hyperparameter tuning
-N_OPTUNA_TRIALS = 50        # Number of Optuna trials per tuning run
+N_OPTUNA_TRIALS = 25        # Number of Optuna trials per tuning run
 OPTUNA_TIMEOUT = 300        # Max seconds per tuning run
 TUNE_EVERY_N_MONTHS = 12   # Re-tune hyperparameters every N months in backtest
 

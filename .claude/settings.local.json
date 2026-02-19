@@ -48,7 +48,9 @@
       "Bash(f=\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/exogenous_noaa_snapshots/decades/$y:0:30s/$y/$y-12.parquet\")",
       "Bash(python3.11:*)",
       "Bash(f=\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/Exogenous_data/exogenous_fred_data/decades/$y:0:30s/$y/$y-12.parquet\")",
-      "Bash(conda env list:*)"
+      "Bash(conda env list:*)",
+      "WebFetch(domain:optuna-integration.readthedocs.io)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

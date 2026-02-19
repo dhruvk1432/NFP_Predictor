@@ -420,10 +420,117 @@ def get_lagged_target_features(
     return features
 
 
+def batch_lagged_target_features(
+    target_df: pd.DataFrame,
+    prefix: str = 'nfp',
+) -> Dict[pd.Timestamp, Dict[str, float]]:
+    """
+    Vectorized batch computation of lagged target features for ALL months at once.
+
+    Replaces per-month get_lagged_target_features() calls with a single pass
+    using pandas shift/rolling. Returns a lookup dict for O(1) access per month.
+
+    Semantics match get_lagged_target_features exactly:
+    - shift(1) = "most recent value before this month" (lag 1)
+    - rolling(N, min_periods=N) on shifted data = rolling average of N prior months
+
+    Args:
+        target_df: DataFrame with ds, y, y_mom, y_yoy columns
+        prefix: Feature name prefix ('nfp_nsa' or 'nfp_sa')
+
+    Returns:
+        Dict mapping target_month -> {feature_name: value} (NaN features omitted)
+    """
+    df = target_df.sort_values('ds').set_index('ds')
+    mom = df['y_mom']
+    level = df['y']
+    mom_shifted = mom.shift(1)
+
+    # Build all lag columns vectorized
+    result = pd.DataFrame(index=df.index)
+    result[f'{prefix}_mom_lag1'] = mom.shift(1)
+    result[f'{prefix}_level_lag1'] = level.shift(1)
+    result[f'{prefix}_mom_lag2'] = mom.shift(2)
+    result[f'{prefix}_mom_lag3'] = mom.shift(3)
+    result[f'{prefix}_mom_lag6'] = mom.shift(6)
+    result[f'{prefix}_mom_lag12'] = mom.shift(12)
+
+    if 'y_yoy' in df.columns:
+        result[f'{prefix}_yoy'] = df['y_yoy'].shift(1)
+
+    # Rolling averages on shifted data (so rolling_3m at month M = mean of M-1, M-2, M-3)
+    result[f'{prefix}_rolling_3m'] = mom_shifted.rolling(3, min_periods=3).mean()
+    result[f'{prefix}_rolling_6m'] = mom_shifted.rolling(6, min_periods=6).mean()
+    result[f'{prefix}_rolling_12m'] = mom_shifted.rolling(12, min_periods=12).mean()
+    result[f'{prefix}_volatility_6m'] = mom_shifted.rolling(6, min_periods=6).std()
+    result[f'{prefix}_momentum'] = result[f'{prefix}_rolling_3m'] - result[f'{prefix}_rolling_12m']
+
+    # Convert to dict-of-dicts, dropping NaN values per row
+    lookup: Dict[pd.Timestamp, Dict[str, float]] = {}
+    cols = result.columns.tolist()
+    arr = result.values  # numpy array for fast row access
+    for i, ts in enumerate(result.index):
+        row_vals = arr[i]
+        features = {}
+        for j, col in enumerate(cols):
+            v = row_vals[j]
+            if not np.isnan(v):
+                features[col] = float(v)
+        lookup[ts] = features
+
+    return lookup
+
+
+def prefilter_snapshot(
+    df: pd.DataFrame,
+    selected_features: List[str],
+) -> pd.DataFrame:
+    """
+    Pre-filter a loaded snapshot to only include series matching selected features.
+
+    Call this ONCE right after loading a snapshot, before passing it to
+    multiple pivot_snapshot_to_wide() calls. This avoids repeated filtering
+    inside each pivot call, reducing DataFrame copies and groupby operations
+    on the full snapshot.
+
+    Args:
+        df: Snapshot DataFrame (wide or long format)
+        selected_features: List of sanitized feature names to keep
+
+    Returns:
+        Filtered DataFrame with only relevant series/columns
+    """
+    if df is None or df.empty or not selected_features:
+        return df
+
+    selected_set = set(selected_features)
+    is_wide = 'series_name' not in df.columns
+
+    if is_wide:
+        # Wide format: filter columns (keep 'date' index/column + selected)
+        cols_to_keep = []
+        for col in df.columns:
+            if col == 'date':
+                cols_to_keep.append(col)
+            elif sanitize_feature_name(str(col)) in selected_set:
+                cols_to_keep.append(col)
+        if not cols_to_keep:
+            return pd.DataFrame()
+        return df[cols_to_keep]
+    else:
+        # Long format: filter rows by series_name
+        unique_raw = df['series_name'].unique()
+        allowed_raw = [raw for raw in unique_raw if sanitize_feature_name(str(raw)) in selected_set]
+        if not allowed_raw:
+            return pd.DataFrame()
+        return df[df['series_name'].isin(set(allowed_raw))]
+
+
 def pivot_snapshot_to_wide(
     snapshot_df: pd.DataFrame,
     target_month: pd.Timestamp,
-    cutoff_date: Optional[pd.Timestamp] = None
+    cutoff_date: Optional[pd.Timestamp] = None,
+    selected_features: Optional[List[str]] = None
 ) -> pd.DataFrame:
     """
     Convert snapshot to wide format, taking the latest value for target month.
@@ -438,6 +545,8 @@ def pivot_snapshot_to_wide(
         snapshot_df: Snapshot DataFrame (wide or long format)
         target_month: Month we're predicting (format: YYYY-MM-01)
         cutoff_date: Strict cutoff for data availability (e.g., NFP release date)
+        selected_features: List of sanitized feature names to keep. If provided,
+            filters data early for performance.
 
     Returns:
         Single-row DataFrame with features as columns
@@ -451,10 +560,19 @@ def pivot_snapshot_to_wide(
     if is_wide:
         # Wide-format: index=date (or 'date' column), columns=feature names
         wide_df = snapshot_df.copy()
+        
+        # Ensure 'date' is available as column or index for filtering
         if 'date' in wide_df.columns:
             wide_df['date'] = pd.to_datetime(wide_df['date'])
             wide_df = wide_df.set_index('date')
-        wide_df.index = pd.to_datetime(wide_df.index)
+        
+        if not isinstance(wide_df.index, pd.DatetimeIndex):
+             # Try to convert index if not datetime
+             try:
+                 wide_df.index = pd.to_datetime(wide_df.index)
+             except:
+                 pass
+        
         wide_df = wide_df.sort_index()
 
         # Apply cutoff
@@ -464,8 +582,30 @@ def pivot_snapshot_to_wide(
         if wide_df.empty:
             return pd.DataFrame()
 
+        # EARLY FILTERING (Wide): Filter columns
+        if selected_features is not None:
+            # Match columns to selected features
+            # Columns in wide format are series names (potentially raw)
+            # We need to sanitize them to check against selected_features
+            
+            # Optimization: 
+            # 1. Sanitize all columns (once) -> Map sanitized to raw
+            # 2. Keep only raw columns where sanitized version is in selected_features
+            
+            selected_set = set(selected_features)
+            cols_to_keep = []
+            
+            for col in wide_df.columns:
+                sanitized = sanitize_feature_name(str(col))
+                if sanitized in selected_set:
+                    cols_to_keep.append(col)
+            
+            if not cols_to_keep:
+                return pd.DataFrame()
+                
+            wide_df = wide_df[cols_to_keep]
+
         # Take last valid value per column (vectorized)
-        # standard "as-of" join logic: fill forward, then take latest
         if wide_df.empty:
              return pd.DataFrame()
              
@@ -479,40 +619,80 @@ def pivot_snapshot_to_wide(
         features = {sanitize_feature_name(str(k)): v for k, v in last_valid.items()}
         return pd.DataFrame([features])
 
-    # Long-format path (legacy)
+    # Valid "Long" format has 'series_name' and 'value'
+    # Optimize: Filter -> GroupBy -> Last (Avoids creating sparse wide DF)
     df = snapshot_df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-
-    cutoff = pd.to_datetime(cutoff_date) if cutoff_date is not None else pd.to_datetime(target_month)
-    df = df[df['date'] < cutoff]
+    
+    # Ensure 'date' is a column
+    if 'date' not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+        
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        
+        cutoff = pd.to_datetime(cutoff_date) if cutoff_date is not None else pd.to_datetime(target_month)
+        df = df[df['date'] < cutoff]
+    else:
+        # If no date column and no DatetimeIndex, we can't filter by time
+        # This shouldn't happen for valid snapshots
+        return pd.DataFrame()
 
     if df.empty:
         return pd.DataFrame()
+        
+    # EARLY FILTERING: Filter by selected features if provided
+    if selected_features is not None:
+        try:
+            # Get unique raw series names present in this filtered slice
+            unique_raw = df['series_name'].unique()
+        except KeyError as e:
+            logger.error(f"KeyError accessing 'series_name'. Columns: {df.columns.tolist()}")
+            logger.error(f"Original is_wide detection: {is_wide}")
+            # Fallback: maybe it's in the index now?
+            if 'series_name' in df.index.names:
+                df = df.reset_index()
+                unique_raw = df['series_name'].unique()
+            else:
+                raise e
+        
+        # Build mapping: raw -> sanitized
+        # Only keep those that are in selected_features
+        allowed_raw = []
+        selected_set = set(selected_features)
+        
+        for raw in unique_raw:
+            sanitized = sanitize_feature_name(str(raw))
+            if sanitized in selected_set:
+                allowed_raw.append(raw)
+        
+        if not allowed_raw:
+            return pd.DataFrame()
+            
+        # Filter DataFrame to only allowed raw series
+        df = df[df['series_name'].isin(allowed_raw)]
+        
+        if df.empty:
+            return pd.DataFrame()
 
-    wide_df = df.pivot_table(
-        index='date',
-        columns='series_name',
-        values='value',
-        aggfunc='first'
-    ).sort_index()
-
-    if wide_df.empty:
+    # Sort by date so "last" is truly the latest
+    df = df.sort_values('date')
+    
+    # Take last value for each series
+    latest_values = df.groupby('series_name')['value'].last()
+    
+    if latest_values.empty:
         return pd.DataFrame()
-
-    features = {}
-
-    for raw_series_name in wide_df.columns:
-        series = wide_df[raw_series_name].dropna()
-
-        if len(series) == 0:
-            continue
-
-        series_name = sanitize_feature_name(str(raw_series_name))
-        features[series_name] = series.iloc[-1]
-
-    if not features:
-        return pd.DataFrame()
-
+        
+    # Convert to dict -> DataFrame (1 row)
+    features = {sanitize_feature_name(str(k)): v for k, v in latest_values.to_dict().items()}
+    
+    # Final check: if selected_features provided, ensure we only return those
+    # (The pre-filtering above handled the bulk, this is just cleanup)
+    if selected_features is not None:
+         # Dict comprehension above already sanitized keys.
+         # Just filter the dict.
+         features = {k: v for k, v in features.items() if k in selected_set}
+         
     return pd.DataFrame([features])
 
 

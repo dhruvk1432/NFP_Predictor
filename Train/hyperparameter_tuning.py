@@ -21,6 +21,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from settings import TEMP_DIR, setup_logger
 from Train.config import (
     DEFAULT_LGBM_PARAMS,
+    HUBER_DELTA,
     N_OPTUNA_TRIALS,
     OPTUNA_TIMEOUT,
     NUM_BOOST_ROUND,
@@ -32,8 +33,12 @@ try:
     import optuna
     from optuna.integration import LightGBMPruningCallback
     OPTUNA_AVAILABLE = True
-except ImportError:
+except ImportError as _optuna_import_err:
     OPTUNA_AVAILABLE = False
+    _OPTUNA_IMPORT_ERROR = _optuna_import_err
+    logger.error(f"Optuna import failed: {_optuna_import_err}. "
+                 "Hyperparameter tuning will not be available. "
+                 "Install with: pip install optuna")
 
 try:
     import lightgbm as lgb
@@ -48,7 +53,7 @@ def tune_hyperparameters(
     y: pd.Series,
     weights: np.ndarray,
     n_trials: int = N_OPTUNA_TRIALS,
-    n_inner_splits: int = 3,
+    n_inner_splits: int = 5,
     use_huber_loss: bool = True,
     timeout: int = OPTUNA_TIMEOUT,
     num_boost_round: int = NUM_BOOST_ROUND,
@@ -75,13 +80,10 @@ def tune_hyperparameters(
         Best LightGBM parameter dict (ready to pass to lgb.train)
     """
     if not OPTUNA_AVAILABLE:
-        logger.warning("Optuna not installed — using static defaults. "
-                       "Install with: pip install optuna")
-        params = DEFAULT_LGBM_PARAMS.copy()
-        if use_huber_loss:
-            params['objective'] = 'huber'
-            params['alpha'] = 1.0
-        return params
+        raise RuntimeError(
+            f"Optuna is required for hyperparameter tuning but failed to import: "
+            f"{_OPTUNA_IMPORT_ERROR}. Install with: pip install optuna"
+        )
 
     if not LIGHTGBM_AVAILABLE:
         raise ImportError("LightGBM not available")
@@ -117,7 +119,7 @@ def tune_hyperparameters(
         }
 
         if use_huber_loss:
-            params['alpha'] = trial.suggest_float('huber_delta', 0.5, 5.0)
+            params['alpha'] = trial.suggest_float('huber_delta', 25.0, 500.0)
 
         fold_maes = []
 
@@ -129,7 +131,7 @@ def tune_hyperparameters(
             train_data = lgb.Dataset(X_tr, label=y_tr, weight=w_tr)
             val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
-            pruning_callback = LightGBMPruningCallback(trial, 'valid', metric_name='l1')
+            pruning_callback = LightGBMPruningCallback(trial, 'l1', valid_name='valid')
 
             callbacks = [
                 lgb.early_stopping(stopping_rounds=early_stopping_rounds),

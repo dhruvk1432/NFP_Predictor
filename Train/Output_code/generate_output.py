@@ -6,7 +6,8 @@ Generates the full _Output/ folder structure after training both NSA and SA mode
   ├── NSA_prediction/   (5 items)
   ├── SA_prediction/    (5 items)
   ├── NSA_plus_adjustment/  (3 items)
-  └── Archive/YYYY-MM-DD_HHMMSS/  (dated copy of the above 3 folders)
+  ├── Predictions/      (predictions.csv with forward predictions + CIs)
+  └── Archive/YYYY-MM-DD_HHMMSS/  (dated copy of all folders above)
 """
 
 import shutil
@@ -70,7 +71,14 @@ def _generate_prediction_folder(
         save_path=folder / "backtest_predictions.png",
     )
 
-    # (b) Summary statistics CSV
+    # (b) Backtest results CSV (per-month predictions vs actuals)
+    csv_cols = ["ds", "actual", "predicted", "error"]
+    optional_cols = ["lower_80", "upper_80", "lower_50", "upper_50", "lower_95", "upper_95"]
+    csv_cols += [c for c in optional_cols if c in results_df.columns]
+    results_df[csv_cols].to_csv(folder / "backtest_results.csv", index=False)
+    logger.info(f"  Saved {label} backtest results CSV ({len(results_df)} rows)")
+
+    # (c) Summary statistics CSV
     metrics = compute_metrics(results_df)
     save_metrics_csv(metrics, folder / "summary_statistics.csv")
     logger.info(f"  {label} metrics: RMSE={metrics['RMSE']:.2f}, MAE={metrics['MAE']:.2f}, MSE={metrics['MSE']:.2f}")
@@ -143,7 +151,11 @@ def _generate_adjustment_folder(
         save_path=folder / "backtest_predictions.png",
     )
 
-    # (b) Summary statistics CSV
+    # (b) Backtest results CSV
+    adj_results.to_csv(folder / "backtest_results.csv", index=False)
+    logger.info(f"  Saved NSA+adj backtest results CSV ({len(adj_results)} rows)")
+
+    # (c) Summary statistics CSV
     metrics = compute_metrics(adj_results)
     save_metrics_csv(metrics, folder / "summary_statistics.csv")
     logger.info(f"  NSA+adj metrics: RMSE={metrics['RMSE']:.2f}, MAE={metrics['MAE']:.2f}, MSE={metrics['MSE']:.2f}")
@@ -152,6 +164,84 @@ def _generate_adjustment_folder(
     render_summary_table(metrics, [], 0, folder / "summary_table.png")
 
     logger.info(f"  NSA + adjustment output complete → {folder}")
+
+
+def _generate_predictions_folder(
+    nsa_model,
+    sa_model,
+    nsa_metadata: Dict,
+    sa_metadata: Dict,
+    nsa_X_full: pd.DataFrame,
+    sa_X_full: pd.DataFrame,
+    nsa_y_full: pd.Series,
+    sa_y_full: pd.Series,
+    nsa_residuals: List,
+    sa_residuals: List,
+    folder: Path,
+) -> None:
+    """
+    Generate forward predictions using the production models for months
+    where the target is NaN (unreleased data).
+
+    Outputs:
+        predictions.csv — one row per future month with point prediction + CIs
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for label, model, metadata, X_full, y_full, residuals in [
+        ("NSA", nsa_model, nsa_metadata, nsa_X_full, nsa_y_full, nsa_residuals),
+        ("SA", sa_model, sa_metadata, sa_X_full, sa_y_full, sa_residuals),
+    ]:
+        feature_cols = metadata["feature_cols"]
+        future_mask = y_full.isna()
+        if not future_mask.any():
+            logger.info(f"  No future months to predict for {label}")
+            continue
+
+        X_future = X_full[future_mask].copy()
+        future_dates = X_future['ds'].tolist()
+        X_pred = X_future[[c for c in feature_cols if c in X_future.columns]]
+        preds = model.predict(X_pred)
+
+        # Confidence intervals from OOS residuals
+        if len(residuals) > 2:
+            res = np.array(residuals[-36:])  # Use up to last 36 OOS residuals
+            for j, (ds, pred) in enumerate(zip(future_dates, preds)):
+                rows.append({
+                    "model": label,
+                    "ds": ds,
+                    "predicted": pred,
+                    "lower_50": pred + np.percentile(res, 25),
+                    "upper_50": pred + np.percentile(res, 75),
+                    "lower_80": pred + np.percentile(res, 10),
+                    "upper_80": pred + np.percentile(res, 90),
+                    "lower_95": pred + np.percentile(res, 2.5),
+                    "upper_95": pred + np.percentile(res, 97.5),
+                })
+        else:
+            # Fallback: no residual history
+            for j, (ds, pred) in enumerate(zip(future_dates, preds)):
+                rows.append({
+                    "model": label,
+                    "ds": ds,
+                    "predicted": pred,
+                    "lower_50": np.nan, "upper_50": np.nan,
+                    "lower_80": np.nan, "upper_80": np.nan,
+                    "lower_95": np.nan, "upper_95": np.nan,
+                })
+
+        for r in rows[-len(future_dates):]:
+            logger.info(f"  {label} {r['ds'].strftime('%Y-%m')}: "
+                        f"Pred={r['predicted']:.0f} "
+                        f"[80% CI: {r['lower_80']:.0f}, {r['upper_80']:.0f}]")
+
+    if rows:
+        pred_df = pd.DataFrame(rows)
+        pred_df.to_csv(folder / "predictions.csv", index=False)
+        logger.info(f"  Saved {len(rows)} predictions to {folder / 'predictions.csv'}")
+    else:
+        logger.warning("  No future predictions to output")
 
 
 def generate_all_output(
@@ -163,6 +253,10 @@ def generate_all_output(
     sa_metadata: Dict,
     nsa_X_full: pd.DataFrame,
     sa_X_full: pd.DataFrame,
+    nsa_y_full: pd.Series = None,
+    sa_y_full: pd.Series = None,
+    nsa_residuals: List = None,
+    sa_residuals: List = None,
     output_base: Optional[Path] = None,
 ) -> Path:
     """
@@ -177,6 +271,10 @@ def generate_all_output(
         sa_metadata: SA model metadata.
         nsa_X_full: NSA full training feature matrix (for SHAP).
         sa_X_full: SA full training feature matrix (for SHAP).
+        nsa_y_full: NSA target series (to identify future months).
+        sa_y_full: SA target series (to identify future months).
+        nsa_residuals: NSA OOS residuals from backtest (for confidence intervals).
+        sa_residuals: SA OOS residuals from backtest (for confidence intervals).
         output_base: Base output directory. Defaults to project-level _Output/.
 
     Returns:
@@ -191,33 +289,49 @@ def generate_all_output(
     logger.info("=" * 60)
 
     # 1) NSA prediction folder
-    logger.info("\n[1/4] NSA Prediction")
+    logger.info("\n[1/5] NSA Prediction")
     nsa_folder = output_base / "NSA_prediction"
     _generate_prediction_folder(
         nsa_results, nsa_model, nsa_metadata, nsa_X_full, nsa_folder, "NSA",
     )
 
     # 2) SA prediction folder
-    logger.info("\n[2/4] SA Prediction")
+    logger.info("\n[2/5] SA Prediction")
     sa_folder = output_base / "SA_prediction"
     _generate_prediction_folder(
         sa_results, sa_model, sa_metadata, sa_X_full, sa_folder, "SA",
     )
 
     # 3) NSA + perfect seasonal adjustment folder
-    logger.info("\n[3/4] NSA + Perfect Seasonal Adjustment")
+    logger.info("\n[3/5] NSA + Perfect Seasonal Adjustment")
     adj_folder = output_base / "NSA_plus_adjustment"
     _generate_adjustment_folder(nsa_results, sa_results, adj_folder)
 
-    # 4) Archive: copy all three folders with timestamp
-    logger.info("\n[4/4] Archiving output")
+    # 4) Forward predictions folder
+    logger.info("\n[4/5] Forward Predictions")
+    pred_folder = output_base / "Predictions"
+    if nsa_y_full is not None and sa_y_full is not None:
+        _generate_predictions_folder(
+            nsa_model, sa_model,
+            nsa_metadata, sa_metadata,
+            nsa_X_full, sa_X_full,
+            nsa_y_full, sa_y_full,
+            nsa_residuals or [], sa_residuals or [],
+            pred_folder,
+        )
+    else:
+        logger.warning("  Skipping predictions folder — y_full not provided")
+
+    # 5) Archive: copy all folders with timestamp
+    logger.info("\n[5/5] Archiving output")
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     archive_folder = output_base / "Archive" / timestamp
 
-    for src_name in ["NSA_prediction", "SA_prediction", "NSA_plus_adjustment"]:
+    for src_name in ["NSA_prediction", "SA_prediction", "NSA_plus_adjustment", "Predictions"]:
         src = output_base / src_name
-        dst = archive_folder / src_name
-        shutil.copytree(src, dst)
+        if src.exists():
+            dst = archive_folder / src_name
+            shutil.copytree(src, dst)
 
     logger.info(f"  Archived to {archive_folder}")
     logger.info("\n" + "=" * 60)

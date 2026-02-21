@@ -34,6 +34,8 @@ from Train.config import (
     get_model_id,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
+    VALID_TARGET_SOURCES,
+    REVISED_TARGET_SERIES,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -131,6 +133,14 @@ def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     # Use prepared data if configured
     base_dir = FRED_PREPARED_DIR if USE_PREPARED_FRED_DATA else FRED_SNAPSHOTS_DIR
     return base_dir / decade / year / f"{month_str}.parquet"
+
+
+def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
+    """Build path to raw FRED employment snapshot (levels, not prepared features)."""
+    decade = f"{snapshot_date.year // 10 * 10}s"
+    year = str(snapshot_date.year)
+    month_str = snapshot_date.strftime('%Y-%m')
+    return FRED_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
 
 
 def get_master_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
@@ -242,6 +252,7 @@ def clear_snapshot_cache() -> None:
 def load_target_data(
     target_type: str = 'nsa',
     release_type: str = 'first',
+    target_source: str = 'first_release',
     use_cache: bool = True
 ) -> pd.DataFrame:
     """
@@ -250,6 +261,8 @@ def load_target_data(
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised release
+        target_source: 'first_release' for original release, 'revised' for once-revised
+            (from M+1 FRED snapshot). Revised targets use raw FRED snapshot levels.
         use_cache: Whether to use/populate the module cache
 
     Returns:
@@ -264,11 +277,23 @@ def load_target_data(
         raise ValueError(f"Invalid target_type: {target_type}. Must be one of {VALID_TARGET_TYPES}")
     if release_type not in VALID_RELEASE_TYPES:
         raise ValueError(f"Invalid release_type: {release_type}. Must be one of {VALID_RELEASE_TYPES}")
+    if target_source not in VALID_TARGET_SOURCES:
+        raise ValueError(f"Invalid target_source: {target_source}. Must be one of {VALID_TARGET_SOURCES}")
 
-    cache_key = f"target_{get_model_id(target_type, release_type)}"
+    cache_key = f"target_{get_model_id(target_type, release_type, target_source)}"
 
     if use_cache and cache_key in _target_cache:
         return _target_cache[cache_key].copy()
+
+    # Revised target: build from raw FRED snapshots instead of loading parquet
+    if target_source == 'revised':
+        logger.info(f"Building revised {target_type.upper()} target from raw FRED snapshots...")
+        df = build_revised_target(target_type)
+        model_id = get_model_id(target_type, release_type, target_source)
+        if use_cache:
+            _target_cache[cache_key] = df
+            logger.info(f"Loaded {model_id.upper()} target data: {len(df)} observations (cached)")
+        return df.copy() if use_cache else df
 
     # Load appropriate target file using dynamic path
     target_path = get_target_path(target_type, release_type)
@@ -319,12 +344,14 @@ def load_target_data(
     return df.copy() if use_cache else df
 
 
-def load_all_target_data(release_type: str = 'first') -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_all_target_data(release_type: str = 'first',
+                        target_source: str = 'first_release') -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load both NSA and SA target data with all derived features for a given release type.
 
     Args:
         release_type: 'first' for initial release, 'last' for final revised
+        target_source: 'first_release' or 'revised'
 
     Returns:
         Tuple of (nsa_df, sa_df) with columns:
@@ -333,9 +360,99 @@ def load_all_target_data(release_type: str = 'first') -> Tuple[pd.DataFrame, pd.
         - y_mom: month-on-month change
         - Additional momentum/divergence features
     """
-    nsa_df = load_target_data('nsa', release_type=release_type)
-    sa_df = load_target_data('sa', release_type=release_type)
+    nsa_df = load_target_data('nsa', release_type=release_type, target_source=target_source)
+    sa_df = load_target_data('sa', release_type=release_type, target_source=target_source)
     return nsa_df, sa_df
+
+
+def build_revised_target(target_type: str = 'nsa') -> pd.DataFrame:
+    """
+    Build revised target data from raw FRED snapshots.
+
+    For each month M, loads the M+1 snapshot and computes:
+        revised_mom[M] = level[M] - level[M-1]  (both from M+1 snapshot)
+
+    This captures the "once-revised" MoM change, which includes BLS revisions
+    to the M-1 level that occur between the M and M+1 NFP releases.
+
+    Args:
+        target_type: 'nsa' or 'sa'
+
+    Returns:
+        DataFrame matching load_target_data() output shape:
+        ds, y, y_mom, release_date, and derived momentum features.
+    """
+    series_name = REVISED_TARGET_SERIES[target_type]
+
+    # Load first-release target to get the list of months and release_dates
+    first_release_path = get_target_path(target_type, 'first')
+    first_release_df = pd.read_parquet(first_release_path)
+    first_release_df['ds'] = pd.to_datetime(first_release_df['ds'])
+    first_release_df = first_release_df.sort_values('ds').reset_index(drop=True)
+
+    records = []
+    for _, row in first_release_df.iterrows():
+        m = row['ds']
+        release_date = row.get('release_date', pd.NaT)
+
+        # Load M+1 raw snapshot (levels)
+        snapshot_date = m + pd.DateOffset(months=1)
+        snapshot_path = get_raw_fred_snapshot_path(snapshot_date)
+
+        if not snapshot_path.exists():
+            records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,
+                            'release_date': release_date})
+            continue
+
+        snap = pd.read_parquet(snapshot_path)
+        series_data = snap[snap['series_name'] == series_name]
+        if series_data.empty:
+            records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,
+                            'release_date': release_date})
+            continue
+
+        levels = (series_data[['date', 'value']]
+                  .drop_duplicates('date')
+                  .set_index('date')['value']
+                  .sort_index())
+
+        m_minus1 = m - pd.DateOffset(months=1)
+        level_m = levels.get(m)
+        level_m1 = levels.get(m_minus1)
+
+        if level_m is not None and level_m1 is not None:
+            records.append({'ds': m, 'y': float(level_m),
+                            'y_mom': float(level_m) - float(level_m1),
+                            'release_date': release_date})
+        elif level_m is not None:
+            records.append({'ds': m, 'y': float(level_m), 'y_mom': np.nan,
+                            'release_date': release_date})
+        else:
+            records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,
+                            'release_date': release_date})
+
+    df = pd.DataFrame(records)
+    df['ds'] = pd.to_datetime(df['ds'])
+    df = df.sort_values('ds').reset_index(drop=True)
+
+    # Derived features (same as load_target_data)
+    df['y_rolling_3m'] = df['y'].rolling(window=3, min_periods=1).mean()
+    df['y_rolling_6m'] = df['y'].rolling(window=6, min_periods=1).mean()
+    df['y_rolling_12m'] = df['y'].rolling(window=12, min_periods=1).mean()
+    df['y_mom_rolling_3m'] = df['y_mom'].rolling(window=3, min_periods=1).mean()
+    df['y_mom_rolling_6m'] = df['y_mom'].rolling(window=6, min_periods=1).mean()
+    df['divergence_3m'] = df['y'] - df['y_rolling_3m']
+    df['divergence_6m'] = df['y'] - df['y_rolling_6m']
+    df['acceleration'] = df['y_mom'].diff()
+    df['y_yoy'] = df['y'].diff(12)
+    df['y_mom_yoy'] = df['y_mom'].diff(12)
+
+    # Drop first row (no MoM for first observation)
+    df = df[df.index != 0].reset_index(drop=True)
+
+    logger.info(f"Built revised {target_type.upper()} target: {len(df)} months, "
+                f"{df['y_mom'].notna().sum()} with valid MoM")
+    return df
 
 
 def clear_target_cache() -> None:

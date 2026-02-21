@@ -31,6 +31,10 @@ from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE
 
 VALID_TARGET_TYPES = ('nsa', 'sa')
 VALID_RELEASE_TYPES = ('first', 'last')
+VALID_TARGET_SOURCES = ('first_release', 'revised')
+
+# FRED series names for revised target construction (raw snapshot levels)
+REVISED_TARGET_SERIES = {'nsa': 'total_nsa', 'sa': 'total'}
 
 # Target combinations - FIRST RELEASE ONLY
 # Only training nsa_first and sa_first models.
@@ -86,18 +90,21 @@ def get_target_path(target_type: str, release_type: str = 'first') -> Path:
     return NFP_TARGET_DIR / filename
 
 
-def get_model_id(target_type: str, release_type: str = 'first') -> str:
+def get_model_id(target_type: str, release_type: str = 'first',
+                 target_source: str = 'first_release') -> str:
     """
     Get a unique model identifier string for the target configuration.
 
     Args:
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
+        target_source: 'first_release' or 'revised'
 
     Returns:
-        Model identifier string (e.g., 'nsa_first', 'sa_last')
+        Model identifier string (e.g., 'nsa_first', 'nsa_first_revised')
     """
-    return f"{target_type.lower()}_{release_type.lower()}"
+    base = f"{target_type.lower()}_{release_type.lower()}"
+    return f"{base}_revised" if target_source == 'revised' else base
 
 
 def parse_model_id(model_id: str) -> Tuple[str, str]:

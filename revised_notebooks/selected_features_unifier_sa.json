@@ -1,0 +1,10 @@
+[
+    "AWH_Manufacturing_symlog_pct_chg",
+    "AWH_Manufacturing_symlog_pct_chg_rolling_std_6m",
+    "AWH_Manufacturing_symlog_pct_chg_rolling_std_6m_lag_1m",
+    "CB_Consumer_Confidence_symlog",
+    "CB_Consumer_Confidence_symlog_zscore_3m_lag_18m",
+    "Challenger_Job_Cuts_symlog_chg_12m_lag_1m",
+    "Industrial_Production_pct_chg",
+    "Industrial_Production_pct_chg_rolling_std_6m"
+]

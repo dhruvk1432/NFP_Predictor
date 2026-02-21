@@ -1,0 +1,9 @@
+[
+    "ADP_actual_chg_12m_lag_1m",
+    "ADP_actual_chg_12m_lag_6m",
+    "ADP_actual_diff_lag_1m",
+    "ADP_actual_pct_chg_rolling_std_6m_lag_1m",
+    "ADP_actual_symlog_chg_12m_lag_6m",
+    "ADP_actual_symlog_pct_chg_lag_1m",
+    "ADP_actual_symlog_rolling_std_6m_lag_1m"
+]

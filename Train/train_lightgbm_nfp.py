@@ -229,6 +229,7 @@ def build_training_dataset(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
+    target_source: str = 'first_release',
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
     show_progress: bool = True,
@@ -245,6 +246,7 @@ def build_training_dataset(
         target_df: Target DataFrame with y_mom column (the prediction target)
         target_type: 'nsa' or 'sa' - determines which target we're predicting
         release_type: 'first' or 'last' - determines which release to use for lagged features
+        target_source: 'first_release' or 'revised' - determines lag data source
         start_date: Start date for training data
         end_date: End date for training data
         show_progress: Whether to show progress logging
@@ -260,10 +262,11 @@ def build_training_dataset(
 
     model_id = get_model_id(target_type, release_type)
 
-    # Load both NSA and SA target data ONCE (cached) - use same release_type for consistency
-    logger.info(f"Loading NSA and SA {release_type} release target data for feature engineering...")
-    nsa_target_full = load_target_data('nsa', release_type=release_type)
-    sa_target_full = load_target_data('sa', release_type=release_type)
+    # Load both NSA and SA target data ONCE (cached) - use same release_type and target_source
+    source_label = "revised" if target_source == "revised" else f"{release_type} release"
+    logger.info(f"Loading NSA and SA {source_label} target data for feature engineering...")
+    nsa_target_full = load_target_data('nsa', release_type=release_type, target_source=target_source)
+    sa_target_full = load_target_data('sa', release_type=release_type, target_source=target_source)
 
     # Pre-compute ALL lagged target features vectorized (shift/rolling) instead
     # of per-worker filtering. Produces lightweight dicts for O(1) worker lookup.
@@ -392,6 +395,7 @@ def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
+    target_source: str = 'first_release',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
     selected_features: Optional[List[str]] = None,
@@ -411,6 +415,7 @@ def run_expanding_window_backtest(
         target_df: Target DataFrame with 'ds' and 'y_mom' columns
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
+        target_source: 'first_release' or 'revised'
         use_huber_loss: Whether to use Huber loss
         huber_delta: Huber delta parameter
         selected_features: Pre-selected feature names to use
@@ -420,7 +425,7 @@ def run_expanding_window_backtest(
         Tuple of (results_df, X_full, y_full) where X_full and y_full are the
         pre-built feature matrix and target series (reusable for production model).
     """
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     logger.info("=" * 60)
     logger.info(f"EXPANDING WINDOW BACKTEST [{model_id.upper()}] (No Time-Travel)")
@@ -432,14 +437,15 @@ def run_expanding_window_backtest(
 
     logger.info(f"Backtest period: {BACKTEST_MONTHS} months ({backtest_months[0].strftime('%Y-%m')} to {backtest_months[-1].strftime('%Y-%m')})")
 
-    # Load target data for lagged features (cached) - use same release_type
-    load_target_data('nsa', release_type=release_type)
-    load_target_data('sa', release_type=release_type)
+    # Load target data for lagged features (cached) - use same release_type and target_source
+    load_target_data('nsa', release_type=release_type, target_source=target_source)
+    load_target_data('sa', release_type=release_type, target_source=target_source)
 
     # Build FULL feature dataset once
     logger.info("Building full feature dataset...")
     X_full, y_full = build_training_dataset(
         target_df, target_type=target_type, release_type=release_type,
+        target_source=target_source,
         show_progress=False, selected_features=selected_features
     )
 
@@ -664,6 +670,7 @@ def run_expanding_window_backtest(
 def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
+    target_source: str = 'first_release',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
     tune: bool = True,
@@ -679,11 +686,12 @@ def train_and_evaluate(
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised
+        target_source: 'first_release' or 'revised' (from M+1 FRED snapshot)
         use_huber_loss: If True, use Huber loss function
         huber_delta: Huber delta parameter
         tune: If True, run Optuna hyperparameter tuning
     """
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     logger.info("=" * 60)
     logger.info(f"LightGBM NFP Prediction Model - Training [{model_id.upper()}]")
@@ -695,7 +703,8 @@ def train_and_evaluate(
     logger.info(f"Loaded {len(selected_features)} pre-selected features for {target_type.upper()}")
 
     # Load target data
-    target_df = load_target_data(target_type=target_type, release_type=release_type)
+    target_df = load_target_data(target_type=target_type, release_type=release_type,
+                                 target_source=target_source)
 
     # Determine date ranges
     train_end = target_df['ds'].max() - pd.DateOffset(months=BACKTEST_MONTHS)
@@ -708,6 +717,7 @@ def train_and_evaluate(
         target_df=target_df,
         target_type=target_type,
         release_type=release_type,
+        target_source=target_source,
         use_huber_loss=use_huber_loss,
         huber_delta=huber_delta,
         selected_features=selected_features,
@@ -942,19 +952,23 @@ Examples:
                         help=f'Huber delta parameter (default: {HUBER_DELTA}). Lower = more robust to outliers.')
     parser.add_argument('--no-tune', action='store_true',
                         help='Skip Optuna hyperparameter tuning (use static defaults). Faster for debugging.')
+    parser.add_argument('--revised', action='store_true',
+                        help='Train on revised MoM target (from M+1 FRED snapshot instead of first release)')
 
     args = parser.parse_args()
 
     # Convert --no-* flags to booleans
     use_huber_loss = not args.no_huber_loss
     tune = not args.no_tune
+    target_source = 'revised' if args.revised else 'first_release'
 
-    model_id = get_model_id(args.target, args.release)
+    model_id = get_model_id(args.target, args.release, target_source)
 
     if args.train:
         result = train_and_evaluate(
             target_type=args.target,
             release_type=args.release,
+            target_source=target_source,
             use_huber_loss=use_huber_loss,
             huber_delta=args.huber_delta,
             tune=tune,
@@ -973,6 +987,7 @@ Examples:
                 sa_result = train_and_evaluate(
                     target_type='sa',
                     release_type=args.release,
+                    target_source=target_source,
                     use_huber_loss=use_huber_loss,
                     huber_delta=args.huber_delta,
                     tune=tune,
@@ -985,6 +1000,7 @@ Examples:
                     }
 
                     from Train.Output_code.generate_output import generate_all_output
+                    output_suffix = '_revised' if target_source == 'revised' else ''
                     generate_all_output(
                         nsa_results=backtest_results,
                         sa_results=sa_backtest,
@@ -998,6 +1014,7 @@ Examples:
                         sa_y_full=sa_y_full,
                         nsa_residuals=residuals,
                         sa_residuals=sa_residuals,
+                        suffix=output_suffix,
                     )
 
     elif args.predict:
@@ -1029,4 +1046,4 @@ Examples:
 
     else:
         # Default: train and evaluate with defaults (nsa_first)
-        train_and_evaluate()
+        train_and_evaluate(target_source=target_source)

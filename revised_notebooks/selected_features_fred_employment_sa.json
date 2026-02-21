@@ -1,0 +1,12 @@
+[
+    "total.government.local.education_symlog_chg_3m_lag_3m",
+    "total.government.local.education_symlog_rolling_mean_3m",
+    "total.government.state.excluding_education_nsa_symlog_pct_chg_rolling_std_6m_lag_12m",
+    "total.private",
+    "total.private.goods.manufacturing.durable.transportation_equipment",
+    "total.private.goods_symlog",
+    "total.private.services.trade_transportation_utilities.retail.food_beverage_nsa_rolling_std_6m",
+    "total.private.services_nsa_zscore_12m",
+    "total.private_nsa_rolling_mean_3m",
+    "total_symlog_pct_chg_rolling_std_6m_lag_6m"
+]

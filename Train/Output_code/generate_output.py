@@ -258,6 +258,7 @@ def generate_all_output(
     nsa_residuals: List = None,
     sa_residuals: List = None,
     output_base: Optional[Path] = None,
+    suffix: str = '',
 ) -> Path:
     """
     Generate the complete _Output/ folder structure.
@@ -276,6 +277,7 @@ def generate_all_output(
         nsa_residuals: NSA OOS residuals from backtest (for confidence intervals).
         sa_residuals: SA OOS residuals from backtest (for confidence intervals).
         output_base: Base output directory. Defaults to project-level _Output/.
+        suffix: Suffix appended to output folder names (e.g., '_revised').
 
     Returns:
         Path to the output directory.
@@ -289,27 +291,27 @@ def generate_all_output(
     logger.info("=" * 60)
 
     # 1) NSA prediction folder
-    logger.info("\n[1/5] NSA Prediction")
-    nsa_folder = output_base / "NSA_prediction"
+    logger.info(f"\n[1/5] NSA Prediction{suffix}")
+    nsa_folder = output_base / f"NSA_prediction{suffix}"
     _generate_prediction_folder(
-        nsa_results, nsa_model, nsa_metadata, nsa_X_full, nsa_folder, "NSA",
+        nsa_results, nsa_model, nsa_metadata, nsa_X_full, nsa_folder, f"NSA{suffix}",
     )
 
     # 2) SA prediction folder
-    logger.info("\n[2/5] SA Prediction")
-    sa_folder = output_base / "SA_prediction"
+    logger.info(f"\n[2/5] SA Prediction{suffix}")
+    sa_folder = output_base / f"SA_prediction{suffix}"
     _generate_prediction_folder(
-        sa_results, sa_model, sa_metadata, sa_X_full, sa_folder, "SA",
+        sa_results, sa_model, sa_metadata, sa_X_full, sa_folder, f"SA{suffix}",
     )
 
     # 3) NSA + perfect seasonal adjustment folder
-    logger.info("\n[3/5] NSA + Perfect Seasonal Adjustment")
-    adj_folder = output_base / "NSA_plus_adjustment"
+    logger.info(f"\n[3/5] NSA + Perfect Seasonal Adjustment{suffix}")
+    adj_folder = output_base / f"NSA_plus_adjustment{suffix}"
     _generate_adjustment_folder(nsa_results, sa_results, adj_folder)
 
     # 4) Forward predictions folder
-    logger.info("\n[4/5] Forward Predictions")
-    pred_folder = output_base / "Predictions"
+    logger.info(f"\n[4/5] Forward Predictions{suffix}")
+    pred_folder = output_base / f"Predictions{suffix}"
     if nsa_y_full is not None and sa_y_full is not None:
         _generate_predictions_folder(
             nsa_model, sa_model,
@@ -327,7 +329,8 @@ def generate_all_output(
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     archive_folder = output_base / "Archive" / timestamp
 
-    for src_name in ["NSA_prediction", "SA_prediction", "NSA_plus_adjustment", "Predictions"]:
+    for src_name in [f"NSA_prediction{suffix}", f"SA_prediction{suffix}",
+                     f"NSA_plus_adjustment{suffix}", f"Predictions{suffix}"]:
         src = output_base / src_name
         if src.exists():
             dst = archive_folder / src_name

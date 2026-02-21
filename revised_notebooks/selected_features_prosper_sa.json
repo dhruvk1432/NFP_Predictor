@@ -1,0 +1,8 @@
+[
+    "Prosper Consumer Spending Forecast | Consumer Spending Forecast | 18-34_rolling_mean_3m_lag_6m",
+    "Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | Fewer | Females",
+    "Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | 18-34_symlog_zscore_3m",
+    "Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present? | More | Females_symlog_rolling_std_6m_lag_1m",
+    "Which of the following most accurately describes your employment environment? (Check all that apply) | I am employed full-time | 18-34_chg_12m_lag_6m",
+    "Which of the following most accurately describes your employment environment? (Check all that apply) | I know people who have been laid off | Males_diff_zscore_12m"
+]

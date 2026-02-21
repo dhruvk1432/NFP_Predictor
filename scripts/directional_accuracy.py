@@ -24,6 +24,21 @@ models = {
     },
 }
 
+# Add revised model paths if output exists
+_revised = {
+    "NSA Revised": {
+        "path": OUTPUT_DIR / "NSA_prediction_revised" / "backtest_results.csv",
+        "series": "total_nsa",
+    },
+    "SA Revised": {
+        "path": OUTPUT_DIR / "SA_prediction_revised" / "backtest_results.csv",
+        "series": "total",
+    },
+}
+for _name, _cfg in _revised.items():
+    if _cfg["path"].exists():
+        models[_name] = _cfg
+
 
 def get_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     decade = f"{snapshot_date.year // 10 * 10}s"
@@ -148,7 +163,7 @@ for name, cfg in models.items():
 result = pd.DataFrame(rows)
 
 # ── Table figure ──
-fig_table, ax = plt.subplots(figsize=(7, 1.8))
+fig_table, ax = plt.subplots(figsize=(7, 0.5 + 0.4 * len(result)))
 ax.axis("off")
 table = ax.table(
     cellText=result.values,

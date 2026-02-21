@@ -1,0 +1,19 @@
+[
+    "CCNSA_max_spike_symlog_pct_chg_zscore_12m_lag_3m",
+    "CCNSA_max_spike_symlog_pct_chg_zscore_3m_lag_1m",
+    "CCNSA_max_spike_symlog_zscore_3m_lag_3m",
+    "CCNSA_monthly_avg_diff",
+    "CCNSA_monthly_avg_diff_zscore_3m_lag_12m",
+    "CCNSA_monthly_avg_diff_zscore_3m_lag_18m",
+    "CCNSA_monthly_avg_diff_zscore_3m_lag_6m",
+    "CCNSA_monthly_avg_pct_chg_zscore_12m_lag_6m",
+    "CCNSA_monthly_avg_symlog_pct_chg_zscore_12m_lag_1m",
+    "Credit_Spreads_avg_symlog_rolling_std_6m_lag_6m",
+    "Financial_Stress_monthly_avg_chg_3m",
+    "SP500_consecutive_down_days_symlog_diff_zscore_12m_lag_6m",
+    "VIX_mean_symlog_chg_3m_lag_3m",
+    "Weekly_Econ_Index_monthly_max_diff_zscore_3m",
+    "Weekly_Econ_Index_monthly_max_symlog_diff",
+    "Yield_Curve_monthly_chg_chg_12m_lag_1m",
+    "Yield_Curve_monthly_chg_diff_zscore_12m_lag_1m"
+]

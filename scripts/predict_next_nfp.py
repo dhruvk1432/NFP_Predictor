@@ -2,8 +2,12 @@
 """
 Predict Next NFP
 
-Production script to generate NFP prediction for the upcoming month.
-Loads latest model, fetches fresh data, and outputs formatted prediction.
+Production script to generate NFP predictions for the upcoming month.
+This script is the final deployment artifact that consumes the master snapshot,
+loads the latest LightGBM model (either NSA or SA), builds the exact feature set 
+expected by the model, handles missing feature imputation, and outputs the 
+final prediction along with dynamic confidence intervals (50%, 80%, 95%) 
+based on the model's historical OOS residuals.
 
 Usage:
     python scripts/predict_next_nfp.py --target nsa
@@ -28,7 +32,20 @@ logger = setup_logger(__file__, TEMP_DIR)
 
 
 def get_latest_snapshot_date() -> pd.Timestamp:
-    """Find the most recent master snapshot available."""
+    """
+    Find the most recent master snapshot available in the file system.
+    
+    Searches the `MASTER_SNAPSHOTS_DIR` for `.parquet` files, extracting
+    their YYYY-MM prefixes to determine the absolute latest snapshot month 
+    available for prediction.
+    
+    Returns:
+        pd.Timestamp: The exact month of the latest snapshot (e.g., '2024-11-01').
+        
+    Raises:
+        FileNotFoundError: If no master snapshots exist.
+        ValueError: If filenames cannot be parsed.
+    """
     from Train.config import MASTER_SNAPSHOTS_DIR
     
     all_files = list(MASTER_SNAPSHOTS_DIR.rglob("*.parquet"))
@@ -53,7 +70,18 @@ def get_latest_snapshot_date() -> pd.Timestamp:
 
 
 def load_latest_snapshot(snapshot_date: pd.Timestamp) -> pd.DataFrame:
-    """Load the most recent master snapshot."""
+    """
+    Load the most recent master snapshot DataFrame for the given date.
+    
+    Args:
+        snapshot_date (pd.Timestamp): The date identified by `get_latest_snapshot_date`.
+        
+    Returns:
+        pd.DataFrame: The loaded master snapshot containing all economic series.
+        
+    Raises:
+        FileNotFoundError: If the exact snapshot file does not exist.
+    """
     from Train.data_loader import load_master_snapshot
     
     snapshot = load_master_snapshot(snapshot_date)
@@ -221,7 +249,13 @@ def generate_prediction(
 
 
 def main():
-    """CLI entry point."""
+    """
+    CLI entry point. 
+    
+    Parses command-line arguments to determine the target type (nsa/sa) 
+    and optional JSON output paths, then triggers the prediction generation.
+    Returns standard exit codes (0 for success, 1 for failure/errors).
+    """
     parser = argparse.ArgumentParser(
         description="Generate NFP prediction for upcoming month"
     )

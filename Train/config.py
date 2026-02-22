@@ -1,8 +1,9 @@
 """
 LightGBM NFP Model Configuration
 
-Centralized configuration constants for the NFP prediction model.
-Extracted from train_lightgbm_nfp.py for maintainability.
+Centralized configuration constants and path definitions for the NFP prediction model.
+This file acts as the single source of truth for all hyperparameter bounds, valid 
+target configurations, and file paths used during the data loading and training phases.
 
 TARGET TYPES:
     - target_type: 'nsa' (non-seasonally adjusted) or 'sa' (seasonally adjusted)
@@ -12,7 +13,8 @@ This creates 2 model variants (first release only):
     - nsa_first: NSA with first release data
     - sa_first: SA with first release data
 
-NOTE: Last release models (nsa_last, sa_last) are disabled.
+NOTE: Last release models (nsa_last, sa_last) are disabled as they represent a backward-looking 
+ideal state rather than point-in-time actionable predictions.
 """
 
 from pathlib import Path
@@ -30,15 +32,21 @@ from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE
 # =============================================================================
 
 VALID_TARGET_TYPES = ('nsa', 'sa')
+"""Tuple of valid target types. 'nsa' for Non-Seasonally Adjusted, 'sa' for Seasonally Adjusted."""
+
 VALID_RELEASE_TYPES = ('first', 'last')
+"""Tuple of valid release types. 'first' is the initial release, 'last' is the final revised release."""
+
 VALID_TARGET_SOURCES = ('first_release', 'revised')
+"""Tuple of valid target sources. 'first_release' uses the initially reported number. 'revised' uses the revised number reported in the subsequent month."""
 
 # FRED series names for revised target construction (raw snapshot levels)
 REVISED_TARGET_SERIES = {'nsa': 'total_nsa', 'sa': 'total'}
+"""Dictionary mapping target types to their corresponding raw FRED series names used for target construction."""
 
 # Target combinations - FIRST RELEASE ONLY
 # Only training nsa_first and sa_first models.
-# Last release models are disabled and commented out.
+# Last release models are disabled and commented out because they represent hindsight data.
 ALL_TARGET_CONFIGS = [
     ('nsa', 'first'),
     ('sa', 'first'),
@@ -46,6 +54,7 @@ ALL_TARGET_CONFIGS = [
     # ('nsa', 'last'),  # Disabled - last release not supported
     # ('sa', 'last'),   # Disabled - last release not supported
 ]
+"""List of valid target combinations to be trained. Currently restricted to first releases only."""
 
 
 # =============================================================================
@@ -53,13 +62,23 @@ ALL_TARGET_CONFIGS = [
 # =============================================================================
 
 MASTER_SNAPSHOTS_DIR = DATA_PATH / "Exogenous_data" / "master_snapshots" / "decades"
+"""Directory containing the final merged point-in-time snapshots of all data sources."""
+
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
+"""Directory containing raw FRED data snapshots."""
+
 FRED_PREPARED_DIR = DATA_PATH / "fred_data_prepared" / "decades"  # Preprocessed data
+"""Directory containing preprocessed and transformed FRED data snapshots."""
+
 NFP_TARGET_DIR = DATA_PATH / "NFP_target"
+"""Directory containing the target parquet files for both first and revised NFP prints."""
+
 MODEL_SAVE_DIR = OUTPUT_DIR / "models" / "lightgbm_nfp"
+"""Directory where the final trained LightGBM models are saved."""
 
 # Use prepared data (SymLog transformed, scaled) or raw data
 USE_PREPARED_FRED_DATA = True
+"""Flag determining whether to use the preprocessed FRED data (True) or raw data (False)."""
 
 
 def get_target_path(target_type: str, release_type: str = 'first') -> Path:
@@ -227,8 +246,9 @@ N_CV_SPLITS = 5
 NUM_BOOST_ROUND = 1000
 EARLY_STOPPING_ROUNDS = 50
 
-# Training weights for extreme events
-PANIC_REGIME_WEIGHT = 5.0  # 5x weight for VIX_panic_regime or SP500_crash_month
+# Exponential Decay Sample Weighting (Optuna bounds)
+HALF_LIFE_MIN_MONTHS = 12
+HALF_LIFE_MAX_MONTHS = 120
 
 # Optuna hyperparameter tuning
 N_OPTUNA_TRIALS = 25        # Number of Optuna trials per tuning run

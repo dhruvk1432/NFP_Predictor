@@ -1,8 +1,10 @@
 """
 Tests for Data Loader Module
 
-Tests for data loading utilities including path generation,
-snapshot loading, and target data loading.
+This module contains comprehensive tests for the NFP Predictor's data loading,
+target generation, and snapshot pivoting functionalities. It ensures that data 
+is correctly ingested, strictly adheres to anti-lookahead point-in-time constraints, 
+and supports the robust calculation of MoM/YoY targets based on 'revised' vs 'first_release' logic.
 """
 
 import pytest

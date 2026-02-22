@@ -175,14 +175,18 @@ def filter_unwanted_series(combined_df: pd.DataFrame) -> pd.DataFrame:
 
 def merge_employment_series(combined_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge full-time + part-time employment as continuation of the legacy
-    'I am employed (last asked 9-2009)' series, then rename to 'I am employed'.
+    Merge full-time + part-time employment to seamlessly extend the legacy
+    'I am employed (last asked 9-2009)' series, solving collinearity issues.
 
-    For each demographic group:
-    1. Rename legacy 'I am employed (last asked 9-2009)' → 'I am employed'
-    2. For dates after the legacy data ends, append rows with
-       value = full-time + part-time
-    3. Drop the part-time series entirely (avoid collinearity with full-time)
+    Historical context:
+    Prior to 9-2009, Prosper asked a binary "I am employed" question. After 9-2009, 
+    they split this into "full-time" and "part-time". If we feed both FT and PT to the 
+    model, they introduce multicollinearity. 
+
+    This function pieces together a single continuous employment feature for the model:
+    1. Rename legacy 'I am employed (last asked 9-2009)' -> 'I am employed'.
+    2. For dates after the legacy data ends, append rows with value = full-time + part-time.
+    3. Drop the part-time series entirely.
     """
     groups = ['US 18+', '18-34', 'Males', 'Females']
     extension_rows = []
@@ -253,18 +257,17 @@ def merge_employment_series(combined_df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers: int = 4):
     """
-    Fetch Prosper survey data and create monthly snapshots.
+    Fetch Prosper survey data from the Unifier API and generate point-in-time snapshots.
 
-    Each snapshot (YYYY-MM.parquet) contains ALL prosper data that was available
-    by that month - i.e., all data with release_date < snapshot_date.
-
-    Output format matches load_unifier_data.py:
-    - date: observation date (first of month for the survey period)
-    - release_date: when the data was released
-    - value: the survey value
-    - series_name: shortened question text
-    - series_code: unique identifier ({symbol}_ans{answer_id})
-    - snapshot_date: the snapshot cutoff date
+    Prosper provides high-signal consumer sentiment datasets. This function:
+    1. Queries the Unifier API for pre-selected predictive questions (e.g. layoff expectations).
+    2. Cleans the data by dropping collinear or retired series.
+    3. Iterates chronologically through every historical NFP release date.
+    4. For each NFP date, filters the survey data using a strict `<` inequality against the 
+       `release_date` to guarantee the model cannot see survey results published after the NFP.
+    
+    Output format aligns perfectly with `load_unifier_data.py` to ensure seamless ingestion 
+    into the master snapshot builder.
     """
     # Setup credentials
     unifier.user = UNIFIER_USER

@@ -151,19 +151,31 @@ def get_effective_release_and_value(row, snap_date, median_lag_days, nfp_offset_
 
 def get_effective_release_and_value_vectorized(df, snap_date, median_lag_days, nfp_offset_days=None):
     """
-    Vectorized version of get_effective_release_and_value for batch processing.
+    Vectorized logic to strictly determine what data was known on `snap_date`.
 
-    This is ~100x faster than using iterrows() with the single-row version.
+    This function solves a massive data quality issue in the Unifier API: 
+    When an indicator is missing its `first_release_date`, Unifier incorrectly fills the 
+    `last_revision_date` with the `timestamp` (the exact start of the observation month).
+    If we used this date, the model would see data before it was actually published 
+    (lookahead bias).
+
+    Logic branch:
+    1. If `first_release_date` is missing: NEVER trust `last_revision_date`. Instead, backfill 
+       the release date using the historical `median_lag_days` for this specific series.
+    2. If `first_release_date` exists:
+        a. If a revision happened *before* `snap_date`, use the revised value.
+        b. Else, use the original first release value.
+    
+    Finally, drops any row where the calculated `release_date >= snap_date`.
 
     Args:
-        df: DataFrame with columns: first_release_date, last_revision_date,
-            first_release_value, latest_revised_value, timestamp, date
-        snap_date: Snapshot date (pd.Timestamp)
-        median_lag_days: Median lag in days for backfilling
-        nfp_offset_days: Optional NFP offset for adjustment (currently unused in vectorized version)
+        df: DataFrame with timestamps, publication dates, and values.
+        snap_date: The point-in-time cutoff date.
+        median_lag_days: The empirical historical lag for this specific indicator.
+        nfp_offset_days: Unused in vectorized currently.
 
     Returns:
-        DataFrame with columns: date, release_date, value (only rows with release_date < snap_date)
+        DataFrame strictly filtered to data known before snapshot.
     """
     result = df.copy()
 
@@ -214,15 +226,18 @@ def get_effective_release_and_value_vectorized(df, snap_date, median_lag_days, n
 
 def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
     """
-    Fetch Unifier data and create monthly snapshots aligned with NFP release dates.
+    Master orchestrator for producing point-in-time accurate snapshots of Unifier data.
 
-    Each snapshot (YYYY-MM.parquet) contains exogenous data that was available
-    when NFP for month YYYY-MM was released.
+    Fetches LSEG US Economics point-in-time (PIT) data, including leading indicators 
+    like ISM Manufacturing, Housing Starts, and Consumer Confidence.
 
-    Key improvements:
-    - Never uses last_revision_date when first_release_date is missing (lookahead bias)
-    - Backfills missing release dates using median lag from real data
-    - Uses most recent value available by snapshot time
+    Critical protections against Lookahead Bias:
+    1. Rejects Unifier's default revision dates when the initial release date is missing
+       (which would otherwise leak data into the past).
+    2. Computes the empirical median publication lag for every single series to intelligently 
+       backfill corrupted release dates.
+    3. Strictly filters out data where `release_date >= snapshot_date` using the 
+       `get_effective_release_and_value_vectorized` function.
     """
     # Setup credentials
     unifier.user = UNIFIER_USER

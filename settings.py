@@ -1,3 +1,11 @@
+"""
+Settings Module
+
+This module centralizes environment variables and global configuration paths 
+across the NFP Predictor project. It loads configurations from the `.env` file 
+and manages absolute path resolutions to ensure scripts can be executed from 
+any working directory safely.
+"""
 from __future__ import annotations
 import os
 import sys

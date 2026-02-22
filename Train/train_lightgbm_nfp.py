@@ -69,12 +69,34 @@ def _process_single_month_task(
     selected_features: Optional[List[str]] = None
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """
-    Helper function to process a single month in parallel.
+    Helper function to process the feature engineering for a single month in parallel.
     Disables caching to avoid memory bloat in worker processes.
 
     Accepts pre-computed lag lookups (from batch_lagged_target_features) instead
     of full target DataFrames to avoid redundant per-worker filtering/sorting
     and reduce joblib serialization overhead.
+
+    This function sequentially:
+    1. Extracts calendar metrics (survey weeks, seasonality).
+    2. Collects historical NFP target lags (1m, 2m, 3m, 6m, 12m).
+    3. Pivots the massive long-format Master Snapshot into wide format for just this date cutoff.
+    4. Pivots the raw FRED Snapshot to gather base employment features.
+    5. Computes short-term data revision metrics by comparing the current snapshot with 
+       the snapshot published one month prior.
+
+    Args:
+        target_month (pd.Timestamp): The month being predicted.
+        target_value (float): The actual target value (used simply for tracking).
+        cutoff_date (pd.Timestamp): The strict barrier preventing future data leakage (usually release date).
+        snapshot_date (pd.Timestamp): The date of the data snapshot being used.
+        target_type (str): 'nsa' or 'sa'.
+        release_type (str): 'first' or 'last'.
+        nsa_lags_lookup (Dict): Pre-computed dictionary of NSA target lags.
+        sa_lags_lookup (Dict): Pre-computed dictionary of SA target lags.
+        selected_features (Optional[List[str]]): Specific features to filter, reducing memory usage.
+
+    Returns:
+        Tuple[Optional[Dict[str, float]], Optional[float]]: A dictionary of extracted features, and the target value.
     """
     # Initialize dictionary for features
     features = {'ds': target_month}
@@ -402,14 +424,19 @@ def run_expanding_window_backtest(
     tune: bool = True,
 ) -> pd.DataFrame:
     """
-    Run proper expanding window backtest with NO TIME-TRAVEL VIOLATIONS.
+    Run proper expanding window backtest with strictly NO TIME-TRAVEL VIOLATIONS.
+
+    This is the core loop evaluating the model's true real-world point-in-time performance.
+    Instead of standard K-Fold CV (which randomly shuffles data and predicts the past using the future),
+    this loop marches chronologically forward one month at a time. It uses strictly the available data 
+    as of that specific historical month to predict it, precisely mirroring a real-time trading environment.
 
     Critical Design Principles:
-    1. LightGBM handles NaN natively - no imputation needed
-    2. Model is FULLY retrained from scratch at each step
-    3. No information from future time periods leaks into predictions
-    4. Features are pre-selected per target_type (NSA or SA)
-    5. Hyperparameters tuned via inner CV every TUNE_EVERY_N_MONTHS months
+    1. LightGBM handles NaN natively - no imputation needed preventing forward-filling bias.
+    2. Model is FULLY retrained from scratch at each step.
+    3. No information from future time periods leaks into predictions.
+    4. Features are pre-selected per target_type (NSA or SA).
+    5. Hyperparameters tuned via inner CV every `TUNE_EVERY_N_MONTHS` months.
 
     Args:
         target_df: Target DataFrame with 'ds' and 'y_mom' columns
@@ -520,22 +547,38 @@ def run_expanding_window_backtest(
 
         feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
-        # Compute sample weights for panic regime upweighting
-        weights = calculate_sample_weights(X_train_valid)
+        # Compute default sample weights for initial/static use
+        # (Optuna will dynamically test different half-lifes if tuning)
+        # Using 60.0 months (5 years) as a reasonable default baseline if not tuning
+        default_half_life = 60.0
+        weights = calculate_sample_weights(X_train_valid, target_month, default_half_life)
 
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
+        # X_train_selected contains NO 'ds' column to avoid issues in lgb.train
+        X_train_valid_with_ds = X_train_valid.copy() # keep one with ds
 
         # Tune hyperparameters periodically (same cadence as feature cleaning)
         if tune and (tuned_params is None or i % TUNE_EVERY_N_MONTHS == 0):
             logger.info(f"[{i+1}/{len(backtest_months)}] Tuning hyperparameters on "
                         f"{len(X_train_selected)} samples, {len(feature_cols)} features...")
+            
+            # Note: We pass the valid DataFrame WITH 'ds' to hyperparameter tuning
+            # because the inner CV needs to recompute weights per inner-fold using 'ds'
+            X_train_for_tuning = X_train_valid_with_ds[['ds'] + feature_cols]
+            
             tuned_params = tune_hyperparameters(
-                X_train_selected, y_train_valid, weights,
+                X_train_for_tuning, y_train_valid, target_month=target_month,
                 use_huber_loss=use_huber_loss,
             )
 
         params = tuned_params if tune and tuned_params is not None else static_params
+        
+        # Determine the final half_life_months to use for this expanding window iteration model
+        final_half_life = params.get('half_life_months', default_half_life)
+        
+        # Recompute final training weights for the main model fit using the chosen half_life
+        weights = calculate_sample_weights(X_train_valid_with_ds, target_month, final_half_life)
 
         # Train-validation split (data already sorted by date above)
         train_size = int(len(X_train_selected) * 0.85)
@@ -746,19 +789,31 @@ def train_and_evaluate(
     feature_cols = cleaned_feature_cols
 
     X_train = X_full_valid[['ds'] + [c for c in feature_cols if c in X_full_valid.columns]].copy()
-
     logger.info(f"Training final model with {len(feature_cols)} features")
 
     # Tune hyperparameters on all available data for the production model
     final_params = None
+    # Final target_month anchor for the production model is simply the most recent date available
+    # or equivalently, a future date where we plan to predict. But to be safe, we anchor it to 
+    # the max date in the data (most recent NFP print).
+    final_target_month = pd.to_datetime(X_train['ds'].max())
+
     if tune:
         logger.info("Tuning hyperparameters for final production model...")
         feature_only_cols = [c for c in feature_cols if c in X_train.columns and c != 'ds']
-        weights = calculate_sample_weights(X_train)
+        
+        # Pass the DF WITH 'ds' so inner tuning folds can manage their own point-in-time weights
         final_params = tune_hyperparameters(
-            X_train[feature_only_cols], y_full_valid, weights,
+            X_train[['ds'] + feature_only_cols], y_full_valid, target_month=final_target_month,
             use_huber_loss=use_huber_loss,
         )
+        
+        final_half_life = final_params.get('half_life_months', 60.0)
+        # Reattach the targets and half_life so train_lightgbm_model can recompute internally
+        final_params['target_month'] = final_target_month
+        final_params['half_life_months'] = final_half_life
+    else:
+        final_params = {'target_month': final_target_month, 'half_life_months': 60.0}
 
     # Train final model
     model, importance, residuals = train_lightgbm_model(

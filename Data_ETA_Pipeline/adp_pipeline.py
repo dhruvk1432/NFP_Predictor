@@ -46,15 +46,23 @@ ADP_API_URL = "https://endpoints.investing.com/pd-instruments/v1/calendars/econo
 
 def fetch_adp_from_api() -> pd.DataFrame:
     """
-    Fetch ADP employment data from investing.com REST API.
+    Fetch raw ADP national employment change data from the investing.com REST API.
 
-    The API returns historical ADP occurrences with actual, forecast, and previous values.
-    Only actual values are kept (forecast excluded).
-    Values are already in thousands (K), matching NFP target units.
+    This function pulls historical 'event' occurrences, capturing what the reported 
+    ADP employment value was at the exact moment of its release. This is critical for 
+    point-in-time modeling to avoid using cleanly revised current-day data.
+
+    Data details:
+    - Only 'actual' reported values are retained (forecasts and 'previous' estimates are dropped).
+    - Extracted values are intrinsically measured in thousands (K), precisely natively aligning 
+      with the scaling of the NFP target.
+    - Dates are parsed to trace both the period the employment covers (`date`) and the specific
+      timestamp the public became aware of it (`release_date`).
 
     Returns:
-        DataFrame with columns: date, series_name, value, release_date, series_type
-        Empty DataFrame on failure.
+        pd.DataFrame: Structured DataFrame containing point-in-time releases. Columns include 
+                      ['date', 'series_name', 'value', 'release_date', 'series_type'].
+                      Returns an empty DataFrame upon network or parsing failure.
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
@@ -202,14 +210,23 @@ def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:
 
 def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE):
     """
-    Create ADP snapshots aligned with NFP release dates.
+    Generate point-in-time master snapshots of the ADP data, precisely synchronized 
+    with the release schedule of the Non-Farm Payrolls (NFP) report.
 
-    For each NFP release:
-    - snapshot_date = NFP release date
-    - Include all ADP data where release_date < NFP release date (strict < to prevent leakage)
-    - Keep release_date in output for traceability
+    This is the core anti-leakage defense mechanism for the ADP pipeline:
+    For every monthly NFP release, it generates an isolated snapshot file containing 
+    ONLY the ADP data that was publicly known *immediately prior* to the NFP report.
 
-    Saves to: ADP_snapshots/decades/{decade}s/{year}/{YYYY-MM}.parquet
+    Operational Logic:
+    1. Iterates chronologically through every historical NFP release date.
+    2. Filters the raw ADP dataset ensuring `release_date < NFP_release_date` (strict inequality ensures no same-day leakage).
+    3. Retains only the most recent (freshest) reported value for any given reference month.
+    4. Appends standard mathematical transformations (symmetric log scaling, momentum percentages).
+    5. Saves the isolated chronological snapshot securely into the `decades/` subfolder structure.
+
+    Args:
+         start_date (str): Lower boundary for NFP events to process.
+         end_date (str): Upper boundary for NFP events to process.
     """
     if not CLEAN_ADP_PARQUET.exists():
         raise FileNotFoundError(f"ADP data not found: {CLEAN_ADP_PARQUET}")

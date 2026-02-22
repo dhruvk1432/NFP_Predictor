@@ -18,11 +18,8 @@ from Train.config import (
     get_model_id,
     parse_model_id,
     DEFAULT_LGBM_PARAMS,
-    PROTECTED_BINARY_FLAGS,
-    LINEAR_BASELINE_PREDICTORS,
-    KEY_EMPLOYMENT_SERIES,
-    ALL_KEY_EMPLOYMENT_SERIES,
-    ALL_LAGS,
+    HALF_LIFE_MIN_MONTHS,
+    HALF_LIFE_MAX_MONTHS
 )
 
 
@@ -52,15 +49,15 @@ class TestGetTargetPath:
     """Tests for target path generation."""
 
     def test_nsa_first_path(self):
-        """Test NSA first release path generation."""
+        """Test NSA first release path."""
         path = get_target_path('nsa', 'first')
-        assert 'y_nsa_first_release.parquet' in str(path)
+        assert 'total_nsa_first_release.parquet' in str(path)
         assert 'NFP_target' in str(path)
 
     def test_sa_last_path(self):
-        """Test SA last release path generation."""
+        """Test SA last release path."""
         path = get_target_path('sa', 'last')
-        assert 'y_sa_last_release.parquet' in str(path)
+        assert 'total_sa_last_release.parquet' in str(path)
 
     def test_case_insensitivity(self):
         """Test that target and release types are case insensitive."""
@@ -144,67 +141,18 @@ class TestLightGBMParams:
         assert 2 <= num_leaves <= 256
 
 
-class TestProtectedFeatures:
-    """Tests for protected binary flags configuration."""
-
-    def test_protected_flags_defined(self):
-        """Test that protected binary flags are defined."""
-        assert len(PROTECTED_BINARY_FLAGS) > 0
-
-    def test_vix_panic_in_protected(self):
-        """Test that VIX panic regime is protected."""
-        assert 'VIX_panic_regime' in PROTECTED_BINARY_FLAGS
-
-    def test_sp500_crash_in_protected(self):
-        """Test that SP500 crash indicators are protected."""
-        assert 'SP500_crash_month' in PROTECTED_BINARY_FLAGS
-
-
-class TestLinearBaselinePredictors:
-    """Tests for linear baseline predictor configuration."""
-
-    def test_predictors_defined(self):
-        """Test that linear baseline predictors are defined."""
-        assert len(LINEAR_BASELINE_PREDICTORS) > 0
-
-    def test_contains_claims_data(self):
-        """Test that claims data is included."""
-        claims_predictors = [p for p in LINEAR_BASELINE_PREDICTORS if 'CCSA' in p]
-        assert len(claims_predictors) > 0
-
-
-class TestEmploymentSeries:
-    """Tests for employment series configuration."""
-
-    def test_key_series_categories(self):
-        """Test that key employment series categories are defined."""
-        assert 'aggregates' in KEY_EMPLOYMENT_SERIES
-        assert 'goods_services' in KEY_EMPLOYMENT_SERIES
-        assert 'goods_industries' in KEY_EMPLOYMENT_SERIES
-        assert 'service_industries' in KEY_EMPLOYMENT_SERIES
-
-    def test_all_series_flattened(self):
-        """Test that ALL_KEY_EMPLOYMENT_SERIES contains all series."""
-        assert len(ALL_KEY_EMPLOYMENT_SERIES) > 20  # Should have many series
-
-    def test_series_naming_convention(self):
-        """Test that series follow naming convention."""
-        for series in ALL_KEY_EMPLOYMENT_SERIES:
-            # All should end with _nsa (NSA series)
-            assert series.endswith('_nsa'), f"Series {series} should end with _nsa"
-
-
-class TestLagConfiguration:
-    """Tests for lag configuration."""
-
-    def test_lags_defined(self):
-        """Test that lag periods are defined."""
-        assert len(ALL_LAGS) > 0
-
-    def test_lag_values(self):
-        """Test that expected lag values are present."""
-        assert 1 in ALL_LAGS  # Short-term
-        assert 12 in ALL_LAGS  # Annual
+class TestHyperparameters:
+    """Tests for hyperparameter bounds and defaults."""
+    
+    def test_halflife_bounds_exist(self):
+        """Test that exponential decay bounds exist."""
+        assert HALF_LIFE_MIN_MONTHS > 0
+        assert HALF_LIFE_MAX_MONTHS > HALF_LIFE_MIN_MONTHS
+        
+    def test_halflife_values(self):
+        """Test that the default half-life bounds are reasonable."""
+        assert HALF_LIFE_MIN_MONTHS >= 6  # At least 6 months
+        assert HALF_LIFE_MAX_MONTHS <= 240  # Max 20 years
 
 
 if __name__ == "__main__":

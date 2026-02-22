@@ -1,7 +1,10 @@
 """
-Pytest Configuration and Fixtures
+Pytest Configuration and Fixtures Module
 
-Shared fixtures for NFP Predictor tests.
+Provides centralized, reusable data fixtures across the NFP Predictor test suite.
+This includes synthesized chronological DataFrames, mock target constructs, 
+standardized snapshot dates, and simulated structural regimes to rigorously 
+validate model behavior across diverse states and historical edges.
 """
 
 import pytest
@@ -165,29 +168,7 @@ def sample_exogenous_df():
     return pd.DataFrame(data)
 
 
-@pytest.fixture
-def sample_panic_features():
-    """Sample features with panic regime indicators."""
-    return pd.DataFrame({
-        'VIX_panic_regime': [0, 1, 0, 1, 0],
-        'SP500_crash_month': [0, 0, 1, 0, 0],
-        'VIX_high_regime': [0, 1, 1, 0, 0],
-        'SP500_bear_market': [0, 0, 0, 0, 0],
-        'feature1': [1, 2, 3, 4, 5],
-        'feature2': [10, 20, 30, 40, 50],
-    })
 
-
-@pytest.fixture
-def sample_normal_features():
-    """Sample features with no panic indicators."""
-    return pd.DataFrame({
-        'VIX_panic_regime': [0, 0, 0, 0, 0],
-        'SP500_crash_month': [0, 0, 0, 0, 0],
-        'VIX_high_regime': [0, 0, 0, 0, 0],
-        'feature1': [1, 2, 3, 4, 5],
-        'feature2': [10, 20, 30, 40, 50],
-    })
 
 
 # =============================================================================

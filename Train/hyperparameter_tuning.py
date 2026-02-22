@@ -25,6 +25,8 @@ from Train.config import (
     N_OPTUNA_TRIALS,
     OPTUNA_TIMEOUT,
     NUM_BOOST_ROUND,
+    HALF_LIFE_MIN_MONTHS,
+    HALF_LIFE_MAX_MONTHS,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -51,7 +53,7 @@ except ImportError:
 def tune_hyperparameters(
     X: pd.DataFrame,
     y: pd.Series,
-    weights: np.ndarray,
+    target_month: pd.Timestamp,
     n_trials: int = N_OPTUNA_TRIALS,
     n_inner_splits: int = 5,
     use_huber_loss: bool = True,
@@ -60,15 +62,18 @@ def tune_hyperparameters(
     early_stopping_rounds: int = 50,
 ) -> Dict:
     """
-    Tune LightGBM hyperparameters using Optuna with inner TimeSeriesSplit CV.
+    Tune LightGBM hyperparameters using Optuna to find the optimal model configuration 
+    for the current expanding window step.
 
-    This is leakage-safe: it only uses the X/y data passed in (which should
-    be strictly the training fold from the outer expanding window).
+    This function utilizes an inner TimeSeriesSplit cross-validation strategy, which is 
+    strictly forward-looking. This guarantees that hyperparameter search never leaks 
+    future target information into the training phase (a common point of failure in 
+    time-series ML models). 
 
     Args:
-        X: Training features (no 'ds' column)
+        X: Training features (must include 'ds' column for weight calculation)
         y: Training targets
-        weights: Sample weights (from calculate_sample_weights)
+        target_month: The target month being predicted in the outer loop
         n_trials: Number of Optuna trials
         n_inner_splits: Number of inner TimeSeriesSplit folds
         use_huber_loss: Whether to use Huber objective
@@ -95,11 +100,20 @@ def tune_hyperparameters(
     valid = ~y.isna()
     X = X[valid].copy()
     y = y[valid].copy()
-    weights = weights[valid.values]
 
     inner_cv = TimeSeriesSplit(n_splits=n_inner_splits)
 
     def objective(trial: optuna.Trial) -> float:
+        """
+        The Optuna objective function, defining the hyperparameter search space and 
+        evaluation metrics for each trial round.
+
+        Args:
+            trial (optuna.Trial): The current Optuna trial object suggesting params.
+
+        Returns:
+            float: The mean Absolute Error across all inner CV folds.
+        """
         params = {
             'objective': 'huber' if use_huber_loss else 'regression',
             'metric': 'mae',
@@ -121,15 +135,32 @@ def tune_hyperparameters(
         if use_huber_loss:
             params['alpha'] = trial.suggest_float('huber_delta', 25.0, 500.0)
 
+        # Dynamic sample weighting half-life
+        half_life_months = trial.suggest_float('half_life_months', HALF_LIFE_MIN_MONTHS, HALF_LIFE_MAX_MONTHS)
+
+        # Import locally to avoid circular import since model.py imports config.py
+        from Train.model import calculate_sample_weights
+
         fold_maes = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(inner_cv.split(X)):
             X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            w_tr = weights[train_idx]
+            
+            # Recalculate weights for this specific fold using the fold's own target month
+            # (which is effectively the maximum date available in the fold to simulate true point-in-time)
+            # or we could use the outer target_month. But using the true available max date prevents 
+            # the weights from overly decaying for early folds.
+            fold_target_month = pd.to_datetime(X.iloc[val_idx]['ds'].max())
+            
+            w_tr = calculate_sample_weights(X_tr, fold_target_month, half_life_months)
 
-            train_data = lgb.Dataset(X_tr, label=y_tr, weight=w_tr)
-            val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+            # Drop 'ds' for LightGBM
+            X_tr_feats = X_tr.drop(columns=['ds'])
+            X_val_feats = X_val.drop(columns=['ds'])
+
+            train_data = lgb.Dataset(X_tr_feats, label=y_tr, weight=w_tr)
+            val_data = lgb.Dataset(X_val_feats, label=y_val, reference=train_data)
 
             pruning_callback = LightGBMPruningCallback(trial, 'l1', valid_name='valid')
 
@@ -148,7 +179,7 @@ def tune_hyperparameters(
                 callbacks=callbacks,
             )
 
-            preds = model.predict(X_val)
+            preds = model.predict(X_val_feats)
             fold_mae = np.mean(np.abs(y_val.values - preds))
             fold_maes.append(fold_mae)
 
@@ -189,6 +220,11 @@ def tune_hyperparameters(
     # Rename huber_delta -> alpha for LightGBM
     if 'huber_delta' in best_params:
         best_params['alpha'] = best_params.pop('huber_delta')
+        
+    # Extract structural best_params for weights so they can be passed to model training
+    if 'half_life_months' in best_params:
+        # It's kept in best_params so model.py can extract it later via params_override
+        pass
 
     logger.info(f"Optuna tuning complete in {_tune_str}: {len(study.trials)} trials, "
                 f"best MAE={best.value:.2f}")
@@ -197,6 +233,7 @@ def tune_hyperparameters(
                 f"depth={best_params.get('max_depth', '?')}, "
                 f"min_leaf={best_params.get('min_data_in_leaf', '?')}, "
                 f"L1={best_params.get('lambda_l1', '?'):.2e}, "
-                f"L2={best_params.get('lambda_l2', '?'):.2e}")
+                f"L2={best_params.get('lambda_l2', '?'):.2e}, "
+                f"half_life={best_params.get('half_life_months', '?'):.1f}m")
 
     return best_params

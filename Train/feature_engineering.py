@@ -1,8 +1,13 @@
 """
 Feature Engineering for LightGBM NFP Model
 
-Calendar feature functions for the NFP prediction pipeline.
-Extracted from train_lightgbm_nfp.py for maintainability.
+This module provides specialized calendar and timing feature extraction functions 
+crucial for the Non-Farm Payroll prediction pipeline. Since NFP data exhibits 
+strong seasonality and depends heavily on specific calendrical quirks (like 
+the varying number of weeks between survey periods), these functions capture those nuances.
+
+These features are generally used to augment the macroeconomic feature set with 
+structural time-based variables.
 """
 
 import pandas as pd
@@ -26,10 +31,18 @@ logger = setup_logger(__file__, TEMP_DIR)
 
 def get_survey_week_date(year: int, month: int) -> datetime:
     """
-    Get the date of the week containing the 12th of the month.
-    NFP survey covers the pay period including the 12th.
+    Determine the specific date for the BLS employment survey week for a given month.
+    
+    The BLS defines the reference week for the establishment survey (Non-Farm Payrolls) 
+    as the pay period that includes the 12th of the month. This function calculates the 
+    Sunday that begins that specific week.
 
-    Returns the Sunday of that week (start of survey week).
+    Args:
+        year (int): The year of the survey.
+        month (int): The month of the survey.
+
+    Returns:
+        datetime: The exact date of the Sunday representing the start of the survey week.
     """
     # Find the 12th of the month
     day_12 = datetime(year, month, 12)
@@ -46,15 +59,18 @@ def get_survey_week_date(year: int, month: int) -> datetime:
 
 def calculate_weeks_between_surveys(target_month: pd.Timestamp) -> int:
     """
-    Calculate weeks between current and previous month's survey weeks.
+    Calculate the elapsed weeks between the current month's survey and the previous month's.
 
-    This captures the "4 vs 5 weeks" logic that affects NFP seasonality.
+    Due to the way the calendar falls, there are either 4 or 5 weeks between the
+    12th-of-the-month survey periods. This is a critical structural feature for predicting
+    the NSA (Non-Seasonally Adjusted) NFP variations. A 5-week interval usually allows 
+    for more accumulated job growth/loss between reports.
 
     Args:
-        target_month: The month being predicted (format: YYYY-MM-01)
+        target_month (pd.Timestamp): The month being predicted (expected format: YYYY-MM-01).
 
     Returns:
-        Number of weeks (typically 4 or 5)
+        int: Total number of full weeks (typically exactly 4 or 5) between the two surveys.
     """
     # Get survey weeks for current and previous month
     current_survey = get_survey_week_date(target_month.year, target_month.month)
@@ -72,20 +88,22 @@ def calculate_weeks_between_surveys(target_month: pd.Timestamp) -> int:
 
 def add_calendar_features(df: pd.DataFrame, target_month: pd.Timestamp) -> pd.DataFrame:
     """
-    Add comprehensive calendar-based features to a DataFrame.
+    Enrich an existing features DataFrame with comprehensive calendar-based metrics.
 
-    Includes:
-    - Cyclical month encoding (sin/cos) - preserves December/January proximity
-    - Quarter cyclical encoding
-    - Survey interval (4 vs 5 weeks)
-    - Seasonal and timing indicators
+    This function appends several time-structural features beneficial for tree-based models:
+    - Target month and quarter cyclical encoding (using sine and cosine to preserve proximity, 
+      so December is mathematically adjacent to January).
+    - Survey intervals representing whether a month had a 4 or 5 week gap since the last print.
+    - Key seasonality indicators for structural BLS adjustments (e.g. January benchmark 
+      revisions, mid-year July adjustments).
+    - Cyclical business and hiring seasons (holidays, summer).
 
     Args:
-        df: Input DataFrame to add features to
-        target_month: Target month being predicted
+        df (pd.DataFrame): The input DataFrame containing baseline features.
+        target_month (pd.Timestamp): The target month being predicted.
 
     Returns:
-        DataFrame with calendar features added as columns
+        pd.DataFrame: A copy of the DataFrame with added calendar feature columns.
     """
     df = df.copy()
 
@@ -130,13 +148,16 @@ def add_calendar_features(df: pd.DataFrame, target_month: pd.Timestamp) -> pd.Da
 
 def get_calendar_features_dict(target_month: pd.Timestamp) -> Dict[str, float]:
     """
-    Get calendar features as a dictionary (for merging into feature dict).
+    Generate calendar features as a flat dictionary, useful for merging into a single sample's feature dict.
+
+    This performs the same extraction as `add_calendar_features` but outputs a simple key-value structure
+    rather than operating on a full Pandas DataFrame.
 
     Args:
-        target_month: Target month being predicted
+        target_month (pd.Timestamp): The target month being predicted.
 
     Returns:
-        Dictionary of calendar features
+        Dict[str, float]: A dictionary containing all computed calendar features for the single month.
     """
     features = {}
     month = target_month.month

@@ -125,7 +125,19 @@ def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
-    """Build path to FRED employment snapshot file."""
+    """
+    Constructs the exact active file path to a processed FRED employment snapshot 
+    for the specified month. It correctly routes to decades-based subfolders.
+
+    Depending on `USE_PREPARED_FRED_DATA` from config, this will either point to 
+    the raw snapshot or the preprocessed transformed data.
+
+    Args:
+        snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
+
+    Returns:
+        Path: The fully resolved filesystem path.
+    """
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime('%Y-%m')
@@ -136,7 +148,17 @@ def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
 
 
 def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
-    """Build path to raw FRED employment snapshot (levels, not prepared features)."""
+    """
+    Constructs the file path to a completely raw FRED employment snapshot (base levels only), 
+    bypassing the preprocessing check. This is used explicitly for calculating true 
+    revised target levels across snapshots.
+
+    Args:
+        snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
+
+    Returns:
+        Path: The fully resolved filesystem path to the raw data.
+    """
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime('%Y-%m')
@@ -144,7 +166,17 @@ def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
 
 
 def get_master_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
-    """Build path to master snapshot file."""
+    """
+    Constructs the file path to the fully merged master exogenous snapshot. This file 
+    combines all varied data sources (NOAA, Unifier, ADP, Prosper, etc.) available at 
+    a specific point in time.
+
+    Args:
+        snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
+
+    Returns:
+        Path: The fully resolved filesystem path to the master snapshot.
+    """
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime('%Y-%m')

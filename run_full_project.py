@@ -61,6 +61,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from settings import DATA_PATH, OUTPUT_DIR
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -68,16 +70,16 @@ from typing import List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 DATA_DIRECTORIES = [
-    PROJECT_ROOT / "data" / "fred_data",
-    PROJECT_ROOT / "data" / "fred_data_prepared",
-    PROJECT_ROOT / "data" / "Exogenous_data",
-    PROJECT_ROOT / "data" / "NFP_target",
+    DATA_PATH / "fred_data",
+    DATA_PATH / "fred_data_prepared",
+    DATA_PATH / "Exogenous_data",
+    DATA_PATH / "NFP_target",
 ]
 
 OUTPUT_DIRECTORIES = [
-    PROJECT_ROOT / "_output" / "models",
-    PROJECT_ROOT / "_output" / "backtest_results",
-    PROJECT_ROOT / "_output" / "backtest_historical",
+    OUTPUT_DIR / "models",
+    OUTPUT_DIR / "backtest_results",
+    OUTPUT_DIR / "backtest_historical",
 ]
 
 # =============================================================================
@@ -333,10 +335,10 @@ def _print_summary(
         print(f"\n{Colors.FAIL}{Colors.BOLD}PIPELINE COMPLETED WITH {total_failed} FAILURE(S){Colors.ENDC}")
 
     print(f"\n{Colors.CYAN}Output Locations:{Colors.ENDC}")
-    print(f"  Models:      {PROJECT_ROOT}/_output/models/lightgbm_nfp/")
-    print(f"  Backtests:   {PROJECT_ROOT}/_output/backtest_results/")
-    print(f"  Master Data: {PROJECT_ROOT}/data/Exogenous_data/master_snapshots/")
-    print(f"  Targets:     {PROJECT_ROOT}/data/NFP_target/")
+    print(f"  Models:      {OUTPUT_DIR}/models/lightgbm_nfp/")
+    print(f"  Backtests:   {OUTPUT_DIR}/backtest_results/")
+    print(f"  Master Data: {DATA_PATH}/Exogenous_data/master_snapshots/")
+    print(f"  Targets:     {DATA_PATH}/NFP_target/")
     print()
 
 

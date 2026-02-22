@@ -1,7 +1,10 @@
 """
-Tests for Path Utilities
+Tests for Path Utilities Module
 
-Tests for snapshot path generation functions.
+This module ensures that internal file and directory linking logic throughout the
+project dynamically resolves to the correct locations. It verifies the decade-bucketing
+logic for FRED snapshots, validation of output formats (parquet), and correctness
+of the NFP target paths.
 """
 
 import pytest

@@ -1,3 +1,17 @@
+"""
+Master Snapshot Generation Pipeline
+===================================
+This module constructs the final, unified "Master Snapshots" used by the Machine Learning
+model. It acts as the grand aggregator, combining independently generated exogenous datasets
+(FRED, Unifier, ADP, NOAA, Prosper) into a single wide-format parquet file per prediction month.
+
+Critical Architecture:
+- Point-in-time accuracy is strictly maintained because the upstream source directories
+  have already filtered their data relative to the NFP release calendar.
+- This script merely blindly concatenates rows from the individual source snapshots 
+  for a given month-end `obs_month`, creating a unified point-in-time ledger.
+"""
+
 import pandas as pd
 import sys
 from pathlib import Path
@@ -86,8 +100,17 @@ def _process_single_snapshot(obs_month: pd.Timestamp, snap_date: pd.Timestamp) -
 
 def create_master_snapshots(n_workers: int = 1, skip_existing: bool = False):
     """
-    Generate master snapshots for all dates in range.
-    Pipeline: Load all sources -> Concatenate -> Save.
+    Iterate chronologically through all historical NFP release dates and merge all
+    available exogenous data sources into a single master snapshot for each month.
+    
+    This function discovers the specific NFP release date for a given month, finds 
+    the corresponding pre-filtered sub-snapshots from FRED, NOAA, ADP, etc., and 
+    concatenates them vertically into a unified dataframe representing all macroeconomic 
+    knowledge available immediately before the BLS publication.
+
+    Args:
+        n_workers (int): Number of parallel processes to use for parsing files.
+        skip_existing (bool): If True, skips months that already have a master parquet file.
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)

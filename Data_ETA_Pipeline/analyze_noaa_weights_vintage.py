@@ -41,8 +41,20 @@ STATE_NAME_TO_CODE = {
 
 def download_state_employment_vintages(fred: Fred, end_date: str = END_DATE):
     """
-    Download ALL vintages for all state employment series.
-    Identical logic to create_noaa_weighted.py to ensure consistency.
+    Download ALL point-in-time publication records (vintages) for all 50 states' 
+    employment numbers from the FRED ALFRED database.
+
+    This essentially asks the database: "Give me every single historical data point 
+    you have for this state, and attach the exact timestamp that data point first 
+    became publicly visible."
+
+    Args:
+        fred (Fred): Authenticated FRED API client.
+        end_date (str): Upper boundary string for downloading.
+
+    Returns:
+        pd.DataFrame: A massive long-format DataFrame binding all states, representing 
+                      what the data looked like at any specific `realtime_start` release.
     """
     logger.info(f"Downloading state employment vintages as of {end_date}...")
     
@@ -143,10 +155,23 @@ def analyze_earliest_vintages(vintages_df: pd.DataFrame):
 
 def analyze_fallback_impact(vintages_df: pd.DataFrame, earliest_by_state: pd.DataFrame):
     """
-    Analyze how many snapshots would be affected by fallback logic.
+    Quantify how many historical forecasting months would be forced to use 
+    "look-ahead" fallback data due to missing point-in-time vintages.
     
-    Fallback logic in create_noaa_weighted.py:
-    - If snap_date < earliest vintage → use earliest vintage (LOOKAHEAD BIAS)
+    Fallback logic inside `create_noaa_weighted.py`:
+    - If `snapshot_date < earliest_available_vintage` -> use the earliest available 
+      vintage (which creates a LOOKAHEAD BIAS for that specific early snapshot).
+    
+    This function measures what percentage of our testing months are contaminated 
+    by this API limitation, giving us an estimate of how reliable the NOAA weights 
+    were in the 1990s vs the 2010s.
+
+    Args:
+        vintages_df (pd.DataFrame): Raw vintage dataset.
+        earliest_by_state (pd.DataFrame): The first available release dates per state.
+
+    Returns:
+        pd.DataFrame: Statistical summary of fallback impact per state.
     """
     logger.info("\n" + "="*70)
     logger.info("FALLBACK IMPACT ANALYSIS")

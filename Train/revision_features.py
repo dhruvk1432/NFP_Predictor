@@ -1,17 +1,18 @@
 """
 Cross-Snapshot Revision Features for LightGBM NFP Model
 
-Computes aggregate revision statistics by comparing what two consecutive
-snapshots say about the same historical period. Captures data revisions,
-late releases, and benchmark adjustments.
+Macroeconomic data is frequently revised months after initial publication.
+This module computes aggregate revision statistics by comparing what two consecutive
+snapshots say about the exactly identical historical period. This captures the magnitude 
+and direction of data revisions, late releases, and benchmark adjustments.
 
-For target month M:
-- Load snapshot M and snapshot M-1
-- Apply prev_month cutoff to both (same historical window)
-- Diff = revisions released between M-1 and M NFP dates
+For predicting target month M's NFP value:
+- We load the data snapshot published at the end of M, and the snapshot published at M-1.
+- We apply a strict cutoff (e.g. the NFP release date) to both to prevent looking into the future.
+- Diff = The revisions released to the public *between* M-1 and M.
 
-No look-ahead bias: both snapshots are pre-filtered at ETL time
-(release_date < snapshot_date), and pivot applies obs_date < cutoff.
+By design, this has NO look-ahead bias: both snapshots are pre-filtered at ETL time
+(release_date < snapshot_date), and the pivot strictly enforces obs_date < cutoff.
 """
 
 import pandas as pd
@@ -124,13 +125,17 @@ def get_revision_features_for_month(
     include_fred: bool = True,
 ) -> pd.DataFrame:
     """
-    Load two consecutive snapshots and compute revision features for
-    ONLY the pre-selected series.
+    Load two consecutive monthly data snapshots and compute the numerical differences
+    (revisions) for ONLY the pre-selected series to prevent memory bloat.
 
-    For target month M, compares snapshot M vs snapshot M-1 using
-    prev_month as the observation cutoff for both pivots. Pivoted
-    DataFrames are filtered to selected_features before computing
-    revisions, so only curated series are touched.
+    For a target prediction month M (e.g., May), this function compares the data world as it 
+    existed at the end of May vs the end of April, using *April* as the observation cutoff 
+    for both pivots. Any subsequent changes in the May snapshot for data points occurring 
+    in April or earlier represent "revisions".
+
+    These revisions are aggregated into statistical features (mean magnitude, standard 
+    deviation, positivity ratio) which give the LightGBM model an understanding of whether
+    macroeconomic data is broadly being revised upwards or downwards entering the release.
 
     Args:
         target_month: The month being predicted (YYYY-MM-01).
@@ -138,14 +143,12 @@ def get_revision_features_for_month(
             Typically the M-1 NFP release date. Defaults to prev_month.
         selected_features: Pre-selected feature names. Both aggregates and
             per-series revisions are computed only over these columns.
-            If None, uses all columns (not recommended).
-        include_fred: Whether to also compute FRED revision features.
+        include_fred: Whether to also compute independent FRED revision features.
 
     Returns:
-        Single-row DataFrame with 16 aggregate revision features
-        (8 master + 8 FRED) plus per-series FRED employment revision diffs
-        (one {series}_rev column per selected FRED series).
-        Empty DataFrame if M-1 snapshot unavailable.
+        pd.DataFrame: A single-row DataFrame containing ~16 aggregate revision features
+        (8 master metrics + 8 FRED metrics) plus individual per-series FRED employment 
+        revision diffs. Returns an empty DataFrame if the M-1 snapshot is missing.
     """
     prev_month = target_month - pd.DateOffset(months=1)
     if prev_cutoff is None:

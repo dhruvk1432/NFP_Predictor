@@ -1,7 +1,10 @@
 """
 Tests for Feature Engineering Module
 
-Tests for calendar features (survey week dates, seasonal indicators).
+This module tests the generation of chronological and cyclical features used 
+by the LightGBM model. This includes survey week calculation (the week containing 
+the 12th day of the month), weeks-between-surveys logic, and seasonal indicators
+(summer, holidays, sin/cos cyclical encodings).
 """
 
 import pytest

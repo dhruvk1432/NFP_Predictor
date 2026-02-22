@@ -1,12 +1,17 @@
 """
 LightGBM Model Training for NFP Prediction
 
-Core model training, prediction, and interval calculation functions.
-Extracted from train_lightgbm_nfp.py for maintainability.
+This module encapsulates the core predictive infrastructure for the Non-Farm Payrolls model.
+It handles:
+1. Model hyperparameter retrieval (with optional Huber Loss for outlier robustness).
+2. Dynamic sample weighting (using exponential decay to prioritize recent data regimes).
+3. The main LightGBM training loop (including TimeSeriesSplit cross-validation and early stopping).
+4. Prediction interval generation (using empirical non-parametric historical residuals).
+5. Model persistence (saving and loading models alongside their feature states).
 
 MULTI-TARGET SUPPORT:
-Model save/load functions support 4 target configurations:
-- nsa_first, nsa_last, sa_first, sa_last
+Model save/load functions support 4 architectural target configurations depending on the 
+chosen macro pipeline: nsa_first, nsa_last, sa_first, sa_last.
 """
 
 import pandas as pd
@@ -26,7 +31,6 @@ from Train.config import (
     N_CV_SPLITS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
-    PANIC_REGIME_WEIGHT,
     CONFIDENCE_LEVELS,
     MODEL_SAVE_DIR,
     get_model_id,
@@ -76,70 +80,43 @@ def get_lgbm_params(
 # SAMPLE WEIGHTING
 # =============================================================================
 
-def calculate_sample_weights(X: pd.DataFrame) -> np.ndarray:
+def calculate_sample_weights(
+    X: pd.DataFrame, 
+    target_month: pd.Timestamp, 
+    half_life_months: float
+) -> np.ndarray:
     """
-    Calculate training sample weights based on regime.
-
-    Assigns higher weights to extreme event periods (COVID-like scenarios).
+    Calculate sample weights using exponential decay based on recency.
+    
+    More recent samples relative to the target prediction month are 
+    assigned higher weights. The decay rate is determined by the half-life.
 
     Args:
-        X: Feature DataFrame with regime flag columns
+        X: Feature DataFrame containing a 'ds' column with sample dates
+        target_month: The month being predicted 
+        half_life_months: The exponential decay half-life in months
 
     Returns:
         Array of sample weights
     """
-    weights = np.ones(len(X))
+    if 'ds' not in X.columns:
+        logger.warning("'ds' date column not found in features - using equal weights")
+        return np.ones(len(X))
 
-    # Check for panic regime flags - try multiple column name patterns
-    # Pattern 1: With _latest suffix (from pivot_snapshot_to_wide)
-    # Pattern 2: Without suffix (direct column names)
-    vix_panic_cols = ['VIX_panic_regime', 'VIX_panic_regime_latest']
-    sp500_crash_cols = ['SP500_crash_month', 'SP500_crash_month_latest']
-    vix_high_cols = ['VIX_high_regime', 'VIX_high_regime_latest']
-    sp500_bear_cols = ['SP500_bear_market', 'SP500_bear_market_latest']
-    sp500_circuit_cols = ['SP500_circuit_breaker', 'SP500_circuit_breaker_latest']
+    # Calculate distance in approx months (days / 30.44)
+    # Ensure distance is non-negative (training data should be strictly before target)
+    distance_days = (target_month - pd.to_datetime(X['ds'])).dt.days
+    distance_months = np.maximum(0, distance_days / 30.436875)
 
-    panic_mask = np.zeros(len(X), dtype=bool)
+    # Calculate exponential weights: w = exp(-ln(2) * distance_months / half_life)
+    # The weight approaches 1.0 as distance approaches 0
+    decay_rate = np.log(2) / half_life_months
+    weights = np.exp(-decay_rate * distance_months)
 
-    # Check VIX panic regime
-    for col in vix_panic_cols:
-        if col in X.columns:
-            panic_mask |= (X[col] == 1)
-            break
-
-    # Check SP500 crash month
-    for col in sp500_crash_cols:
-        if col in X.columns:
-            panic_mask |= (X[col] == 1)
-            break
-
-    # Check VIX high regime
-    for col in vix_high_cols:
-        if col in X.columns:
-            panic_mask |= (X[col] == 1)
-            break
-
-    # Check SP500 bear market
-    for col in sp500_bear_cols:
-        if col in X.columns:
-            panic_mask |= (X[col] == 1)
-            break
-
-    # Check SP500 circuit breaker
-    for col in sp500_circuit_cols:
-        if col in X.columns:
-            panic_mask |= (X[col] == 1)
-            break
-
-    weights[panic_mask] = PANIC_REGIME_WEIGHT
-
-    n_panic_samples = panic_mask.sum()
-    if n_panic_samples > 0:
-        logger.info(f"Applying {PANIC_REGIME_WEIGHT}x weight to {n_panic_samples} panic regime samples ({100*n_panic_samples/len(weights):.1f}%)")
-    else:
-        logger.warning("No regime indicators found or no panic samples detected - using equal weights")
-
-    return weights
+    # Normalize weights so mean equals 1.0 (maintains LightGBM learning rate scale)
+    weights = weights / np.mean(weights)
+    
+    return weights.values
 
 
 # =============================================================================
@@ -157,21 +134,33 @@ def train_lightgbm_model(
     params_override: Optional[Dict] = None,
 ) -> Tuple[lgb.Booster, Dict, List[float]]:
     """
-    Train LightGBM model with time-series cross-validation.
+    Train a LightGBM regression model using robust time-series cross-validation.
+
+    This function performs a rigorously leakage-free training process:
+    1. It drops invalid targets gracefully.
+    2. It calculates point-in-time sample weights using exponential decay.
+    3. It trains `n_splits` intermediate models across chronological folds to 
+       calculate Out-Of-Fold (OOF) residuals and cross-validation performance.
+    4. Finally, it trains one 'production' model on the entire provided dataset, 
+       using a predefined 85/15 chronological split for early stopping to prevent 
+       overfitting to the terminal edge of the window.
 
     Args:
-        X: Feature DataFrame (includes 'ds' column for date reference)
-        y: Target Series
-        n_splits: Number of time series CV splits
-        num_boost_round: Maximum number of boosting rounds
-        early_stopping_rounds: Early stopping patience
-        use_huber_loss: If True, use Huber objective
-        huber_delta: Huber delta parameter
-        params_override: If provided, use these LightGBM params instead of defaults.
-            Typically from Optuna hyperparameter tuning.
+        X (pd.DataFrame): Feature DataFrame (must include 'ds' column for dating).
+        y (pd.Series): Target numerical Series.
+        n_splits (int): Number of time series CV splits for error calculation.
+        num_boost_round (int): Maximum number of boosting rounds for LightGBM.
+        early_stopping_rounds (int): Early stopping patience parameter.
+        use_huber_loss (bool): If True, use Huber objective function.
+        huber_delta (float): Huber delta parameter if Huber loss is enabled.
+        params_override (Optional[Dict]): Pre-tuned dictionary of Optuna hyperparameters.
+            If None, the system falls back to default settings.
 
     Returns:
-        Tuple of (trained model, feature importance dict, residuals list)
+        Tuple[lgb.Booster, Dict, List[float]]: 
+            - trained_model: The final LightGBM Booster trained on all available data.
+            - importance: Dictionary mapping feature_name -> gain importance score.
+            - final_residuals: List of Out-Of-Sample prediction errors from the final 15% holdout.
     """
     if not LIGHTGBM_AVAILABLE:
         raise ImportError("LightGBM not available")
@@ -190,14 +179,23 @@ def train_lightgbm_model(
     valid_mask = ~y.isna()
     X_clean = X_train[valid_mask].copy()
     y_clean = y[valid_mask].copy()
+    X_clean_with_ds = X[valid_mask].copy() # Keep ds for weight calculation
 
     if len(X_clean) < 50:
         raise ValueError(f"Not enough valid training samples: {len(X_clean)}")
 
     logger.info(f"After cleaning: {len(X_clean)} valid samples (dropped {(~valid_mask).sum()} NaN targets)")
 
-    # Calculate sample weights based on regime indicators
-    weights = calculate_sample_weights(X[valid_mask])
+    # Calculate sample weights (using target_month as the anchor, which should be passed via params_override or derived)
+    # In normal CV, the "target_month" anchor should be the maximum date in the validation partition
+    # But since this function is broadly used, we default to a flat weight if target_month isn't provided or we fallback.
+    # Note: `calculate_sample_weights` requires target_month, so we derive it from the dataset's max date
+    # if it's not provided in params_override.
+    target_month = params_override.pop('target_month', pd.to_datetime(X['ds'].max())) if params_override and 'target_month' in params_override else pd.to_datetime(X['ds'].max())
+    half_life_months = params_override.pop('half_life_months', 60.0) if params_override and 'half_life_months' in params_override else 60.0
+    
+    # Needs the full dataframe with 'ds' attached for weight calculation
+    weights = calculate_sample_weights(X_clean_with_ds, target_month, half_life_months)
 
     # LightGBM parameters (use tuned params if provided, else static defaults)
     if params_override is not None:
@@ -309,17 +307,20 @@ def calculate_prediction_intervals(
     confidence_levels: List[float] = CONFIDENCE_LEVELS
 ) -> Dict[float, Tuple[float, float]]:
     """
-    Calculate prediction intervals based on historical residuals.
+    Calculate confidence intervals for a point prediction based strictly on historical OOS errors.
 
-    Uses empirical quantiles of residuals for non-parametric intervals.
+    Rather than assuming a normal distribution (Gaussian errors) for the model's accuracy, 
+    this function uses completely non-parametric empirical quantiles derived from the model's 
+    actual historical residuals. 
 
     Args:
-        residuals: List of historical prediction residuals
-        prediction: Point prediction
-        confidence_levels: List of confidence levels (e.g., [0.50, 0.80, 0.95])
+        residuals (List[float]): List of historical out-of-sample prediction residuals.
+        prediction (float): The newly predicted point estimate.
+        confidence_levels (List[float]): Desired probability coverage levels (e.g., [0.50, 0.95]).
 
     Returns:
-        Dictionary with confidence level as key and (lower, upper) bounds as value
+        Dict[float, Tuple[float, float]]: Dictionary mapping the confidence level to its
+        respective (lower_bound, upper_bound) tuple.
     """
     intervals = {}
     

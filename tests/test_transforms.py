@@ -1,7 +1,10 @@
 """
-Tests for Transform Utilities
+Tests for Transform Utilities Module
 
-Tests for symlog, z-score, winsorization, and the _symlog_pct_chg variant.
+This module ensures that statistical transformations (symlog for extreme values, 
+z-scores for normalized volatility, log1p, and winsorization) act predictably on both
+positive and negative economic data. It also validates the _symlog_pct_chg variant
+logic introduced for the Branch-and-Expand pipeline, ensuring no double-transforms occur.
 """
 
 import pytest

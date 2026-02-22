@@ -1,9 +1,12 @@
 """
 Phase 0: Revision Analysis
-Understand the statistical properties of revision deltas before building models.
+
+This script analyzes the statistical properties of historical NFP revision deltas.
+Understanding the nature, frequency, and magnitude of BLS revisions is critical before modeling,
+as it determines how the target changes from the first release to the "true" revised number.
 
 revision_delta[M] = revised_mom[M] - first_release_mom[M]
-where revised_mom uses levels from the M+1 FRED snapshot.
+where revised_mom uses employment levels extracted strictly from the M+1 FRED snapshot.
 """
 
 import pandas as pd
@@ -12,16 +15,28 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
+import sys
 from statsmodels.tsa.stattools import acf
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = BASE_DIR / "_output"
-FRED_DIR = BASE_DIR / "data" / "fred_data" / "decades"
+sys.path.append(str(BASE_DIR))
+from settings import DATA_PATH, OUTPUT_DIR
+
+FRED_DIR = DATA_PATH / "fred_data" / "decades"
 ANALYSIS_DIR = OUTPUT_DIR / "revision_analysis"
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
+    """
+    Generate the path to a FRED employment snapshot file for a given date.
+    
+    Args:
+        snapshot_date (pd.Timestamp): The date of the snapshot.
+        
+    Returns:
+        Path: The absolute path to the corresponding .parquet snapshot file.
+    """
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime("%Y-%m")

@@ -854,11 +854,16 @@ def download_state_employment_vintages(fred: Fred, end_date: str = END_DATE) -> 
 
 def get_state_employment_weights(vintages_df: pd.DataFrame, snap_date: pd.Timestamp) -> pd.DataFrame:
     """
-    Calculate employment-share weights from vintages as of snap_date.
-    Uses point-in-time filtering: only data released by snap_date.
+    Calculate state-by-state employment share weights strictly from data known on `snap_date`.
 
-    If snap_date is before the earliest available vintage (e.g. pre-2005),
-    falls back to the earliest vintage as a best-effort proxy.
+    This function prevents lookahead bias in the weighting process. If we used modern, 
+    fully-revised employment shares to weight historical storm damage, we would be implicitly 
+    feeding the model future economic information. By querying `vintages_df` (which contains 
+    ALFRED real-time publication dates) with a strict `< snap_date` filter, we construct 
+    employment shares exactly as they would have been perceived by a trader on that day.
+
+    If snap_date is before the earliest ALFRED vintage (e.g. pre-2005), falls back to 
+    the earliest available vintage as a best-effort proxy.
     """
     # Check if we have any vintage by snap_date
     earliest_vintage = vintages_df['realtime_start'].min()
@@ -983,17 +988,26 @@ def create_weighted_national_aggregates(
     snap_date: pd.Timestamp
 ) -> pd.DataFrame:
     """
-    Apply NFP employment weights to state damage data and aggregate to national level.
-    Uses release_date for point-in-time filtering.
-    CRITICAL: Applies log1p transformation to the final aggregated result.
+    Apply point-in-time employment weights to state damage data and aggregate to the national level.
+
+    Storms hit specific states, but NFP is a national number. A hurricane in Florida (high employment) 
+    matters more to NFP than a blizzard in Wyoming (low employment). This function weights each state's 
+    weather impact by its share of national employment.
+
+    Critical protections against leakage:
+    1. Only includes weather data where `release_date < snap_date` (strict inequality). Since NOAA 
+       has an ~75-day publication lag, June weather is legally forbidden from informing the July NFP 
+       forecast (as it isn't published until mid-September).
+    2. Applies a `log1p` transformation to the final sum to stabilize variance, as raw dollar damages 
+       from catastrophic hurricanes can artificially blow out the variance of the entire feature space.
 
     Args:
-        noaa_states: State-level NOAA data with columns: date, metric, value, release_date, state_name
-        weights: Employment weights with columns: state_code, weight
-        snap_date: NFP release date to align snapshot with
+        noaa_states: State-level NOAA data with release dates.
+        weights: PIT employment share weights.
+        snap_date: The absolute "today" boundary.
 
     Returns:
-        DataFrame with columns: date, series_name, value, release_date
+        DataFrame with strictly point-in-time national aggregates.
     """
     # Filter to data known by snap_date
     noaa_states['date'] = pd.to_datetime(noaa_states['date'])

@@ -1800,10 +1800,30 @@ def download_master_audit(
 
 def collapse_latest_asof(audit: pd.DataFrame, as_of_cutoff: pd.Timestamp) -> pd.DataFrame:
     """
-    Revised collapse function:
-    1. Imputes total_nsa first-release dates BEFORE snapshot filtering.
-    2. Propagates total_nsa release calendar to all series.
-    3. Uses strict < instead of <= to prevent same-day data leakage.
+    Reduce a massive multi-vintage "audit" dataframe into a single, clean, point-in-time 
+    snapshot strictly bounded by `as_of_cutoff`.
+
+    This is the core anti-leakage mechanism for the FRED employment pipeline. It asks:
+    "If I am standing on `as_of_cutoff`, what is the MOST RECENT valid data I know 
+    for every historical observation month?"
+
+    Critical logic steps:
+    1. **Target Date Imputation**: Imputes `total_nsa` first-release dates *before* filtering to 
+       ensure alignment with BLS publication laws.
+    2. **Calendar Propagation**: Enforces the `total_nsa` release calendar constraint onto all child 
+       sub-components, preventing component data from magically appearing before the headline number.
+    3. **Strict Inequality Filtering**: Drops all rows where `realtime_start >= as_of_cutoff`. The strict
+       `<` is absolutely required to prevent same-day data leakage (where the model trains on data 
+       published later on the same day it makes a prediction).
+    4. **Last Vintage Selection**: After filtering out the future, drops all obsolete historical revisions,
+       keeping only `keep="last"` for each `(unique_id, ds)` pair.
+    
+    Args:
+        audit (pd.DataFrame): Long-format dataframe with all historical vintages.
+        as_of_cutoff (pd.Timestamp): The strict boundary datetime representing "today".
+
+    Returns:
+        pd.DataFrame: A point-in-time correct view of the employment data.
     """
     if audit.empty:
         return pd.DataFrame(columns=["date", "value", "series_name", "series_code", "release_date"])
@@ -2229,6 +2249,18 @@ def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_exis
     return sched[0][0], sched[-1][0]
 
 def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existing=False):
+    """
+    Master orchestrator for the FRED Pipeline.
+
+    This function sequentially:
+    1. Triggers the massive ALFRED vintage download via `download_master_audit`.
+    2. Identifies all NFP target release rules and saves the `y_nsa`/`y_sa` label files.
+    3. Iterates chronologically through every historical BLS publication date, collapsing the
+       audit dataframe into isolated, point-in-time `.parquet` snapshot files for every month.
+    
+    If `refresh_existing` is False, intelligently skips the multi-hour download process if 
+    all downstream snapshot files and target files are proven to already exist on disk.
+    """
     as_of = pd.to_datetime(end_date).strftime("%Y-%m-%d")
     audit_file = FRED_ROOT / f"_audit_asof_{as_of}.parquet"
 

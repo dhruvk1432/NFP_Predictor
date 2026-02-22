@@ -257,18 +257,27 @@ def load_nfp_release_schedule():
 
 def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
     """
-    Aggregate weekly data into monthly buckets based on NFP release windows.
+    Aggregate weekly data into monthly buckets based strictly on NFP release windows.
 
-    Logic: For target month M (e.g., June data released July 3):
-    - Include weekly releases where: NFP_release(M-1) <= weekly_release < NFP_release(M)
-    - Data released ON M-1 NFP day is included in M-1 bucket, not M bucket
+    This function solves a critical problem: Weekly Continuous Claims are released every Thursday.
+    A standard "calendar month" average for May would include data released *after* the May NFP
+    number is published (usually the first Friday of June). Using calendar months would introduce 
+    massive lookahead bias.
+
+    Instead, we define a "month" practically:
+    For target month M (e.g., June data released July 3):
+    - The bucket opens immediately *after* the NFP release for M-1.
+    - The bucket closes immediately *before* the NFP release for M.
+    
+    This guarantees that every weekly data point averaged into target month M was explicitly 
+    known to market participants standing right before the NFP M release.
 
     Args:
         weekly_df: DataFrame with columns ['date', 'value', 'realtime_start']
         nfp_schedule: DataFrame with columns ['data_month', 'nfp_release_date']
 
     Returns:
-        DataFrame with monthly aggregated values
+        DataFrame with point-in-time correct monthly aggregated values.
     """
     if weekly_df.empty or nfp_schedule is None:
         # Fallback: simple monthly resampling with 7-day lag
@@ -942,6 +951,20 @@ def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, c
 
 
 def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers=3):
+    """
+    Master orchestrator for producing point-in-time accurate snapshots of non-NFP FRED data.
+
+    This pipeline handles three completely different types of data, all strictly filtered
+    so that a snapshot dated `YYYY-MM-DD` only contains data known *before* that day:
+
+    1. Daily Financial Data (Oil, VIX, SP500, Credit Spreads, Yield Curve): Assumed to be 
+       known at T+1. Features like max drawdowns, Z-scores, and trailing returns are computed daily.
+    2. Weekly Data (Jobless Claims, WEI, Financial Stress): Handled via `aggregate_weekly_to_monthly_nfp_based` 
+       to bucket releases explicitly between NFP publication dates.
+    3. Monthly Data (Regional Fed Surveys): Kept strictly to their publication vintage lag.
+
+    Outputs are fully-featured `.parquet` snapshots ready for direct modeling.
+    """
     if not FRED_API_KEY:
         logger.error("FRED_API_KEY not found")
         return

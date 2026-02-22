@@ -1,13 +1,28 @@
+"""
+Directional Accuracy Analysis Script
+
+This script evaluates the directional accuracy and acceleration accuracy of the NFP prediction models.
+It compares the model's predictions (from backtest results) against the *revised* MoM changes 
+as well as the first release numbers. 
+
+The rationale is that a "correct" direction (positive or negative job growth) should be judged against 
+the true underlying economic reality (the revised number), while the real-time prediction must match 
+the trader's expectation (the first release).
+"""
+
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
+import sys
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = BASE_DIR / "_output"
-FRED_DIR = BASE_DIR / "data" / "fred_data" / "decades"
+sys.path.append(str(BASE_DIR))
+from settings import DATA_PATH, OUTPUT_DIR
+
+FRED_DIR = DATA_PATH / "fred_data" / "decades"
 
 models = {
     "NSA Prediction": {
@@ -41,6 +56,15 @@ for _name, _cfg in _revised.items():
 
 
 def get_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
+    """
+    Generate the path to a FRED employment snapshot file for a given date.
+    
+    Args:
+        snapshot_date (pd.Timestamp): The date of the snapshot.
+        
+    Returns:
+        Path: The absolute path to the corresponding .parquet snapshot file.
+    """
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime("%Y-%m")

@@ -14,9 +14,11 @@ from settings import START_DATE, END_DATE
 
 def get_nfp_release_calendar(start = START_DATE, end = END_DATE):
     """
-    Generate NFP release calendar.
+    Generate naive NFP release calendar based strictly on the "First Friday" rule.
     
-    NFP is released on the first Friday of each month at 8:30 AM ET.
+    Warning: This is a mathematical approximation. True NFP release dates can deviate
+    due to federal holidays or severe weather events. For strict production point-in-time
+    correctness, the BLS scraped schedule in `fred_employment_pipeline.py` is preferred.
     
     Args:
         start: Starting date
@@ -60,7 +62,9 @@ def get_nfp_release_calendar(start = START_DATE, end = END_DATE):
 
 def get_nfp_release_for_month(observation_month):
     """
-    Get NFP release date for a specific observation month.
+    Get naively calculated NFP release date for a specific observation month.
+    
+    Note: Calculations do not account for BLS holiday schedule adjustments.
     
     Args:
         observation_month: Date representing the observation month (e.g., '2024-07-01')

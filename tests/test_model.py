@@ -23,8 +23,9 @@ from Train.model import (
 
 from Train.config import (
     DEFAULT_LGBM_PARAMS,
-    PANIC_REGIME_WEIGHT,
     CONFIDENCE_LEVELS,
+    HALF_LIFE_MIN_MONTHS,
+    HALF_LIFE_MAX_MONTHS
 )
 
 
@@ -36,11 +37,11 @@ class TestGetLgbmParams:
         params = get_lgbm_params()
         assert isinstance(params, dict)
 
-    def test_default_objective_is_huber(self):
-        """Test default objective is Huber (for outlier robustness)."""
+    def test_default_objective_is_regression(self):
+        """Test that default objective is regression (Huber disabled by default)."""
         params = get_lgbm_params()
-        assert params['objective'] == 'huber'
-        assert 'alpha' in params
+        assert params['objective'] == 'regression'
+        assert 'alpha' not in params
 
     def test_disable_huber_loss(self):
         """Test disabling Huber loss returns regression objective."""
@@ -61,78 +62,63 @@ class TestGetLgbmParams:
 
 
 class TestCalculateSampleWeights:
-    """Tests for sample weight calculation."""
+    """Tests for sample weight calculation using exponential decay."""
 
     @pytest.fixture
-    def normal_features(self):
-        """Create features for normal market conditions."""
+    def sample_features(self):
+        """Create features for different dates to test decay."""
         return pd.DataFrame({
-            'VIX_panic_regime': [0, 0, 0, 0, 0],
-            'SP500_crash_month': [0, 0, 0, 0, 0],
-            'VIX_high_regime': [0, 0, 0, 0, 0],
-            'feature1': [1, 2, 3, 4, 5],
+            'ds': [
+                pd.Timestamp('2020-01-01'),  # Oldest (furthest)
+                pd.Timestamp('2022-01-01'),  # Middle
+                pd.Timestamp('2024-01-01'),  # Newest (closest)
+            ],
+            'feature1': [1, 2, 3],
         })
 
-    @pytest.fixture
-    def panic_features(self):
-        """Create features with panic regime indicators."""
-        return pd.DataFrame({
-            'VIX_panic_regime': [0, 1, 0, 1, 0],  # 2 panic months
-            'SP500_crash_month': [0, 0, 1, 0, 0],  # 1 crash month
-            'VIX_high_regime': [0, 0, 0, 0, 0],
-            'feature1': [1, 2, 3, 4, 5],
-        })
-
-    def test_returns_array(self, normal_features):
+    def test_returns_array(self, sample_features):
         """Test that function returns numpy array."""
-        weights = calculate_sample_weights(normal_features)
+        target_month = pd.Timestamp('2024-02-01')
+        weights = calculate_sample_weights(sample_features, target_month, 60.0)
         assert isinstance(weights, np.ndarray)
 
-    def test_correct_length(self, normal_features):
+    def test_correct_length(self, sample_features):
         """Test that weights have correct length."""
-        weights = calculate_sample_weights(normal_features)
-        assert len(weights) == len(normal_features)
+        target_month = pd.Timestamp('2024-02-01')
+        weights = calculate_sample_weights(sample_features, target_month, 60.0)
+        assert len(weights) == len(sample_features)
 
-    def test_normal_weights_are_one(self, normal_features):
-        """Test that normal samples get weight of 1."""
-        weights = calculate_sample_weights(normal_features)
-        assert np.all(weights == 1.0)
+    def test_more_recent_gets_higher_weight(self, sample_features):
+        """Test that more recent samples get exponentially higher weights."""
+        target_month = pd.Timestamp('2024-02-01')
+        weights = calculate_sample_weights(sample_features, target_month, 60.0)
+        
+        # weights[2] is 2024, weights[1] is 2022, weights[0] is 2020
+        assert weights[2] > weights[1] > weights[0]
 
-    def test_panic_weights_elevated(self, panic_features):
-        """Test that panic samples get elevated weights."""
-        weights = calculate_sample_weights(panic_features)
+    def test_mean_weight_is_one(self, sample_features):
+        """Test that weights are normalized to mean 1.0 to preserve learning rate."""
+        target_month = pd.Timestamp('2024-02-01')
+        weights = calculate_sample_weights(sample_features, target_month, 60.0)
+        assert np.isclose(np.mean(weights), 1.0)
+        
+    def test_shorter_halflife_creates_steeper_decay(self, sample_features):
+        """Test that a shorter half-life penalizes older dates more heavily."""
+        target_month = pd.Timestamp('2024-02-01')
+        weights_short = calculate_sample_weights(sample_features, target_month, 12.0)
+        weights_long = calculate_sample_weights(sample_features, target_month, 120.0)
+        
+        # The ratio of newest weight to oldest weight should be much larger for the short half-life
+        ratio_short = weights_short[2] / weights_short[0]
+        ratio_long = weights_long[2] / weights_long[0]
+        
+        assert ratio_short > ratio_long
 
-        # Rows 1, 2, 3 have panic indicators
-        assert weights[1] == PANIC_REGIME_WEIGHT
-        assert weights[2] == PANIC_REGIME_WEIGHT
-        assert weights[3] == PANIC_REGIME_WEIGHT
-
-        # Rows 0, 4 are normal
-        assert weights[0] == 1.0
-        assert weights[4] == 1.0
-
-    def test_handles_latest_suffix_columns(self):
-        """Test handling of columns with _latest suffix."""
-        df = pd.DataFrame({
-            'VIX_panic_regime_latest': [0, 1, 0],
-            'SP500_crash_month_latest': [0, 0, 1],
-            'feature1': [1, 2, 3],
-        })
-        weights = calculate_sample_weights(df)
-
-        assert weights[0] == 1.0
-        assert weights[1] == PANIC_REGIME_WEIGHT
-        assert weights[2] == PANIC_REGIME_WEIGHT
-
-    def test_handles_missing_columns(self):
-        """Test handling when regime columns are missing."""
-        df = pd.DataFrame({
-            'feature1': [1, 2, 3],
-            'feature2': [4, 5, 6],
-        })
-        weights = calculate_sample_weights(df)
-
-        # Should return all ones when no indicators found
+    def test_handles_missing_ds_column(self):
+        """Test fallback to equal weights if date column is missing."""
+        df = pd.DataFrame({'feature1': [1, 2, 3]})
+        target_month = pd.Timestamp('2024-02-01')
+        weights = calculate_sample_weights(df, target_month, 60.0)
         assert np.all(weights == 1.0)
 
 

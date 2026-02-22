@@ -13,6 +13,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import warnings
+from pathlib import Path
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.append(str(BASE_DIR))
+
+from settings import DATA_PATH, OUTPUT_DIR
+import warnings
 warnings.filterwarnings('ignore')
 
 # =============================================================================
@@ -20,8 +29,8 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 
 print("Loading target data...")
-data_nsa = pd.read_parquet("data/NFP_target/total_nsa_first_release.parquet")
-data_sa = pd.read_parquet("data/NFP_target/total_sa_first_release.parquet")
+data_nsa = pd.read_parquet(DATA_PATH / "NFP_target" / "total_nsa_first_release.parquet")
+data_sa = pd.read_parquet(DATA_PATH / "NFP_target" / "total_sa_first_release.parquet")
 
 # Calculate seasonal adjustment (SA - NSA)
 # This represents the adjustment applied to convert NSA to SA
@@ -42,8 +51,8 @@ print(f"Date range: {adjustment.index.min()} to {adjustment.index.max()}")
 # =============================================================================
 
 print("\nLoading prediction data...")
-nsa_predictions = pd.read_csv("_output/backtest_results/nsa_first/backtest_results_nsa_first.csv")
-sa_predictions = pd.read_csv("_output/backtest_results/sa_first/predictions.csv")
+nsa_predictions = pd.read_csv(OUTPUT_DIR / "backtest_results" / "nsa_first" / "backtest_results_nsa_first.csv")
+sa_predictions = pd.read_csv(OUTPUT_DIR / "backtest_results" / "sa_first" / "predictions.csv")
 
 # Rename column for consistency (sa_first uses 'date', nsa_first uses 'ds')
 if 'date' in sa_predictions.columns:
@@ -267,9 +276,10 @@ ax3.set_ylabel('MoM Change (thousands)')
 ax3.legend(loc='best', fontsize=8)
 ax3.grid(True, alpha=0.3)
 
+save_path = OUTPUT_DIR / 'seasonal_adjustment_analysis.png'
 plt.tight_layout()
-plt.savefig('_output/seasonal_adjustment_analysis.png', dpi=150, bbox_inches='tight')
-print("\nPlot saved to: _output/seasonal_adjustment_analysis.png")
+plt.savefig(save_path, dpi=150, bbox_inches='tight')
+print(f"\nPlot saved to: {save_path}")
 plt.show()
 
 # =============================================================================
@@ -296,5 +306,6 @@ summary['SA_Actual'] = sa_actual_plot.reindex(pred_nsa.index).values if not sa_a
 print(summary.to_string(index=False))
 
 # Save summary to CSV
-summary.to_csv('_output/seasonal_adjustment_summary.csv', index=False)
-print("\nSummary saved to: _output/seasonal_adjustment_summary.csv")
+csv_path = OUTPUT_DIR / 'seasonal_adjustment_summary.csv'
+summary.to_csv(csv_path, index=False)
+print(f"\nSummary saved to: {csv_path}")

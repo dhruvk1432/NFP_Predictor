@@ -1,4 +1,11 @@
+"""
+Tests for Global Feature Lagging
 
+This module validates that the feature engineering pipeline correctly applies 
+time-series lags globally to all exogenous features, ensuring that historical 
+states of both base features and derived features (like variance or rate of change)
+are correctly mapped forward to prevent any leakage.
+"""
 import pytest
 import pandas as pd
 import numpy as np

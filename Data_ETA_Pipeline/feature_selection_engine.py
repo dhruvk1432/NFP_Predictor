@@ -1,5 +1,5 @@
 """
-7-Stage Feature Selection Engine
+6-Stage Feature Selection Engine
 ================================
 Exact replica of the per-source Jupyter notebook pipelines.
 Each stage matches the notebook implementation precisely.
@@ -11,7 +11,6 @@ Stages:
 4. Cluster Redundancy (NaN-aware Spearman hierarchical clustering)
 5. Interaction Rescue (two-phase: single-feature + split-pair detection)
 6. Sequential Forward Selection (walk-forward CV with embargo)
-7. Union of MoM + Acceleration targets (handled by caller)
 """
 
 from pathlib import Path
@@ -1000,42 +999,26 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
     return final_list
 
 
-def run_full_source_pipeline(snap_wide, target_mom, target_acc,
+def run_full_source_pipeline(snap_wide, target_mom,
                              source_name, snapshots_dir, series_groups):
     """
-    Run the 7-stage pipeline on a single source for both MoM and Acc targets.
-    Returns the union of MoM + Acc selected features (Stage 7).
+    Run the 6-stage pipeline on a single source for the MoM target.
+    Returns the selected features.
     """
-    targets = {
-        'MoM': target_mom,
-        'Acc': target_acc,
-    }
+    y_clean = target_mom.dropna()
+    if len(y_clean) < 50:
+        logger.warning(f"   [MoM] Insufficient target data "
+                       f"({len(y_clean)} obs). Skipping.")
+        return []
 
-    final_results = {}
-    for t_name, y_target in targets.items():
-        y_clean = y_target.dropna()
-        if len(y_clean) < 50:
-            logger.warning(f"   [{t_name}] Insufficient target data "
-                           f"({len(y_clean)} obs). Skipping.")
-            final_results[t_name] = []
-            continue
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"  PIPELINE START: {source_name} / MoM")
+    logger.info(f"{'=' * 60}")
 
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"  PIPELINE START: {source_name} / {t_name}")
-        logger.info(f"{'=' * 60}")
+    final_feats = run_pipeline(
+        snap_wide, y_clean, source_name, snapshots_dir, series_groups
+    )
 
-        final_results[t_name] = run_pipeline(
-            snap_wide, y_clean, source_name, snapshots_dir, series_groups
-        )
+    logger.info(f"\n  [{source_name}] Selected: {len(final_feats)} features (MoM only)")
 
-    # ===== Stage 7: Union MoM + Acc =====
-    mom_feats = set(final_results.get('MoM', []))
-    acc_feats = set(final_results.get('Acc', []))
-    union_feats = sorted(mom_feats | acc_feats)
-
-    logger.info(f"\n  [{source_name}] Stage 7 Union: "
-                f"{len(mom_feats)} MoM + {len(acc_feats)} Acc "
-                f"-> {len(union_feats)} union "
-                f"({len(mom_feats & acc_feats)} overlap)")
-
-    return union_feats
+    return final_feats

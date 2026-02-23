@@ -26,7 +26,6 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from settings import TEMP_DIR, setup_logger
 from Train.data_loader import (
     load_master_snapshot,
-    load_fred_snapshot,
     pivot_snapshot_to_wide,
 )
 
@@ -110,45 +109,37 @@ def compute_revision_features(
     return pd.DataFrame([result])
 
 
-def _filter_to_selected(df: pd.DataFrame, selected_features: List[str]) -> pd.DataFrame:
-    """Filter a single-row DataFrame to only columns matching selected features."""
-    if df.empty:
-        return df
-    keep = [c for c in df.columns if c in set(selected_features)]
-    return df[keep] if keep else pd.DataFrame()
-
-
 def get_revision_features_for_month(
     target_month: pd.Timestamp,
     prev_cutoff: Optional[pd.Timestamp] = None,
-    selected_features: Optional[List[str]] = None,
-    include_fred: bool = True,
+    target_type: str = 'nsa',
+    target_source: str = 'first_release',
 ) -> pd.DataFrame:
     """
-    Load two consecutive monthly data snapshots and compute the numerical differences
-    (revisions) for ONLY the pre-selected series to prevent memory bloat.
+    Load two consecutive master snapshots and compute revision statistics.
 
-    For a target prediction month M (e.g., May), this function compares the data world as it 
-    existed at the end of May vs the end of April, using *April* as the observation cutoff 
-    for both pivots. Any subsequent changes in the May snapshot for data points occurring 
+    For a target prediction month M (e.g., May), this function compares the data world as it
+    existed at the end of May vs the end of April, using *April* as the observation cutoff
+    for both pivots. Any subsequent changes in the May snapshot for data points occurring
     in April or earlier represent "revisions".
 
-    These revisions are aggregated into statistical features (mean magnitude, standard 
+    These revisions are aggregated into statistical features (mean magnitude, standard
     deviation, positivity ratio) which give the LightGBM model an understanding of whether
     macroeconomic data is broadly being revised upwards or downwards entering the release.
+
+    Master snapshots already contain all data sources (FRED employment + exogenous) and
+    are pre-filtered to only selected features, so no additional filtering is needed.
 
     Args:
         target_month: The month being predicted (YYYY-MM-01).
         prev_cutoff: Cutoff date for the previous month's data window.
             Typically the M-1 NFP release date. Defaults to prev_month.
-        selected_features: Pre-selected feature names. Both aggregates and
-            per-series revisions are computed only over these columns.
-        include_fred: Whether to also compute independent FRED revision features.
+        target_type: 'nsa' or 'sa' - determines which master snapshot variant to load.
+        target_source: 'first_release' or 'revised' - determines which master snapshot variant.
 
     Returns:
-        pd.DataFrame: A single-row DataFrame containing ~16 aggregate revision features
-        (8 master metrics + 8 FRED metrics) plus individual per-series FRED employment 
-        revision diffs. Returns an empty DataFrame if the M-1 snapshot is missing.
+        pd.DataFrame: A single-row DataFrame containing 8 aggregate revision features.
+        Returns an empty DataFrame if the M-1 snapshot is missing.
     """
     prev_month = target_month - pd.DateOffset(months=1)
     if prev_cutoff is None:
@@ -158,53 +149,20 @@ def get_revision_features_for_month(
     snapshot_date_m = target_month + pd.offsets.MonthEnd(0)
     snapshot_date_prev = prev_month + pd.offsets.MonthEnd(0)
 
-    all_revision_features = pd.DataFrame()
+    # Load master snapshots (already contain all data sources, pre-filtered to selected features)
+    master_m = load_master_snapshot(
+        snapshot_date_m, target_type=target_type, target_source=target_source
+    )
+    master_prev = load_master_snapshot(
+        snapshot_date_prev, target_type=target_type, target_source=target_source
+    )
 
-    # --- Master snapshot revisions (aggregates only, selected features only) ---
-    master_m = load_master_snapshot(snapshot_date_m)
-    master_prev = load_master_snapshot(snapshot_date_prev)
+    if master_prev is None or master_prev.empty:
+        logger.debug(f"No previous master snapshot for {prev_month.strftime('%Y-%m')}, skipping revisions")
+        return pd.DataFrame()
 
-    if master_prev is not None and not master_prev.empty:
-        view_current = pivot_snapshot_to_wide(master_m, prev_month, cutoff_date=prev_cutoff) if master_m is not None else pd.DataFrame()
-        view_prev = pivot_snapshot_to_wide(master_prev, prev_month, cutoff_date=prev_cutoff)
+    view_current = pivot_snapshot_to_wide(master_m, prev_month, cutoff_date=prev_cutoff) if master_m is not None else pd.DataFrame()
+    view_prev = pivot_snapshot_to_wide(master_prev, prev_month, cutoff_date=prev_cutoff)
 
-        # Filter to only selected features before computing revisions
-        if selected_features is not None:
-            view_current = _filter_to_selected(view_current, selected_features)
-            view_prev = _filter_to_selected(view_prev, selected_features)
-
-        master_revisions = compute_revision_features(view_current, view_prev, prefix='rev_master')
-        if not master_revisions.empty:
-            all_revision_features = master_revisions
-    else:
-        logger.debug(f"No previous master snapshot for {prev_month.strftime('%Y-%m')}, skipping master revisions")
-
-    # --- FRED employment revisions (aggregates + per-series, selected features only) ---
-    if include_fred:
-        fred_m = load_fred_snapshot(snapshot_date_m)
-        fred_prev = load_fred_snapshot(snapshot_date_prev)
-
-        if fred_prev is not None and not fred_prev.empty:
-            fred_view_current = pivot_snapshot_to_wide(fred_m, prev_month, cutoff_date=prev_cutoff) if fred_m is not None else pd.DataFrame()
-            fred_view_prev = pivot_snapshot_to_wide(fred_prev, prev_month, cutoff_date=prev_cutoff)
-
-            # Filter to only selected features before computing revisions
-            if selected_features is not None:
-                fred_view_current = _filter_to_selected(fred_view_current, selected_features)
-                fred_view_prev = _filter_to_selected(fred_view_prev, selected_features)
-
-            # Per-series revisions for selected FRED employment series
-            fred_revisions = compute_revision_features(
-                fred_view_current, fred_view_prev,
-                prefix='rev_fred', per_series=True,
-            )
-            if not fred_revisions.empty:
-                if all_revision_features.empty:
-                    all_revision_features = fred_revisions
-                else:
-                    for col in fred_revisions.columns:
-                        all_revision_features[col] = fred_revisions[col].iloc[0]
-        else:
-            logger.debug(f"No previous FRED snapshot for {prev_month.strftime('%Y-%m')}, skipping FRED revisions")
-
-    return all_revision_features
+    revisions = compute_revision_features(view_current, view_prev, prefix='rev_master')
+    return revisions if not revisions.empty else pd.DataFrame()

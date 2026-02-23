@@ -181,14 +181,18 @@ class TestPivotSnapshotToWide:
         assert isinstance(result, pd.DataFrame)
 
     def test_pivot_creates_feature_columns(self, sample_snapshot_df):
-        """Test that pivot creates expected feature columns."""
+        """Test that pivot creates expected feature columns (sanitized names)."""
         target_month = pd.Timestamp('2020-03-01')
         result = pivot_snapshot_to_wide(sample_snapshot_df, target_month)
 
         if not result.empty:
-            # Should have _latest columns
-            latest_cols = [c for c in result.columns if '_latest' in c]
-            assert len(latest_cols) > 0
+            # Should have columns matching sanitized input series names
+            expected_names = {'VIX_max', 'SP500_return', 'Credit_Spreads_avg'}
+            assert len(result.columns) > 0
+            assert result.columns.tolist() != []
+            # At least some of the expected series should be present
+            found = expected_names & set(result.columns)
+            assert len(found) > 0, f"Expected some of {expected_names}, got {result.columns.tolist()}"
 
     def test_pivot_filters_by_target_month(self, sample_snapshot_df):
         """Test that pivot only uses data up to target month."""

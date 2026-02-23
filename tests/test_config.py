@@ -100,20 +100,34 @@ class TestParseModelId:
 
     def test_parse_nsa_first(self):
         """Test parsing nsa_first model ID."""
-        target_type, release_type = parse_model_id('nsa_first')
+        target_type, release_type, target_source = parse_model_id('nsa_first')
         assert target_type == 'nsa'
         assert release_type == 'first'
+        assert target_source == 'first_release'
 
     def test_parse_sa_last(self):
         """Test parsing sa_last model ID."""
-        target_type, release_type = parse_model_id('sa_last')
+        target_type, release_type, target_source = parse_model_id('sa_last')
         assert target_type == 'sa'
         assert release_type == 'last'
+        assert target_source == 'first_release'
+
+    def test_parse_nsa_first_revised(self):
+        """Test parsing nsa_first_revised model ID."""
+        target_type, release_type, target_source = parse_model_id('nsa_first_revised')
+        assert target_type == 'nsa'
+        assert release_type == 'first'
+        assert target_source == 'revised'
 
     def test_parse_invalid_format(self):
         """Test that invalid format raises ValueError."""
         with pytest.raises(ValueError, match="Invalid model_id format"):
             parse_model_id('invalid')
+
+    def test_parse_invalid_three_parts(self):
+        """Test that invalid 3-part format raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid model_id format"):
+            parse_model_id('nsa_first_bogus')
 
     def test_parse_invalid_target(self):
         """Test that invalid target in model ID raises ValueError."""

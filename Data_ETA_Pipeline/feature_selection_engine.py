@@ -149,6 +149,8 @@ def load_snapshot_wide(path, feature_filter=None):
     """Load a snapshot parquet and return in wide format (date index, feature columns).
 
     Handles both long-format (series_name/value columns) and pre-pivoted wide format.
+    Also handles the case where 'date' is stored as the DataFrame index (e.g., output
+    from compute_features_wide).
     """
     df = pd.read_parquet(path)
     if 'series_name' in df.columns and 'value' in df.columns:
@@ -158,8 +160,17 @@ def load_snapshot_wide(path, feature_filter=None):
         df = df.drop_duplicates(subset=['date', 'series_name'], keep='last')
         wide = df.pivot(index='date', columns='series_name', values='value')
     else:
-        df['date'] = pd.to_datetime(df['date'])
-        wide = df.set_index('date')
+        # Handle 'date' being either a column or the index
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            wide = df.set_index('date')
+        elif df.index.name == 'date':
+            df.index = pd.to_datetime(df.index)
+            wide = df
+        else:
+            # Fallback: assume the index IS the date
+            df.index = pd.to_datetime(df.index)
+            wide = df
         wide = wide.drop(columns=['snapshot_date'], errors='ignore')
         wide = wide.select_dtypes(include=[np.number])
         if feature_filter:

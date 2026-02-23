@@ -48,6 +48,17 @@ _target_cache: Dict[str, pd.DataFrame] = {}
 # FEATURE NAME SANITIZATION (for LightGBM compatibility)
 # =============================================================================
 
+# Pre-compiled patterns for sanitize_feature_name (avoid recompilation per call)
+_SANITIZE_MULTI_CHAR = {
+    '+': 'plus', '%': 'pct', '&': '_and_', '<': '_lt_', '>': '_gt_',
+}
+_SANITIZE_MULTI_RE = re.compile('|'.join(re.escape(k) for k in _SANITIZE_MULTI_CHAR))
+_SANITIZE_TO_UNDERSCORE = re.compile(r"[|\s\[\]{}\\,()\?/:;!@#$*=.<>]")
+_SANITIZE_STRIP_QUOTES = re.compile(r"[\"']")
+_SANITIZE_INTERIOR_HYPHEN = re.compile(r'(?<!^)-(?!$)')
+_SANITIZE_COLLAPSE = re.compile(r'_+')
+
+
 def sanitize_feature_name(name: str) -> str:
     """
     Sanitize feature name for LightGBM compatibility.
@@ -61,46 +72,16 @@ def sanitize_feature_name(name: str) -> str:
     Returns:
         Sanitized feature name
     """
-    # Replace pipes with underscores
-    name = name.replace('|', '_')
-    # Replace spaces with underscores
-    name = name.replace(' ', '_')
-    # Replace hyphens with underscores (keep at start/end for negative numbers)
-    name = re.sub(r'(?<!^)-(?!$)', '_', name)
-    # Remove or replace brackets and braces
-    name = name.replace('[', '_').replace(']', '_')
-    name = name.replace('{', '_').replace('}', '_')
-    # Remove quotes
-    name = name.replace('"', '').replace("'", '')
-    name = name.replace('\\', '_')
-    # Replace commas (JSON special character)
-    name = name.replace(',', '_')
-    # Replace parentheses
-    name = name.replace('(', '_').replace(')', '_')
-    # Replace question marks
-    name = name.replace('?', '_')
-    # Replace plus signs
-    name = name.replace('+', 'plus')
-    # Replace other special characters that might cause issues
-    name = name.replace('/', '_')
-    name = name.replace(':', '_')
-    name = name.replace(';', '_')
-    name = name.replace('!', '_')
-    name = name.replace('@', '_')
-    name = name.replace('#', '_')
-    name = name.replace('$', '_')
-    name = name.replace('%', 'pct')
-    name = name.replace('&', '_and_')
-    name = name.replace('*', '_')
-    name = name.replace('=', '_')
-    name = name.replace('<', '_lt_')
-    name = name.replace('>', '_gt_')
-    # Replace periods (e.g., "U.S." -> "US")
-    name = name.replace('.', '_')
-    # Collapse multiple underscores
-    name = re.sub(r'_+', '_', name)
-    # Remove leading/trailing underscores
-    name = name.strip('_')
+    # Multi-char replacements first (%, &, +, <, >)
+    name = _SANITIZE_MULTI_RE.sub(lambda m: _SANITIZE_MULTI_CHAR[m.group()], name)
+    # Strip quotes entirely
+    name = _SANITIZE_STRIP_QUOTES.sub('', name)
+    # Replace interior hyphens with underscores
+    name = _SANITIZE_INTERIOR_HYPHEN.sub('_', name)
+    # Replace all single-char specials with underscores in one pass
+    name = _SANITIZE_TO_UNDERSCORE.sub('_', name)
+    # Collapse multiple underscores and strip
+    name = _SANITIZE_COLLAPSE.sub('_', name).strip('_')
     return name
 
 
@@ -143,22 +124,6 @@ def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     return FRED_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
 
 
-def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
-    """
-    Constructs the file path to a completely raw FRED employment snapshot (base levels only), 
-    bypassing the preprocessing check. This is used explicitly for calculating true 
-    revised target levels across snapshots.
-
-    Args:
-        snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
-
-    Returns:
-        Path: The fully resolved filesystem path to the raw data.
-    """
-    decade = f"{snapshot_date.year // 10 * 10}s"
-    year = str(snapshot_date.year)
-    month_str = snapshot_date.strftime('%Y-%m')
-    return FRED_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
 
 
 def get_master_snapshot_path(snapshot_date: pd.Timestamp,
@@ -438,7 +403,7 @@ def build_revised_target(target_type: str = 'nsa') -> pd.DataFrame:
 
         # Load M+1 raw snapshot (levels)
         snapshot_date = m + pd.DateOffset(months=1)
-        snapshot_path = get_raw_fred_snapshot_path(snapshot_date)
+        snapshot_path = get_fred_snapshot_path(snapshot_date)
 
         if not snapshot_path.exists():
             records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,

@@ -9,7 +9,7 @@ Critical Architecture:
 - Point-in-time accuracy is strictly maintained.
 - It operates in a quad-track mode: {nsa, sa} x {first_release, revised}.
 - Prior to concatenation, if a valid JSON cache is not found for the specific combo,
-  it spins up parallel workers to run a rigorous 7-stage LightGBM feature selection engine on ALL sources.
+  it spins up parallel workers to run a rigorous 6-stage LightGBM feature selection engine on ALL sources.
 - It strictly filters the final master outputs to ONLY include the surviving features,
   preventing massive horizontal array bloat.
 """
@@ -41,7 +41,7 @@ warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 MASTER_BASE = DATA_PATH / "master_snapshots"
 
 SOURCES = {
-    'FRED_Employment': DATA_PATH / "FRED_Employment_Snapshots" / "decades",
+    'FRED_Employment': DATA_PATH / "fred_data_prepared" / "decades",
     'FRED_Exogenous': DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades",
     'Unifier': DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades",
     'ADP': DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
@@ -124,7 +124,7 @@ def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
 
 def _process_source_features(source_name: str, source_dir: Path,
                              target_cat: str, target_source: str) -> list[str]:
-    """Worker function for ProcessPoolExecutor to run the 7-stage engine on one source."""
+    """Worker function for ProcessPoolExecutor to run the 6-stage engine on one source."""
     label = f"{target_cat.upper()}/{target_source}"
 
     # 1. Find and load latest snapshot
@@ -168,17 +168,15 @@ def _process_source_features(source_name: str, source_dir: Path,
     logger.info(f"[{label}] [{source_name}] {len(series_groups)} groups, "
                 f"{snap_wide.shape[1]} total features")
 
-    # 4. Load targets (MoM and Acc)
+    # 4. Load targets (MoM only)
     logger.info(f"[{label}] [{source_name}] Loading targets...")
     if target_source == 'revised':
         from Train.data_loader import build_revised_target
         target_df = build_revised_target(target_cat)
         target_df['ds'] = pd.to_datetime(target_df['ds'])
         target_df = target_df.sort_values('ds')
-        target_df['y_acc'] = target_df['y_mom'].diff()
     else:
         target_df = load_target_data(target_type=target_cat, release_type='first', use_cache=False)
-        target_df['y_acc'] = target_df['y_mom'].diff()
 
     if target_df.empty or 'y_mom' not in target_df.columns:
         logger.error(f"[{label}] [{source_name}] Failed to load valid targets.")
@@ -186,14 +184,13 @@ def _process_source_features(source_name: str, source_dir: Path,
 
     target_indexed = target_df.dropna(subset=['y_mom']).set_index('ds')
     y_mom = target_indexed['y_mom']
-    y_acc = target_indexed['y_acc'].dropna()
 
-    # 5. Run full pipeline (Stages 1-7: MoM + Acc union)
+    # 5. Run full pipeline (Stages 1-6: MoM only)
     logger.info(f"[{label}] [{source_name}] Matrix shape {snap_wide.shape}. "
-                f"Starting 7-stage pipeline...")
+                f"Starting 6-stage pipeline...")
     try:
         survivors = run_full_source_pipeline(
-            snap_wide, y_mom, y_acc, source_name, source_dir, series_groups
+            snap_wide, y_mom, source_name, source_dir, series_groups
         )
         logger.info(f"[{label}] [{source_name}] Engine returned {len(survivors)} features.")
         return survivors
@@ -206,7 +203,7 @@ def _process_source_features(source_name: str, source_dir: Path,
 
 def _run_parallel_feature_selection(target_cat: str, target_source: str) -> list[str]:
     label = f"{target_cat.upper()}/{target_source}"
-    logger.info(f"[{label}] Starting Parallel 7-Stage Feature Selection Across All Sources...")
+    logger.info(f"[{label}] Starting Parallel 6-Stage Feature Selection Across All Sources...")
     all_selected = []
 
     # max_workers=6 maps perfectly to our 6 sources

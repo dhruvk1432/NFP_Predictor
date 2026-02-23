@@ -39,20 +39,17 @@ from Train.config import (
     get_target_path,
     USE_HUBER_LOSS_DEFAULT,
     HUBER_DELTA,
-    load_selected_features,
     TUNE_EVERY_N_MONTHS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
 )
 
 from Train.data_loader import (
-    load_fred_snapshot,
     load_master_snapshot,
     load_target_data,
     get_lagged_target_features,
     batch_lagged_target_features,
     pivot_snapshot_to_wide,
-    prefilter_snapshot,
 )
 
 from joblib import Parallel, delayed
@@ -64,39 +61,36 @@ def _process_single_month_task(
     snapshot_date: pd.Timestamp,
     target_type: str,
     release_type: str,
+    target_source: str,
     nsa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
     sa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
-    selected_features: Optional[List[str]] = None
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """
     Helper function to process the feature engineering for a single month in parallel.
     Disables caching to avoid memory bloat in worker processes.
 
-    Accepts pre-computed lag lookups (from batch_lagged_target_features) instead
-    of full target DataFrames to avoid redundant per-worker filtering/sorting
-    and reduce joblib serialization overhead.
+    Loads from the pre-merged, feature-selected master snapshot which already contains
+    ALL data sources (FRED employment + exogenous). No separate FRED loading needed.
 
     This function sequentially:
     1. Extracts calendar metrics (survey weeks, seasonality).
     2. Collects historical NFP target lags (1m, 2m, 3m, 6m, 12m).
-    3. Pivots the massive long-format Master Snapshot into wide format for just this date cutoff.
-    4. Pivots the raw FRED Snapshot to gather base employment features.
-    5. Computes short-term data revision metrics by comparing the current snapshot with 
-       the snapshot published one month prior.
+    3. Pivots the wide-format Master Snapshot for just this date cutoff.
+    4. Computes short-term data revision metrics by comparing master[M] vs master[M-1].
 
     Args:
-        target_month (pd.Timestamp): The month being predicted.
-        target_value (float): The actual target value (used simply for tracking).
-        cutoff_date (pd.Timestamp): The strict barrier preventing future data leakage (usually release date).
-        snapshot_date (pd.Timestamp): The date of the data snapshot being used.
-        target_type (str): 'nsa' or 'sa'.
-        release_type (str): 'first' or 'last'.
-        nsa_lags_lookup (Dict): Pre-computed dictionary of NSA target lags.
-        sa_lags_lookup (Dict): Pre-computed dictionary of SA target lags.
-        selected_features (Optional[List[str]]): Specific features to filter, reducing memory usage.
+        target_month: The month being predicted.
+        target_value: The actual target value (used simply for tracking).
+        cutoff_date: The strict barrier preventing future data leakage (usually release date).
+        snapshot_date: The date of the data snapshot being used.
+        target_type: 'nsa' or 'sa'.
+        release_type: 'first' or 'last'.
+        target_source: 'first_release' or 'revised'.
+        nsa_lags_lookup: Pre-computed dictionary of NSA target lags.
+        sa_lags_lookup: Pre-computed dictionary of SA target lags.
 
     Returns:
-        Tuple[Optional[Dict[str, float]], Optional[float]]: A dictionary of extracted features, and the target value.
+        Tuple of (feature dict, target value). None if snapshot missing.
     """
     # Initialize dictionary for features
     features = {'ds': target_month}
@@ -109,79 +103,30 @@ def _process_single_month_task(
     features.update(nsa_lags_lookup.get(target_month, {}))
     features.update(sa_lags_lookup.get(target_month, {}))
 
-    # 3. Load and process Master Snapshot
-    #    Pre-filter to selected features ONCE so all subsequent pivots work on smaller data
-    snapshot_df = load_master_snapshot(snapshot_date, use_cache=False)
+    # 3. Load pre-merged, pre-selected master snapshot (contains ALL sources)
+    snapshot_df = load_master_snapshot(snapshot_date, target_type=target_type,
+                                       target_source=target_source, use_cache=False)
 
     if snapshot_df is None or snapshot_df.empty:
         return None, None
 
-    if selected_features is not None:
-        snapshot_df = prefilter_snapshot(snapshot_df, selected_features)
-        if snapshot_df.empty:
-            return None, None
-
-    features_wide = pivot_snapshot_to_wide(
-        snapshot_df, target_month, cutoff_date=cutoff_date,
-        selected_features=selected_features
-    )
+    features_wide = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
     if not features_wide.empty:
         features.update(features_wide.iloc[0].to_dict())
 
-    # 4. Load and process FRED Snapshot (pre-filtered)
-    fred_df = load_fred_snapshot(snapshot_date, use_cache=False)
-    if fred_df is not None and not fred_df.empty and selected_features is not None:
-        fred_df = prefilter_snapshot(fred_df, selected_features)
-
-    if fred_df is not None and not fred_df.empty:
-        fred_features = pivot_snapshot_to_wide(
-            fred_df, target_month, cutoff_date=cutoff_date,
-            selected_features=selected_features
-        )
-        if not fred_features.empty:
-            features.update(fred_features.iloc[0].to_dict())
-
-    # 5. Compute Revisions (Master & FRED)
-    #    Compare snapshot M vs snapshot M-1 for the PREVIOUS month
+    # 4. Compute Revisions: compare master[M] vs master[M-1] for the PREVIOUS month
     prev_month_target = target_month - pd.DateOffset(months=1)
     prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
 
-    # Load & pre-filter previous master snapshot
-    prev_snapshot = load_master_snapshot(prev_snapshot_date, use_cache=False)
-    if prev_snapshot is not None and not prev_snapshot.empty and selected_features is not None:
-        prev_snapshot = prefilter_snapshot(prev_snapshot, selected_features)
+    prev_snapshot = load_master_snapshot(prev_snapshot_date, target_type=target_type,
+                                         target_source=target_source, use_cache=False)
 
-    # Master Revisions
     if prev_snapshot is not None and not prev_snapshot.empty:
-        view_curr = pivot_snapshot_to_wide(
-            snapshot_df, prev_month_target, cutoff_date=cutoff_date,
-            selected_features=selected_features
-        )
-        view_prev = pivot_snapshot_to_wide(
-            prev_snapshot, prev_month_target, cutoff_date=cutoff_date,
-            selected_features=selected_features
-        )
+        view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
+        view_prev = pivot_snapshot_to_wide(prev_snapshot, prev_month_target, cutoff_date=cutoff_date)
         revs = compute_revision_features(view_curr, view_prev, prefix='rev_master')
         if not revs.empty:
             features.update(revs.iloc[0].to_dict())
-
-    # Load & pre-filter previous FRED snapshot
-    prev_fred = load_fred_snapshot(prev_snapshot_date, use_cache=False)
-    if prev_fred is not None and not prev_fred.empty and selected_features is not None:
-        prev_fred = prefilter_snapshot(prev_fred, selected_features)
-
-    if fred_df is not None and not fred_df.empty and prev_fred is not None and not prev_fred.empty:
-        f_view_curr = pivot_snapshot_to_wide(
-            fred_df, prev_month_target, cutoff_date=cutoff_date,
-            selected_features=selected_features
-        )
-        f_view_prev = pivot_snapshot_to_wide(
-            prev_fred, prev_month_target, cutoff_date=cutoff_date,
-            selected_features=selected_features
-        )
-        f_revs = compute_revision_features(f_view_curr, f_view_prev, prefix='rev_fred', per_series=True)
-        if not f_revs.empty:
-            features.update(f_revs.iloc[0].to_dict())
 
     return features, target_value
 
@@ -255,10 +200,12 @@ def build_training_dataset(
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
     show_progress: bool = True,
-    selected_features: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Build training dataset by joining snapshots with targets.
+    Build training dataset by loading pre-merged master snapshots.
+
+    Master snapshots already contain ALL data sources (FRED employment + exogenous),
+    pre-filtered to selected features. No separate FRED loading or feature selection needed.
 
     Uses the NFP release_date as the data cutoff (e.g., May 3rd for April NFP),
     matching inference behavior so the model learns from intra-month data.
@@ -268,12 +215,10 @@ def build_training_dataset(
         target_df: Target DataFrame with y_mom column (the prediction target)
         target_type: 'nsa' or 'sa' - determines which target we're predicting
         release_type: 'first' or 'last' - determines which release to use for lagged features
-        target_source: 'first_release' or 'revised' - determines lag data source
+        target_source: 'first_release' or 'revised' - determines which master snapshot variant
         start_date: Start date for training data
         end_date: End date for training data
         show_progress: Whether to show progress logging
-        selected_features: Pre-selected feature names to keep (from load_selected_features).
-            Calendar and lagged NFP features are always included regardless.
 
     Returns:
         Tuple of (features DataFrame, target Series)
@@ -329,8 +274,8 @@ def build_training_dataset(
             tm, target_values[i],
             release_date_map.get(tm, tm),
             tm + pd.offsets.MonthEnd(0),
-            target_type, release_type,
-            nsa_lags_lookup, sa_lags_lookup, selected_features,
+            target_type, release_type, target_source,
+            nsa_lags_lookup, sa_lags_lookup,
         ))
 
     logger.info(f"Starting parallel feature engineering for {len(tasks)} months using all processors...")
@@ -339,16 +284,16 @@ def build_training_dataset(
     results = Parallel(n_jobs=-1, verbose=5)(
         delayed(_process_single_month_task)(*args) for args in tasks
     )
-    
+
     # Filter out None results (skipped months)
     valid_results = [r for r in results if r[0] is not None]
-    
+
     if not valid_results:
          logger.warning("No valid training samples generated!")
          return pd.DataFrame(), pd.Series(dtype=float)
 
     all_features_dicts, all_targets_list = zip(*valid_results)
-    
+
     # Create final lists for DataFrame construction
     all_features = list(all_features_dicts)
     all_targets = list(all_targets_list)
@@ -366,45 +311,20 @@ def build_training_dataset(
     X['ds'] = valid_dates
 
     # NOTE: COVID winsorization moved to backtest loop (per-fold) to avoid future data leakage.
-    # Previously computed quantile bounds on full dataset including test months.
 
     # Replace inf with NaN (LightGBM handles NaN natively but not inf)
     numeric_cols = X.select_dtypes(include=[np.number]).columns
     X[numeric_cols] = X[numeric_cols].replace([np.inf, -np.inf], np.nan)
 
-    # Drop duplicate columns (can occur if FRED and master snapshots share series names)
+    # Drop duplicate columns (can occur from overlapping source data)
     dupes = X.columns.duplicated()
     if dupes.any():
         n_dupes = dupes.sum()
         logger.warning(f"Dropping {n_dupes} duplicate columns")
         X = X.loc[:, ~dupes]
 
-    # Filter to pre-selected features (calendar + NFP lags always included)
-    calendar_features = ['month_sin', 'month_cos', 'quarter_sin', 'quarter_cos',
-                         'weeks_since_last_survey', 'is_5_week_month', 'is_jan',
-                         'is_july', 'year', 'is_summer', 'is_holiday_season', 'is_december']
-    target_lag_features = [c for c in X.columns if c.startswith('nfp_')]
-
-    if selected_features is not None:
-        revision_cols = [c for c in X.columns if c.startswith('rev_') or c.endswith('_rev')]
-        always_keep = set(calendar_features) | set(target_lag_features) | set(revision_cols) | {'ds'}
-        allowed = set(selected_features) | always_keep
-        available = [c for c in X.columns if c in allowed]
-
-        n_before = len(X.columns)
-        X = X[available]
-
-        # Check for missing selected features
-        missing = set(selected_features) - set(X.columns)
-        if missing:
-            logger.warning(f"  {len(missing)} selected features not found in data: {sorted(list(missing))[:10]}...")
-
-        logger.info(f"Feature selection: {len(X.columns)} of {n_before} columns kept "
-                    f"({len([c for c in X.columns if c in set(selected_features)])} selected + "
-                    f"{len([c for c in X.columns if c in set(calendar_features)])} calendar + "
-                    f"{len(target_lag_features)} NFP lags)")
-    else:
-        logger.info(f"Built training dataset: {len(X)} samples, {len(X.columns)} total features")
+    logger.info(f"Built training dataset: {len(X)} samples, {len(X.columns)} total features "
+                f"(master snapshot features are pre-selected in ETL)")
 
     return X, y
 
@@ -420,7 +340,6 @@ def run_expanding_window_backtest(
     target_source: str = 'first_release',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
-    selected_features: Optional[List[str]] = None,
     tune: bool = True,
 ) -> pd.DataFrame:
     """
@@ -445,7 +364,6 @@ def run_expanding_window_backtest(
         target_source: 'first_release' or 'revised'
         use_huber_loss: Whether to use Huber loss
         huber_delta: Huber delta parameter
-        selected_features: Pre-selected feature names to use
         tune: If True, run Optuna hyperparameter tuning periodically
 
     Returns:
@@ -473,7 +391,7 @@ def run_expanding_window_backtest(
     X_full, y_full = build_training_dataset(
         target_df, target_type=target_type, release_type=release_type,
         target_source=target_source,
-        show_progress=False, selected_features=selected_features
+        show_progress=False
     )
 
     if X_full.empty:
@@ -741,10 +659,6 @@ def train_and_evaluate(
     logger.info("=" * 60)
     logger.info(f"Using EXPANDING WINDOW methodology (no time-travel, tune={tune})")
 
-    # Load pre-selected features for this target type
-    selected_features = load_selected_features(target_type)
-    logger.info(f"Loaded {len(selected_features)} pre-selected features for {target_type.upper()}")
-
     # Load target data
     target_df = load_target_data(target_type=target_type, release_type=release_type,
                                  target_source=target_source)
@@ -763,7 +677,6 @@ def train_and_evaluate(
         target_source=target_source,
         use_huber_loss=use_huber_loss,
         huber_delta=huber_delta,
-        selected_features=selected_features,
         tune=tune,
     )
 
@@ -845,7 +758,8 @@ def predict_nfp_mom(
     model: Optional[lgb.Booster] = None,
     metadata: Optional[Dict] = None,
     target_type: str = 'nsa',
-    release_type: str = 'first'
+    release_type: str = 'first',
+    target_source: str = 'first_release',
 ) -> Dict:
     """
     Make NFP MoM prediction for a specific month.
@@ -858,11 +772,12 @@ def predict_nfp_mom(
         metadata: Optional pre-loaded metadata. If None, loads from disk.
         target_type: 'nsa' or 'sa' - determines which model to load
         release_type: 'first' or 'last' - determines which release model to load
+        target_source: 'first_release' or 'revised' - determines which master snapshot variant
 
     Returns:
         Dictionary with prediction, intervals, and metadata
     """
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     # Normalize target_month to first of month
     target_month = pd.Timestamp(target_month).replace(day=1)
@@ -874,12 +789,14 @@ def predict_nfp_mom(
     feature_cols = metadata['feature_cols']
     residuals = metadata['residuals']
 
-    # Get snapshot for this month
+    # Get snapshot for this month (single pre-merged, pre-selected master snapshot)
     snapshot_date = target_month + pd.offsets.MonthEnd(0)
-    snapshot_df = load_master_snapshot(snapshot_date)
+    snapshot_df = load_master_snapshot(
+        snapshot_date, target_type=target_type, target_source=target_source
+    )
 
     if snapshot_df is None or snapshot_df.empty:
-        raise FileNotFoundError(f"No snapshot available for {snapshot_date}")
+        raise FileNotFoundError(f"No master snapshot available for {snapshot_date}")
 
     # Load target data for lagged features - use same release_type
     nsa_target_full = load_target_data('nsa', release_type=release_type)
@@ -895,7 +812,7 @@ def predict_nfp_mom(
             if pd.notna(rd):
                 cutoff_date = rd
 
-    # Create features
+    # Create features from master snapshot (already contains all data sources)
     features = pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date=cutoff_date)
 
     if features.empty:
@@ -909,15 +826,7 @@ def predict_nfp_mom(
     for k, v in {**nsa_target_features, **sa_target_features}.items():
         features[k] = v
 
-    # Add FRED employment features (pre-enriched snapshots with symlog + lags)
-    fred_df = load_fred_snapshot(snapshot_date)
-    if fred_df is not None and not fred_df.empty:
-        fred_features = pivot_snapshot_to_wide(fred_df, target_month, cutoff_date=cutoff_date)
-        if not fred_features.empty:
-            for col in fred_features.columns:
-                features[col] = fred_features[col].iloc[0]
-
-    # Add cross-snapshot revision features
+    # Add cross-snapshot revision features (master[M] vs master[M-1])
     prev_month = target_month - pd.DateOffset(months=1)
     target_ref_df = nsa_target_full if target_type == 'nsa' else sa_target_full
     prev_row = target_ref_df[target_ref_df['ds'] == prev_month]
@@ -927,10 +836,9 @@ def predict_nfp_mom(
     else:
         prev_cutoff = prev_month
 
-    selected_features = load_selected_features(target_type)
     revision_feats = get_revision_features_for_month(
         target_month, prev_cutoff,
-        selected_features=selected_features, include_fred=True,
+        target_type=target_type, target_source=target_source,
     )
     if not revision_feats.empty:
         for col in revision_feats.columns:

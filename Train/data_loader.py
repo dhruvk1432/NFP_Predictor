@@ -26,10 +26,9 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger
 from Train.config import (
-    MASTER_SNAPSHOTS_DIR,
+    MASTER_SNAPSHOTS_BASE,
     FRED_SNAPSHOTS_DIR,
-    FRED_PREPARED_DIR,
-    USE_PREPARED_FRED_DATA,
+    get_master_snapshots_dir,
     get_target_path,
     get_model_id,
     VALID_TARGET_TYPES,
@@ -126,11 +125,11 @@ def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     """
-    Constructs the exact active file path to a processed FRED employment snapshot 
-    for the specified month. It correctly routes to decades-based subfolders.
+    Constructs path to raw FRED employment snapshot for the specified month.
 
-    Depending on `USE_PREPARED_FRED_DATA` from config, this will either point to 
-    the raw snapshot or the preprocessed transformed data.
+    Note: Training no longer loads FRED snapshots directly (they are included in
+    master snapshots). This function is kept for build_revised_target() which needs
+    raw FRED levels.
 
     Args:
         snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
@@ -141,10 +140,7 @@ def get_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime('%Y-%m')
-
-    # Use prepared data if configured
-    base_dir = FRED_PREPARED_DIR if USE_PREPARED_FRED_DATA else FRED_SNAPSHOTS_DIR
-    return base_dir / decade / year / f"{month_str}.parquet"
+    return FRED_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
 
 
 def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
@@ -165,22 +161,27 @@ def get_raw_fred_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
     return FRED_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
 
 
-def get_master_snapshot_path(snapshot_date: pd.Timestamp) -> Path:
+def get_master_snapshot_path(snapshot_date: pd.Timestamp,
+                            target_type: str = 'nsa',
+                            target_source: str = 'first_release') -> Path:
     """
-    Constructs the file path to the fully merged master exogenous snapshot. This file 
-    combines all varied data sources (NOAA, Unifier, ADP, Prosper, etc.) available at 
-    a specific point in time.
+    Constructs the file path to the feature-selected master snapshot. This file
+    combines all data sources (FRED employment, FRED exog, Unifier, ADP, NOAA, Prosper)
+    already merged and filtered to selected features.
 
     Args:
         snapshot_date (pd.Timestamp): The vintage/snapshot month-end date.
+        target_type: 'nsa' or 'sa' — determines which feature-selected variant.
+        target_source: 'first_release' or 'revised' — determines target used for selection.
 
     Returns:
         Path: The fully resolved filesystem path to the master snapshot.
     """
+    base_dir = get_master_snapshots_dir(target_type, target_source)
     decade = f"{snapshot_date.year // 10 * 10}s"
     year = str(snapshot_date.year)
     month_str = snapshot_date.strftime('%Y-%m')
-    return MASTER_SNAPSHOTS_DIR / decade / year / f"{month_str}.parquet"
+    return base_dir / decade / year / f"{month_str}.parquet"
 
 
 # =============================================================================
@@ -230,27 +231,35 @@ def load_fred_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> O
     return df.copy() if use_cache else df
 
 
-def load_master_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> Optional[pd.DataFrame]:
+def load_master_snapshot(snapshot_date: pd.Timestamp,
+                        target_type: str = 'nsa',
+                        target_source: str = 'first_release',
+                        use_cache: bool = True) -> Optional[pd.DataFrame]:
     """
-    Load master snapshot for a given date.
+    Load feature-selected master snapshot for a given date.
+
+    The master snapshots are pre-merged wide-format files containing ALL data sources
+    (FRED employment + exogenous) filtered to the features selected by the 7-stage engine.
 
     Args:
         snapshot_date: Month-end timestamp (e.g., 2024-10-31)
+        target_type: 'nsa' or 'sa'
+        target_source: 'first_release' or 'revised'
         use_cache: Whether to use/populate the module cache
 
     Returns:
-        DataFrame with columns: date, series_name, value, release_date, series_code, snapshot_date
+        Wide-format DataFrame with columns: date, snapshot_date, + feature columns
     """
-    cache_key = f"master_{snapshot_date.strftime('%Y-%m')}"
+    cache_key = f"master_{target_type}_{target_source}_{snapshot_date.strftime('%Y-%m')}"
 
     if use_cache and cache_key in _snapshot_cache:
-        return _snapshot_cache[cache_key].copy()
+        cached = _snapshot_cache[cache_key]
+        return cached.copy() if cached is not None else None
 
-    path = get_master_snapshot_path(snapshot_date)
+    path = get_master_snapshot_path(snapshot_date, target_type, target_source)
     if not path.exists():
         if use_cache:
             _snapshot_cache[cache_key] = None
-        # logger.warning(f"Master snapshot not found: {path}") # Suppressed as expected for early history
         return None
 
     # Check for empty or corrupt file

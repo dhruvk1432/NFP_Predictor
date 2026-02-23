@@ -61,14 +61,25 @@ ALL_TARGET_CONFIGS = [
 # PATH CONFIGURATION
 # =============================================================================
 
-MASTER_SNAPSHOTS_DIR = DATA_PATH / "Exogenous_data" / "master_snapshots" / "decades"
-"""Directory containing the final merged point-in-time snapshots of all data sources."""
+MASTER_SNAPSHOTS_BASE = DATA_PATH / "master_snapshots"
+"""Base directory for feature-selected master snapshots ({nsa,sa}/{first_release,revised}/decades/)."""
 
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
-"""Directory containing raw FRED data snapshots."""
+"""Directory containing raw FRED data snapshots (still needed for build_revised_target)."""
 
-FRED_PREPARED_DIR = DATA_PATH / "fred_data_prepared" / "decades"  # Preprocessed data
-"""Directory containing preprocessed and transformed FRED data snapshots."""
+
+def get_master_snapshots_dir(target_type: str, target_source: str = 'first_release') -> Path:
+    """
+    Get the decades directory for master snapshots of a specific target configuration.
+
+    Args:
+        target_type: 'nsa' or 'sa'
+        target_source: 'first_release' or 'revised'
+
+    Returns:
+        Path to the decades directory containing master snapshots.
+    """
+    return MASTER_SNAPSHOTS_BASE / target_type / target_source / "decades"
 
 NFP_TARGET_DIR = DATA_PATH / "NFP_target"
 """Directory containing the target parquet files for both first and revised NFP prints."""
@@ -76,9 +87,6 @@ NFP_TARGET_DIR = DATA_PATH / "NFP_target"
 MODEL_SAVE_DIR = OUTPUT_DIR / "models" / "lightgbm_nfp"
 """Directory where the final trained LightGBM models are saved."""
 
-# Use prepared data (SymLog transformed, scaled) or raw data
-USE_PREPARED_FRED_DATA = True
-"""Flag determining whether to use the preprocessed FRED data (True) or raw data (False)."""
 
 
 def get_target_path(target_type: str, release_type: str = 'first') -> Path:
@@ -161,53 +169,36 @@ TARGET_PATH_SA = get_target_path('sa', 'first')
 # SELECTED FEATURES
 # =============================================================================
 
-SELECTED_FEATURES_DIR = Path(__file__).resolve().parent / "selected_features"
-
-ALL_SOURCES = ['fred_employment', 'fred_exog', 'unifier', 'adp', 'noaa', 'prosper']
-
-
-def load_selected_features(target_type: str) -> List[str]:
+def load_selected_features(target_type: str, target_source: str = 'first_release') -> List[str]:
     """
-    Load pre-selected feature names for a given target type (nsa or sa).
+    Load pre-selected feature names from the master snapshots feature selection cache.
 
-    Loads from all 6 source JSONs, sanitizes names to match
-    pivot_snapshot_to_wide() output, and returns a deduplicated list.
+    The feature selection engine (Data_ETA_Pipeline/create_master_snapshots.py) saves
+    a JSON cache of surviving features per {target_type, target_source} combination.
+    This function reads that cache directly.
 
     Args:
         target_type: 'nsa' or 'sa'
+        target_source: 'first_release' or 'revised'
 
     Returns:
-        List of sanitized feature names selected for this target type
+        List of feature names selected for this target configuration
     """
     if target_type not in VALID_TARGET_TYPES:
         raise ValueError(f"Invalid target_type: {target_type}. Must be one of {VALID_TARGET_TYPES}")
 
-    # Lazy import to avoid circular dependency (data_loader imports config)
-    from Train.data_loader import sanitize_feature_name
+    cache_path = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_{target_source}.json"
 
-    all_features = []
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Feature selection cache not found: {cache_path}. "
+            f"Run Data_ETA_Pipeline/create_master_snapshots.py first."
+        )
 
-    for source in ALL_SOURCES:
-        json_path = SELECTED_FEATURES_DIR / f"{source}_{target_type}.json"
+    with open(cache_path, 'r') as f:
+        data = json.load(f)
 
-        if not json_path.exists():
-            raise FileNotFoundError(f"Selected features file not found: {json_path}")
-
-        with open(json_path, 'r') as f:
-            raw_features = json.load(f)
-
-        sanitized = [sanitize_feature_name(name) for name in raw_features]
-        all_features.extend(sanitized)
-
-    # Deduplicate preserving order
-    seen = set()
-    unique_features = []
-    for f in all_features:
-        if f not in seen:
-            seen.add(f)
-            unique_features.append(f)
-
-    return unique_features
+    return data.get("features", [])
 
 
 # =============================================================================

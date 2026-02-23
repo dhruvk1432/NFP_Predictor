@@ -134,30 +134,41 @@ def get_model_id(target_type: str, release_type: str = 'first',
     return f"{base}_revised" if target_source == 'revised' else base
 
 
-def parse_model_id(model_id: str) -> Tuple[str, str]:
+def parse_model_id(model_id: str) -> Tuple[str, str, str]:
     """
-    Parse a model identifier string into target_type and release_type.
+    Parse a model identifier string into target_type, release_type, and target_source.
 
     Args:
-        model_id: Model identifier (e.g., 'nsa_first')
+        model_id: Model identifier (e.g., 'nsa_first' or 'nsa_first_revised')
 
     Returns:
-        Tuple of (target_type, release_type)
+        Tuple of (target_type, release_type, target_source)
 
     Raises:
         ValueError: If invalid model_id format
     """
     parts = model_id.lower().split('_')
-    if len(parts) != 2:
-        raise ValueError(f"Invalid model_id format: {model_id}. Expected 'target_release' (e.g., 'nsa_first')")
+    if len(parts) == 2:
+        target_type, release_type = parts
+        target_source = 'first_release'
+    elif len(parts) == 3 and parts[2] == 'revised':
+        target_type, release_type = parts[0], parts[1]
+        target_source = 'revised'
+    else:
+        raise ValueError(
+            f"Invalid model_id format: {model_id}. "
+            f"Expected 'target_release' (e.g., 'nsa_first') or "
+            f"'target_release_revised' (e.g., 'nsa_first_revised')"
+        )
 
-    target_type, release_type = parts
     if target_type not in VALID_TARGET_TYPES:
         raise ValueError(f"Invalid target_type in model_id: {target_type}")
     if release_type not in VALID_RELEASE_TYPES:
         raise ValueError(f"Invalid release_type in model_id: {release_type}")
+    if target_source not in VALID_TARGET_SOURCES:
+        raise ValueError(f"Invalid target_source in model_id: {target_source}")
 
-    return target_type, release_type
+    return target_type, release_type, target_source
 
 
 # Legacy compatibility - point to first release files

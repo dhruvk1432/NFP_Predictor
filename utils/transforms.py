@@ -608,14 +608,18 @@ def winsorize_covid_period(
     covid_mask = (data.index >= pd.Timestamp(covid_start)) & \
                  (data.index <= pd.Timestamp(covid_end))
 
+    if not covid_mask.any():
+        return data
+
     if isinstance(data, pd.DataFrame):
         non_covid = data.loc[~covid_mask]
-        for col in data.columns:
-            lower = non_covid[col].quantile(lower_percentile)
-            upper = non_covid[col].quantile(upper_percentile)
-            data.loc[covid_mask, col] = data.loc[covid_mask, col].clip(
-                lower=lower, upper=upper
-            )
+        # Vectorized: compute quantiles for all columns at once (returns Series)
+        lower_bounds = non_covid.quantile(lower_percentile)
+        upper_bounds = non_covid.quantile(upper_percentile)
+        # Clip all COVID rows against per-column bounds in one operation
+        data.loc[covid_mask] = data.loc[covid_mask].clip(
+            lower=lower_bounds, upper=upper_bounds, axis=1
+        )
     else:  # pd.Series
         non_covid = data.loc[~covid_mask]
         lower = non_covid.quantile(lower_percentile)

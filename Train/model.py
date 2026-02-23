@@ -191,15 +191,18 @@ def train_lightgbm_model(
     # But since this function is broadly used, we default to a flat weight if target_month isn't provided or we fallback.
     # Note: `calculate_sample_weights` requires target_month, so we derive it from the dataset's max date
     # if it's not provided in params_override.
-    target_month = params_override.pop('target_month', pd.to_datetime(X['ds'].max())) if params_override and 'target_month' in params_override else pd.to_datetime(X['ds'].max())
-    half_life_months = params_override.pop('half_life_months', 60.0) if params_override and 'half_life_months' in params_override else 60.0
+    # Extract custom keys without mutating the caller's dict
+    _NON_LGB_KEYS = {'target_month', 'half_life_months'}
+    target_month = params_override.get('target_month', pd.to_datetime(X['ds'].max())) if params_override else pd.to_datetime(X['ds'].max())
+    half_life_months = params_override.get('half_life_months', 60.0) if params_override else 60.0
     
     # Needs the full dataframe with 'ds' attached for weight calculation
     weights = calculate_sample_weights(X_clean_with_ds, target_month, half_life_months)
 
     # LightGBM parameters (use tuned params if provided, else static defaults)
+    # Filter out non-LightGBM keys to prevent unknown parameter errors
     if params_override is not None:
-        params = params_override.copy()
+        params = {k: v for k, v in params_override.items() if k not in _NON_LGB_KEYS}
         logger.info("Using Optuna-tuned hyperparameters")
     else:
         params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)

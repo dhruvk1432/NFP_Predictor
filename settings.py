@@ -69,6 +69,7 @@ TEMP_DIR       = if_relative_make_abs(_get_env("TEMP_DIR", "./_temp"))
 UNIFIER_USER   = _require_env("UNIFIER_USER")
 UNIFIER_TOKEN  = _require_env("UNIFIER_TOKEN")
 MODEL_TYPE = _get_env("MODEL_TYPE")
+TARGET_TYPE = _get_env("TARGET_TYPE")
 
 CACHE_DATA_DIR = DATA_PATH / "cache"
 BACKTEST_DIR   = OUTPUT_DIR / "backtest"

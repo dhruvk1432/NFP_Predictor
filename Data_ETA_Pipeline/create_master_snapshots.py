@@ -1,47 +1,105 @@
 """
-Master Snapshot Generation Pipeline
+Master Snapshot Generation Pipeline (Auto-Feature Selection)
 ===================================
 This module constructs the final, unified "Master Snapshots" used by the Machine Learning
-model. It acts as the grand aggregator, combining independently generated exogenous datasets
+model. It acts as the grand aggregator, combining independently generated datasets
 (FRED, Unifier, ADP, NOAA, Prosper) into a single wide-format parquet file per prediction month.
 
 Critical Architecture:
-- Point-in-time accuracy is strictly maintained because the upstream source directories
-  have already filtered their data relative to the NFP release calendar.
-- This script merely blindly concatenates rows from the individual source snapshots 
-  for a given month-end `obs_month`, creating a unified point-in-time ledger.
+- Point-in-time accuracy is strictly maintained.
+- It operates in a dual-track mode: once for 'nsa' targets and once for 'sa' targets.
+- Prior to concatenation, if a valid JSON cache is not found for the specific (sa/nsa) target, 
+  it spins up parallel workers to run a rigorous 7-stage LightGBM feature selection engine on ALL sources.
+- It strictly filters the final master outputs to ONLY include the surviving features,
+  preventing massive horizontal array bloat.
 """
 
 import pandas as pd
 import sys
-from pathlib import Path
+import os
+import json
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Add parent directory to FRONT of path so project-level packages (utils/, settings)
-# take priority over local files (Data_ETA_Pipeline/utils.py shadows utils/ package)
+# take priority over local files
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
+from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, TARGET_TYPE
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map
+from Data_ETA_Pipeline.feature_selection_engine import run_pipeline
+from Train.data_loader import load_target_data, pivot_snapshot_to_wide
 
 logger = setup_logger(__file__, TEMP_DIR)
-
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-# --- Source directories ---
-SOURCE_DIRS = [
-    DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades",
-    DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades",
-    DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
-    DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots" / "decades",
-    DATA_PATH / "Exogenous_data" / "prosper" / "decades",
-]
-MASTER_DIR = DATA_PATH / "Exogenous_data" / "master_snapshots" / "decades"
+MASTER_BASE = DATA_PATH / "master_snapshots"
+
+SOURCES = {
+    'FRED_Employment': DATA_PATH / "FRED_Employment_Snapshots" / "decades",
+    'FRED_Exogenous': DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades",
+    'Unifier': DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades",
+    'ADP': DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
+    'NOAA': DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots" / "decades",
+    'Prosper': DATA_PATH / "Exogenous_data" / "prosper" / "decades",
+}
+
+# Ordered by typical execution time (longest to shortest) to optimize ProcessPool scheduling
+SOURCE_EXEC_ORDER = ['FRED_Employment', 'FRED_Exogenous', 'Unifier', 'Prosper', 'NOAA', 'ADP']
 
 
 # =============================================================================
-# HELPERS
+# CACHE LOGIC
+# =============================================================================
+
+def _get_cache_path(target_cat: str) -> Path:
+    MASTER_BASE.mkdir(parents=True, exist_ok=True)
+    slug = (TARGET_TYPE or "default").replace("_", "-")
+    return MASTER_BASE / f"selected_features_{target_cat}_{slug}.json"
+
+
+def _check_cache(target_cat: str) -> list[str]:
+    """Return cached features if generated within the last 30 days, else None."""
+    cache_path = _get_cache_path(target_cat)
+    if not cache_path.exists():
+        return None
+        
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+            
+        last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
+        days_old = (datetime.now() - last_run).days
+        
+        if data.get("target_type") == TARGET_TYPE and data.get("target_cat") == target_cat and days_old < 30:
+            logger.info(f"[{target_cat.upper()}] Using cached features (Age: {days_old} days). Target: {TARGET_TYPE}")
+            return data.get("features", [])
+            
+        logger.info(f"[{target_cat.upper()}] Cache expired/invalid (Age: {days_old} days). Rebuilding...")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Failed to read feature cache: {e}")
+        return None
+
+
+def _save_cache(features: list[str], target_cat: str) -> None:
+    cache_path = _get_cache_path(target_cat)
+    data = {
+        "last_run_date": datetime.now().strftime("%Y-%m-%d"),
+        "target_type": TARGET_TYPE,
+        "target_cat": target_cat,
+        "features": sorted(list(set(features)))
+    }
+    with open(cache_path, 'w') as f:
+        json.dump(data, f, indent=4)
+    logger.info(f"Saved {len(features)} selected features to cache: {cache_path}")
+
+
+# =============================================================================
+# FEATURE SELECTION PIPELINE (PARALLEL WORKERS)
 # =============================================================================
 
 def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
@@ -50,170 +108,190 @@ def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
     return base_dir / decade / year / f"{date_ts.strftime('%Y-%m')}.parquet"
 
 
-def _load_parquet(path: Path) -> pd.DataFrame:
-    if path.exists():
-        return pd.read_parquet(path)
-    return pd.DataFrame()
+def _build_historical_matrix(source_dir: Path, nfp_map: dict) -> pd.DataFrame:
+    """Builds a wide feature matrix for a specific source across all history."""
+    rows = []
+    months = []
+    for obs_month in sorted(nfp_map.keys()):
+        path = _snapshot_path(source_dir, obs_month)
+        if not path.exists(): continue
+        
+        try:
+            df = pd.read_parquet(path)
+            # Ensure long strings (if pre-pivoted) or pivot if long
+            if 'series_name' in df.columns and 'value' in df.columns:
+                wide = df.pivot(index='date', columns='series_name', values='value')
+                feats = wide.iloc[-1].to_dict() if len(wide) > 0 else {}
+            else:
+                feats = df.iloc[-1].to_dict() if len(df) > 0 else {}
+                
+            if feats:
+                rows.append(feats)
+                months.append(obs_month)
+        except Exception:
+            pass
+            
+    if not rows: return pd.DataFrame()
+    wide_df = pd.DataFrame(rows, index=pd.DatetimeIndex(months, name='date'))
+    return wide_df.dropna(axis=1, how='all')
 
 
-def _load_all_sources(obs_month: pd.Timestamp) -> pd.DataFrame:
-    """Load all source snapshots for a given observation month in parallel."""
-    results = []
-    with ThreadPoolExecutor(max_workers=len(SOURCE_DIRS)) as executor:
-        futures = [executor.submit(_load_parquet, _snapshot_path(d, obs_month)) for d in SOURCE_DIRS]
-        for future in as_completed(futures):
-            df = future.result()
-            if not df.empty:
-                results.append(df)
-
-    if results:
-        return pd.concat(results, ignore_index=True)
-    return pd.DataFrame()
-
-
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
-
-def _process_single_snapshot(obs_month: pd.Timestamp, snap_date: pd.Timestamp) -> tuple[bool, str]:
-    """Process a single snapshot date. Returns (success, message)."""
-    try:
-        current_vintage_df = _load_all_sources(obs_month)
-
-        if current_vintage_df.empty:
-            return (True, f"Skipped {obs_month.date()} (no data)")
-
-        current_vintage_df['date'] = pd.to_datetime(current_vintage_df['date'])
-        current_vintage_df['snapshot_date'] = snap_date
-
-        save_dir = _snapshot_path(MASTER_DIR, obs_month).parent
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{obs_month.strftime('%Y-%m')}.parquet"
-
-        current_vintage_df.to_parquet(save_path, index=False)
-
-        return (True, f"Generated {obs_month.date()} (snapshot={snap_date.date()})")
-
-    except Exception as e:
-        return (False, f"Error processing {obs_month.date()}: {str(e)}")
-
-
-def create_master_snapshots(n_workers: int = 1, skip_existing: bool = False):
-    """
-    Iterate chronologically through all historical NFP release dates and merge all
-    available exogenous data sources into a single master snapshot for each month.
+def _process_source_features(source_name: str, source_dir: Path, nfp_map: dict, target_cat: str) -> list[str]:
+    """Worker function for ProcessPoolExecutor to run the 7-stage engine on one source."""
+    logger.info(f"[{target_cat.upper()}] [{source_name}] Building historical matrix...")
+    X = _build_historical_matrix(source_dir, nfp_map)
+    if X.empty:
+        logger.warning(f"[{target_cat.upper()}] [{source_name}] Empty history matrix. Skipping.")
+        return []
+        
+    logger.info(f"[{target_cat.upper()}] [{source_name}] Loading targets for {TARGET_TYPE}...")
+    release = "revised" if "revised" in (TARGET_TYPE or "").lower() else "first"
+    target_df = load_target_data(target_type=target_cat, release_type=release, label_type='unrevised', use_cache=False)
     
-    This function discovers the specific NFP release date for a given month, finds 
-    the corresponding pre-filtered sub-snapshots from FRED, NOAA, ADP, etc., and 
-    concatenates them vertically into a unified dataframe representing all macroeconomic 
-    knowledge available immediately before the BLS publication.
+    if target_df.empty or 'y_mom' not in target_df.columns:
+        logger.error(f"[{target_cat.upper()}] [{source_name}] Failed to load valid targets.")
+        return []
+        
+    y = target_df.dropna(subset=['y_mom']).set_index('ds')['y_mom']
+    
+    logger.info(f"[{target_cat.upper()}] [{source_name}] Matrix shape {X.shape}. Starting 7-stage pipeline...")
+    try:
+        survivors = run_pipeline(X, y, source_name)
+        logger.info(f"[{target_cat.upper()}] [{source_name}] Engine returned {len(survivors)} features.")
+        return survivors
+    except Exception as e:
+        logger.error(f"[{target_cat.upper()}] [{source_name}] Pipeline failed: {e}")
+        return []
 
-    Args:
-        n_workers (int): Number of parallel processes to use for parsing files.
-        skip_existing (bool): If True, skips months that already have a master parquet file.
-    """
+
+def _run_parallel_feature_selection(nfp_map: dict, target_cat: str) -> list[str]:
+    logger.info(f"[{target_cat.upper()}] Starting Parallel 7-Stage Feature Selection Across All Sources...")
+    all_selected = []
+    
+    # max_workers=6 maps perfectly to our 6 sources
+    with ProcessPoolExecutor(max_workers=min(6, os.cpu_count() or 1)) as executor:
+        futures = {
+            executor.submit(_process_source_features, name, SOURCES[name], nfp_map, target_cat): name
+            for name in SOURCE_EXEC_ORDER
+        }
+        
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                feats = future.result()
+                all_selected.extend(feats)
+                logger.info(f"+++ [{target_cat.upper()}] {name} completed successfully. Added {len(feats)} features.")
+            except Exception as e:
+                logger.error(f"--- [{target_cat.upper()}] {name} spawned an exception: {e}")
+                
+    all_selected = list(set(all_selected))
+    logger.info(f"[{target_cat.upper()}] Feature Selection Complete. Total surviving features: {len(all_selected)}")
+    return all_selected
+
+
+# =============================================================================
+# MASTER GENERATION
+# =============================================================================
+
+def _load_all_sources(obs_month: pd.Timestamp, allowed_features: set) -> pd.DataFrame:
+    """Load and merge all sources for a single month, dropping unselected columns."""
+    results = []
+    for name, sdir in SOURCES.items():
+        path = _snapshot_path(sdir, obs_month)
+        if not path.exists(): continue
+        
+        df = pd.read_parquet(path)
+        if df.empty: continue
+        
+        # Format normalization
+        if 'series_name' in df.columns and 'value' in df.columns:
+            wide = df.pivot(index='date', columns='series_name', values='value').reset_index()
+        else:
+            wide = df
+            
+        keep_cols = [c for c in wide.columns if c in allowed_features or c in ['date', 'snapshot_date']]
+        wide = wide[keep_cols]
+        
+        if not wide.drop(columns=['date', 'snapshot_date'], errors='ignore').empty:
+            results.append(wide)
+
+    if not results: return pd.DataFrame()
+    
+    master = results[0]
+    for nxt in results[1:]:
+        master = pd.merge(master, nxt, on='date', how='outer')
+        
+    return master
+
+
+def create_master_snapshots(skip_existing: bool = False):
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
-    nfp_release_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
-    snapshot_pairs = sorted(nfp_release_map.items(), key=lambda x: x[0])
+    nfp_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
+    snapshot_pairs = sorted(nfp_map.items(), key=lambda x: x[0])
 
     if not snapshot_pairs:
-        logger.info("No NFP release dates found for master snapshot generation.")
+        logger.info("No NFP release dates found.")
         return
 
-    logger.info(
-        f"Generating Master Snapshots from {snapshot_pairs[0][0].date()} to {snapshot_pairs[-1][0].date()}"
-    )
-    logger.info(f"Total snapshots to process: {len(snapshot_pairs)}")
+    # Loop dual branches specifically for Not Seasonally Adjusted & Seasonally Adjusted
+    for target_cat in ['nsa', 'sa']:
+        logger.info(f"========== COMMENCING BRANCH: {target_cat.upper()} ==========")
+        target_master_dir = MASTER_BASE / target_cat / "decades"
+        
+        # 1. Check Cache / Run Engine
+        allowed_list = _check_cache(target_cat)
+        if allowed_list is None:
+            logger.info(f"[{target_cat.upper()}] Executing vast compute pool for automated selection...")
+            allowed_list = _run_parallel_feature_selection(nfp_map, target_cat)
+            if not allowed_list:
+                logger.error(f"[{target_cat.upper()}] Feature selection catastrophic failure. No features returned.")
+                continue
+            _save_cache(allowed_list, target_cat)
 
-    if skip_existing:
-        before = len(snapshot_pairs)
-        snapshot_pairs = [
-            (obs, snap) for obs, snap in snapshot_pairs
-            if not _snapshot_path(MASTER_DIR, obs).exists()
-        ]
-        logger.info(f"Skipping {before - len(snapshot_pairs)} existing snapshots")
+        allowed_set = set(allowed_list)
+        logger.info(f"[{target_cat.upper()}] Proceeding strictly with {len(allowed_set)} whitelisted features.")
 
-    if not snapshot_pairs:
-        logger.info("No snapshots to process.")
-        return
+        # 2. Iterate and Build
+        branch_snapshot_pairs = snapshot_pairs
+        if skip_existing:
+            branch_snapshot_pairs = [
+                (obs, snap) for obs, snap in snapshot_pairs
+                if not _snapshot_path(target_master_dir, obs).exists()
+            ]
 
-    if n_workers == 1:
-        for i, (obs_month, snap_date) in enumerate(snapshot_pairs):
-            success, msg = _process_single_snapshot(obs_month, snap_date)
-            if not success:
-                logger.error(msg)
-            elif i % 12 == 0:
-                logger.info(msg)
-    else:
-        from concurrent.futures import ProcessPoolExecutor
+        for i, (obs_month, snap_date) in enumerate(branch_snapshot_pairs):
+            try:
+                master = _load_all_sources(obs_month, allowed_set)
+                if master.empty:
+                    logger.debug(f"[{target_cat.upper()}] Skipped {obs_month.date()} (no valid data)")
+                    continue
 
-        logger.info(f"Using {n_workers} parallel workers")
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_process_single_snapshot, obs, snap): (obs, snap)
-                for obs, snap in snapshot_pairs
-            }
-            completed = 0
-            for future in as_completed(futures):
-                success, msg = future.result()
-                completed += 1
-                if not success:
-                    logger.error(msg)
-                elif completed % 12 == 0:
-                    logger.info(f"Progress: {completed}/{len(snapshot_pairs)} - {msg}")
+                master['date'] = pd.to_datetime(master['date'])
+                master['snapshot_date'] = snap_date
 
-    logger.info("Master Snapshots generation complete.")
+                save_dir = _snapshot_path(target_master_dir, obs_month).parent
+                save_dir.mkdir(parents=True, exist_ok=True)
+                master.to_parquet(save_dir / f"{obs_month.strftime('%Y-%m')}.parquet", index=False)
+                
+                if i % 12 == 0:
+                    logger.info(f"[{target_cat.upper()}] Generated {obs_month.date()} (Cols: {master.shape[1]})")
+                    
+            except Exception as e:
+                logger.error(f"[{target_cat.upper()}] Error processing {obs_month.date()}: {e}")
 
+        logger.info(f"========== BRANCH COMPLETE: {target_cat.upper()} ==========\n")
 
-# =============================================================================
-# VERIFICATION
-# =============================================================================
-
-def verify_master_snapshot():
-    """Check the latest master snapshot has data from all expected sources."""
-    logger.info("Verifying Master Snapshots...")
-
-    nfp_release_map = get_nfp_release_map(start_date=START_DATE, end_date=END_DATE)
-    if not nfp_release_map:
-        logger.error("Verification failed: No NFP release dates found.")
-        return
-
-    test_month = max(nfp_release_map.keys())
-    master_path = _snapshot_path(MASTER_DIR, test_month)
-
-    if not master_path.exists():
-        logger.error(f"Verification failed: Could not find file at {master_path}")
-        return
-
-    df = pd.read_parquet(master_path)
-    series = df['series_name'].unique()
-
-    logger.info(f"--- Verification Report for {test_month.date()} ---")
-    logger.info(f"Total unique series: {len(series)}")
-    logger.info(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
-    logger.info(f"Rows: {len(df):,}")
-    logger.info("Verification Complete.")
-
+    logger.info("Master Snapshots generation completely finished for all branches.")
 
 if __name__ == "__main__":
     import argparse
     import time
-
-    parser = argparse.ArgumentParser(description="Generate master exogenous snapshots")
-    parser.add_argument('--workers', '-w', type=int, default=1,
-                        help="Number of parallel workers (default: 1, sequential)")
-    parser.add_argument('--skip-existing', action='store_true',
-                        help="Skip snapshots that already exist")
-    parser.add_argument('--verify-only', action='store_true',
-                        help="Only run verification, skip generation")
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-existing', action='store_true')
     args = parser.parse_args()
-
-    if args.verify_only:
-        verify_master_snapshot()
-    else:
-        start_time = time.time()
-        create_master_snapshots(n_workers=args.workers, skip_existing=args.skip_existing)
-        elapsed = time.time() - start_time
-        logger.info(f"Total processing time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
-        verify_master_snapshot()
+    
+    start_time = time.time()
+    create_master_snapshots(skip_existing=args.skip_existing)
+    logger.info(f"Total Master Time: {(time.time() - start_time)/60:.1f} minutes")

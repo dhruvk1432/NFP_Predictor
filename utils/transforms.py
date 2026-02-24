@@ -293,8 +293,8 @@ def compute_all_features(
 
     # --- Global Lag Application ---
     # Apply lags to EVERY feature generated above
-    # Lags: 1, 3, 6, 12, 18 months
-    lags = [1, 3, 6, 12, 18]
+    # Lags: 1, 3, 6, 12 months (18m removed — stale for monthly employment data)
+    lags = [1, 3, 6, 12]
     final_output_list = []
     
     for feature_block in base_features_list:
@@ -388,23 +388,18 @@ def compute_features_wide(
     symlog_wide.columns = [f"{c}_symlog" for c in base_cols]
     symlog_cols = list(symlog_wide.columns)
 
-    # 2. Pct change of base and symlog
+    # 2. Pct change of base (symlog_pct_chg removed — redundant with pct_chg for tree models)
     pct_base = wide.pct_change() * 100
     pct_base = pct_base.replace([np.inf, -np.inf], np.nan)
     pct_base.columns = [f"{c}_pct_chg" for c in base_cols]
     pct_base_cols = list(pct_base.columns)
 
-    pct_symlog = symlog_wide.pct_change() * 100
-    pct_symlog = pct_symlog.replace([np.inf, -np.inf], np.nan)
-    pct_symlog.columns = [f"{c}_symlog_pct_chg" for c in base_cols]
-    pct_symlog_cols = list(pct_symlog.columns)
-
     # Combine all base series into one wide DataFrame
-    all_wide = pd.concat([wide, symlog_wide, pct_base, pct_symlog], axis=1)
+    all_wide = pd.concat([wide, symlog_wide, pct_base], axis=1)
 
     # Identify column categories for feature generation
     raw_symlog_cols = base_cols + symlog_cols  # get diff + multi-period
-    pct_chg_cols = pct_base_cols + pct_symlog_cols  # no diff, no multi-period
+    pct_chg_cols = pct_base_cols  # no diff, no multi-period
     all_series_cols = raw_symlog_cols + pct_chg_cols
 
     # --- Generate features (all vectorized) ---
@@ -448,7 +443,7 @@ def compute_features_wide(
 
     # --- Apply lags to ALL feature columns ---
     lag_frames = [all_features]  # include un-lagged
-    for lag in [1, 3, 6, 12, 18]:
+    for lag in [1, 3, 6, 12]:
         lagged = all_features.shift(lag)
         lagged.columns = [f"{c}_lag_{lag}m" for c in all_features.columns]
         lag_frames.append(lagged)

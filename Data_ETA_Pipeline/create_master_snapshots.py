@@ -252,6 +252,13 @@ def _load_all_sources(obs_month: pd.Timestamp, allowed_features: set) -> pd.Data
         else:
             wide = df
 
+        # Ensure 'date' is a column (not the index)
+        if 'date' not in wide.columns:
+            if isinstance(wide.index, pd.DatetimeIndex) or wide.index.name == 'date':
+                wide = wide.reset_index()
+            elif hasattr(wide.index, 'name') and wide.index.name is not None:
+                wide = wide.reset_index()
+
         keep_cols = [c for c in wide.columns if c in allowed_features or c in ['date', 'snapshot_date']]
         wide = wide[keep_cols]
 

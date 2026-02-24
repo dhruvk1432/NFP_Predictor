@@ -15,9 +15,15 @@ from datetime import datetime, timedelta
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from Data_ETA_Pipeline.create_master_snapshots import (
+    _check_regime_cache,
+    _save_regime_cache,
     _check_source_cache,
     _save_source_cache,
     _get_source_cache_path,
+    _build_feature_selection_regimes,
+    _resolve_regime_cutoff,
+    _min_valid_obs_for_source,
+    _process_source_features,
     _normalize_to_wide,
     _batch_load_source,
     _load_all_sources_from_cache,
@@ -26,7 +32,9 @@ from Data_ETA_Pipeline.create_master_snapshots import (
     _save_progress,
     _clear_progress,
     _get_progress_path,
+    _resolve_target_combos,
     MASTER_BASE,
+    HARD_CODED_REGIME_STARTS,
 )
 
 
@@ -36,7 +44,7 @@ from Data_ETA_Pipeline.create_master_snapshots import (
 
 @pytest.fixture
 def source_cache_dir(tmp_path, monkeypatch):
-    """Redirect MASTER_BASE to tmp_path so cache files don't pollute real data."""
+    """Redirect cache root to tmp_path so cache files don't pollute real data."""
     monkeypatch.setattr(
         'Data_ETA_Pipeline.create_master_snapshots.MASTER_BASE', tmp_path
     )
@@ -152,7 +160,6 @@ class TestPerSourceCache:
         _save_source_cache([], 'Prosper', 'nsa', 'first_release')
         result = _check_source_cache('Prosper', 'nsa', 'first_release')
         assert result == []
-
 
 # =============================================================================
 # Batch Loading
@@ -359,3 +366,225 @@ class TestProgressTracking:
 
         result = _load_progress('nsa', 'first_release')
         assert result == set()
+
+
+class TestRegimeSelection:
+    """Tests for leakage-safe regime feature selection and routing."""
+
+    def test_build_feature_selection_regimes_uses_window_relevant_hard_coded_cutoffs(self):
+        months = [
+            pd.Timestamp("2024-01-01"),
+            pd.Timestamp("2024-12-01"),
+            pd.Timestamp("2026-02-01"),
+        ]
+        cutoffs = _build_feature_selection_regimes(months)
+        assert cutoffs == [
+            pd.Timestamp("2022-03-01"),
+            pd.Timestamp("2025-02-01"),
+        ]
+
+    def test_build_feature_selection_regimes_returns_all_for_full_history_window(self):
+        months = [
+            pd.Timestamp("1990-01-01"),
+            pd.Timestamp("2026-02-01"),
+        ]
+        cutoffs = _build_feature_selection_regimes(months)
+        assert cutoffs == [
+            pd.Timestamp("1998-01-01"),
+            pd.Timestamp("2008-01-01"),
+            pd.Timestamp("2015-01-01"),
+            pd.Timestamp("2020-03-01"),
+            pd.Timestamp("2022-03-01"),
+            pd.Timestamp("2025-02-01"),
+        ]
+
+    def test_build_feature_selection_regimes_returns_empty_before_first_regime(self):
+        months = [
+            pd.Timestamp("1990-01-01"),
+            pd.Timestamp("1997-12-01"),
+        ]
+        cutoffs = _build_feature_selection_regimes(months)
+        assert cutoffs == []
+
+    def test_hard_coded_regimes_start_in_1998(self):
+        assert HARD_CODED_REGIME_STARTS[0][1] == pd.Timestamp("1998-01-01")
+
+    def test_regime_cache_round_trip(self, source_cache_dir):
+        cutoff = pd.Timestamp("2020-01-01")
+        _save_regime_cache(["feat_a", "feat_b"], "nsa", "first_release", cutoff)
+        loaded = _check_regime_cache("nsa", "first_release", cutoff)
+        assert sorted(loaded) == ["feat_a", "feat_b"]
+
+    def test_resolve_regime_cutoff_uses_latest_past_cutoff(self):
+        cutoffs = [
+            pd.Timestamp("2019-01-01"),
+            pd.Timestamp("2020-01-01"),
+            pd.Timestamp("2021-01-01"),
+        ]
+        obs_month = pd.Timestamp("2020-11-01")
+        resolved = _resolve_regime_cutoff(obs_month, cutoffs)
+        assert resolved == pd.Timestamp("2020-01-01")
+
+    def test_resolve_regime_cutoff_backfills_to_first_cutoff(self):
+        cutoffs = [
+            pd.Timestamp("1998-01-01"),
+            pd.Timestamp("2008-01-01"),
+        ]
+        obs_month = pd.Timestamp("1997-12-01")
+        resolved = _resolve_regime_cutoff(obs_month, cutoffs)
+        assert resolved == pd.Timestamp("1998-01-01")
+
+    def test_create_master_snapshots_routes_months_to_past_regime(self, tmp_path, monkeypatch):
+        import Data_ETA_Pipeline.create_master_snapshots as cms
+
+        master_base = tmp_path / "master_snapshots"
+        monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "first_release")])
+        monkeypatch.setattr(cms, "SOURCES", {"ADP": tmp_path / "mock_sources" / "adp" / "decades"})
+        monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
+        monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
+        monkeypatch.setattr(cms, "END_DATE", "2021-02-01")
+
+        month_pairs = {
+            pd.Timestamp("2019-12-01"): pd.Timestamp("2019-12-06"),
+            pd.Timestamp("2020-01-01"): pd.Timestamp("2020-01-03"),
+            pd.Timestamp("2020-02-01"): pd.Timestamp("2020-02-07"),
+            pd.Timestamp("2021-01-01"): pd.Timestamp("2021-01-08"),
+            pd.Timestamp("2021-02-01"): pd.Timestamp("2021-02-05"),
+        }
+        monkeypatch.setattr(cms, "get_nfp_release_map", lambda start_date, end_date: month_pairs)
+        monkeypatch.setattr(
+            cms,
+            "_build_feature_selection_regimes",
+            lambda months, refresh_months=cms.FEATURE_SELECTION_REGIME_REFRESH_MONTHS: [
+                pd.Timestamp("2020-01-01"),
+                pd.Timestamp("2021-01-01"),
+            ],
+        )
+        monkeypatch.setattr(cms, "_check_regime_cache", lambda *args, **kwargs: None)
+
+        def fake_parallel_selection(target_cat, target_source, asof_month=None):
+            asof_key = pd.Timestamp(asof_month).strftime("%Y-%m")
+            return ["feat_old"] if asof_key == "2020-01" else ["feat_new"]
+
+        def fake_batch_load(source_name, source_dir, snapshot_months, allowed_features):
+            keep_col = "feat_new" if "feat_new" in allowed_features else "feat_old"
+            result = {}
+            for month in snapshot_months:
+                result[month.strftime("%Y-%m")] = pd.DataFrame(
+                    {
+                        "date": pd.date_range(month, periods=2, freq="MS"),
+                        keep_col: [1.0, 2.0],
+                    }
+                )
+            return result
+
+        monkeypatch.setattr(cms, "_run_parallel_feature_selection", fake_parallel_selection)
+        monkeypatch.setattr(cms, "_batch_load_source", fake_batch_load)
+
+        cms.create_master_snapshots(skip_existing=False)
+
+        target_dir = master_base / "nsa" / "first_release" / "decades"
+        pre_path = cms._snapshot_path(target_dir, pd.Timestamp("2019-12-01"))
+        old_path = cms._snapshot_path(target_dir, pd.Timestamp("2020-02-01"))
+        new_path = cms._snapshot_path(target_dir, pd.Timestamp("2021-02-01"))
+        assert pre_path.exists()
+        assert old_path.exists()
+        assert new_path.exists()
+
+        pre_df = pd.read_parquet(pre_path)
+        old_df = pd.read_parquet(old_path)
+        new_df = pd.read_parquet(new_path)
+        assert "feat_old" in pre_df.columns
+        assert "feat_new" not in pre_df.columns
+        assert "feat_old" in old_df.columns
+        assert "feat_new" not in old_df.columns
+        assert "feat_new" in new_df.columns
+        assert "feat_old" not in new_df.columns
+
+
+class TestTargetScopeResolution:
+    """Tests for auto/all/revised/first_release branch selection."""
+
+    def test_auto_uses_revised_for_short_window(self):
+        combos = _resolve_target_combos(
+            pd.Timestamp("2024-01-01"),
+            pd.Timestamp("2026-02-01"),
+            target_source_scope="auto",
+        )
+        assert combos == [("nsa", "revised"), ("sa", "revised")]
+
+    def test_auto_uses_all_for_long_window(self):
+        combos = _resolve_target_combos(
+            pd.Timestamp("1990-01-01"),
+            pd.Timestamp("2026-02-01"),
+            target_source_scope="auto",
+        )
+        assert ("nsa", "first_release") in combos
+        assert ("nsa", "revised") in combos
+        assert ("sa", "first_release") in combos
+        assert ("sa", "revised") in combos
+        assert len(combos) == 4
+
+    def test_explicit_scope_revised(self):
+        combos = _resolve_target_combos(
+            pd.Timestamp("1990-01-01"),
+            pd.Timestamp("2026-02-01"),
+            target_source_scope="revised",
+        )
+        assert combos == [("nsa", "revised"), ("sa", "revised")]
+
+
+class TestSourceSpecificMinObs:
+    """Tests for source-specific short-history filtering."""
+
+    def test_process_source_features_uses_source_threshold(self, tmp_path, monkeypatch):
+        import Data_ETA_Pipeline.create_master_snapshots as cms
+
+        source_dir = tmp_path / "adp" / "decades"
+        obs_month = pd.Timestamp("2020-01-01")
+        path = _snapshot_path(source_dir, obs_month)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        dates = pd.date_range("2010-01-01", periods=90, freq="MS")
+        feat_short = np.arange(90, dtype=float)
+        feat_short[:25] = np.nan  # 65 valid observations
+        feat_long = np.arange(90, dtype=float) + 10.0
+        df = pd.DataFrame(
+            {
+                "date": dates,
+                "feat_short": feat_short,
+                "feat_long": feat_long,
+            }
+        )
+        df.to_parquet(path, index=False)
+
+        monkeypatch.setitem(cms.SOURCE_MIN_VALID_OBS, "ADP", 70)
+        assert _min_valid_obs_for_source("ADP") == 70
+
+        target_df = pd.DataFrame({"ds": dates, "y_mom": np.linspace(0.0, 1.0, len(dates))})
+        monkeypatch.setattr(
+            cms,
+            "load_target_data",
+            lambda target_type, release_type, use_cache=False: target_df,
+        )
+
+        captured = {}
+
+        def fake_pipeline(snap_wide, y_mom, source_name, snapshots_dir, series_groups):
+            captured["cols"] = list(snap_wide.columns)
+            return list(snap_wide.columns)
+
+        monkeypatch.setattr(cms, "run_full_source_pipeline", fake_pipeline)
+
+        selected = _process_source_features(
+            "ADP",
+            source_dir,
+            "nsa",
+            "first_release",
+            asof_month=obs_month,
+        )
+
+        assert "feat_long" in selected
+        assert "feat_short" not in selected
+        assert captured["cols"] == ["feat_long"]

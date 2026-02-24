@@ -8,15 +8,26 @@ import pandas as pd
 import time
 import sys
 from pathlib import Path
+from collections import Counter
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from Data_ETA_Pipeline.feature_selection_engine import (
+    _safe_lgb_fit,
+    _safe_lgb_predict,
+    _prepare_lgb_frame,
     _variance_filter,
     _deduplicate_group,
+    _source_aware_recency_mask,
     _lgb_screen_group,
+    _bh_fdr_select,
+    _memoized_score,
+    _parallel_trial_scores,
+    _aggregate_vintage_scores,
     filter_group_data_purged,
+    _adaptive_boruta_runs,
+    _adaptive_boruta_shadow_cap,
     _boruta_core,
     get_boruta_importance,
     _discover_vintage_snapshots,
@@ -26,6 +37,7 @@ from Data_ETA_Pipeline.feature_selection_engine import (
     _extract_split_pairs,
     interaction_rescue,
     sequential_forward_selection,
+    should_keep_change,
 )
 
 
@@ -53,6 +65,67 @@ def make_target():
         dates = pd.date_range('2010-01-01', periods=n_rows, freq='MS')
         return pd.Series(rng.randn(n_rows) * 100, index=dates, name='y_mom')
     return _make
+
+
+# =============================================================================
+# LightGBM Safe Helpers
+# =============================================================================
+
+class TestSafeLgbHelpers:
+    """Tests for cached/no-copy LightGBM input sanitization."""
+
+    def test_prepare_lgb_frame_returns_same_object_when_clean(self, make_wide_df):
+        X = make_wide_df(n_rows=50, n_cols=5)
+        X_prep, raw_cols, safe_cols = _prepare_lgb_frame(X)
+        assert X_prep is X
+        assert raw_cols == tuple(X.columns)
+        assert safe_cols == tuple(X.columns)
+
+    def test_prepare_lgb_frame_sanitizes_columns(self):
+        dates = pd.date_range('2010-01-01', periods=20, freq='MS')
+        X = pd.DataFrame(
+            {
+                'a[b]': np.arange(20, dtype=float),
+                'a{b}': np.arange(20, dtype=float) + 1,
+            },
+            index=dates,
+        )
+        X_prep, _, safe_cols = _prepare_lgb_frame(X)
+        assert tuple(X_prep.columns) == safe_cols
+        assert safe_cols[0] == 'a_b_'
+        assert safe_cols[1].startswith('a_b_')
+        assert np.shares_memory(X_prep.to_numpy(), X.to_numpy())
+
+    def test_safe_lgb_predict_reuses_fit_schema(self):
+        import lightgbm as lgb
+        import Data_ETA_Pipeline.feature_selection_engine as fse
+
+        rng = np.random.RandomState(42)
+        n_rows = 120
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        X = pd.DataFrame(
+            {
+                'feat[0]': rng.randn(n_rows),
+                'feat{1}': rng.randn(n_rows),
+                'feat:2': rng.randn(n_rows),
+            },
+            index=dates,
+        )
+        y = pd.Series(
+            X['feat[0]'] * 40 + X['feat{1}'] * -15 + rng.randn(n_rows) * 15,
+            index=dates,
+        )
+        model = lgb.LGBMRegressor(**fse.LGB_PARAMS)
+
+        with patch.object(
+            fse, '_get_lgb_column_schema', wraps=fse._get_lgb_column_schema
+        ) as schema_fn:
+            _safe_lgb_fit(model, X, y)
+            _safe_lgb_predict(model, X.iloc[-12:])
+            _safe_lgb_predict(model, X.iloc[:12])
+
+        assert schema_fn.call_count == 1, \
+            "Predict on same feature schema should reuse fit-time sanitized columns"
 
 
 # =============================================================================
@@ -273,6 +346,25 @@ class TestRecencyCheck:
             f"Expected at least 3x speedup, got {speedup:.1f}x " \
             f"(vectorized={t_vectorized:.3f}s, apply={t_apply:.3f}s)"
 
+    def test_source_aware_noaa_window(self):
+        """NOAA features should pass with 6m recency even when non-NOAA fail 3m."""
+        dates = pd.date_range('2020-01-01', periods=12, freq='MS')
+        df = pd.DataFrame(
+            {
+                'NOAA_Economic_Damage_Index_feat': np.nan,
+                'macro_feat': np.nan,
+            },
+            index=dates,
+        )
+        # Last value is 5 months before the final date (inside NOAA 6m, outside 3m)
+        df.loc[pd.Timestamp('2020-07-01'), 'NOAA_Economic_Damage_Index_feat'] = 1.0
+        df.loc[pd.Timestamp('2020-07-01'), 'macro_feat'] = 1.0
+
+        mask = _source_aware_recency_mask(df)
+
+        assert bool(mask['NOAA_Economic_Damage_Index_feat']) is True
+        assert bool(mask['macro_feat']) is False
+
 
 # =============================================================================
 # Stage 1: Filter Group Data (VIF Removed)
@@ -323,6 +415,74 @@ class TestFilterGroupDataPurged:
 
         result = filter_group_data_purged(df, target, 'test_group')
         assert isinstance(result, list)
+
+    def test_prefilter_applies_to_path_a_only(self):
+        """Path A may prefilter low-corr columns; Path B should still see full matrix."""
+        n_rows = 120
+        dates = pd.date_range('2010-01-01', periods=n_rows, freq='MS')
+        y_vals = np.tile([1.0, -1.0], n_rows // 2)
+        target = pd.Series(y_vals, index=dates, name='y_mom')
+
+        # feat_zero has exact zero linear correlation to target in this construction.
+        feat_zero = np.tile([1.0, 1.0, -1.0, -1.0], n_rows // 4)
+        feat_signal = y_vals + np.random.RandomState(42).randn(n_rows) * 0.01
+
+        data = {
+            'feat_zero': feat_zero,
+            'feat_signal': feat_signal,
+        }
+        rng = np.random.RandomState(7)
+        for i in range(208):  # total columns = 210 (>200 triggers prefilter)
+            data[f'noise_{i}'] = rng.randn(n_rows)
+        df = pd.DataFrame(data, index=dates)
+
+        path_a_processed = []
+        path_b_seen = {}
+
+        def mock_corr_worker(args):
+            col_name = args[0]
+            path_a_processed.append(col_name)
+            return (col_name, 0.9)
+
+        def mock_lgb_screen(X_lgb, y_lgb, top_k=15):
+            path_b_seen['columns'] = list(X_lgb.columns)
+            return ['feat_zero']
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine._compute_purged_corr_for_col',
+                   side_effect=mock_corr_worker), \
+             patch('Data_ETA_Pipeline.feature_selection_engine._lgb_screen_group',
+                   side_effect=mock_lgb_screen):
+            result = filter_group_data_purged(df, target, 'path_split_test')
+
+        assert 'feat_zero' not in set(path_a_processed), \
+            "Path A prefilter should remove low-corr feature from purged-corr path"
+        assert 'feat_zero' in path_b_seen.get('columns', []), \
+            "Path B should receive full recency-filtered matrix, including low-corr features"
+        assert 'feat_zero' in result, \
+            "Union step should keep nonlinear candidate returned by Path B"
+
+
+class TestBhFdrSelect:
+    """Tests for Benjamini-Hochberg selection with largest passing rank logic."""
+
+    def test_uses_largest_passing_rank_not_first_break(self):
+        """Should keep top-k where k is largest passing BH rank (not early break)."""
+        pvals = {
+            "feat_a": 0.020,  # fails at rank 1 for alpha=0.05, n=3
+            "feat_b": 0.021,  # passes at rank 2
+            "feat_c": 0.900,
+        }
+        selected = _bh_fdr_select(pvals, fdr_alpha=0.05)
+        assert selected == ["feat_a", "feat_b"]
+
+    def test_returns_empty_when_no_rank_passes(self):
+        """Should return empty list when BH finds no passing rank."""
+        pvals = {"a": 0.7, "b": 0.8, "c": 0.9}
+        assert _bh_fdr_select(pvals, fdr_alpha=0.05) == []
+
+    def test_empty_input(self):
+        """Empty p-value mapping should return empty list."""
+        assert _bh_fdr_select({}, fdr_alpha=0.1) == []
 
 
 # =============================================================================
@@ -442,7 +602,7 @@ class TestBorutaTournament:
         heat_n_runs = []
         original_boruta = _boruta_core
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
             heat_n_runs.append(n_runs)
             # Return a few fake survivors to keep tournament going
             return list(X.columns[:3])
@@ -469,7 +629,7 @@ class TestBorutaTournament:
 
         call_count = [0]
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
             call_count[0] += 1
             return list(X.columns[:2])
 
@@ -493,7 +653,7 @@ class TestBorutaTournament:
 
         call_count = [0]
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
             call_count[0] += 1
             return list(X.columns[:3])
 
@@ -503,6 +663,98 @@ class TestBorutaTournament:
 
         assert call_count[0] == 1, \
             f"Standard mode should make exactly 1 call, got {call_count[0]}"
+
+    def test_adaptive_run_budget_for_very_large_sets(self):
+        """Very large sets should use reduced heat/final run budgets."""
+        rng = np.random.RandomState(42)
+        n_rows = 150
+        n_cols = 2500
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+        data = rng.randn(n_rows, n_cols)
+        cols = [f'feat_{i}' for i in range(n_cols)]
+        df = pd.DataFrame(data, index=dates, columns=cols)
+
+        calls = []
+
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+            calls.append((X.shape[1], n_runs, max_shadows))
+            # Keep tournament moving
+            return list(X.columns[:3])
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine._boruta_core',
+                   side_effect=mock_boruta):
+            get_boruta_importance(df, target, tournament_threshold=150)
+
+        # Last call is final round, preceding calls are heats
+        heat_runs = [n_runs for _, n_runs, _ in calls[:-1]]
+        final_runs = calls[-1][1]
+        assert heat_runs, "Expected at least one heat call"
+        assert all(n < 35 for n in heat_runs), f"Expected reduced heat runs, got {heat_runs}"
+        assert final_runs < 80, f"Expected reduced final runs, got {final_runs}"
+
+    def test_explicit_n_runs_overrides_adaptive_standard_runs(self):
+        """User-specified n_runs should override adaptive standard-mode budget."""
+        rng = np.random.RandomState(42)
+        n_rows = 150
+        n_cols = 90
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+        data = rng.randn(n_rows, n_cols)
+        cols = [f'feat_{i}' for i in range(n_cols)]
+        df = pd.DataFrame(data, index=dates, columns=cols)
+
+        seen_runs = []
+
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+            seen_runs.append(n_runs)
+            return list(X.columns[:3])
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine._boruta_core',
+                   side_effect=mock_boruta):
+            get_boruta_importance(df, target, n_runs=77, tournament_threshold=150)
+
+        assert seen_runs == [77], f"Expected explicit n_runs=77, got {seen_runs}"
+
+    def test_standard_mode_passes_adaptive_shadow_cap(self):
+        """Standard mode should pass adaptive max_shadows through to core."""
+        rng = np.random.RandomState(42)
+        n_rows = 150
+        n_cols = 500
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+        data = rng.randn(n_rows, n_cols)
+        cols = [f'feat_{i}' for i in range(n_cols)]
+        df = pd.DataFrame(data, index=dates, columns=cols)
+
+        seen_caps = []
+
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+            seen_caps.append(max_shadows)
+            return list(X.columns[:3])
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine._boruta_core',
+                   side_effect=mock_boruta):
+            get_boruta_importance(df, target, tournament_threshold=600)
+
+        assert seen_caps, "Expected _boruta_core to be called"
+        assert seen_caps[0] == _adaptive_boruta_shadow_cap(n_cols)
+
+
+class TestBorutaAdaptiveHelpers:
+    """Unit tests for adaptive Boruta budget helper functions."""
+
+    def test_adaptive_runs_scale_with_feature_count(self):
+        small = _adaptive_boruta_runs(n_features=200, n_rows=180)
+        huge = _adaptive_boruta_runs(n_features=4000, n_rows=180)
+        assert small['standard_runs'] > huge['standard_runs']
+        assert small['heat_runs'] > huge['heat_runs']
+        assert small['final_runs'] > huge['final_runs']
+
+    def test_adaptive_shadow_cap_scales_down_for_large_sets(self):
+        assert _adaptive_boruta_shadow_cap(200) == 200
+        assert _adaptive_boruta_shadow_cap(1200) <= 450
+        assert _adaptive_boruta_shadow_cap(5000) <= 250
 
 
 # =============================================================================
@@ -636,17 +888,94 @@ class TestGetVintageStability:
             "All returned features should have positive weighted importance"
 
 
+class TestScoringHelpers:
+    """Tests for memoization and vectorized vintage score aggregation helpers."""
+
+    def test_memoized_score_reuses_equivalent_feature_sets(self):
+        calls = {'n': 0}
+
+        def scorer(feature_set):
+            calls['n'] += 1
+            return float(len(feature_set))
+
+        cache = {}
+        v1 = _memoized_score(['b', 'a'], scorer=scorer, cache=cache)
+        v2 = _memoized_score(['a', 'b', 'a'], scorer=scorer, cache=cache)
+
+        assert v1 == v2 == 2.0
+        assert calls['n'] == 1, f"Expected one scorer call, got {calls['n']}"
+
+    def test_vectorized_vintage_aggregation_matches_manual_logic(self):
+        scores = pd.DataFrame(
+            {
+                '2018': [0.10, np.nan, -0.10, 0.20],
+                '2022': [0.20, 0.10, 0.00, np.nan],
+                'Latest': [0.30, 0.20, -0.20, np.nan],
+            },
+            index=['f1', 'f2', 'f3', 'f4'],
+        )
+        weight_series = pd.Series({'2018': 1, '2022': 2, 'Latest': 4})
+
+        manual = {}
+        for feat in scores.index:
+            feat_scores = scores.loc[feat].dropna()
+            if len(feat_scores) == 0:
+                continue
+            if (feat_scores > 0).sum() < 2:
+                continue
+            weighted_score = (
+                (feat_scores * weight_series[feat_scores.index]).sum()
+                / weight_series[feat_scores.index].sum()
+            )
+            if pd.notna(scores.loc[feat, 'Latest']) and scores.loc[feat, 'Latest'] > 0:
+                manual[feat] = weighted_score
+
+        expected = pd.Series(manual).sort_values(ascending=False)
+        got = _aggregate_vintage_scores(scores, weight_series, min_presence=2)
+
+        pd.testing.assert_series_equal(got, expected)
+
+    def test_parallel_trial_scores_uses_supplied_executor(self):
+        trial_defs = [
+            ('a', ['f1']),
+            ('b', ['f2', 'f3']),
+            ('c', ['f4']),
+        ]
+
+        class FakeExecutor:
+            def __init__(self):
+                self.map_calls = 0
+
+            def map(self, fn, iterable):
+                self.map_calls += 1
+                return [fn(item) for item in iterable]
+
+        exec_inst = FakeExecutor()
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine.ThreadPoolExecutor',
+                   side_effect=AssertionError("Should not construct new pool")):
+            scored = _parallel_trial_scores(
+                trial_defs,
+                scorer=lambda feats: float(len(feats)),
+                max_workers=4,
+                executor=exec_inst,
+            )
+
+        assert exec_inst.map_calls == 1
+        assert scored == [('a', 1.0), ('b', 2.0), ('c', 1.0)]
+
+
 # =============================================================================
 # Stage 4: Cluster Redundancy
 # =============================================================================
 
 class TestClusterRedundancy:
-    """Tests for cluster_redundancy with scaled clusters, vectorized overlap, LGB gain."""
+    """Tests for cluster_redundancy with threshold gating and redundant-subset guardrail."""
 
     def test_scaled_max_clusters_small_input(self):
-        """51 features with max_clusters=50 should reduce to ~25 (// 2)."""
+        """Weakly correlated features should not be force-collapsed by max_clusters."""
         rng = np.random.RandomState(42)
-        n_rows = 120
+        n_rows = 300
         n_feats = 51
         dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
         target = pd.Series(rng.randn(n_rows) * 100, index=dates)
@@ -655,9 +984,8 @@ class TestClusterRedundancy:
         X = pd.DataFrame(data, index=dates, columns=cols)
 
         result = cluster_redundancy(X, cols, target, max_clusters=50)
-        # min(50, 51 // 2) = 25 clusters → ~25 features
-        assert len(result) <= 26, \
-            f"Expected ≤26 features (scaled max_clusters=25), got {len(result)}"
+        assert len(result) == n_feats, \
+            f"Independent features should be preserved, got {len(result)}/{n_feats}"
 
     def test_passthrough_when_fewer_than_max(self):
         """Input smaller than max_clusters should pass through unchanged."""
@@ -745,6 +1073,38 @@ class TestClusterRedundancy:
             f"Expected heavy reduction from 50 redundant features, got {len(result)}"
         assert len(result) < 50, \
             f"Should reduce from 50 features, got {len(result)}"
+
+    def test_preserves_independent_features_when_redundant_subset_exists(self):
+        """Only redundant subset should be clustered; independent columns stay."""
+        rng = np.random.RandomState(42)
+        n_rows = 160
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+
+        base = rng.randn(n_rows)
+        redundant = {
+            f'base_copy_{i}': base + rng.randn(n_rows) * 0.001
+            for i in range(6)
+        }
+        independent = {
+            f'indep_{i}': rng.randn(n_rows)
+            for i in range(8)
+        }
+        X = pd.DataFrame({**redundant, **independent}, index=dates)
+        cols = list(X.columns)
+
+        result = cluster_redundancy(
+            X, cols, target,
+            max_clusters=2,
+            min_corr_to_cluster=0.9,
+        )
+
+        for col in independent:
+            assert col in result, f"Independent feature {col} should be preserved"
+
+        redundant_selected = [c for c in result if c.startswith('base_copy_')]
+        assert len(redundant_selected) <= 2, \
+            f"Redundant subset should respect guardrail cap, got {len(redundant_selected)}"
 
 
 # =============================================================================
@@ -887,6 +1247,50 @@ class TestInteractionRescue:
             n_splits=3, gap=1
         )
         assert result == []
+
+    def test_uses_parallel_trial_evaluation_for_single_feature_phase(self):
+        """Single-feature trial scoring should use ThreadPoolExecutor when enabled."""
+        rng = np.random.RandomState(42)
+        n_rows = 120
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+
+        data = rng.randn(n_rows, 24)
+        conf_cols = [f'conf_{i}' for i in range(4)]
+        rej_cols = [f'rej_{i}' for i in range(20)]
+        all_cols = conf_cols + rej_cols
+        X = pd.DataFrame(data, index=dates, columns=all_cols)
+
+        map_calls = {'n': 0}
+
+        class FakeExecutor:
+            def __init__(self, max_workers=None):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, fn, iterable):
+                map_calls['n'] += 1
+                return [fn(item) for item in iterable]
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine.ThreadPoolExecutor', FakeExecutor), \
+             patch('Data_ETA_Pipeline.feature_selection_engine._extract_split_pairs',
+                   return_value=Counter()):
+            rescued = interaction_rescue(
+                X, target,
+                confirmed_features=conf_cols,
+                rejected_pool=rej_cols,
+                n_splits=3, gap=1,
+                top_k=5,
+                trial_eval_workers=2,
+            )
+
+        assert isinstance(rescued, list)
+        assert map_calls['n'] >= 1, "Expected parallel trial map() call in phase-1 scoring"
 
 
 # =============================================================================
@@ -1035,3 +1439,85 @@ class TestSequentialForwardSelection:
             n_splits=3, gap=1, min_features=1, patience=1, beam_width=2
         )
         assert result == ['only_feat']
+
+    def test_uses_parallel_trial_evaluation_in_beam_step(self):
+        """Beam trial evaluation should reuse one ThreadPoolExecutor across rounds."""
+        rng = np.random.RandomState(42)
+        n_rows = 120
+        n_cols = 12
+        dates = pd.date_range('2000-01-01', periods=n_rows, freq='MS')
+        target = pd.Series(rng.randn(n_rows) * 100, index=dates)
+        data = rng.randn(n_rows, n_cols)
+        data[:, 0] = target.values * 0.8 + rng.randn(n_rows) * 20
+        cols = [f'feat_{i}' for i in range(n_cols)]
+        X = pd.DataFrame(data, index=dates, columns=cols)
+
+        map_calls = {'n': 0}
+        init_calls = {'n': 0}
+
+        class FakeExecutor:
+            def __init__(self, max_workers=None):
+                init_calls['n'] += 1
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, fn, iterable):
+                map_calls['n'] += 1
+                return [fn(item) for item in iterable]
+
+        with patch('Data_ETA_Pipeline.feature_selection_engine.ThreadPoolExecutor', FakeExecutor):
+            result = sequential_forward_selection(
+                X, target, cols,
+                n_splits=3, gap=1,
+                min_improvement=0.001, patience=2, min_features=2,
+                beam_width=2,
+                trial_eval_workers=2,
+            )
+
+        assert isinstance(result, list)
+        assert init_calls['n'] == 1, "Expected one persistent executor for SFS beam loop"
+        assert map_calls['n'] >= 2, "Expected multiple parallel map() calls across beam rounds"
+
+class TestKeepRule:
+    """Tests for keep-rule acceptance logic."""
+
+    def test_keep_on_mae_improvement(self):
+        """Should keep when MAE improves by at least 0.5%."""
+        assert should_keep_change(
+            baseline_mae=100.0,
+            candidate_mae=99.4,  # +0.6% MAE improvement
+            baseline_runtime_s=100.0,
+            candidate_runtime_s=110.0,
+        )
+
+    def test_keep_on_runtime_gain_with_small_mae_loss(self):
+        """Should keep on >=15% runtime gain if MAE loss is within 0.5%."""
+        assert should_keep_change(
+            baseline_mae=100.0,
+            candidate_mae=100.4,  # -0.4% MAE improvement (small degradation)
+            baseline_runtime_s=100.0,
+            candidate_runtime_s=80.0,  # +20% runtime improvement
+        )
+
+    def test_reject_on_runtime_gain_with_large_mae_loss(self):
+        """Should reject when runtime improves but MAE degrades beyond tolerance."""
+        assert not should_keep_change(
+            baseline_mae=100.0,
+            candidate_mae=100.7,  # -0.7% MAE improvement (too much degradation)
+            baseline_runtime_s=100.0,
+            candidate_runtime_s=80.0,
+        )
+
+    def test_reject_when_neither_threshold_met(self):
+        """Should reject if no MAE threshold and no runtime threshold are met."""
+        assert not should_keep_change(
+            baseline_mae=100.0,
+            candidate_mae=100.2,
+            baseline_runtime_s=100.0,
+            candidate_runtime_s=95.0,
+        )

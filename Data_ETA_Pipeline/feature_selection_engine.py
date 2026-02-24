@@ -23,6 +23,8 @@ from scipy.spatial.distance import squareform
 from sklearn.model_selection import TimeSeriesSplit
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from threading import Lock
 import re
 import time
 import logging
@@ -36,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 SEED = 42
 MIN_VALID_OBS = 60
+TRIAL_EVAL_MAX_WORKERS_DEFAULT = 4
+BORUTA_SHADOW_CAP_MAX = 500
+DEFAULT_RECENCY_MONTHS = 3
+NOAA_RECENCY_MONTHS = 6
 
 LGB_PARAMS = {
     'objective': 'regression',
@@ -53,21 +59,104 @@ LGB_PARAMS = {
 # LightGBM Safe Helpers
 # =============================================================================
 
+_LGB_COL_SCHEMA_CACHE: dict[tuple[object, ...], tuple[tuple[str, ...], bool]] = {}
+_LGB_COL_SCHEMA_CACHE_LOCK = Lock()
+_LGB_COL_SCHEMA_CACHE_MAX = 4096
+
+
+def _sanitize_lgb_col_name(name) -> str:
+    """Sanitize LightGBM JSON-forbidden characters."""
+    return re.sub(r'[\[\]\{\}:,]', '_', str(name))
+
+
+def _get_lgb_column_schema(columns) -> tuple[tuple[str, ...], bool]:
+    """
+    Return (sanitized_columns, changed) for a given column sequence.
+
+    Results are cached by the exact column tuple to avoid repeated regex work
+    in CV-heavy loops.
+    """
+    key = tuple(columns)
+    with _LGB_COL_SCHEMA_CACHE_LOCK:
+        cached = _LGB_COL_SCHEMA_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    seen = set()
+    safe_cols = []
+    changed = False
+
+    for col in key:
+        raw = str(col)
+        safe = _sanitize_lgb_col_name(raw)
+        base = safe
+        suffix = 2
+        while safe in seen:
+            safe = f"{base}_{suffix}"
+            suffix += 1
+        if safe != raw:
+            changed = True
+        seen.add(safe)
+        safe_cols.append(safe)
+
+    result = (tuple(safe_cols), changed)
+    with _LGB_COL_SCHEMA_CACHE_LOCK:
+        if key not in _LGB_COL_SCHEMA_CACHE:
+            if len(_LGB_COL_SCHEMA_CACHE) >= _LGB_COL_SCHEMA_CACHE_MAX:
+                _LGB_COL_SCHEMA_CACHE.pop(next(iter(_LGB_COL_SCHEMA_CACHE)))
+            _LGB_COL_SCHEMA_CACHE[key] = result
+    return result
+
+
+def _prepare_lgb_frame(
+    X: pd.DataFrame,
+    *,
+    expected_raw_columns: tuple[object, ...] | None = None,
+    expected_safe_columns: tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, tuple[object, ...], tuple[str, ...]]:
+    """
+    Align feature columns for LightGBM without copying underlying data.
+    """
+    raw_cols = tuple(X.columns)
+
+    if expected_raw_columns is not None and expected_safe_columns is not None:
+        if raw_cols == expected_raw_columns:
+            if tuple(expected_safe_columns) == raw_cols:
+                return X, raw_cols, tuple(expected_safe_columns)
+            return (
+                X.set_axis(list(expected_safe_columns), axis=1, copy=False),
+                raw_cols,
+                tuple(expected_safe_columns),
+            )
+
+    safe_cols, changed = _get_lgb_column_schema(raw_cols)
+    if not changed:
+        return X, raw_cols, safe_cols
+    return X.set_axis(list(safe_cols), axis=1, copy=False), raw_cols, safe_cols
+
+
 def _safe_lgb_fit(model, X, y):
-    """Safely fit LightGBM by replacing JSON-forbidden characters in column names."""
+    """Safely fit LightGBM with cached column sanitization and no data copy."""
     if X.empty:
         return model
-    X_safe = X.copy()
-    X_safe.columns = [re.sub(r'[\[\]\{\}:,]', '_', str(c)) for c in X.columns]
+    X_safe, raw_cols, safe_cols = _prepare_lgb_frame(X)
     model.fit(X_safe, y)
+    model._safe_lgb_raw_cols = raw_cols
+    model._safe_lgb_safe_cols = safe_cols
     return model
 
+
 def _safe_lgb_predict(model, X):
-    """Safely predict LightGBM matching the sanitized feature names."""
+    """Safely predict LightGBM matching sanitized feature names from fit."""
     if X.empty:
         return np.array([])
-    X_safe = X.copy()
-    X_safe.columns = [re.sub(r'[\[\]\{\}:,]', '_', str(c)) for c in X.columns]
+    raw_cols = getattr(model, '_safe_lgb_raw_cols', None)
+    safe_cols = getattr(model, '_safe_lgb_safe_cols', None)
+    X_safe, _, _ = _prepare_lgb_frame(
+        X,
+        expected_raw_columns=raw_cols,
+        expected_safe_columns=safe_cols,
+    )
     return model.predict(X_safe)
 
 # =============================================================================
@@ -477,6 +566,52 @@ def _deduplicate_group(wide_df, threshold=0.95):
         return wide_df
 
 
+def _is_noaa_feature_name(col_name: str) -> bool:
+    """Heuristic NOAA feature detector for raw/sanitized column names."""
+    name = str(col_name).upper()
+    return name.startswith('NOAA') or '_NOAA_' in name
+
+
+def _source_aware_recency_mask(
+    X: pd.DataFrame,
+    default_months: int = DEFAULT_RECENCY_MONTHS,
+    noaa_months: int = NOAA_RECENCY_MONTHS,
+) -> pd.Series:
+    """
+    Build a recency mask with source-aware windows.
+
+    Non-NOAA features must have data in the last `default_months`.
+    NOAA features get a wider window (`noaa_months`) due publication lag.
+    """
+    if X.empty:
+        return pd.Series(False, index=X.columns, dtype=bool)
+
+    last_date = X.index.max()
+    default_cutoff = last_date - pd.DateOffset(months=default_months)
+    default_rows = X.loc[X.index >= default_cutoff]
+    if default_rows.empty:
+        recency_mask = pd.Series(False, index=X.columns, dtype=bool)
+    else:
+        recency_mask = default_rows.notna().any(axis=0)
+
+    if noaa_months <= default_months:
+        return recency_mask
+
+    noaa_cols = pd.Index([col for col in X.columns if _is_noaa_feature_name(col)])
+    if noaa_cols.empty:
+        return recency_mask
+
+    noaa_cutoff = last_date - pd.DateOffset(months=noaa_months)
+    noaa_rows = X.loc[X.index >= noaa_cutoff]
+    if noaa_rows.empty:
+        recency_mask.loc[noaa_cols] = False
+        return recency_mask
+
+    noaa_mask = noaa_rows.notna().any(axis=0)
+    recency_mask.loc[noaa_cols] = noaa_mask.reindex(noaa_cols, fill_value=False)
+    return recency_mask
+
+
 def _lgb_screen_group(wide_df, target_series, top_k=15,
                       n_subspaces=10, subspace_frac=0.3):
     """
@@ -491,13 +626,8 @@ def _lgb_screen_group(wide_df, target_series, top_k=15,
     X = wide_df.loc[common]
     y = target_series.loc[common]
 
-    # Recency check (vectorized: check for any non-NaN in the recent window)
-    last_date = X.index.max()
-    recent_cutoff = last_date - pd.DateOffset(months=3)
-    recent_rows = X.loc[X.index >= recent_cutoff]
-    if recent_rows.empty:
-        return []
-    recency_mask = recent_rows.notna().any(axis=0)
+    # Recency check (source-aware: NOAA gets a wider window due release lag)
+    recency_mask = _source_aware_recency_mask(X)
     X = X.loc[:, recency_mask]
 
     if X.shape[1] == 0:
@@ -552,6 +682,91 @@ def _compute_purged_corr_for_col(args):
     return (col_name, p_value)
 
 
+def _bh_fdr_select(feature_pvalues: dict[str, float], fdr_alpha: float) -> list[str]:
+    """Benjamini-Hochberg FDR selection using the largest passing rank."""
+    if not feature_pvalues:
+        return []
+
+    sorted_features = sorted(feature_pvalues.items(), key=lambda x: x[1])
+    n_tests = len(sorted_features)
+    max_pass_rank = 0
+
+    for rank, (_, pval) in enumerate(sorted_features, 1):
+        bh_threshold = (rank / n_tests) * fdr_alpha
+        if pval <= bh_threshold:
+            max_pass_rank = rank
+
+    if max_pass_rank == 0:
+        return []
+
+    return [feat for feat, _ in sorted_features[:max_pass_rank]]
+
+
+def _feature_set_cache_key(feature_set) -> tuple[str, ...]:
+    """Deterministic, order-insensitive cache key for a feature set."""
+    return tuple(sorted(dict.fromkeys(feature_set)))
+
+
+def _memoized_score(
+    feature_set,
+    scorer,
+    cache: dict[tuple[str, ...], float],
+    cache_lock=None,
+) -> float:
+    """
+    Evaluate scorer(feature_set) with memoization.
+
+    Feature order is normalized in the key so semantically identical sets reuse
+    the same cached MAE evaluation.
+    """
+    key = _feature_set_cache_key(feature_set)
+
+    if cache_lock is not None:
+        with cache_lock:
+            if key in cache:
+                return cache[key]
+    elif key in cache:
+        return cache[key]
+
+    value = float(scorer(list(key)))
+
+    if cache_lock is not None:
+        with cache_lock:
+            if key not in cache:
+                cache[key] = value
+            return cache[key]
+
+    cache.setdefault(key, value)
+    return cache[key]
+
+
+def _parallel_trial_scores(
+    trial_defs: list[tuple[object, list[str]]],
+    scorer,
+    max_workers: int,
+    executor: ThreadPoolExecutor | None = None,
+) -> list[tuple[object, float]]:
+    """
+    Evaluate (label, feature_set) trials, parallelizing when beneficial.
+    """
+    if not trial_defs:
+        return []
+    max_workers = max(1, int(max_workers))
+    if len(trial_defs) <= 1 or max_workers == 1:
+        return [(label, float(scorer(feature_set))) for label, feature_set in trial_defs]
+
+    def _score_item(item):
+        label, feature_set = item
+        return label, float(scorer(feature_set))
+
+    if executor is not None:
+        return list(executor.map(_score_item, trial_defs))
+
+    workers = min(max_workers, len(trial_defs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_score_item, trial_defs))
+
+
 def filter_group_data_purged(wide_df, target_series, group_name,
                              fdr_alpha=0.10):
     """
@@ -570,13 +785,8 @@ def filter_group_data_purged(wide_df, target_series, group_name,
     if X_local.empty:
         return []
 
-    # 1. Recency Check (vectorized: check for any non-NaN in the recent window)
-    last_date = X_local.index.max()
-    recent_cutoff = last_date - pd.DateOffset(months=3)
-    recent_rows = X_local.loc[X_local.index >= recent_cutoff]
-    if recent_rows.empty:
-        return []
-    recency_mask = recent_rows.notna().any(axis=0)
+    # 1. Recency Check (source-aware: NOAA gets a wider window due release lag)
+    recency_mask = _source_aware_recency_mask(X_local)
     X_local = X_local.loc[:, recency_mask]
 
     if X_local.shape[1] == 0:
@@ -589,67 +799,58 @@ def filter_group_data_purged(wide_df, target_series, group_name,
     # Relaxed min_window for binary groups (fewer events = fewer valid obs)
     min_window = 30 if is_binary_group else 60
 
-    # === FAST PRE-FILTER: vectorized correlation to eliminate obviously ===
-    # === uncorrelated features before expensive purged correlation     ===
-    n_before_prefilter = X_local.shape[1]
+    # === FAST PRE-FILTER (Path A only): vectorized correlation to eliminate ===
+    # === obviously uncorrelated features before expensive purged-corr      ===
+    # Keep Path B on the full recency-filtered matrix so non-linear signals
+    # are not dropped before LightGBM can evaluate them.
+    X_path_a = X_local
+    n_before_prefilter = X_path_a.shape[1]
     if n_before_prefilter > 200:  # Only worth it for large groups
-        fast_corrs = X_local.corrwith(y_local).abs()
+        fast_corrs = X_path_a.corrwith(y_local).abs()
         # Tiered threshold: tighter for very large groups (safe because
-        # Path B random subspace independently catches non-linear features)
+        # Path B runs on full X_local and catches non-linear features.
         corr_threshold = 0.05 if n_before_prefilter > 500 else 0.02
         keep_mask = (fast_corrs > corr_threshold) | fast_corrs.isna()
-        X_local = X_local.loc[:, keep_mask]
-        n_eliminated = n_before_prefilter - X_local.shape[1]
+        X_path_a = X_path_a.loc[:, keep_mask]
+        n_eliminated = n_before_prefilter - X_path_a.shape[1]
         if n_eliminated > 0:
             logger.info(f"    [{group_name}] Pre-filter (|r|>{corr_threshold}): "
-                        f"{n_before_prefilter} → {X_local.shape[1]} features "
+                        f"{n_before_prefilter} → {X_path_a.shape[1]} features "
                         f"(eliminated {n_eliminated})")
-
-    if X_local.shape[1] == 0:
-        return []
 
     # === Path A: Purged Expanding-Window Correlation + BH-FDR ===
     # Use ThreadPoolExecutor for parallel correlation computation
-    n_cols = X_local.shape[1]
+    n_cols = X_path_a.shape[1]
     n_threads = min(os.cpu_count() or 4, max(1, n_cols // 10))
+    feature_pvalues = {}
+    if n_cols > 0:
+        if n_cols > 50 and n_threads > 1:
+            # Parallel path
+            args_list = [
+                (col, X_path_a[col], y_local, min_window)
+                for col in X_path_a.columns
+            ]
+            with ThreadPoolExecutor(max_workers=n_threads) as pool:
+                for result in pool.map(_compute_purged_corr_for_col, args_list):
+                    if result is not None:
+                        feature_pvalues[result[0]] = result[1]
+        else:
+            # Sequential path for small groups
+            for col in X_path_a.columns:
+                avg_corr, eff_n = _purged_expanding_corr(
+                    X_path_a[col], y_local, min_window=min_window
+                )
+                if np.isnan(avg_corr) or eff_n < min_window:
+                    continue
+                denom = max(1 - avg_corr ** 2, 1e-8)
+                t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
+                p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
+                feature_pvalues[col] = p_value
 
-    if n_cols > 50 and n_threads > 1:
-        # Parallel path
-        args_list = [
-            (col, X_local[col], y_local, min_window)
-            for col in X_local.columns
-        ]
-        feature_pvalues = {}
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
-            for result in pool.map(_compute_purged_corr_for_col, args_list):
-                if result is not None:
-                    feature_pvalues[result[0]] = result[1]
-    else:
-        # Sequential path for small groups
-        feature_pvalues = {}
-        for col in X_local.columns:
-            avg_corr, eff_n = _purged_expanding_corr(
-                X_local[col], y_local, min_window=min_window
-            )
-            if np.isnan(avg_corr) or eff_n < min_window:
-                continue
-            denom = max(1 - avg_corr ** 2, 1e-8)
-            t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
-            p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
-            feature_pvalues[col] = p_value
-
-    corr_features = []
-    if feature_pvalues:
-        sorted_features = sorted(feature_pvalues.items(), key=lambda x: x[1])
-        n_tests = len(sorted_features)
-        for rank, (feat, pval) in enumerate(sorted_features, 1):
-            bh_threshold = (rank / n_tests) * fdr_alpha
-            if pval <= bh_threshold:
-                corr_features.append(feat)
-            else:
-                break
+    corr_features = _bh_fdr_select(feature_pvalues, fdr_alpha=fdr_alpha)
 
     # === Path B: LightGBM Gain Importance Pre-Screen ===
+    # Use full recency-filtered matrix (no correlation prefilter).
     lgb_features = _lgb_screen_group(X_local, y_local, top_k=15)
 
     # === Union of both paths ===
@@ -671,7 +872,64 @@ def filter_group_data_purged(wide_df, target_series, group_name,
 # Stage 2: Boruta Feature Selection (Tournament Architecture)
 # =============================================================================
 
-def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05):
+def _adaptive_boruta_shadow_cap(n_features: int) -> int:
+    """
+    Adaptive cap for shadow features.
+
+    Keeps full shadows for small/medium sets and progressively caps very large
+    sets to control memory/runtime without collapsing the null distribution.
+    """
+    if n_features <= 300:
+        return n_features
+    if n_features <= 1200:
+        return min(n_features, 450)
+    if n_features <= 3000:
+        return min(n_features, 350)
+    return min(n_features, 250)
+
+
+def _adaptive_boruta_runs(
+    n_features: int,
+    n_rows: int,
+) -> dict[str, int]:
+    """
+    Choose Boruta run counts based on feature-set size and sample size.
+    """
+    if n_features <= 300:
+        standard_runs = 100
+        heat_runs = 35
+        final_runs = 80
+    elif n_features <= 1000:
+        standard_runs = 85
+        heat_runs = 30
+        final_runs = 70
+    elif n_features <= 3000:
+        standard_runs = 70
+        heat_runs = 24
+        final_runs = 60
+    else:
+        standard_runs = 60
+        heat_runs = 20
+        final_runs = 50
+
+    # Slightly more runs when data is plentiful, slightly fewer when scarce.
+    if n_rows >= 320:
+        standard_runs += 10
+        heat_runs += 4
+        final_runs += 10
+    elif n_rows < 120:
+        standard_runs = max(50, standard_runs - 10)
+        heat_runs = max(16, heat_runs - 4)
+        final_runs = max(40, final_runs - 10)
+
+    return {
+        'standard_runs': int(standard_runs),
+        'heat_runs': int(heat_runs),
+        'final_runs': int(final_runs),
+    }
+
+
+def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
     """
     Core Boruta logic: shadow feature comparison with early stopping.
 
@@ -691,12 +949,18 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05):
 
     hits = np.zeros(n_features, dtype=int)
 
-    # Cap shadow features at 500 to prevent OOMs.
-    # If we cap, we compensate by raising the percentile threshold from 75th to 80th
-    # to account for the smaller sample size of the null distribution.
-    max_shadows = 500
+    # Adaptive shadow cap limits memory and runtime for very large pools.
+    if max_shadows is None:
+        max_shadows = _adaptive_boruta_shadow_cap(n_features)
+    max_shadows = max(50, min(int(max_shadows), BORUTA_SHADOW_CAP_MAX))
     n_shadows = min(n_features, max_shadows)
-    percentile_thresh = 80 if n_features > max_shadows else 75
+    shadow_ratio = n_shadows / max(n_features, 1)
+    if shadow_ratio >= 0.75:
+        percentile_thresh = 75
+    elif shadow_ratio >= 0.5:
+        percentile_thresh = 78
+    else:
+        percentile_thresh = 80
 
     # Pre-allocate shadow array and build combined DataFrame structure once
     X_values = X_curr.values
@@ -831,13 +1095,24 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
     X_curr = X.loc[common]
     y_curr = y.loc[common]
     n_features = X_curr.shape[1]
+    run_plan = _adaptive_boruta_runs(
+        n_features=n_features,
+        n_rows=len(common),
+    )
+    shadow_cap = _adaptive_boruta_shadow_cap(n_features)
 
     if n_features <= tournament_threshold:
         # Small enough for standard single-round Boruta
         if n_runs is None:
-            n_runs = 100
+            n_runs = run_plan['standard_runs']
         logger.info(f"   Boruta (standard): {n_features} features × {n_runs} runs")
-        return _boruta_core(X_curr, y_curr, n_runs=n_runs, alpha=alpha)
+        return _boruta_core(
+            X_curr,
+            y_curr,
+            n_runs=n_runs,
+            alpha=alpha,
+            max_shadows=shadow_cap,
+        )
 
     # ==========================================
     # TOURNAMENT MODE for large feature sets
@@ -852,13 +1127,22 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
     chunks = [cols[i:i + tournament_chunk]
               for i in range(0, len(cols), tournament_chunk)]
 
-    # Round 1: Fast heats (35 runs, relaxed alpha)
+    # Round 1: Fast heats, relaxed alpha
     heat_survivors = []
     heat_alpha = alpha * 2  # More permissive in heats to avoid dropping good features
+    heat_runs = run_plan['heat_runs']
 
     for ci, chunk in enumerate(chunks, 1):
-        logger.info(f"   Heat {ci}/{len(chunks)}: {len(chunk)} features × 35 runs...")
-        survivors = _boruta_core(X_curr[chunk], y_curr, n_runs=35, alpha=heat_alpha)
+        chunk_shadow_cap = _adaptive_boruta_shadow_cap(len(chunk))
+        logger.info(f"   Heat {ci}/{len(chunks)}: "
+                    f"{len(chunk)} features × {heat_runs} runs...")
+        survivors = _boruta_core(
+            X_curr[chunk],
+            y_curr,
+            n_runs=heat_runs,
+            alpha=heat_alpha,
+            max_shadows=chunk_shadow_cap,
+        )
         heat_survivors.extend(survivors)
         logger.info(f"   Heat {ci}: {len(survivors)} survived")
 
@@ -869,9 +1153,17 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
         logger.info("   WARNING: No features survived tournament heats.")
         return []
 
-    # Round 2: Rigorous final (80 runs, strict alpha)
-    logger.info(f"   Final round: {len(heat_survivors)} features × 80 runs")
-    final = _boruta_core(X_curr[heat_survivors], y_curr, n_runs=80, alpha=alpha)
+    # Round 2: Rigorous final, strict alpha
+    final_runs = run_plan['final_runs']
+    final_shadow_cap = _adaptive_boruta_shadow_cap(len(heat_survivors))
+    logger.info(f"   Final round: {len(heat_survivors)} features × {final_runs} runs")
+    final = _boruta_core(
+        X_curr[heat_survivors],
+        y_curr,
+        n_runs=final_runs,
+        alpha=alpha,
+        max_shadows=final_shadow_cap,
+    )
     logger.info(f"   Final survivors: {len(final)}")
     return final
 
@@ -949,6 +1241,37 @@ def _vintage_cv_importance(X_wide, target_series, feature_list, n_folds=3):
     return agg_imp
 
 
+def _aggregate_vintage_scores(
+    scores: pd.DataFrame,
+    weight_series: pd.Series,
+    min_presence: int,
+) -> pd.Series:
+    """
+    Vectorized aggregation of per-checkpoint importance scores.
+    """
+    if scores.empty:
+        return pd.Series(dtype=float)
+
+    available = scores.notna()
+    positive = scores > 0
+    nonzero_counts = positive.sum(axis=1)
+
+    weighted_values = scores.mul(weight_series, axis=1)
+    weighted_sum = weighted_values.where(available).sum(axis=1, min_count=1)
+    weight_totals = available.mul(weight_series, axis=1).sum(axis=1)
+    weighted_scores = weighted_sum / weight_totals.replace(0, np.nan)
+
+    latest_positive = positive['Latest'] if 'Latest' in positive.columns else pd.Series(
+        False, index=scores.index
+    )
+    keep_mask = (
+        (nonzero_counts >= min_presence)
+        & latest_positive
+        & weighted_scores.notna()
+    )
+    return weighted_scores[keep_mask].sort_values(ascending=False)
+
+
 def get_vintage_stability(feature_list, target_series, snapshots_dir,
                           snap_latest_wide, min_presence=2):
     """
@@ -974,9 +1297,7 @@ def get_vintage_stability(feature_list, target_series, snapshots_dir,
 
     # --- 2. Build exponential recency weights ---
     # weight = 2^rank  →  e.g. 5 vintages + Latest → {v0:1, v1:2, v2:4, v3:8, v4:16, Latest:32}
-    weights = {}
-    for rank, label in enumerate(checkpoints):
-        weights[label] = 2 ** rank
+    weights = {label: 2 ** rank for rank, label in enumerate(checkpoints)}
 
     logger.info(f"   Vintage checkpoints: {checkpoints} "
                 f"(weights: {list(weights.values())})")
@@ -1002,34 +1323,12 @@ def get_vintage_stability(feature_list, target_series, snapshots_dir,
         if imp.empty:
             continue
 
-        for feat in imp.index:
-            if feat in scores.index:
-                scores.loc[feat, label] = imp[feat]
+        valid_imp = imp.reindex(scores.index).dropna()
+        if not valid_imp.empty:
+            scores.loc[valid_imp.index, label] = valid_imp.values
 
     weight_series = pd.Series(weights)
-
-    results = {}
-    for feat in feature_list:
-        feat_scores = scores.loc[feat].dropna()
-        if len(feat_scores) == 0:
-            continue
-
-        nonzero_count = (feat_scores > 0).sum()
-        if nonzero_count < min_presence:
-            continue
-
-        available_weights = weight_series[feat_scores.index]
-        weighted_score = ((feat_scores * available_weights).sum()
-                          / available_weights.sum())
-        results[feat] = weighted_score
-
-    result_series = pd.Series(results)
-
-    latest_scores = scores['Latest'].dropna()
-    latest_nonzero = latest_scores[latest_scores > 0].index
-    result_series = result_series[result_series.index.isin(latest_nonzero)]
-
-    return result_series.sort_values(ascending=False)
+    return _aggregate_vintage_scores(scores, weight_series, min_presence=min_presence)
 
 
 # =============================================================================
@@ -1037,26 +1336,26 @@ def get_vintage_stability(feature_list, target_series, snapshots_dir,
 # =============================================================================
 
 def cluster_redundancy(X, feature_list, target_series,
-                       max_clusters=50, min_overlap=30):
+                       max_clusters=50, min_overlap=30,
+                       min_corr_to_cluster=0.85):
     """
     Hierarchical clustering to remove redundant features.
     NaN-aware pairwise Spearman correlations.
 
     Improvements:
-    - **Scaled max_clusters**: adapts to input size instead of a fixed 50.
-      Uses min(50, len(features) // 2) so small inputs aren't barely reduced
-      and large inputs are reasonably capped.
+    - **Correlation-threshold gating**: only features participating in at least
+      one high-correlation pair (|rho| >= min_corr_to_cluster) are clustered.
+      Independent features are preserved.
+    - **Guardrail clustering for redundant subset only**: max_clusters acts as
+      a safety cap on the redundant subset, avoiding forced pruning of
+      unrelated predictors.
     - **Vectorized overlap matrix**: replaces O(p²) Python loop with a single
       matrix multiply: X.notna().T @ X.notna()  →  full overlap counts in one call.
     - **LightGBM gain for cluster representatives**: replaces median-imputed MI
       (which biases against features with many NaNs) with LightGBM gain
       importance, which handles NaN natively and reflects actual model usage.
     """
-    # Scale max_clusters with input size
-    max_clusters = min(max_clusters, len(feature_list) // 2)
-    max_clusters = max(max_clusters, 2)  # floor at 2
-
-    if len(feature_list) <= max_clusters:
+    if len(feature_list) <= 2:
         return feature_list
 
     X_curr = X[feature_list].copy()
@@ -1083,16 +1382,41 @@ def cluster_redundancy(X, feature_list, target_series,
     corr_values[low_overlap] = 0.0
     corr = pd.DataFrame(corr_values, index=corr.index, columns=corr.columns)
 
-    dist_matrix = 1 - corr.abs().values
-    np.fill_diagonal(dist_matrix, 0)
+    abs_corr = corr.abs().values
+    high_corr = abs_corr >= min_corr_to_cluster
+    np.fill_diagonal(high_corr, False)
 
+    # No strong redundancy detected: preserve all features.
+    if not high_corr.any():
+        return feature_list
+
+    redundant_mask = high_corr.any(axis=0)
+    redundant_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
+                          if is_redundant]
+    independent_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
+                            if not is_redundant]
+
+    if len(redundant_features) <= 1:
+        return feature_list
+
+    corr_red = corr.loc[redundant_features, redundant_features]
+    dist_matrix = 1 - corr_red.abs().values
+    np.fill_diagonal(dist_matrix, 0)
     dist_matrix = np.maximum(dist_matrix, 0)
     dist_matrix = (dist_matrix + dist_matrix.T) / 2
-
     condensed = squareform(dist_matrix, checks=False)
-
     linkage = hierarchy.ward(condensed)
-    cluster_ids = hierarchy.fcluster(linkage, t=max_clusters, criterion='maxclust')
+
+    dist_threshold = max(0.0, 1.0 - float(min_corr_to_cluster))
+    cluster_ids = hierarchy.fcluster(linkage, t=dist_threshold, criterion='distance')
+
+    n_clusters = len(np.unique(cluster_ids))
+    redundant_guardrail = min(max_clusters, len(redundant_features))
+    redundant_guardrail = max(redundant_guardrail, 1)
+    if n_clusters > redundant_guardrail and len(redundant_features) > redundant_guardrail:
+        logger.info(f"   Redundancy guardrail: {n_clusters} clusters in redundant subset "
+                    f"→ capped to {redundant_guardrail}")
+        cluster_ids = hierarchy.fcluster(linkage, t=redundant_guardrail, criterion='maxclust')
 
     # Use LightGBM gain importance for cluster representative selection.
     # This avoids median imputation bias and reflects actual model usage of
@@ -1101,13 +1425,15 @@ def cluster_redundancy(X, feature_list, target_series,
     _safe_lgb_fit(model, X_curr, y_curr)
     importance_series = pd.Series(model.feature_importances_, index=feature_list)
 
-    selected = []
+    selected_redundant = []
     for cluster_id in np.unique(cluster_ids):
-        members = [feature_list[i]
+        members = [redundant_features[i]
                    for i, c in enumerate(cluster_ids) if c == cluster_id]
         best = importance_series[members].idxmax()
-        selected.append(best)
+        selected_redundant.append(best)
 
+    selected_set = set(independent_features) | set(selected_redundant)
+    selected = [f for f in feature_list if f in selected_set]
     return selected
 
 
@@ -1155,7 +1481,8 @@ def _extract_split_pairs(model, feature_names):
 
 
 def interaction_rescue(X, y, confirmed_features, rejected_pool,
-                       n_splits=8, gap=3, top_k=10, max_phase1_screen=30):
+                       n_splits=8, gap=3, top_k=10, max_phase1_screen=30,
+                       trial_eval_workers=None):
     """
     Two-phase interaction rescue:
     Phase 1: Single-feature conditional test
@@ -1173,46 +1500,75 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
     X_curr = X.loc[common]
     y_curr = y.loc[common]
 
+    if trial_eval_workers is None:
+        trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
+    trial_eval_workers = max(1, int(trial_eval_workers))
+
     rejected = [f for f in rejected_pool
                 if f in X_curr.columns and f not in confirmed_features]
 
     if not rejected:
         return []
 
-    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
+    fold_indices = list(TimeSeriesSplit(n_splits=n_splits, gap=gap).split(X_curr))
 
-    def _cv_mae(feature_set):
+    def _cv_mae_raw(feature_set):
         X_sub = X_curr[feature_set]
         maes = []
-        for train_idx, test_idx in tscv.split(X_sub):
+        for train_idx, test_idx in fold_indices:
             model = lgb.LGBMRegressor(**LGB_PARAMS)
             _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
             preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
             maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
         return np.mean(maes)
 
+    mae_cache = {}
+    mae_cache_lock = Lock()
+
+    def _cv_mae(feature_set):
+        return _memoized_score(
+            feature_set,
+            scorer=_cv_mae_raw,
+            cache=mae_cache,
+            cache_lock=mae_cache_lock,
+        )
+
     baseline_mae = _cv_mae(confirmed_features)
 
-    # === Phase 1: Single-feature conditional rescue ===
-    # Pre-screen rejected features by LightGBM gain in a single full model
-    # to avoid O(|rejected| × n_splits) CV fits for every rejected feature.
-    if len(rejected) > max_phase1_screen:
-        all_phase1_feats = confirmed_features + rejected
-        all_phase1_feats = list(dict.fromkeys(all_phase1_feats))
-        screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
-        _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr)
-        screen_imp = pd.Series(
-            screen_model.feature_importances_, index=all_phase1_feats
-        )
-        # Rank only rejected features by gain, take top-N
-        rejected_imp = screen_imp[rejected].sort_values(ascending=False)
-        rejected = rejected_imp.head(max_phase1_screen).index.tolist()
-        logger.info(f"   Phase 1 pre-screen: {len(rejected_pool)} rejected "
-                    f"→ top {len(rejected)} by LightGBM gain")
+    trial_pool_cm = (
+        ThreadPoolExecutor(max_workers=trial_eval_workers)
+        if trial_eval_workers > 1 else nullcontext(None)
+    )
+    with trial_pool_cm as trial_pool:
+        # === Phase 1: Single-feature conditional rescue ===
+        # Pre-screen rejected features by LightGBM gain in a single full model
+        # to avoid O(|rejected| × n_splits) CV fits for every rejected feature.
+        if len(rejected) > max_phase1_screen:
+            all_phase1_feats = confirmed_features + rejected
+            all_phase1_feats = list(dict.fromkeys(all_phase1_feats))
+            screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
+            _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr)
+            screen_imp = pd.Series(
+                screen_model.feature_importances_, index=all_phase1_feats
+            )
+            # Rank only rejected features by gain, take top-N
+            rejected_imp = screen_imp[rejected].sort_values(ascending=False)
+            rejected = rejected_imp.head(max_phase1_screen).index.tolist()
+            logger.info(f"   Phase 1 pre-screen: {len(rejected_pool)} rejected "
+                        f"→ top {len(rejected)} by LightGBM gain")
 
+        single_trials = [
+            (feat, confirmed_features + [feat])
+            for feat in rejected
+        ]
+        trial_scores = _parallel_trial_scores(
+            single_trials,
+            scorer=_cv_mae,
+            max_workers=trial_eval_workers,
+            executor=trial_pool,
+        )
     single_improvements = {}
-    for feat in rejected:
-        trial_mae = _cv_mae(confirmed_features + [feat])
+    for feat, trial_mae in trial_scores:
         improvement = (baseline_mae - trial_mae) / (baseline_mae + 1e-12)
         if improvement > 0:
             single_improvements[feat] = improvement
@@ -1294,7 +1650,8 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
 
 def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                                  n_splits=8, gap=3, min_improvement=0.001,
-                                 patience=3, min_features=3, beam_width=3):
+                                 patience=3, min_features=3, beam_width=3,
+                                 trial_eval_workers=None):
     """Sequential Forward Selection using walk-forward CV.
 
     Improvements:
@@ -1309,15 +1666,25 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
       step, which can discover feature pairs that are weak individually but
       strong together.
     """
+    if not candidate_features:
+        return []
+
     common = X.index.intersection(y.index)
     X_curr = X.loc[common]
     y_curr = y.loc[common]
+    candidate_features = [f for f in candidate_features if f in X_curr.columns]
+    if not candidate_features:
+        return []
+
+    if trial_eval_workers is None:
+        trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
+    trial_eval_workers = max(1, int(trial_eval_workers))
 
     tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
     # Pre-compute fold indices once (they only depend on array length)
     fold_indices = list(tscv.split(X_curr))
 
-    def _cv_mae(feature_set):
+    def _cv_mae_raw(feature_set):
         if not feature_set:
             return float('inf')
         X_sub = X_curr[feature_set]
@@ -1328,6 +1695,17 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
             preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
             maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
         return np.mean(maes)
+
+    mae_cache = {}
+    mae_cache_lock = Lock()
+
+    def _cv_mae(feature_set):
+        return _memoized_score(
+            feature_set,
+            scorer=_cv_mae_raw,
+            cache=mae_cache,
+            cache_lock=mae_cache_lock,
+        )
 
     # --- Pre-screen candidates by LightGBM gain ---
     # Fit one model on all candidates to get a rough importance ranking.
@@ -1348,6 +1726,9 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
     else:
         candidates = gain_rank.index.tolist()
 
+    if not candidates:
+        return []
+
     # Start with best single feature (test top 20)
     best_single_mae = float('inf')
     best_single = candidates[0]
@@ -1366,93 +1747,137 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                 f"beam_width={beam_width}")
 
     consecutive_failures = 0
+    trial_pool_cm = (
+        ThreadPoolExecutor(max_workers=trial_eval_workers)
+        if trial_eval_workers > 1 else nullcontext(None)
+    )
+    with trial_pool_cm as trial_pool:
+        while all_remaining:
+            next_beams = []
 
-    while all_remaining:
-        next_beams = []
+            for selected, current_mae in beams:
+                remaining = [f for f in all_remaining if f not in selected]
+                if not remaining:
+                    next_beams.append((selected, current_mae))
+                    continue
 
-        for selected, current_mae in beams:
-            remaining = [f for f in all_remaining if f not in selected]
-            if not remaining:
-                next_beams.append((selected, current_mae))
-                continue
+                # Evaluate each candidate feature added to this beam's selection
+                trial_defs = [
+                    (feat, selected + [feat])
+                    for feat in remaining
+                ]
+                trials = _parallel_trial_scores(
+                    trial_defs,
+                    scorer=_cv_mae,
+                    max_workers=trial_eval_workers,
+                    executor=trial_pool,
+                )
 
-            # Evaluate each candidate feature added to this beam's selection
-            trials = []
-            for feat in remaining:
-                trial = selected + [feat]
-                mae = _cv_mae(trial)
-                trials.append((feat, mae))
+                # Sort by MAE (ascending = best first)
+                trials.sort(key=lambda x: x[1])
 
-            # Sort by MAE (ascending = best first)
-            trials.sort(key=lambda x: x[1])
+                # Keep top beam_width expansions from this beam
+                for feat, mae in trials[:beam_width]:
+                    next_beams.append((selected + [feat], mae))
 
-            # Keep top beam_width expansions from this beam
-            for feat, mae in trials[:beam_width]:
-                next_beams.append((selected + [feat], mae))
-
-        if not next_beams:
-            break
-
-        # Deduplicate beams by frozen feature set, keeping lowest MAE
-        seen_sets = {}
-        for sel, mae in next_beams:
-            key = frozenset(sel)
-            if key not in seen_sets or mae < seen_sets[key][1]:
-                seen_sets[key] = (sel, mae)
-
-        # Keep top beam_width beams overall
-        ranked_beams = sorted(seen_sets.values(), key=lambda x: x[1])
-        ranked_beams = ranked_beams[:beam_width]
-
-        # Check improvement of the best beam vs previous best
-        best_beam_sel, best_beam_mae = ranked_beams[0]
-        prev_best_mae = beams[0][1]
-
-        improvement = ((prev_best_mae - best_beam_mae)
-                       / (prev_best_mae + 1e-12))
-
-        # Log the best addition this round
-        new_feat = [f for f in best_beam_sel if f not in beams[0][0]]
-        new_feat_str = new_feat[0] if new_feat else "?"
-
-        if improvement < min_improvement:
-            consecutive_failures += 1
-            if (len(best_beam_sel) >= min_features
-                    and consecutive_failures >= patience):
-                logger.info(f"   SFS stop: {patience} consecutive improvements "
-                            f"< {min_improvement:.4f}")
+            if not next_beams:
                 break
-            logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
-                        f"delta={improvement:.4f}, "
-                        f"patience {consecutive_failures}/{patience})")
-        else:
-            consecutive_failures = 0
-            logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
-                        f"delta={improvement:.4f})")
 
-        if best_beam_mae >= prev_best_mae:
-            # No beam improved — check forced add for min_features
-            if len(beams[0][0]) < min_features:
-                forced = all_remaining[0]
-                beams = [(beams[0][0] + [forced], prev_best_mae)]
-                all_remaining.remove(forced)
-                logger.info(f"   SFS +{forced} (forced, "
-                            f"MAE~{prev_best_mae:.2f}, "
-                            f"below min_features={min_features})")
-                continue
+            # Deduplicate beams by frozen feature set, keeping lowest MAE
+            seen_sets = {}
+            for sel, mae in next_beams:
+                key = frozenset(sel)
+                if key not in seen_sets or mae < seen_sets[key][1]:
+                    seen_sets[key] = (sel, mae)
 
-        beams = ranked_beams
+            # Keep top beam_width beams overall
+            ranked_beams = sorted(seen_sets.values(), key=lambda x: x[1])
+            ranked_beams = ranked_beams[:beam_width]
 
-        # Update remaining pool: remove features selected by ANY beam
-        all_selected = set()
-        for sel, _ in beams:
-            all_selected.update(sel)
-        all_remaining = [f for f in all_remaining if f not in all_selected]
+            # Check improvement of the best beam vs previous best
+            best_beam_sel, best_beam_mae = ranked_beams[0]
+            prev_best_mae = beams[0][1]
+
+            improvement = ((prev_best_mae - best_beam_mae)
+                           / (prev_best_mae + 1e-12))
+
+            # Log the best addition this round
+            new_feat = [f for f in best_beam_sel if f not in beams[0][0]]
+            new_feat_str = new_feat[0] if new_feat else "?"
+
+            if improvement < min_improvement:
+                consecutive_failures += 1
+                if (len(best_beam_sel) >= min_features
+                        and consecutive_failures >= patience):
+                    logger.info(f"   SFS stop: {patience} consecutive improvements "
+                                f"< {min_improvement:.4f}")
+                    break
+                logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
+                            f"delta={improvement:.4f}, "
+                            f"patience {consecutive_failures}/{patience})")
+            else:
+                consecutive_failures = 0
+                logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
+                            f"delta={improvement:.4f})")
+
+            if best_beam_mae >= prev_best_mae:
+                # No beam improved — check forced add for min_features
+                if len(beams[0][0]) < min_features:
+                    forced = all_remaining[0]
+                    beams = [(beams[0][0] + [forced], prev_best_mae)]
+                    all_remaining.remove(forced)
+                    logger.info(f"   SFS +{forced} (forced, "
+                                f"MAE~{prev_best_mae:.2f}, "
+                                f"below min_features={min_features})")
+                    continue
+
+            beams = ranked_beams
+
+            # Update remaining pool: remove features selected by ANY beam
+            all_selected = set()
+            for sel, _ in beams:
+                all_selected.update(sel)
+            all_remaining = [f for f in all_remaining if f not in all_selected]
 
     # Return the best beam
     best_selected, best_mae = min(beams, key=lambda x: x[1])
     logger.info(f"   SFS final: {len(best_selected)} features, MAE={best_mae:.2f}")
     return best_selected
+
+
+def should_keep_change(
+    baseline_mae: float,
+    candidate_mae: float,
+    baseline_runtime_s: float,
+    candidate_runtime_s: float,
+    min_mae_improvement_pct: float = 0.5,
+    min_runtime_improvement_pct: float = 15.0,
+    max_mae_loss_for_runtime_pct: float = 0.5,
+) -> bool:
+    """
+    Keep-rule used to gate pipeline changes.
+
+    Rule:
+    1) Keep if MAE improves by >= min_mae_improvement_pct.
+    2) Otherwise keep only if runtime improves by >= min_runtime_improvement_pct
+       AND MAE degradation is no worse than max_mae_loss_for_runtime_pct.
+    """
+    if baseline_mae == 0 or baseline_runtime_s == 0:
+        raise ValueError("baseline_mae and baseline_runtime_s must be non-zero")
+
+    mae_improvement_pct = ((baseline_mae - candidate_mae) / abs(baseline_mae)) * 100.0
+    runtime_improvement_pct = (
+        (baseline_runtime_s - candidate_runtime_s) / abs(baseline_runtime_s)
+    ) * 100.0
+
+    if mae_improvement_pct >= min_mae_improvement_pct:
+        return True
+
+    if (runtime_improvement_pct >= min_runtime_improvement_pct
+            and mae_improvement_pct >= -max_mae_loss_for_runtime_pct):
+        return True
+
+    return False
 
 
 # =============================================================================

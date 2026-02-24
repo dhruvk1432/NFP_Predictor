@@ -42,6 +42,8 @@ logger = setup_logger(__file__, TEMP_DIR)
 # Module-level cache for loaded data
 _snapshot_cache: Dict[str, pd.DataFrame] = {}
 _target_cache: Dict[str, pd.DataFrame] = {}
+NOAA_MAX_FFILL_MONTHS = 6
+NOAA_STALENESS_SUFFIX = "__staleness_months"
 
 
 # =============================================================================
@@ -98,6 +100,12 @@ def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [sanitize_feature_name(str(c)) for c in df.columns]
     return df
+
+
+def _is_noaa_feature_name(name: str) -> bool:
+    """Heuristic NOAA feature detector for raw/sanitized column names."""
+    col = str(name).upper()
+    return col.startswith("NOAA") or "_NOAA_" in col
 
 
 # =============================================================================
@@ -731,15 +739,44 @@ def pivot_snapshot_to_wide(
         # Take last valid value per column (vectorized)
         if wide_df.empty:
              return pd.DataFrame()
-             
-        last_valid = wide_df.ffill().iloc[-1]
-        last_valid = last_valid.dropna()
 
-        if last_valid.empty:
-            return pd.DataFrame()
+        # NOAA release lag can leave trailing NaNs; capture staleness explicitly.
+        noaa_cols = [col for col in wide_df.columns if _is_noaa_feature_name(col)]
+        noaa_staleness = {}
+        if noaa_cols:
+            noaa_notna = wide_df[noaa_cols].notna()
+            has_obs = noaa_notna.any(axis=0)
+            if has_obs.any():
+                last_obs = noaa_notna.iloc[::-1].idxmax()
+                last_obs = pd.to_datetime(last_obs.where(has_obs, pd.NaT), errors='coerce')
+                staleness_months = (
+                    (cutoff.year - last_obs.dt.year) * 12
+                    + (cutoff.month - last_obs.dt.month)
+                )
+                noaa_staleness = {
+                    f"{sanitize_feature_name(str(col))}{NOAA_STALENESS_SUFFIX}": float(months)
+                    for col, months in staleness_months.items()
+                    if pd.notna(months)
+                }
+
+        if noaa_cols:
+            other_cols = [col for col in wide_df.columns if col not in noaa_cols]
+            filled_parts = []
+            if other_cols:
+                filled_parts.append(wide_df[other_cols].ffill())
+            filled_parts.append(wide_df[noaa_cols].ffill(limit=NOAA_MAX_FFILL_MONTHS))
+            wide_filled = pd.concat(filled_parts, axis=1).reindex(columns=wide_df.columns)
+        else:
+            wide_filled = wide_df.ffill()
+
+        last_valid = wide_filled.iloc[-1].dropna()
 
         # Sanitize feature names for LightGBM compatibility
         features = {sanitize_feature_name(str(k)): v for k, v in last_valid.items()}
+        if noaa_staleness:
+            features.update(noaa_staleness)
+        if not features:
+            return pd.DataFrame()
         return pd.DataFrame([features])
 
     # Valid "Long" format has 'series_name' and 'value'
@@ -865,6 +902,9 @@ def pivot_snapshot_to_wide_batch(
     if wide_df.empty:
         return pd.DataFrame()
 
+    noaa_cols = [col for col in wide_df.columns if _is_noaa_feature_name(col)]
+    other_cols = [col for col in wide_df.columns if col not in noaa_cols]
+
     all_features = []
 
     for target_month in target_months:
@@ -879,15 +919,39 @@ def pivot_snapshot_to_wide_batch(
             continue
 
         features = {'target_month': target_month}
+        noaa_staleness = {}
+        if noaa_cols:
+            noaa_notna = available[noaa_cols].notna()
+            has_obs = noaa_notna.any(axis=0)
+            if has_obs.any():
+                last_obs = noaa_notna.iloc[::-1].idxmax()
+                last_obs = pd.to_datetime(last_obs.where(has_obs, pd.NaT), errors='coerce')
+                staleness_months = (
+                    (cutoff.year - last_obs.dt.year) * 12
+                    + (cutoff.month - last_obs.dt.month)
+                )
+                noaa_staleness = {
+                    f"{sanitize_feature_name(str(col))}{NOAA_STALENESS_SUFFIX}": float(months)
+                    for col, months in staleness_months.items()
+                    if pd.notna(months)
+                }
 
-        for raw_series_name in available.columns:
-            series = available[raw_series_name].dropna()
+        if noaa_cols:
+            filled_parts = []
+            if other_cols:
+                filled_parts.append(available[other_cols].ffill())
+            filled_parts.append(available[noaa_cols].ffill(limit=NOAA_MAX_FFILL_MONTHS))
+            available_filled = pd.concat(filled_parts, axis=1).reindex(columns=available.columns)
+        else:
+            available_filled = available.ffill()
 
-            if len(series) == 0:
-                continue
-
+        last_valid = available_filled.iloc[-1].dropna()
+        for raw_series_name, value in last_valid.items():
             series_name = sanitize_feature_name(str(raw_series_name))
-            features[series_name] = series.iloc[-1]
+            features[series_name] = value
+
+        if noaa_staleness:
+            features.update(noaa_staleness)
 
         all_features.append(features)
 

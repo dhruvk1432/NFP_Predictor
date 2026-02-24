@@ -218,6 +218,51 @@ class TestPivotSnapshotToWide:
 
         assert result.empty
 
+    def test_wide_noaa_ffill_cap_and_staleness(self):
+        """NOAA forward fill should be capped and staleness should be emitted."""
+        dates = pd.date_range('2020-01-01', periods=9, freq='MS')  # Jan..Sep
+        wide_df = pd.DataFrame(
+            {
+                'NOAA_Economic_Damage_Index_feature': [5.0] + [np.nan] * 8,
+                'macro_feature': [3.0] + [np.nan] * 8,
+            },
+            index=dates,
+        )
+        target_month = pd.Timestamp('2020-10-01')
+
+        result = pivot_snapshot_to_wide(wide_df, target_month)
+
+        assert not result.empty
+        # NOAA is too stale (>6m) so capped forward-fill should drop it.
+        assert 'NOAA_Economic_Damage_Index_feature' not in result.columns
+        # Non-NOAA still uses unlimited ffill.
+        assert 'macro_feature' in result.columns
+        assert np.isclose(result['macro_feature'].iloc[0], 3.0)
+        # Staleness feature remains available for the stale NOAA signal.
+        staleness_col = 'NOAA_Economic_Damage_Index_feature__staleness_months'
+        assert staleness_col in result.columns
+        assert np.isclose(result[staleness_col].iloc[0], 9.0)
+
+    def test_wide_noaa_within_cap_survives(self):
+        """NOAA values within fill cap should remain available."""
+        dates = pd.date_range('2020-01-01', periods=9, freq='MS')  # Jan..Sep
+        noaa_values = [np.nan] * 9
+        noaa_values[3] = 7.0  # Apr value, 6 months stale by Oct cutoff
+        wide_df = pd.DataFrame(
+            {'NOAA_Human_Impact_Index_feature': noaa_values},
+            index=dates,
+        )
+        target_month = pd.Timestamp('2020-10-01')
+
+        result = pivot_snapshot_to_wide(wide_df, target_month)
+
+        assert not result.empty
+        assert 'NOAA_Human_Impact_Index_feature' in result.columns
+        assert np.isclose(result['NOAA_Human_Impact_Index_feature'].iloc[0], 7.0)
+        staleness_col = 'NOAA_Human_Impact_Index_feature__staleness_months'
+        assert staleness_col in result.columns
+        assert np.isclose(result[staleness_col].iloc[0], 6.0)
+
 
 class TestCacheFunctions:
     """Tests for cache management functions."""

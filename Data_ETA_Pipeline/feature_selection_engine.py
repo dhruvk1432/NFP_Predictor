@@ -24,8 +24,11 @@ from sklearn.feature_selection import mutual_info_regression
 from sklearn.model_selection import TimeSeriesSplit
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor
 import re
+import time
 import logging
+import os
 
 from utils.transforms import winsorize_covid_period
 
@@ -41,9 +44,30 @@ LGB_PARAMS = {
     'learning_rate': 0.05,
     'num_leaves': 31,
     'verbose': -1,
-    'n_jobs': 1,
+    'n_jobs': -1,
     'random_state': SEED,
 }
+
+# =============================================================================
+# LightGBM Safe Helpers
+# =============================================================================
+
+def _safe_lgb_fit(model, X, y):
+    """Safely fit LightGBM by replacing JSON-forbidden characters in column names."""
+    if X.empty:
+        return model
+    X_safe = X.copy()
+    X_safe.columns = [re.sub(r'[\[\]\{\}:,]', '_', str(c)) for c in X.columns]
+    model.fit(X_safe, y)
+    return model
+
+def _safe_lgb_predict(model, X):
+    """Safely predict LightGBM matching the sanitized feature names."""
+    if X.empty:
+        return np.array([])
+    X_safe = X.copy()
+    X_safe.columns = [re.sub(r'[\[\]\{\}:,]', '_', str(c)) for c in X.columns]
+    return model.predict(X_safe)
 
 # =============================================================================
 # Source-Specific Grouping Taxonomies
@@ -227,7 +251,7 @@ def _lgb_fit(X, y, params=None):
 def _lgb_predict(model, X, mapping):
     orig_to_clean = {v: k for k, v in mapping.items()}
     X_clean = X.rename(columns=orig_to_clean)
-    return model.predict(X_clean)
+    return _safe_lgb_predict(model, X_clean)
 
 
 def _lgb_importances(model, mapping):
@@ -289,10 +313,66 @@ def _purged_expanding_corr(feature_series, target_series,
     return weighted_corr, effective_n
 
 
-def _lgb_screen_group(wide_df, target_series, top_k=15):
+def _variance_filter(wide_df, max_same_frac=0.97, min_obs=30):
     """
-    LightGBM-based group screening: catches features useful for tree splits
-    even if they have zero marginal correlation with the target.
+    Drop near-constant features where >= max_same_frac of non-NaN values
+    are identical. These features cannot split trees meaningfully.
+    """
+    keep = []
+    for col in wide_df.columns:
+        vals = wide_df[col].dropna()
+        if len(vals) < min_obs:
+            continue
+        mode_frac = vals.value_counts(normalize=True).iloc[0]
+        if mode_frac < max_same_frac:
+            keep.append(col)
+    n_dropped = len(wide_df.columns) - len(keep)
+    if n_dropped > 0:
+        logger.info(f"    Variance filter: {len(wide_df.columns)} → {len(keep)} "
+                    f"(dropped {n_dropped} near-constant features)")
+    return wide_df[keep]
+
+
+def _deduplicate_group(wide_df, threshold=0.95):
+    """
+    Agglomerative clustering to collapse near-identical features.
+    Keeps the feature with the most non-NaN observations per cluster.
+    """
+    if wide_df.shape[1] <= 3:
+        return wide_df
+
+    # Compute Spearman correlation (NaN-aware pairwise)
+    corr = wide_df.corr(method='spearman').abs().fillna(0)
+    dist = 1 - corr.values
+    np.fill_diagonal(dist, 0)
+    dist = np.maximum(dist, 0)
+    dist = (dist + dist.T) / 2
+
+    condensed = squareform(dist, checks=False)
+    Z = hierarchy.linkage(condensed, method='average')
+    clusters = hierarchy.fcluster(Z, t=1 - threshold, criterion='distance')
+
+    # Keep the feature with the most non-NaN values per cluster
+    keep = []
+    cols = list(wide_df.columns)
+    for cid in np.unique(clusters):
+        members = [cols[i] for i, c in enumerate(clusters) if c == cid]
+        best = max(members, key=lambda m: wide_df[m].notna().sum())
+        keep.append(best)
+
+    n_deduped = len(cols) - len(keep)
+    if n_deduped > 0:
+        logger.info(f"    Dedup (|r|>{threshold}): {len(cols)} → {len(keep)} "
+                    f"(collapsed {n_deduped} near-identical features)")
+    return wide_df[keep]
+
+
+def _lgb_screen_group(wide_df, target_series, top_k=15,
+                      n_subspaces=10, subspace_frac=0.3):
+    """
+    Random Subspace LightGBM screening: trains multiple models on random
+    column subsets to catch features that a single model might miss.
+    Falls back to single model for small groups (<= 200 features).
     """
     common = wide_df.index.intersection(target_series.index)
     if len(common) < 50:
@@ -310,17 +390,51 @@ def _lgb_screen_group(wide_df, target_series, top_k=15):
     if X.shape[1] == 0:
         return []
 
-    model = lgb.LGBMRegressor(**LGB_PARAMS)
-    model.fit(X, y)
+    # For small groups, fall back to single model (fast enough)
+    if X.shape[1] <= 200:
+        model = lgb.LGBMRegressor(**LGB_PARAMS)
+        _safe_lgb_fit(model, X, y)
+        imp = pd.Series(model.feature_importances_, index=X.columns)
+        nonzero = imp[imp > 0].sort_values(ascending=False)
+        return nonzero.head(top_k).index.tolist()
 
-    imp = pd.Series(model.feature_importances_, index=X.columns)
-    nonzero = imp[imp > 0].sort_values(ascending=False)
-    return nonzero.head(top_k).index.tolist()
+    # Random Subspace ensemble for large groups
+    all_cols = list(X.columns)
+    n_select = max(200, int(len(all_cols) * subspace_frac))
+    rng = np.random.RandomState(SEED)
+
+    aggregated_imp = pd.Series(0.0, index=X.columns)
+
+    for i in range(n_subspaces):
+        subset_cols = list(rng.choice(all_cols,
+                                     size=min(n_select, len(all_cols)),
+                                     replace=False))
+        X_sub = X[subset_cols]
+        model = lgb.LGBMRegressor(**LGB_PARAMS)
+        _safe_lgb_fit(model, X_sub, y)
+        imp = pd.Series(model.feature_importances_, index=subset_cols)
+        aggregated_imp[imp.index] += imp.values
+
+    nonzero = aggregated_imp[aggregated_imp > 0].sort_values(ascending=False)
+    # Wider net (top_k * 2): downstream VIF and Boruta will prune excess
+    return nonzero.head(top_k * 2).index.tolist()
 
 
 def _is_binary_feature(series, threshold=5):
     """Check if a feature is effectively binary (<=threshold unique non-NaN values)."""
     return series.dropna().nunique() <= threshold
+
+
+def _compute_purged_corr_for_col(args):
+    """Worker for threaded purged correlation computation."""
+    col_name, col_values, y_local, min_window = args
+    avg_corr, eff_n = _purged_expanding_corr(col_values, y_local, min_window=min_window)
+    if np.isnan(avg_corr) or eff_n < min_window:
+        return None
+    denom = max(1 - avg_corr ** 2, 1e-8)
+    t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
+    p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
+    return (col_name, p_value)
 
 
 def filter_group_data_purged(wide_df, target_series, group_name,
@@ -359,20 +473,54 @@ def filter_group_data_purged(wide_df, target_series, group_name,
     # Relaxed min_window for binary groups (fewer events = fewer valid obs)
     min_window = 30 if is_binary_group else 60
 
+    # === FAST PRE-FILTER: vectorized correlation to eliminate obviously ===
+    # === uncorrelated features before expensive purged correlation     ===
+    n_before_prefilter = X_local.shape[1]
+    if n_before_prefilter > 200:  # Only worth it for large groups
+        fast_corrs = X_local.corrwith(y_local).abs()
+        # Tiered threshold: tighter for very large groups (safe because
+        # Path B random subspace independently catches non-linear features)
+        corr_threshold = 0.05 if n_before_prefilter > 500 else 0.02
+        keep_mask = (fast_corrs > corr_threshold) | fast_corrs.isna()
+        X_local = X_local.loc[:, keep_mask]
+        n_eliminated = n_before_prefilter - X_local.shape[1]
+        if n_eliminated > 0:
+            logger.info(f"    [{group_name}] Pre-filter (|r|>{corr_threshold}): "
+                        f"{n_before_prefilter} → {X_local.shape[1]} features "
+                        f"(eliminated {n_eliminated})")
+
+    if X_local.shape[1] == 0:
+        return []
+
     # === Path A: Purged Expanding-Window Correlation + BH-FDR ===
-    feature_pvalues = {}
-    for col in X_local.columns:
-        avg_corr, eff_n = _purged_expanding_corr(
-            X_local[col], y_local, min_window=min_window
-        )
+    # Use ThreadPoolExecutor for parallel correlation computation
+    n_cols = X_local.shape[1]
+    n_threads = min(os.cpu_count() or 4, max(1, n_cols // 10))
 
-        if np.isnan(avg_corr) or eff_n < min_window:
-            continue
-
-        denom = max(1 - avg_corr ** 2, 1e-8)
-        t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
-        p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
-        feature_pvalues[col] = p_value
+    if n_cols > 50 and n_threads > 1:
+        # Parallel path
+        args_list = [
+            (col, X_local[col], y_local, min_window)
+            for col in X_local.columns
+        ]
+        feature_pvalues = {}
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            for result in pool.map(_compute_purged_corr_for_col, args_list):
+                if result is not None:
+                    feature_pvalues[result[0]] = result[1]
+    else:
+        # Sequential path for small groups
+        feature_pvalues = {}
+        for col in X_local.columns:
+            avg_corr, eff_n = _purged_expanding_corr(
+                X_local[col], y_local, min_window=min_window
+            )
+            if np.isnan(avg_corr) or eff_n < min_window:
+                continue
+            denom = max(1 - avg_corr ** 2, 1e-8)
+            t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
+            p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
+            feature_pvalues[col] = p_value
 
     corr_features = []
     if feature_pvalues:
@@ -451,18 +599,14 @@ def filter_group_data_purged(wide_df, target_series, group_name,
 
 
 # =============================================================================
-# Stage 2: Boruta Feature Selection
+# Stage 2: Boruta Feature Selection (Tournament Architecture)
 # =============================================================================
 
-def get_boruta_importance(X, y, n_runs=100, block_size=6, alpha=0.05):
+def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05):
     """
-    Boruta-style feature selection with shadow features.
+    Core Boruta logic: shadow feature comparison.
     Compares each real feature to the 75th percentile of all shadow importances.
     """
-    common = X.index.intersection(y.index)
-    X_curr = X.loc[common]
-    y_curr = y.loc[common]
-
     n_features = X_curr.shape[1]
     feature_names = X_curr.columns.tolist()
 
@@ -488,7 +632,7 @@ def get_boruta_importance(X, y, n_runs=100, block_size=6, alpha=0.05):
         X_combined = pd.concat([X_curr, shadow_df], axis=1)
 
         model = lgb.LGBMRegressor(**LGB_PARAMS)
-        model.fit(X_combined, y_curr)
+        _safe_lgb_fit(model, X_combined, y_curr)
 
         importances = pd.Series(
             model.feature_importances_, index=X_combined.columns
@@ -517,6 +661,65 @@ def get_boruta_importance(X, y, n_runs=100, block_size=6, alpha=0.05):
                 f"(hit rates: min={hits.min()}/{n_runs}, max={hits.max()}/{n_runs})")
 
     return confirmed + tentative
+
+
+def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
+                          tournament_chunk=100, tournament_threshold=150):
+    """
+    Tournament Boruta: two-round elimination for large feature sets.
+
+    Round 1 (Heats): Split features into chunks. Run fast Boruta per chunk.
+    Round 2 (Final): Pool survivors. Run rigorous Boruta on combined pool.
+
+    For small feature sets (<= tournament_threshold), runs standard Boruta.
+    """
+    common = X.index.intersection(y.index)
+    X_curr = X.loc[common]
+    y_curr = y.loc[common]
+    n_features = X_curr.shape[1]
+
+    if n_features <= tournament_threshold:
+        # Small enough for standard single-round Boruta
+        if n_runs is None:
+            n_runs = 100
+        logger.info(f"   Boruta (standard): {n_features} features × {n_runs} runs")
+        return _boruta_core(X_curr, y_curr, n_runs=n_runs, alpha=alpha)
+
+    # ==========================================
+    # TOURNAMENT MODE for large feature sets
+    # ==========================================
+    logger.info(f"   Boruta Tournament: {n_features} features → "
+                f"chunked into groups of {tournament_chunk}")
+
+    cols = list(X_curr.columns)
+    rng = np.random.RandomState(SEED)
+    rng.shuffle(cols)
+
+    chunks = [cols[i:i + tournament_chunk]
+              for i in range(0, len(cols), tournament_chunk)]
+
+    # Round 1: Fast heats (20 runs, relaxed alpha)
+    heat_survivors = []
+    heat_alpha = alpha * 2  # More permissive in heats to avoid dropping good features
+
+    for ci, chunk in enumerate(chunks, 1):
+        logger.info(f"   Heat {ci}/{len(chunks)}: {len(chunk)} features × 20 runs...")
+        survivors = _boruta_core(X_curr[chunk], y_curr, n_runs=20, alpha=heat_alpha)
+        heat_survivors.extend(survivors)
+        logger.info(f"   Heat {ci}: {len(survivors)} survived")
+
+    heat_survivors = sorted(set(heat_survivors))
+    logger.info(f"   Round 1 total survivors: {len(heat_survivors)}")
+
+    if len(heat_survivors) == 0:
+        logger.info("   WARNING: No features survived tournament heats.")
+        return []
+
+    # Round 2: Rigorous final (80 runs, strict alpha)
+    logger.info(f"   Final round: {len(heat_survivors)} features × 80 runs")
+    final = _boruta_core(X_curr[heat_survivors], y_curr, n_runs=80, alpha=alpha)
+    logger.info(f"   Final survivors: {len(final)}")
+    return final
 
 
 # =============================================================================
@@ -554,7 +757,7 @@ def get_vintage_stability(feature_list, target_series, snapshots_dir,
             continue
 
         model = lgb.LGBMRegressor(**LGB_PARAMS)
-        model.fit(X_wide.loc[common], target_series.loc[common])
+        _safe_lgb_fit(model, X_wide.loc[common], target_series.loc[common])
 
         imp = pd.Series(model.feature_importances_, index=X_wide.columns)
         if imp.sum() > 0:
@@ -708,8 +911,8 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
         maes = []
         for train_idx, test_idx in tscv.split(X_sub):
             model = lgb.LGBMRegressor(**LGB_PARAMS)
-            model.fit(X_sub.iloc[train_idx], y_curr.iloc[train_idx])
-            preds = model.predict(X_sub.iloc[test_idx])
+            _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
+            preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
             maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
         return np.mean(maes)
 
@@ -738,7 +941,7 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
     model_full = lgb.LGBMRegressor(
         **{**LGB_PARAMS, 'n_estimators': 200, 'num_leaves': 63, 'max_depth': 6}
     )
-    model_full.fit(X_curr[all_feats], y_curr)
+    _safe_lgb_fit(model_full, X_curr[all_feats], y_curr)
 
     pair_counts = _extract_split_pairs(model_full, all_feats)
 
@@ -819,8 +1022,8 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
             y_test = y_curr.iloc[test_idx]
 
             model = lgb.LGBMRegressor(**LGB_PARAMS)
-            model.fit(X_train, y_train)
-            preds = model.predict(X_test)
+            _safe_lgb_fit(model, X_train, y_train)
+            preds = _safe_lgb_predict(model, X_test)
             maes.append(np.mean(np.abs(y_test.values - preds)))
 
         return np.mean(maes)
@@ -908,39 +1111,63 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
 
 def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups):
     """Execute stages 1-6 for a single target on one source."""
+    pipeline_start = time.time()
     y_target = winsorize_covid_period(y_target)
+
+    # ===== Stage 0: Global Pre-Funnel (Variance + Dedup) =====
+    t0 = time.time()
+    n_cols_before = snap_wide.shape[1]
+    if n_cols_before > 500:
+        logger.info(f"0. Pre-funnel: {n_cols_before} features...")
+        snap_wide = _variance_filter(snap_wide)
+    logger.info(f"   > Pre-funnel: {n_cols_before} → {snap_wide.shape[1]} features "
+                f"({time.time() - t0:.1f}s)")
 
     # ===== Stage 1: Group-wise Dual Filter (Linear + LightGBM) =====
     stage1_candidates = []
-    logger.info("1. Group-wise Dual Filter "
-                "(Purged Corr + LightGBM screen + VIF)...")
-    for group_name, series_list in series_groups.items():
+    t0 = time.time()
+    n_groups = len(series_groups)
+    logger.info(f"1. Group-wise Dual Filter "
+                f"(Purged Corr + Random Subspace LightGBM + VIF) — {n_groups} groups...")
+    for gi, (group_name, series_list) in enumerate(series_groups.items(), 1):
+        gt0 = time.time()
         wide_group = _select_wide(snap_wide, series_list)
         if wide_group.empty:
             continue
         wide_group = winsorize_covid_period(wide_group)
 
+        # Intra-group deduplication for large groups
+        n_before_dedup = wide_group.shape[1]
+        if n_before_dedup > 50:
+            wide_group = _deduplicate_group(wide_group, threshold=0.95)
+
         selected = filter_group_data_purged(
             wide_group, y_target, group_name
         )
         stage1_candidates.extend(selected)
+        logger.info(f"    [{group_name}] ({gi}/{n_groups}) "
+                    f"{len(series_list)} features → {len(selected)} survived "
+                    f"({time.time() - gt0:.1f}s)")
 
     stage1_candidates = sorted(list(set(stage1_candidates)))
-    logger.info(f"   > Stage 1 Survivors: {len(stage1_candidates)} features")
+    logger.info(f"   > Stage 1 Survivors: {len(stage1_candidates)} features "
+                f"({time.time() - t0:.1f}s)")
 
     if len(stage1_candidates) == 0:
         logger.info("   WARNING: No features survived Stage 1. Skipping pipeline.")
         return []
 
     # ===== Stage 2: Boruta Importance =====
+    t0 = time.time()
     logger.info("2. Boruta Feature Selection (shadow features)...")
     X_stage2 = _select_wide(snap_wide, stage1_candidates)
     X_stage2 = winsorize_covid_period(X_stage2)
 
     stage2_candidates = get_boruta_importance(
-        X_stage2, y_target, n_runs=100
+        X_stage2, y_target
     )
-    logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features")
+    logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
+                f"({time.time() - t0:.1f}s)")
 
     if len(stage2_candidates) == 0:
         logger.info("   WARNING: No features survived Boruta. "
@@ -952,6 +1179,7 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         stage2_candidates = corrs.nlargest(30).index.tolist()
 
     # ===== Stage 3: Vintage Stability =====
+    t0 = time.time()
     logger.info("3. Vintage Stability "
                 "(exponential recency weights, min 2 snapshots)...")
     weighted_scores = get_vintage_stability(
@@ -967,16 +1195,20 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         stage3_candidates = weighted_scores[
             weighted_scores > threshold
         ].index.tolist()
-    logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features")
+    logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
+                f"({time.time() - t0:.1f}s)")
 
     # ===== Stage 4: Cluster Redundancy =====
+    t0 = time.time()
     logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
     stage4_candidates = cluster_redundancy(
         X_stage2, stage3_candidates, y_target, max_clusters=50
     )
-    logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features")
+    logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
+                f"({time.time() - t0:.1f}s)")
 
     # ===== Stage 5: Interaction Rescue (two-phase) =====
+    t0 = time.time()
     logger.info("5. Interaction Rescue "
                 "(single-feature + split-pair detection)...")
     rescued = interaction_rescue(
@@ -993,9 +1225,11 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
     ]
     logger.info(f"   > Stage 5 Candidates: {len(stage5_candidates)} "
                 f"({len(stage4_candidates)} confirmed "
-                f"+ {len(rescued)} rescued)")
+                f"+ {len(rescued)} rescued) "
+                f"({time.time() - t0:.1f}s)")
 
     # ===== Stage 6: Sequential Forward Selection =====
+    t0 = time.time()
     logger.info("6. Sequential Forward Selection "
                 "(walk-forward CV with embargo)...")
     final_list = sequential_forward_selection(
@@ -1005,8 +1239,10 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         patience=3,
         min_features=3,
     )
-    logger.info(f"   > Final Count: {len(final_list)}")
+    logger.info(f"   > Final Count: {len(final_list)} "
+                f"({time.time() - t0:.1f}s)")
 
+    logger.info(f"   TOTAL PIPELINE: {(time.time() - pipeline_start) / 60:.1f} min")
     return final_list
 
 

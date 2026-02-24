@@ -881,6 +881,15 @@ def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first')
     return predict_nfp_mom(latest_target, target_type=target_type, release_type=release_type)
 
 
+# All 4 model combos for --train-all
+ALL_COMBOS = [
+    ('nsa', 'first', 'first_release'),
+    ('nsa', 'first', 'revised'),
+    ('sa',  'first', 'first_release'),
+    ('sa',  'first', 'revised'),
+]
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -891,6 +900,9 @@ if __name__ == "__main__":
 Examples:
   # Train model (default: nsa_first)
   python Train/train_lightgbm_nfp.py --train
+
+  # Train all 4 model variants and generate comparison
+  python Train/train_lightgbm_nfp.py --train-all
 
   # Train with specific target/release
   python Train/train_lightgbm_nfp.py --train --target nsa --release first
@@ -903,6 +915,8 @@ Examples:
         """
     )
     parser.add_argument('--train', action='store_true', help='Train model')
+    parser.add_argument('--train-all', action='store_true',
+                        help='Train all 4 model variants (NSA/SA × first_release/revised) and generate comparison')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
@@ -927,7 +941,117 @@ Examples:
 
     model_id = get_model_id(args.target, args.release, target_source)
 
-    if args.train:
+    if args.train_all:
+        # =====================================================================
+        # TRAIN ALL 4 MODEL VARIANTS AND GENERATE COMPARISON
+        # =====================================================================
+        import time as _time
+        from Train.Output_code.model_comparison import generate_comparison_scorecard
+
+        logger.info("=" * 70)
+        logger.info("TRAINING ALL 4 MODEL VARIANTS (NSA/SA × first_release/revised)")
+        logger.info("=" * 70)
+
+        all_comparison_results = {}
+        all_train_results = {}  # Store full results for output generation
+        _train_all_t0 = _time.time()
+
+        for combo_idx, (tt, rt, ts) in enumerate(ALL_COMBOS, 1):
+            combo_id = get_model_id(tt, rt, ts)
+            logger.info(f"\n{'#' * 70}")
+            logger.info(f"# [{combo_idx}/4] TRAINING: {combo_id.upper()}")
+            logger.info(f"{'#' * 70}")
+
+            try:
+                result = train_and_evaluate(
+                    target_type=tt,
+                    release_type=rt,
+                    target_source=ts,
+                    use_huber_loss=use_huber_loss,
+                    huber_delta=args.huber_delta,
+                    tune=tune,
+                )
+
+                if result is not None:
+                    model, feature_cols, residuals, backtest_results, X_full, y_full = result
+                    all_comparison_results[combo_id] = {
+                        'backtest_results': backtest_results,
+                        'n_features': len(feature_cols),
+                        'n_train_obs': len(X_full),
+                    }
+                    all_train_results[combo_id] = {
+                        'model': model,
+                        'feature_cols': feature_cols,
+                        'residuals': residuals,
+                        'backtest_results': backtest_results,
+                        'X_full': X_full,
+                        'y_full': y_full,
+                        'target_type': tt,
+                        'release_type': rt,
+                        'target_source': ts,
+                    }
+                    logger.info(f"[{combo_idx}/4] {combo_id.upper()} completed successfully")
+                else:
+                    logger.warning(f"[{combo_idx}/4] {combo_id.upper()} returned None")
+
+            except Exception as e:
+                logger.error(f"[{combo_idx}/4] {combo_id.upper()} FAILED: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        # Generate comparative scorecard
+        if all_comparison_results:
+            logger.info("\nGenerating comparative scorecard...")
+            scorecard = generate_comparison_scorecard(all_comparison_results)
+        else:
+            logger.error("No models completed successfully")
+
+        # Generate combined output for each target_source pair that has both NSA and SA
+        from Train.Output_code.generate_output import generate_all_output
+        for ts_name in ['first_release', 'revised']:
+            nsa_id = get_model_id('nsa', 'first', ts_name)
+            sa_id = get_model_id('sa', 'first', ts_name)
+            if nsa_id in all_train_results and sa_id in all_train_results:
+                nsa_r = all_train_results[nsa_id]
+                sa_r = all_train_results[sa_id]
+                nsa_metadata = {
+                    'feature_cols': nsa_r['feature_cols'],
+                    'importance': dict(zip(
+                        nsa_r['feature_cols'],
+                        nsa_r['model'].feature_importance(importance_type='gain')
+                    )),
+                }
+                sa_metadata = {
+                    'feature_cols': sa_r['feature_cols'],
+                    'importance': dict(zip(
+                        sa_r['feature_cols'],
+                        sa_r['model'].feature_importance(importance_type='gain')
+                    )),
+                }
+                output_suffix = '_revised' if ts_name == 'revised' else ''
+                logger.info(f"\nGenerating combined output for {ts_name}...")
+                generate_all_output(
+                    nsa_results=nsa_r['backtest_results'],
+                    sa_results=sa_r['backtest_results'],
+                    nsa_model=nsa_r['model'],
+                    sa_model=sa_r['model'],
+                    nsa_metadata=nsa_metadata,
+                    sa_metadata=sa_metadata,
+                    nsa_X_full=nsa_r['X_full'],
+                    sa_X_full=sa_r['X_full'],
+                    nsa_y_full=nsa_r['y_full'],
+                    sa_y_full=sa_r['y_full'],
+                    nsa_residuals=nsa_r['residuals'],
+                    sa_residuals=sa_r['residuals'],
+                    suffix=output_suffix,
+                )
+
+        _total_elapsed = _time.time() - _train_all_t0
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"ALL 4 MODELS COMPLETE ({_total_elapsed / 60:.1f} minutes total)")
+        logger.info(f"{'=' * 70}")
+
+    elif args.train:
         result = train_and_evaluate(
             target_type=args.target,
             release_type=args.release,

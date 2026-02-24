@@ -2317,6 +2317,8 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
 
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
 PREPARED_FRED_DIR = DATA_PATH / "fred_data_prepared" / "decades"
+PREPARED_FRED_NSA_DIR = DATA_PATH / "fred_data_prepared_nsa" / "decades"
+PREPARED_FRED_SA_DIR = DATA_PATH / "fred_data_prepared_sa" / "decades"
 
 # Series that should have SymLog applied (high kurtosis MoM changes)
 # These series experience extreme values (like COVID crash/recovery)
@@ -2388,7 +2390,12 @@ def load_snapshot(base_dir: Path, date_ts: pd.Timestamp) -> pd.DataFrame:
 
 def _process_one_snapshot(args):
     """
-    Process a single snapshot: load raw → compute features (wide-format) → save.
+    Process a single snapshot: load raw → split NSA/SA → compute features → save.
+
+    Produces three outputs per snapshot:
+    - Combined (legacy): fred_data_prepared/decades/...
+    - NSA only: fred_data_prepared_nsa/decades/...
+    - SA only: fred_data_prepared_sa/decades/...
 
     Designed as a top-level function for multiprocessing compatibility.
 
@@ -2396,35 +2403,49 @@ def _process_one_snapshot(args):
         args: Tuple of (obs_month, apply_mom, snapshots_dir, prepared_dir)
 
     Returns:
-        Tuple of (obs_month_str, n_features) or (obs_month_str, 0) on failure/skip.
+        Tuple of (obs_month_str, n_features_nsa, n_features_sa) or (obs_month_str, 0, 0).
     """
     obs_month, apply_mom, snapshots_dir, prepared_dir = args
     obs_str = obs_month.strftime('%Y-%m')
+    decade_str = f"{obs_month.year // 10 * 10}s"
+    year_str = str(obs_month.year)
 
     try:
         raw_df = load_snapshot(Path(snapshots_dir), obs_month)
         if raw_df.empty:
-            return (obs_str, 0)
+            return (obs_str, 0, 0)
 
-        # Compute all features in vectorized wide format
-        # Returns wide DataFrame: index=date, columns=feature_names
-        wide_df = compute_features_wide(raw_df, apply_mom=apply_mom)
+        # Split into NSA and SA subsets based on series_name suffix
+        nsa_df = raw_df[raw_df['series_name'].str.endswith('_nsa')].copy()
+        sa_df = raw_df[~raw_df['series_name'].str.endswith('_nsa')].copy()
 
-        if wide_df.empty:
-            return (obs_str, 0)
+        n_nsa, n_sa = 0, 0
 
-        # Save wide-format parquet (index=date, columns=features)
-        decade_str = f"{obs_month.year // 10 * 10}s"
-        year_str = str(obs_month.year)
-        save_dir = Path(prepared_dir) / decade_str / year_str
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"{obs_str}.parquet"
-        wide_df.to_parquet(save_path)
+        # Process and save NSA
+        if not nsa_df.empty:
+            wide_nsa = compute_features_wide(nsa_df, apply_mom=apply_mom)
+            if not wide_nsa.empty:
+                nsa_dir = Path(str(prepared_dir).replace(
+                    'fred_data_prepared', 'fred_data_prepared_nsa'))
+                save_dir = nsa_dir / decade_str / year_str
+                save_dir.mkdir(parents=True, exist_ok=True)
+                wide_nsa.to_parquet(save_dir / f"{obs_str}.parquet")
+                n_nsa = len(wide_nsa.columns)
 
-        n_features = len(wide_df.columns)
-        return (obs_str, n_features)
+        # Process and save SA
+        if not sa_df.empty:
+            wide_sa = compute_features_wide(sa_df, apply_mom=apply_mom)
+            if not wide_sa.empty:
+                sa_dir = Path(str(prepared_dir).replace(
+                    'fred_data_prepared', 'fred_data_prepared_sa'))
+                save_dir = sa_dir / decade_str / year_str
+                save_dir.mkdir(parents=True, exist_ok=True)
+                wide_sa.to_parquet(save_dir / f"{obs_str}.parquet")
+                n_sa = len(wide_sa.columns)
+
+        return (obs_str, n_nsa, n_sa)
     except Exception as e:
-        return (obs_str, -1, str(e))
+        return (obs_str, -1, -1, str(e))
 
 
 def prepare_fred_snapshots(
@@ -2495,13 +2516,16 @@ def prepare_fred_snapshots(
                     logger.info(f"  [{i+1}/{n_snapshots}] {elapsed:.1f}s elapsed")
 
     elapsed = time.time() - t0
-    processed = sum(1 for r in results if len(r) >= 2 and r[1] > 0)
-    errors = [r for r in results if len(r) >= 3]
+    processed_nsa = sum(1 for r in results if len(r) >= 3 and r[1] > 0)
+    processed_sa = sum(1 for r in results if len(r) >= 3 and r[2] > 0)
+    errors = [r for r in results if len(r) >= 4]
     if errors:
         for err in errors[:5]:
-            logger.warning(f"  Error processing {err[0]}: {err[2]}")
+            logger.warning(f"  Error processing {err[0]}: {err[3]}")
 
-    logger.info(f"FRED Snapshots preparation complete: {processed}/{n_snapshots} snapshots in {elapsed:.1f}s")
+    logger.info(f"FRED Snapshots preparation complete: "
+                f"NSA={processed_nsa}, SA={processed_sa} / {n_snapshots} snapshots "
+                f"in {elapsed:.1f}s")
 
 
 # =============================================================================
@@ -2571,7 +2595,7 @@ def verify_prepared_snapshot():
     expected_patterns = [
         f'{test_series}_symlog', f'{test_series}_pct_chg',
         f'{test_series}_diff', f'{test_series}_zscore_3m',
-        f'{test_series}_rolling_mean_3m', f'{test_series}_lag_18m',
+        f'{test_series}_rolling_mean_3m', f'{test_series}_lag_12m',
     ]
     for pattern in expected_patterns:
         found = any(pattern in s for s in features)

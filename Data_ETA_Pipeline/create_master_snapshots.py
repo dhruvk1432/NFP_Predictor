@@ -41,7 +41,8 @@ warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 MASTER_BASE = DATA_PATH / "master_snapshots"
 
 SOURCES = {
-    'FRED_Employment': DATA_PATH / "fred_data_prepared" / "decades",
+    'FRED_Employment_NSA': DATA_PATH / "fred_data_prepared_nsa" / "decades",
+    'FRED_Employment_SA':  DATA_PATH / "fred_data_prepared_sa"  / "decades",
     'FRED_Exogenous': DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades",
     'Unifier': DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades",
     'ADP': DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
@@ -50,7 +51,8 @@ SOURCES = {
 }
 
 # Ordered by typical execution time (longest to shortest) to optimize ProcessPool scheduling
-SOURCE_EXEC_ORDER = ['FRED_Employment', 'FRED_Exogenous', 'Unifier', 'Prosper', 'NOAA', 'ADP']
+SOURCE_EXEC_ORDER = ['FRED_Employment_NSA', 'FRED_Employment_SA', 'FRED_Exogenous',
+                     'Unifier', 'Prosper', 'NOAA', 'ADP']
 
 # All 4 combinations of target category and target source
 TARGET_COMBOS = [
@@ -203,25 +205,54 @@ def _process_source_features(source_name: str, source_dir: Path,
 
 def _run_parallel_feature_selection(target_cat: str, target_source: str) -> list[str]:
     label = f"{target_cat.upper()}/{target_source}"
-    logger.info(f"[{label}] Starting Parallel 6-Stage Feature Selection Across All Sources...")
+    logger.info(f"[{label}] Starting Feature Selection Across All Sources...")
     all_selected = []
 
-    # max_workers=6 maps perfectly to our 6 sources
-    with ProcessPoolExecutor(max_workers=min(6, os.cpu_count() or 1)) as executor:
-        futures = {
-            executor.submit(_process_source_features, name, SOURCES[name],
-                            target_cat, target_source): name
-            for name in SOURCE_EXEC_ORDER
-        }
+    # OOM Protection Strategy:
+    # Massive datasets (FRED) chew up ~15-20GB of RAM *per worker*.
+    # If we run them in parallel with others, macOS will instantly SIGKILL 
+    # the process for RAM exhaustion (Exit Code 137). 
+    # Therefore, we run the massive datasets sequentially first, then
+    # parallelize the smaller ones.
+    
+    massive_sources = ['FRED_Employment_NSA', 'FRED_Employment_SA', 'FRED_Exogenous']
+    small_sources = [s for s in SOURCE_EXEC_ORDER if s not in massive_sources]
 
-        for future in as_completed(futures):
-            name = futures[future]
+    # Route FRED Employment: only process the branch matching target_cat
+    # (nsa model only needs NSA features, sa model only needs SA features)
+    skip_source = 'FRED_Employment_SA' if target_cat == 'nsa' else 'FRED_Employment_NSA'
+
+    # 1. Run massive sources sequentially (skip the irrelevant FRED branch)
+    for name in massive_sources:
+        if name == skip_source:
+            logger.info(f"[{label}] Skipping '{name}' (not needed for {target_cat} branch)")
+            continue
+        if name in SOURCES:
+            logger.info(f"[{label}] Executing massive dataset '{name}' sequentially to prevent OOM...")
             try:
-                feats = future.result()
+                feats = _process_source_features(name, SOURCES[name], target_cat, target_source)
                 all_selected.extend(feats)
                 logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
             except Exception as e:
-                logger.error(f"--- [{label}] {name} spawned an exception: {e}")
+                logger.error(f"--- [{label}] {name} failed: {e}")
+
+    # 2. Run small sources in parallel
+    if small_sources:
+        logger.info(f"[{label}] Executing {len(small_sources)} smaller datasets in parallel...")
+        with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
+            futures = {
+                executor.submit(_process_source_features, name, SOURCES[name],
+                                target_cat, target_source): name
+                for name in small_sources
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    feats = future.result()
+                    all_selected.extend(feats)
+                    logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
+                except Exception as e:
+                    logger.error(f"--- [{label}] {name} spawned an exception: {e}")
 
     all_selected = list(set(all_selected))
     logger.info(f"[{label}] Feature Selection Complete. Total surviving features: {len(all_selected)}")
@@ -232,10 +263,20 @@ def _run_parallel_feature_selection(target_cat: str, target_source: str) -> list
 # MASTER GENERATION
 # =============================================================================
 
-def _load_all_sources(obs_month: pd.Timestamp, allowed_features: set) -> pd.DataFrame:
+def _load_all_sources(obs_month: pd.Timestamp, allowed_features: set,
+                      target_cat: str = None) -> pd.DataFrame:
     """Load and merge all sources for a single month, dropping unselected columns."""
+    # Skip the FRED Employment branch that doesn't match the target category
+    skip_source = None
+    if target_cat == 'nsa':
+        skip_source = 'FRED_Employment_SA'
+    elif target_cat == 'sa':
+        skip_source = 'FRED_Employment_NSA'
+
     results = []
     for name, sdir in SOURCES.items():
+        if name == skip_source:
+            continue
         path = _snapshot_path(sdir, obs_month)
         if not path.exists(): continue
 
@@ -285,13 +326,22 @@ def create_master_snapshots(skip_existing: bool = False):
         return
 
     # Loop all 4 combinations: {nsa, sa} x {first_release, revised}
+    # first_release is processed before revised so we can reuse its feature selection
     for target_cat, target_source in TARGET_COMBOS:
         label = f"{target_cat.upper()}/{target_source}"
         logger.info(f"========== COMMENCING BRANCH: {label} ==========")
         target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
 
         # 1. Check Cache / Run Engine
+        # For 'revised' targets, reuse the feature selection from 'first_release'
+        # (same feature matrix, targets are ~95% correlated — no need to re-run)
         allowed_list = _check_cache(target_cat, target_source)
+        if allowed_list is None and target_source == 'revised':
+            allowed_list = _check_cache(target_cat, 'first_release')
+            if allowed_list:
+                logger.info(f"[{label}] Reusing feature selection from first_release "
+                            f"({len(allowed_list)} features)")
+                _save_cache(allowed_list, target_cat, target_source)
         if allowed_list is None:
             logger.info(f"[{label}] Executing vast compute pool for automated selection...")
             allowed_list = _run_parallel_feature_selection(target_cat, target_source)
@@ -299,6 +349,10 @@ def create_master_snapshots(skip_existing: bool = False):
                 logger.error(f"[{label}] Feature selection catastrophic failure. No features returned.")
                 continue
             _save_cache(allowed_list, target_cat, target_source)
+            # Also save for the revised variant to avoid re-running
+            if target_source == 'first_release':
+                _save_cache(allowed_list, target_cat, 'revised')
+                logger.info(f"[{label}] Pre-cached features for {target_cat}/revised")
 
         allowed_set = set(allowed_list)
         logger.info(f"[{label}] Proceeding strictly with {len(allowed_set)} whitelisted features.")
@@ -313,7 +367,7 @@ def create_master_snapshots(skip_existing: bool = False):
 
         for i, (obs_month, snap_date) in enumerate(branch_snapshot_pairs):
             try:
-                master = _load_all_sources(obs_month, allowed_set)
+                master = _load_all_sources(obs_month, allowed_set, target_cat=target_cat)
                 if master.empty:
                     logger.debug(f"[{label}] Skipped {obs_month.date()} (no valid data)")
                     continue

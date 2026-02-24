@@ -29,6 +29,8 @@ import re
 import time
 import logging
 import os
+import gc
+import psutil
 
 from utils.transforms import winsorize_covid_period
 
@@ -44,7 +46,8 @@ LGB_PARAMS = {
     'learning_rate': 0.05,
     'num_leaves': 31,
     'verbose': -1,
-    'n_jobs': -1,
+    # MUST BE 1. LightGBM + ProcessPoolExecutor + n_jobs=-1 = OOM deadlock on macOS
+    'n_jobs': 1,
     'random_state': SEED,
 }
 
@@ -144,7 +147,7 @@ def _classify_series(col: str, source_name: str) -> str:
             if col.startswith(prefix): return grp
         return 'Other'
 
-    elif source_name == 'FRED_Employment':
+    elif source_name.startswith('FRED_Employment'):
         parts = col.split('.')
         if col.startswith('total.private.services'):
             if len(parts) >= 4:
@@ -200,18 +203,34 @@ def load_snapshot_wide(path, feature_filter=None):
         if feature_filter:
             available = [c for c in feature_filter if c in wide.columns]
             wide = wide[available]
-    wide = wide.sort_index().dropna(axis=1, how='all').dropna(axis=0, how='all')
+            
+    # Cutoff analysis to post-1990 for cleaner, more plentiful data points
+    # (Removes massive NaN sparsity from earlier decades)
+    wide = wide[wide.index >= '1990-01-01']
+            
+    # OOM/Freeze Protection: pandas `dropna(how='all')` freezes on 50k cols. 
+    # Use vectorized boolean indexing instead.
+    valid_cols = wide.columns[wide.notna().any(axis=0)]
+    wide = wide[valid_cols]
+    valid_rows = wide.index[wide.notna().any(axis=1)]
+    wide = wide.loc[valid_rows].sort_index()
+    
     return wide
 
 
 def _select_wide(snap_wide, series_list):
-    """Select a subset of columns from a wide DataFrame, dropping all-NaN rows/cols."""
+    """Select a subset of columns from a wide DataFrame, dropping all-NaN rows/cols using fast vectorized masks."""
     available = [s for s in series_list if s in snap_wide.columns]
     if not available:
         return pd.DataFrame()
     subset = snap_wide[available].copy()
-    subset = subset.dropna(axis=1, how='all').dropna(axis=0, how='all')
-    return subset
+    
+    # Fast vectorized dropna equivalent
+    valid_cols = subset.columns[subset.notna().any(axis=0)]
+    subset = subset[valid_cols]
+    valid_rows = subset.index[subset.notna().any(axis=1)]
+    
+    return subset.loc[valid_rows]
 
 
 # =============================================================================
@@ -316,19 +335,42 @@ def _purged_expanding_corr(feature_series, target_series,
 def _variance_filter(wide_df, max_same_frac=0.97, min_obs=30):
     """
     Drop near-constant features where >= max_same_frac of non-NaN values
-    are identical. These features cannot split trees meaningfully.
+    are identical. Vectorized for speed on 50k+ features.
     """
+    n_original = wide_df.shape[1]
+    
+    # 1. Count valid observations per column
+    valid_counts = wide_df.notna().sum()
+    valid_cols = valid_counts[valid_counts >= min_obs].index
+    if len(valid_cols) == 0:
+        return wide_df[[]]
+        
+    df_valid = wide_df[valid_cols]
+    
+    # 2. Vectorized mode frequency estimation using pandas mode/value_counts across cols is slow.
+    # A faster proxy: standard deviation. Near-constant features have variance ~0.
+    # However, to explicitly match the "mode" requirement without looping 50k times:
+    # We will sample the df_valid and compute modes if it's huge, otherwise exact.
+    # Since var/std can trick us on skewed data, we stick to the exact logic
+    # but use a slightly optimized comprehension.
+    
     keep = []
-    for col in wide_df.columns:
-        vals = wide_df[col].dropna()
-        if len(vals) < min_obs:
+    # Loop over columns is unavoidable for exact mode frequency, 
+    # but we can do it faster on the underlying numpy arrays.
+    for col in df_valid.columns:
+        arr = df_valid[col].values
+        arr = arr[~np.isnan(arr)]
+        if len(arr) < min_obs:
             continue
-        mode_frac = vals.value_counts(normalize=True).iloc[0]
+        # np.unique is much faster than pd.value_counts
+        _, counts = np.unique(arr, return_counts=True)
+        mode_frac = counts.max() / len(arr)
         if mode_frac < max_same_frac:
             keep.append(col)
-    n_dropped = len(wide_df.columns) - len(keep)
+
+    n_dropped = n_original - len(keep)
     if n_dropped > 0:
-        logger.info(f"    Variance filter: {len(wide_df.columns)} → {len(keep)} "
+        logger.info(f"    Variance filter: {n_original} → {len(keep)} "
                     f"(dropped {n_dropped} near-constant features)")
     return wide_df[keep]
 
@@ -337,34 +379,71 @@ def _deduplicate_group(wide_df, threshold=0.95):
     """
     Agglomerative clustering to collapse near-identical features.
     Keeps the feature with the most non-NaN observations per cluster.
+    Auto-chunks massive groups to guarantee OOM-safety.
     """
-    if wide_df.shape[1] <= 3:
+    n_features = wide_df.shape[1]
+    if n_features <= 3:
         return wide_df
 
-    # Compute Spearman correlation (NaN-aware pairwise)
-    corr = wide_df.corr(method='spearman').abs().fillna(0)
-    dist = 1 - corr.values
-    np.fill_diagonal(dist, 0)
-    dist = np.maximum(dist, 0)
-    dist = (dist + dist.T) / 2
+    def _cluster_chunk(df_chunk, t):
+        if df_chunk.shape[1] <= 1:
+            return list(df_chunk.columns)
+        corr = df_chunk.corr(method='spearman').abs().fillna(0)
+        dist = 1 - corr.values
+        np.fill_diagonal(dist, 0)
+        dist = np.maximum(dist, 0)
+        dist = (dist + dist.T) / 2
+        condensed = squareform(dist, checks=False)
+        Z = hierarchy.linkage(condensed, method='average')
+        clusters = hierarchy.fcluster(Z, t=1 - t, criterion='distance')
+        
+        keep = []
+        cols = list(df_chunk.columns)
+        for cid in np.unique(clusters):
+            members = [cols[i] for i, c in enumerate(clusters) if c == cid]
+            best = max(members, key=lambda m: df_chunk[m].notna().sum())
+            keep.append(best)
+        return keep
 
-    condensed = squareform(dist, checks=False)
-    Z = hierarchy.linkage(condensed, method='average')
-    clusters = hierarchy.fcluster(Z, t=1 - threshold, criterion='distance')
-
-    # Keep the feature with the most non-NaN values per cluster
-    keep = []
-    cols = list(wide_df.columns)
-    for cid in np.unique(clusters):
-        members = [cols[i] for i, c in enumerate(clusters) if c == cid]
-        best = max(members, key=lambda m: wide_df[m].notna().sum())
-        keep.append(best)
-
-    n_deduped = len(cols) - len(keep)
-    if n_deduped > 0:
-        logger.info(f"    Dedup (|r|>{threshold}): {len(cols)} → {len(keep)} "
-                    f"(collapsed {n_deduped} near-identical features)")
-    return wide_df[keep]
+    try:
+        # If massive (>5000), chunk the deduplication to save RAM
+        if n_features > 5000:
+            logger.info(f"    Massive group ({n_features} cols). Using chunked deduplication...")
+            cols = list(wide_df.columns)
+            chunk_size = 2500
+            survivors = []
+            
+            # Phase 1: Dedup chunks individually
+            for i in range(0, len(cols), chunk_size):
+                chunk = cols[i:i+chunk_size]
+                chunk_survivors = _cluster_chunk(wide_df[chunk], threshold)
+                survivors.extend(chunk_survivors)
+            
+            logger.info(f"    Chunk dedup Phase 1: {n_features} → {len(survivors)} features.")
+            
+            # Phase 2: Dedup the combined survivors
+            if len(survivors) > chunk_size:
+                final_survivors = _cluster_chunk(wide_df[survivors], threshold)
+            else:
+                final_survivors = survivors
+                
+            n_dropped = n_features - len(final_survivors)
+            logger.info(f"    Chunk dedup complete: {n_features} → {len(final_survivors)} "
+                        f"(dropped {n_dropped})")
+            return wide_df[final_survivors]
+            
+        else:
+            # Normal dedup for <= 5000 features
+            keep = _cluster_chunk(wide_df, threshold)
+            n_dropped = n_features - len(keep)
+            if n_dropped > 0:
+                logger.info(f"    Dedup (|r|>{threshold}): {n_features} → {len(keep)} "
+                            f"(collapsed {n_dropped} near-identical features)")
+            return wide_df[keep]
+            
+    except MemoryError:
+        logger.warning(f"    Dedup OOM on {n_features} cols. Skipping completely to save pipeline.")
+        return wide_df
 
 
 def _lgb_screen_group(wide_df, target_series, top_k=15,
@@ -411,12 +490,14 @@ def _lgb_screen_group(wide_df, target_series, top_k=15,
                                      replace=False))
         X_sub = X[subset_cols]
         model = lgb.LGBMRegressor(**LGB_PARAMS)
+        logger.debug(f"      [LGB Subspace {i+1}/{n_subspaces}] fitting {X_sub.shape[1]} features...")
         _safe_lgb_fit(model, X_sub, y)
         imp = pd.Series(model.feature_importances_, index=subset_cols)
         aggregated_imp[imp.index] += imp.values
 
     nonzero = aggregated_imp[aggregated_imp > 0].sort_values(ascending=False)
     # Wider net (top_k * 2): downstream VIF and Boruta will prune excess
+    logger.debug(f"      [LGB Subspace Done] generated {len(nonzero)} nonzero features")
     return nonzero.head(top_k * 2).index.tolist()
 
 
@@ -548,7 +629,14 @@ def filter_group_data_purged(wide_df, target_series, group_name,
                      f"keeping {len(passed_features)} features")
         return passed_features
 
-    # 3. Iterative Pruning for VIF (need dense matrix)
+    # 3. Skip VIF for large feature sets — Boruta + Cluster Redundancy handle
+    # multicollinearity downstream. VIF is O(p³) and designed for linear models.
+    if len(passed_features) > 40:
+        logger.info(f"    [{group_name}] {len(passed_features)} features passed dual filter. "
+                    f"Skipping VIF (Boruta+Cluster will handle collinearity).")
+        return passed_features
+
+    # Iterative Pruning for VIF (need dense matrix)
     X_vif = X_local[passed_features].copy()
 
     target_rows = 100
@@ -605,18 +693,31 @@ def filter_group_data_purged(wide_df, target_series, group_name,
 def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05):
     """
     Core Boruta logic: shadow feature comparison.
-    Compares each real feature to the 75th percentile of all shadow importances.
+    Compares each real feature to the highest percentiles of shadow importances.
+    Features proportional capping of shadow features to prevent OOMs.
     """
     n_features = X_curr.shape[1]
     feature_names = X_curr.columns.tolist()
 
     hits = np.zeros(n_features, dtype=int)
+    
+    # Cap shadow features at 500 to prevent OOMs.
+    # If we cap, we compensate by raising the percentile threshold from 75th to 80th 
+    # to account for the smaller sample size of the null distribution.
+    max_shadows = 500
+    n_shadows = min(n_features, max_shadows)
+    percentile_thresh = 80 if n_features > max_shadows else 75
 
     for run in range(n_runs):
         rng = np.random.RandomState(SEED + run)
 
+        # Select a random subset of features to shadow if we're hitting the cap
+        shadow_sources = feature_names
+        if n_features > max_shadows:
+            shadow_sources = rng.choice(feature_names, size=n_shadows, replace=False)
+
         shadow_data = {}
-        for col in feature_names:
+        for col in shadow_sources:
             col_vals = X_curr[col].values.copy()
             valid_mask = (
                 ~np.isnan(col_vals)
@@ -639,7 +740,7 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05):
         )
 
         shadow_cols = [c for c in X_combined.columns if c.startswith('_shadow_')]
-        shadow_threshold = np.percentile(importances[shadow_cols].values, 75)
+        shadow_threshold = np.percentile(importances[shadow_cols].values, percentile_thresh)
 
         for i, feat in enumerate(feature_names):
             if importances[feat] > shadow_threshold:
@@ -1117,11 +1218,19 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
     # ===== Stage 0: Global Pre-Funnel (Variance + Dedup) =====
     t0 = time.time()
     n_cols_before = snap_wide.shape[1]
+    
+    # Memory Watchdog
+    mem_pct = psutil.virtual_memory().percent
+    if mem_pct > 80:
+        logger.warning(f"CRITICAL MEMORY: system at {mem_pct}% full before {source_name} pipeline!")
+
     if n_cols_before > 500:
         logger.info(f"0. Pre-funnel: {n_cols_before} features...")
         snap_wide = _variance_filter(snap_wide)
     logger.info(f"   > Pre-funnel: {n_cols_before} → {snap_wide.shape[1]} features "
                 f"({time.time() - t0:.1f}s)")
+                
+    gc.collect()
 
     # ===== Stage 1: Group-wise Dual Filter (Linear + LightGBM) =====
     stage1_candidates = []
@@ -1139,8 +1248,11 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         # Intra-group deduplication for large groups
         n_before_dedup = wide_group.shape[1]
         if n_before_dedup > 50:
-            wide_group = _deduplicate_group(wide_group, threshold=0.95)
+            logger.debug(f"    [{group_name}] Starting dedup on {n_before_dedup} features...")
+            wide_group = _deduplicate_group(wide_group, threshold=0.92)
+            logger.debug(f"    [{group_name}] Dedup finished.")
 
+        logger.debug(f"    [{group_name}] Starting filter_group_data_purged...")
         selected = filter_group_data_purged(
             wide_group, y_target, group_name
         )
@@ -1157,17 +1269,22 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         logger.info("   WARNING: No features survived Stage 1. Skipping pipeline.")
         return []
 
+    # Aggressively release memory — snap_wide is no longer needed after extracting Stage 2 subset
+    X_stage2 = _select_wide(snap_wide, stage1_candidates)
+    X_stage2 = winsorize_covid_period(X_stage2)
+    del snap_wide
+    gc.collect()
+
     # ===== Stage 2: Boruta Importance =====
     t0 = time.time()
     logger.info("2. Boruta Feature Selection (shadow features)...")
-    X_stage2 = _select_wide(snap_wide, stage1_candidates)
-    X_stage2 = winsorize_covid_period(X_stage2)
 
     stage2_candidates = get_boruta_importance(
         X_stage2, y_target
     )
     logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
                 f"({time.time() - t0:.1f}s)")
+    gc.collect()
 
     if len(stage2_candidates) == 0:
         logger.info("   WARNING: No features survived Boruta. "
@@ -1197,6 +1314,7 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         ].index.tolist()
     logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
                 f"({time.time() - t0:.1f}s)")
+    gc.collect()
 
     # ===== Stage 4: Cluster Redundancy =====
     t0 = time.time()
@@ -1206,6 +1324,7 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
     )
     logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
                 f"({time.time() - t0:.1f}s)")
+    gc.collect()
 
     # ===== Stage 5: Interaction Rescue (two-phase) =====
     t0 = time.time()

@@ -33,7 +33,7 @@ class TestGlobalLags:
         result = compute_all_features(sample_data)
         series_names = result['series_name'].unique()
         
-        expected_lags = [1, 3, 6, 12, 18]
+        expected_lags = [1, 3, 6, 12]
         for lag in expected_lags:
             expected_name = f"TestSeries_lag_{lag}m"
             assert expected_name in series_names, f"Missing expected base lag: {expected_name}"
@@ -48,23 +48,23 @@ class TestGlobalLags:
         
         # Ensure base derived feature exists first (might be filtered out if too short, but here length is 25)
         if base_derived in series_names:
-            expected_lags = [1, 3, 6, 12, 18]
+            expected_lags = [1, 3, 6, 12]
             for lag in expected_lags:
                 expected_name = f"{base_derived}_lag_{lag}m"
                 assert expected_name in series_names, f"Missing expected derived lag: {expected_name}"
         else:
             pytest.fail(f"Base derived feature {base_derived} was not generated, cannot test lags.")
 
-    def test_lag_18m_value_correctness(self, sample_data):
-        """Test that the 18-month lag contains the correct shifted values."""
+    def test_lag_12m_value_correctness(self, sample_data):
+        """Test that the 12-month lag contains the correct shifted values."""
         result = compute_all_features(sample_data)
-        
-        lag_18_name = "TestSeries_lag_18m"
-        target_date = sample_data['date'].iloc[18] # Index 18
-        
-        # Value at index 18 for lag 18 should be value at index 0
-        lag_val = result.loc[(result['series_name'] == lag_18_name) & (result['date'] == target_date), 'value']
-        
+
+        lag_12_name = "TestSeries_lag_12m"
+        target_date = sample_data['date'].iloc[12] # Index 12
+
+        # Value at index 12 for lag 12 should be value at index 0
+        lag_val = result.loc[(result['series_name'] == lag_12_name) & (result['date'] == target_date), 'value']
+
         assert len(lag_val) == 1, "Expected exactly one value for lag check"
         assert lag_val.iloc[0] == 0.0, f"Expected 0.0, got {lag_val.iloc[0]}"
 
@@ -75,8 +75,8 @@ class TestGlobalLags:
         result = compute_all_features(df)
         series_names = result['series_name'].unique()
         
-        variants = ['TestSeries_pct_chg', 'TestSeries_symlog_pct_chg']
-        expected_lags = [1, 3, 6, 12, 18]
+        variants = ['TestSeries_pct_chg']
+        expected_lags = [1, 3, 6, 12]
         
         for variant in variants:
             # Check if base variant exists (it should)

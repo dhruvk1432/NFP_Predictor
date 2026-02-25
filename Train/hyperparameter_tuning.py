@@ -19,6 +19,7 @@ import logging
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import TEMP_DIR, setup_logger
+from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter
 from Train.config import (
     DEFAULT_LGBM_PARAMS,
     HUBER_DELTA,
@@ -50,6 +51,7 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 
+@profiled("train.tuning.total")
 def tune_hyperparameters(
     X: pd.DataFrame,
     y: pd.Series,
@@ -185,6 +187,11 @@ def tune_hyperparameters(
 
         return np.mean(fold_maes)
 
+    def _counted_objective(trial: optuna.Trial) -> float:
+        inc_counter("train.tuning.trials")
+        with perf_phase("train.tuning.trial", trial_number=trial.number):
+            return objective(trial)
+
     # Suppress Optuna's verbose logging
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -200,7 +207,7 @@ def tune_hyperparameters(
         pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=20),
     )
 
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    study.optimize(_counted_objective, n_trials=n_trials, timeout=timeout)
 
     _tune_elapsed = _time.time() - _tune_t0
     _tune_str = f"{_tune_elapsed/60:.1f}m" if _tune_elapsed >= 60 else f"{_tune_elapsed:.0f}s"

@@ -24,11 +24,13 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import sys
+import os
 import warnings
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS
+from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump_perf_json, register_atexit_dump
 
 # Import from modular components
 from Train.config import (
@@ -115,18 +117,22 @@ def _process_single_month_task(
         features.update(features_wide.iloc[0].to_dict())
 
     # 4. Compute Revisions: compare master[M] vs master[M-1] for the PREVIOUS month
-    prev_month_target = target_month - pd.DateOffset(months=1)
-    prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
+    # NFP_PERF_SKIP_REVISIONS=1 skips this block during profiling-only runs
+    # (useful when master snapshots contain non-numeric columns that trigger type errors)
+    _skip_revisions = os.getenv("NFP_PERF_SKIP_REVISIONS", "").strip() == "1"
+    if not _skip_revisions:
+        prev_month_target = target_month - pd.DateOffset(months=1)
+        prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
 
-    prev_snapshot = load_master_snapshot(prev_snapshot_date, target_type=target_type,
-                                         target_source=target_source, use_cache=False)
+        prev_snapshot = load_master_snapshot(prev_snapshot_date, target_type=target_type,
+                                             target_source=target_source, use_cache=False)
 
-    if prev_snapshot is not None and not prev_snapshot.empty:
-        view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
-        view_prev = pivot_snapshot_to_wide(prev_snapshot, prev_month_target, cutoff_date=cutoff_date)
-        revs = compute_revision_features(view_curr, view_prev, prefix='rev_master')
-        if not revs.empty:
-            features.update(revs.iloc[0].to_dict())
+        if prev_snapshot is not None and not prev_snapshot.empty:
+            view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
+            view_prev = pivot_snapshot_to_wide(prev_snapshot, prev_month_target, cutoff_date=cutoff_date)
+            revs = compute_revision_features(view_curr, view_prev, prefix='rev_master')
+            if not revs.empty:
+                features.update(revs.iloc[0].to_dict())
 
     return features, target_value
 
@@ -142,6 +148,12 @@ from Train.revision_features import (
 )
 from utils.transforms import winsorize_covid_period
 from Train.hyperparameter_tuning import tune_hyperparameters
+
+from Train.config import (
+    USE_UNION_POOL, UNION_POOL_MAX, SHORTPASS_TOPK, SHORTPASS_METHOD,
+    SHORTPASS_HALF_LIFE, ENABLE_BASELINE_TRACKING, BASELINE_ROLLING_WINDOW,
+    KEEP_RULE_ENABLED, KEEP_RULE_WINDOW_M, KEEP_RULE_TOLERANCE, KEEP_RULE_ACTION,
+)
 
 from Train.model import (
     get_lgbm_params,
@@ -172,11 +184,19 @@ def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> Lis
     Args:
         X: Feature DataFrame
         y: Target series (unused, kept for API consistency)
-        min_non_nan: Minimum number of non-NaN values required to keep a column
+        min_non_nan: Minimum number of non-NaN values required to keep a column.
+            Overridable via NFP_PERF_MIN_NON_NAN env var for profiling-only runs.
 
     Returns:
         List of cleaned feature column names
     """
+    # Profiling-only override: lower threshold when running with sparse data
+    _perf_override = os.getenv("NFP_PERF_MIN_NON_NAN", "").strip()
+    if _perf_override:
+        try:
+            min_non_nan = int(_perf_override)
+        except ValueError:
+            pass
     X_work = X.select_dtypes(include=[np.number]).copy()
     X_work = X_work.drop(columns=['ds'], errors='ignore')
     X_work = X_work.replace([np.inf, -np.inf], np.nan)
@@ -192,6 +212,7 @@ def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> Lis
     return list(X_work.columns)
 
 
+@profiled("train.build_training_dataset")
 def build_training_dataset(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
@@ -333,6 +354,7 @@ def build_training_dataset(
 # BACKTEST FUNCTIONS
 # =============================================================================
 
+@profiled("train.backtest.total")
 def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
@@ -408,9 +430,13 @@ def run_expanding_window_backtest(
     # Static fallback params (used when tune=False)
     static_params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
-    # Run clean_features once on early data to get initial feature set
-    # (will be refined at each step)
-    cleaned_features = None
+    # Load candidate pool for short-pass selection (static set of feature NAMES)
+    candidate_pool = None
+    if USE_UNION_POOL:
+        from Train.candidate_pool import load_or_build_union_pool
+        candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
+        logger.info(f"Union candidate pool loaded: {len(candidate_pool)} features")
+
     tuned_params = None  # Cached tuned hyperparameters
 
     logger.info(f"Running {len(backtest_months)} predictions "
@@ -420,75 +446,107 @@ def run_expanding_window_backtest(
     _backtest_t0 = _time.time()
 
     for i, target_month in enumerate(backtest_months):
+      with perf_phase("train.backtest.step", step=i, month=str(target_month)):
         # Get index of this target month in the full dataset
         target_idx = date_to_idx.get(target_month)
         if target_idx is None:
             continue
 
-        # EXPANDING WINDOW: Training data is everything BEFORE the target month
-        train_mask = X_full['ds'] < target_month
-        train_idx = X_full[train_mask].index.tolist()
+        with perf_phase("train.backtest.step.split_mask", step=i):
+            # EXPANDING WINDOW: Training data is everything BEFORE the target month
+            train_mask = X_full['ds'] < target_month
+            train_idx = X_full[train_mask].index.tolist()
 
-        if len(train_idx) < 24:  # Need at least 2 years of training data
-            continue
+            if len(train_idx) < 24:  # Need at least 2 years of training data
+                continue
 
-        # Get training data (no future leakage)
-        y_train = y_full.iloc[train_idx]
+            # Get training data (no future leakage)
+            y_train = y_full.iloc[train_idx]
 
-        # Filter out NaN targets from training data
-        valid_train_mask = ~y_train.isna()
-        train_idx_valid = [train_idx[j] for j in range(len(train_idx)) if valid_train_mask.iloc[j]]
+            # Filter out NaN targets from training data
+            valid_train_mask = ~y_train.isna()
+            train_idx_valid = [train_idx[j] for j in range(len(train_idx)) if valid_train_mask.iloc[j]]
 
-        if len(train_idx_valid) < 24:
-            continue
+            if len(train_idx_valid) < 24:
+                continue
 
-        # Get valid training data (LightGBM handles NaN natively)
-        X_train_valid = X_full.iloc[train_idx_valid].copy()
-        y_train_valid = y_train[valid_train_mask].copy()
+            # Get valid training data (LightGBM handles NaN natively)
+            X_train_valid = X_full.iloc[train_idx_valid].copy()
+            y_train_valid = y_train[valid_train_mask].copy()
 
-        # Sort by date to ensure time-ordered train/val split
-        sort_order = X_train_valid['ds'].argsort()
-        X_train_valid = X_train_valid.iloc[sort_order].reset_index(drop=True)
-        y_train_valid = y_train_valid.iloc[sort_order].reset_index(drop=True)
+            # Sort by date to ensure time-ordered train/val split
+            sort_order = X_train_valid['ds'].argsort()
+            X_train_valid = X_train_valid.iloc[sort_order].reset_index(drop=True)
+            y_train_valid = y_train_valid.iloc[sort_order].reset_index(drop=True)
 
-        # COVID winsorization on training data only (no future leakage)
-        X_indexed = X_train_valid.set_index('ds')
-        numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
-        X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
-        y_indexed = pd.Series(y_train_valid.values, index=X_indexed.index, name='y_mom')
-        y_train_valid = winsorize_covid_period(y_indexed).reset_index(drop=True)
-        X_train_valid = X_indexed.reset_index(names='ds')
+        with perf_phase("train.backtest.step.covid_winsorize", step=i):
+            # COVID winsorization on training data only (no future leakage)
+            X_indexed = X_train_valid.set_index('ds')
+            numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
+            X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
+            y_indexed = pd.Series(y_train_valid.values, index=X_indexed.index, name='y_mom')
+            y_train_valid = winsorize_covid_period(y_indexed).reset_index(drop=True)
+            X_train_valid = X_indexed.reset_index(names='ds')
 
-        # Basic feature cleaning (no feature selection gates)
-        if cleaned_features is None or i % TUNE_EVERY_N_MONTHS == 0:
+        # Compute baseline predictions using only training data
+        baseline_preds = {}
+        if ENABLE_BASELINE_TRACKING:
+            from Train.baselines import compute_all_baselines
+            baseline_preds = compute_all_baselines(y_train_valid, BASELINE_ROLLING_WINDOW)
+
+        with perf_phase("train.backtest.step.clean_features", step=i):
+            # Recompute clean_features every step (feature availability changes as window expands)
             cleaned_features = clean_features(X_train_valid, y_train_valid)
-
-        feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
+            feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
         # Compute default sample weights for initial/static use
-        # (Optuna will dynamically test different half-lifes if tuning)
-        # Using 60.0 months (5 years) as a reasonable default baseline if not tuning
         default_half_life = 60.0
         weights = calculate_sample_weights(X_train_valid, target_month, default_half_life)
+
+        # ── Short-pass selection from union candidate pool ──
+        if USE_UNION_POOL and candidate_pool is not None:
+            candidate_in_data = [f for f in candidate_pool if f in feature_cols]
+            logger.info(f"Feature pipeline: clean={len(feature_cols)}, pool={len(candidate_pool)}, "
+                        f"intersection={len(candidate_in_data)}")
+
+            if len(candidate_in_data) > SHORTPASS_TOPK:
+                with perf_phase("train.backtest.step.short_pass", step=i):
+                    from Train.short_pass_selection import select_features_for_step
+                    _current_params = tuned_params if (tune and tuned_params is not None) else static_params
+                    sp_half_life = SHORTPASS_HALF_LIFE or _current_params.get('half_life_months', default_half_life)
+                    sp_weights = calculate_sample_weights(X_train_valid, target_month, sp_half_life)
+                    feature_cols = select_features_for_step(
+                        X_train_valid[candidate_in_data], y_train_valid,
+                        candidate_features=candidate_in_data,
+                        top_k=SHORTPASS_TOPK,
+                        method=SHORTPASS_METHOD,
+                        sample_weights=sp_weights,
+                    )
+                    logger.info(f"Short-pass selected {len(feature_cols)} features")
+            else:
+                feature_cols = candidate_in_data
+                logger.info(f"Pool intersection ({len(candidate_in_data)}) <= top_k, using all")
 
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
         # X_train_selected contains NO 'ds' column to avoid issues in lgb.train
         X_train_valid_with_ds = X_train_valid.copy() # keep one with ds
 
-        # Tune hyperparameters periodically (same cadence as feature cleaning)
+        # NOTE: Feature selection (short-pass) is frozen for this step.
+        # Optuna tunes hyperparams on the selected features. Inner CV scores may be
+        # slightly optimistic due to selection-validation overlap. Only outer walk-forward
+        # OOS metrics are trusted for model quality evaluation.
         if tune and (tuned_params is None or i % TUNE_EVERY_N_MONTHS == 0):
             logger.info(f"[{i+1}/{len(backtest_months)}] Tuning hyperparameters on "
                         f"{len(X_train_selected)} samples, {len(feature_cols)} features...")
-            
-            # Note: We pass the valid DataFrame WITH 'ds' to hyperparameter tuning
-            # because the inner CV needs to recompute weights per inner-fold using 'ds'
+
             X_train_for_tuning = X_train_valid_with_ds[['ds'] + feature_cols]
-            
-            tuned_params = tune_hyperparameters(
-                X_train_for_tuning, y_train_valid, target_month=target_month,
-                use_huber_loss=use_huber_loss,
-            )
+
+            with perf_phase("train.backtest.step.tuning", step=i):
+                tuned_params = tune_hyperparameters(
+                    X_train_for_tuning, y_train_valid, target_month=target_month,
+                    use_huber_loss=use_huber_loss,
+                )
 
         params = tuned_params if tune and tuned_params is not None else static_params
         
@@ -498,73 +556,76 @@ def run_expanding_window_backtest(
         # Recompute final training weights for the main model fit using the chosen half_life
         weights = calculate_sample_weights(X_train_valid_with_ds, target_month, final_half_life)
 
-        # Train-validation split (data already sorted by date above)
-        train_size = int(len(X_train_selected) * 0.85)
-        X_tr = X_train_selected.iloc[:train_size]
-        X_val = X_train_selected.iloc[train_size:]
-        y_tr = y_train_valid.iloc[:train_size]
-        y_val = y_train_valid.iloc[train_size:]
-        weights_tr = weights[:train_size]
+        with perf_phase("train.backtest.step.fit", step=i):
+            # Train-validation split (data already sorted by date above)
+            train_size = int(len(X_train_selected) * 0.85)
+            X_tr = X_train_selected.iloc[:train_size]
+            X_val = X_train_selected.iloc[train_size:]
+            y_tr = y_train_valid.iloc[:train_size]
+            y_val = y_train_valid.iloc[train_size:]
+            weights_tr = weights[:train_size]
 
-        train_data = lgb.Dataset(X_tr, label=y_tr, weight=weights_tr, free_raw_data=False)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, free_raw_data=False)
+            train_data = lgb.Dataset(X_tr, label=y_tr, weight=weights_tr, free_raw_data=False)
+            val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, free_raw_data=False)
 
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS),
-            lgb.log_evaluation(period=0)
-        ]
+            callbacks = [
+                lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS),
+                lgb.log_evaluation(period=0)
+            ]
 
-        # Train model
-        model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=NUM_BOOST_ROUND,
-            valid_sets=[train_data, val_data],
-            valid_names=['train', 'valid'],
-            callbacks=callbacks
-        )
+            # Train model
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=NUM_BOOST_ROUND,
+                valid_sets=[train_data, val_data],
+                valid_names=['train', 'valid'],
+                callbacks=callbacks
+            )
 
         # OOS residuals accumulated after prediction below (not in-sample)
 
-        # PREDICTION: Get features for target month
-        X_pred = X_full.iloc[[target_idx]].copy()
+        with perf_phase("train.backtest.step.predict", step=i):
+            # PREDICTION: Get features for target month
+            X_pred = X_full.iloc[[target_idx]].copy()
 
-        X_pred = X_pred[feature_cols]
+            X_pred = X_pred[feature_cols]
 
-        # Make prediction
-        prediction = model.predict(X_pred)[0]
-        actual = y_full.iloc[target_idx]
+            # Make prediction
+            prediction = model.predict(X_pred)[0]
+            actual = y_full.iloc[target_idx]
 
-        # Calculate prediction intervals
-        if len(all_residuals) > 10:
-            residual_array = np.array(all_residuals[-36:])
-            lower_50 = prediction + np.percentile(residual_array, 25)
-            upper_50 = prediction + np.percentile(residual_array, 75)
-            lower_80 = prediction + np.percentile(residual_array, 10)
-            upper_80 = prediction + np.percentile(residual_array, 90)
-            lower_95 = prediction + np.percentile(residual_array, 2.5)
-            upper_95 = prediction + np.percentile(residual_array, 97.5)
-        else:
-            # Not enough OOS residuals yet; use validation-set residuals as initial estimate
-            val_preds = model.predict(X_val)
-            val_residuals = (y_val.values - val_preds).tolist()
-            std_est = np.std(val_residuals) if val_residuals else 50
-            lower_50, upper_50 = prediction - 0.67*std_est, prediction + 0.67*std_est
-            lower_80, upper_80 = prediction - 1.28*std_est, prediction + 1.28*std_est
-            lower_95, upper_95 = prediction - 1.96*std_est, prediction + 1.96*std_est
+        with perf_phase("train.backtest.step.intervals", step=i):
+            # Calculate prediction intervals
+            if len(all_residuals) > 10:
+                residual_array = np.array(all_residuals[-36:])
+                lower_50 = prediction + np.percentile(residual_array, 25)
+                upper_50 = prediction + np.percentile(residual_array, 75)
+                lower_80 = prediction + np.percentile(residual_array, 10)
+                upper_80 = prediction + np.percentile(residual_array, 90)
+                lower_95 = prediction + np.percentile(residual_array, 2.5)
+                upper_95 = prediction + np.percentile(residual_array, 97.5)
+            else:
+                # Not enough OOS residuals yet; use validation-set residuals as initial estimate
+                val_preds = model.predict(X_val)
+                val_residuals = (y_val.values - val_preds).tolist()
+                std_est = np.std(val_residuals) if val_residuals else 50
+                lower_50, upper_50 = prediction - 0.67*std_est, prediction + 0.67*std_est
+                lower_80, upper_80 = prediction - 1.28*std_est, prediction + 1.28*std_est
+                lower_95, upper_95 = prediction - 1.96*std_est, prediction + 1.96*std_est
 
-        # Handle NaN actuals (future predictions)
-        is_future = pd.isna(actual)
-        error = np.nan if is_future else actual - prediction
+            # Handle NaN actuals (future predictions)
+            is_future = pd.isna(actual)
+            error = np.nan if is_future else actual - prediction
 
-        # Accumulate OOS residuals for calibrated prediction intervals
-        if not is_future:
-            all_residuals.append(error)
-        in_50 = np.nan if is_future else (lower_50 <= actual <= upper_50)
-        in_80 = np.nan if is_future else (lower_80 <= actual <= upper_80)
-        in_95 = np.nan if is_future else (lower_95 <= actual <= upper_95)
+            # Accumulate OOS residuals for calibrated prediction intervals
+            if not is_future:
+                all_residuals.append(error)
+            in_50 = np.nan if is_future else (lower_50 <= actual <= upper_50)
+            in_80 = np.nan if is_future else (lower_80 <= actual <= upper_80)
+            in_95 = np.nan if is_future else (lower_95 <= actual <= upper_95)
 
-        results.append({
+        result_row = {
             'ds': target_month,
             'actual': actual,
             'predicted': prediction,
@@ -579,8 +640,19 @@ def run_expanding_window_backtest(
             'in_80_interval': in_80,
             'in_95_interval': in_95,
             'n_train_samples': len(train_idx_valid),
-            'n_features': len(feature_cols)
-        })
+            'n_features': len(feature_cols),
+        }
+
+        # Add baseline predictions and errors (error = actual - baseline_pred)
+        if ENABLE_BASELINE_TRACKING:
+            for bname, bpred in baseline_preds.items():
+                result_row[bname] = bpred
+                if not is_future and not np.isnan(bpred):
+                    result_row[f'{bname}_error'] = actual - bpred
+                else:
+                    result_row[f'{bname}_error'] = np.nan
+
+        results.append(result_row)
 
         # Progress logging — every prediction with elapsed/ETA
         _elapsed = _time.time() - _backtest_t0
@@ -625,9 +697,75 @@ def run_expanding_window_backtest(
             for _, row in future_rows.iterrows():
                 logger.info(f"  {row['ds'].strftime('%Y-%m')}: {row['predicted']:.0f} [{row['lower_80']:.0f}, {row['upper_80']:.0f}]")
 
+    # ── Keep-rule enforcement ──
+    if KEEP_RULE_ENABLED and ENABLE_BASELINE_TRACKING and not results_df.empty:
+        backtest_only = results_df[~results_df['error'].isna()].copy()
+
+        if len(backtest_only) >= KEEP_RULE_WINDOW_M:
+            trailing = backtest_only.iloc[-KEEP_RULE_WINDOW_M:]
+            trailing_indices = trailing.index
+
+            trailing_model_mae = np.mean(np.abs(trailing['error']))
+
+            baseline_error_cols = [c for c in trailing.columns
+                                   if c.startswith('baseline_') and c.endswith('_error')]
+
+            for col in baseline_error_cols:
+                bname = col.replace('_error', '')
+                valid_errors = trailing[col].dropna()
+                if valid_errors.empty:
+                    continue
+
+                trailing_baseline_mae = np.mean(np.abs(valid_errors))
+                degradation = trailing_model_mae - trailing_baseline_mae
+
+                if degradation > KEEP_RULE_TOLERANCE:
+                    logger.warning(
+                        f"KEEP-RULE TRIGGERED for '{bname}': "
+                        f"Model MAE={trailing_model_mae:.2f} vs Baseline MAE={trailing_baseline_mae:.2f} "
+                        f"over last {KEEP_RULE_WINDOW_M} OOS months "
+                        f"(degradation={degradation:+.2f} > tolerance={KEEP_RULE_TOLERANCE})"
+                    )
+
+                    if KEEP_RULE_ACTION == 'fail':
+                        raise RuntimeError(
+                            f"Keep-rule failed: model underperforms '{bname}' by "
+                            f"{degradation:.2f} MAE. Action='fail'. Aborting."
+                        )
+                    elif KEEP_RULE_ACTION == 'fallback_to_baseline':
+                        logger.warning(
+                            f"Action='fallback_to_baseline': replacing predictions "
+                            f"for trailing {KEEP_RULE_WINDOW_M} rows with '{bname}'"
+                        )
+                        results_df.loc[trailing_indices, 'predicted'] = results_df.loc[trailing_indices, bname]
+                        results_df.loc[trailing_indices, 'error'] = (
+                            results_df.loc[trailing_indices, 'actual']
+                            - results_df.loc[trailing_indices, 'predicted']
+                        )
+                        results_df.loc[trailing_indices, 'keep_rule_fallback'] = True
+                    elif KEEP_RULE_ACTION == 'skip_save':
+                        logger.warning(
+                            f"Action='skip_save': production model will NOT be saved"
+                        )
+                        results_df.attrs['skip_save'] = True
+
+                    break  # Enforce against first triggering baseline only
+                else:
+                    logger.info(
+                        f"Keep-rule OK for '{bname}': Model MAE={trailing_model_mae:.2f} "
+                        f"vs Baseline MAE={trailing_baseline_mae:.2f} "
+                        f"(improvement={-degradation:.2f})"
+                    )
+        else:
+            logger.info(
+                f"Keep-rule skipped: only {len(backtest_only)} OOS months "
+                f"(need >= {KEEP_RULE_WINDOW_M})"
+            )
+
     return results_df, X_full, y_full
 
 
+@profiled("train.train_and_evaluate")
 def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
@@ -653,6 +791,9 @@ def train_and_evaluate(
         tune: If True, run Optuna hyperparameter tuning
     """
     model_id = get_model_id(target_type, release_type, target_source)
+
+    # Register atexit perf dump so data is captured even if training exits early
+    register_atexit_dump("train", output_dir=TEMP_DIR / "perf")
 
     logger.info("=" * 60)
     logger.info(f"LightGBM NFP Prediction Model - Training [{model_id.upper()}]")
@@ -740,14 +881,35 @@ def train_and_evaluate(
         params_override=final_params,
     )
 
-    # Save production model
-    save_model(
-        model,
-        feature_cols,
-        residuals,
-        importance,
-        target_type=target_type,
-        release_type=release_type,
+    # Save production model (unless keep-rule flagged skip_save)
+    if backtest_results.attrs.get('skip_save', False):
+        logger.warning(
+            f"SKIPPING production model save for {model_id.upper()} "
+            f"due to keep-rule failure (model underperforms baseline)"
+        )
+    else:
+        save_model(
+            model,
+            feature_cols,
+            residuals,
+            importance,
+            target_type=target_type,
+            release_type=release_type,
+        )
+
+    # ── Perf dump (env-gated: NFP_PERF=1 only) ──
+    dump_perf_json(
+        stage_name="train",
+        output_dir=TEMP_DIR / "perf",
+        extra={
+            "target_type": target_type,
+            "release_type": release_type,
+            "target_source": target_source,
+            "tune": tune,
+            "use_huber_loss": use_huber_loss,
+            "backtest_months": BACKTEST_MONTHS,
+            "model_id": model_id,
+        },
     )
 
     return model, feature_cols, residuals, backtest_results, X_full, y_full

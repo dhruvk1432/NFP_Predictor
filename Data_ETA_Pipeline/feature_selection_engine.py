@@ -33,8 +33,15 @@ import gc
 import psutil
 
 from utils.transforms import winsorize_covid_period
+from Data_ETA_Pipeline.perf_stats import (
+    inc_counter,
+    install_hooks,
+    perf_phase,
+    profiled,
+)
 
 logger = logging.getLogger(__name__)
+install_hooks()
 
 SEED = 42
 MIN_VALID_OBS = 60
@@ -947,138 +954,158 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
     n_rows = len(X_curr)
     feature_names = X_curr.columns.tolist()
 
-    hits = np.zeros(n_features, dtype=int)
+    with perf_phase(
+        "fs.boruta.core",
+        n_features=n_features,
+        n_rows=n_rows,
+        n_runs=n_runs,
+    ):
+        inc_counter("fs.boruta.core.calls", 1)
+        inc_counter("fs.boruta.core.features_total", n_features)
 
-    # Adaptive shadow cap limits memory and runtime for very large pools.
-    if max_shadows is None:
-        max_shadows = _adaptive_boruta_shadow_cap(n_features)
-    max_shadows = max(50, min(int(max_shadows), BORUTA_SHADOW_CAP_MAX))
-    n_shadows = min(n_features, max_shadows)
-    shadow_ratio = n_shadows / max(n_features, 1)
-    if shadow_ratio >= 0.75:
-        percentile_thresh = 75
-    elif shadow_ratio >= 0.5:
-        percentile_thresh = 78
-    else:
-        percentile_thresh = 80
+        hits = np.zeros(n_features, dtype=int)
 
-    # Pre-allocate shadow array and build combined DataFrame structure once
-    X_values = X_curr.values
-    shadow_arr = np.empty((n_rows, n_shadows), dtype=np.float64)
-    shadow_col_names = [f'_shadow_{i}' for i in range(n_shadows)]
-    combined_cols = feature_names + shadow_col_names
-
-    # Pre-compute valid masks for all features (reused each run)
-    valid_masks = []
-    for j in range(n_features):
-        col_vals = X_values[:, j]
-        if np.issubdtype(col_vals.dtype, np.floating):
-            valid_masks.append(~np.isnan(col_vals))
+        # Adaptive shadow cap limits memory and runtime for very large pools.
+        if max_shadows is None:
+            max_shadows = _adaptive_boruta_shadow_cap(n_features)
+        max_shadows = max(50, min(int(max_shadows), BORUTA_SHADOW_CAP_MAX))
+        n_shadows = min(n_features, max_shadows)
+        shadow_ratio = n_shadows / max(n_features, 1)
+        if shadow_ratio >= 0.75:
+            percentile_thresh = 75
+        elif shadow_ratio >= 0.5:
+            percentile_thresh = 78
         else:
-            valid_masks.append(np.ones(n_rows, dtype=bool))
+            percentile_thresh = 80
 
-    # Early stopping state
-    confirmed_early = set()
-    rejected_early = set()
-    half_runs = n_runs // 2
-    actual_runs = n_runs
+        # Pre-allocate shadow array and build combined DataFrame structure once
+        X_values = X_curr.values
+        shadow_arr = np.empty((n_rows, n_shadows), dtype=np.float64)
+        shadow_col_names = [f'_shadow_{i}' for i in range(n_shadows)]
+        combined_cols = feature_names + shadow_col_names
 
-    for run in range(n_runs):
-        rng = np.random.RandomState(SEED + run)
+        # Pre-compute valid masks for all features (reused each run)
+        valid_masks = []
+        for j in range(n_features):
+            col_vals = X_values[:, j]
+            if np.issubdtype(col_vals.dtype, np.floating):
+                valid_masks.append(~np.isnan(col_vals))
+            else:
+                valid_masks.append(np.ones(n_rows, dtype=bool))
 
-        # Determine active features (not yet early-stopped)
-        active_indices = [i for i in range(n_features)
-                          if i not in confirmed_early and i not in rejected_early]
+        # Early stopping state
+        confirmed_early = set()
+        rejected_early = set()
+        half_runs = n_runs // 2
+        actual_runs = n_runs
 
-        # If all features resolved early, stop
-        if not active_indices:
-            actual_runs = run
-            logger.info(f"   Boruta early stop: all features resolved after {run} runs")
-            break
+        for run in range(n_runs):
+            inc_counter("fs.boruta.core.iterations_total", 1)
 
-        # Select shadow source columns
-        if n_features > max_shadows:
-            source_indices = rng.choice(n_features, size=n_shadows, replace=False)
-        else:
-            source_indices = np.arange(n_features)
+            with perf_phase("fs.boruta.core.iteration"):
+                rng = np.random.RandomState(SEED + run)
 
-        # Shuffle valid values into pre-allocated shadow array
-        for j, src_idx in enumerate(source_indices):
-            col_vals = X_values[:, src_idx].copy()
-            mask = valid_masks[src_idx]
-            valid_vals = col_vals[mask].copy()
-            rng.shuffle(valid_vals)
-            col_vals[mask] = valid_vals
-            shadow_arr[:, j] = col_vals
+                # Determine active features (not yet early-stopped)
+                active_indices = [i for i in range(n_features)
+                                  if i not in confirmed_early and i not in rejected_early]
 
-        # Build combined array (avoids pd.concat overhead)
-        combined_arr = np.hstack([X_values, shadow_arr])
-        X_combined = pd.DataFrame(combined_arr, index=X_curr.index,
-                                  columns=combined_cols)
+                # If all features resolved early, stop
+                if not active_indices:
+                    actual_runs = run
+                    inc_counter("fs.boruta.core.early_stop_all_resolved", 1)
+                    logger.info(f"   Boruta early stop: all features resolved after {run} runs")
+                    break
 
-        model = lgb.LGBMRegressor(**LGB_PARAMS)
-        _safe_lgb_fit(model, X_combined, y_curr)
+                # Select shadow source columns
+                if n_features > max_shadows:
+                    source_indices = rng.choice(n_features, size=n_shadows, replace=False)
+                else:
+                    source_indices = np.arange(n_features)
 
-        importances = pd.Series(
-            model.feature_importances_, index=X_combined.columns
-        )
+                with perf_phase("fs.boruta.core.shadow_build"):
+                    # Shuffle valid values into pre-allocated shadow array
+                    for j, src_idx in enumerate(source_indices):
+                        col_vals = X_values[:, src_idx].copy()
+                        mask = valid_masks[src_idx]
+                        valid_vals = col_vals[mask].copy()
+                        rng.shuffle(valid_vals)
+                        col_vals[mask] = valid_vals
+                        shadow_arr[:, j] = col_vals
 
-        shadow_threshold = np.percentile(
-            importances[shadow_col_names].values, percentile_thresh
-        )
+                with perf_phase("fs.boruta.core.model_fit"):
+                    # Build combined array (avoids pd.concat overhead)
+                    combined_arr = np.hstack([X_values, shadow_arr])
+                    X_combined = pd.DataFrame(combined_arr, index=X_curr.index,
+                                              columns=combined_cols)
 
-        # Only count hits for active features
-        for i in active_indices:
-            feat = feature_names[i]
-            if importances[feat] > shadow_threshold:
-                hits[i] += 1
+                    model = lgb.LGBMRegressor(**LGB_PARAMS)
+                    _safe_lgb_fit(model, X_combined, y_curr)
 
-        # Early stopping check after 50% of runs
-        if run == half_runs and half_runs > 0:
-            runs_so_far = run + 1
-            for i in range(n_features):
-                if i in confirmed_early or i in rejected_early:
-                    continue
-                # Confirmed early: very significant binomial test
-                p_confirm = binomtest(
-                    hits[i], n=runs_so_far, p=0.25, alternative='greater'
-                ).pvalue
-                if p_confirm < alpha / 10:
-                    confirmed_early.add(i)
-                # Rejected early: zero hits after 50% of runs
-                elif hits[i] == 0:
-                    rejected_early.add(i)
+                    importances = pd.Series(
+                        model.feature_importances_, index=X_combined.columns
+                    )
 
-            if confirmed_early or rejected_early:
-                logger.info(f"   Boruta early stop at run {runs_so_far}: "
-                            f"{len(confirmed_early)} confirmed, "
-                            f"{len(rejected_early)} rejected early")
+                with perf_phase("fs.boruta.core.hit_update"):
+                    shadow_threshold = np.percentile(
+                        importances[shadow_col_names].values, percentile_thresh
+                    )
 
-    # Final classification
-    confirmed = []
-    tentative = []
+                    # Only count hits for active features
+                    for i in active_indices:
+                        feat = feature_names[i]
+                        if importances[feat] > shadow_threshold:
+                            hits[i] += 1
 
-    for i, feat in enumerate(feature_names):
-        if i in confirmed_early:
-            confirmed.append(feat)
-            continue
-        if i in rejected_early:
-            continue
+                # Early stopping check after 50% of runs
+                if run == half_runs and half_runs > 0:
+                    runs_so_far = run + 1
+                    for i in range(n_features):
+                        if i in confirmed_early or i in rejected_early:
+                            continue
+                        # Confirmed early: very significant binomial test
+                        p_confirm = binomtest(
+                            hits[i], n=runs_so_far, p=0.25, alternative='greater'
+                        ).pvalue
+                        if p_confirm < alpha / 10:
+                            confirmed_early.add(i)
+                        # Rejected early: zero hits after 50% of runs
+                        elif hits[i] == 0:
+                            rejected_early.add(i)
 
-        # Standard binomial test for features that ran the full course
-        p_val = binomtest(
-            hits[i], n=actual_runs, p=0.25, alternative='greater'
-        ).pvalue
-        if p_val < alpha:
-            confirmed.append(feat)
-        elif p_val < alpha * 5:
-            tentative.append(feat)
+                    if confirmed_early or rejected_early:
+                        inc_counter("fs.boruta.core.early_stop_partial", 1)
+                        logger.info(f"   Boruta early stop at run {runs_so_far}: "
+                                    f"{len(confirmed_early)} confirmed, "
+                                    f"{len(rejected_early)} rejected early")
 
-    logger.info(f"   Boruta: {len(confirmed)} confirmed, {len(tentative)} tentative "
-                f"(hit rates: min={hits.min()}/{actual_runs}, "
-                f"max={hits.max()}/{actual_runs})")
+        # Final classification
+        confirmed = []
+        tentative = []
 
-    return confirmed + tentative
+        for i, feat in enumerate(feature_names):
+            if i in confirmed_early:
+                confirmed.append(feat)
+                continue
+            if i in rejected_early:
+                continue
+
+            # Standard binomial test for features that ran the full course
+            p_val = binomtest(
+                hits[i], n=actual_runs, p=0.25, alternative='greater'
+            ).pvalue
+            if p_val < alpha:
+                confirmed.append(feat)
+            elif p_val < alpha * 5:
+                tentative.append(feat)
+
+        inc_counter("fs.boruta.core.confirmed_total", len(confirmed))
+        inc_counter("fs.boruta.core.tentative_total", len(tentative))
+
+        logger.info(f"   Boruta: {len(confirmed)} confirmed, {len(tentative)} tentative "
+                    f"(hit rates: min={hits.min()}/{actual_runs}, "
+                    f"max={hits.max()}/{actual_runs})")
+
+        return confirmed + tentative
 
 
 def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
@@ -1095,77 +1122,94 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
     X_curr = X.loc[common]
     y_curr = y.loc[common]
     n_features = X_curr.shape[1]
-    run_plan = _adaptive_boruta_runs(
-        n_features=n_features,
-        n_rows=len(common),
-    )
-    shadow_cap = _adaptive_boruta_shadow_cap(n_features)
 
-    if n_features <= tournament_threshold:
-        # Small enough for standard single-round Boruta
-        if n_runs is None:
-            n_runs = run_plan['standard_runs']
-        logger.info(f"   Boruta (standard): {n_features} features × {n_runs} runs")
-        return _boruta_core(
-            X_curr,
-            y_curr,
-            n_runs=n_runs,
-            alpha=alpha,
-            max_shadows=shadow_cap,
+    with perf_phase("fs.boruta.get_importance", n_features=n_features):
+        inc_counter("fs.boruta.get_importance.calls", 1)
+
+        run_plan = _adaptive_boruta_runs(
+            n_features=n_features,
+            n_rows=len(common),
         )
+        shadow_cap = _adaptive_boruta_shadow_cap(n_features)
 
-    # ==========================================
-    # TOURNAMENT MODE for large feature sets
-    # ==========================================
-    logger.info(f"   Boruta Tournament: {n_features} features → "
-                f"chunked into groups of {tournament_chunk}")
+        if n_features <= tournament_threshold:
+            # Small enough for standard single-round Boruta
+            if n_runs is None:
+                n_runs = run_plan['standard_runs']
+            logger.info(f"   Boruta (standard): {n_features} features × {n_runs} runs")
+            with perf_phase("fs.boruta.standard", n_features=n_features, n_runs=n_runs):
+                return _boruta_core(
+                    X_curr,
+                    y_curr,
+                    n_runs=n_runs,
+                    alpha=alpha,
+                    max_shadows=shadow_cap,
+                )
 
-    cols = list(X_curr.columns)
-    rng = np.random.RandomState(SEED)
-    rng.shuffle(cols)
+        # ==========================================
+        # TOURNAMENT MODE for large feature sets
+        # ==========================================
+        logger.info(f"   Boruta Tournament: {n_features} features → "
+                    f"chunked into groups of {tournament_chunk}")
 
-    chunks = [cols[i:i + tournament_chunk]
-              for i in range(0, len(cols), tournament_chunk)]
+        cols = list(X_curr.columns)
+        rng = np.random.RandomState(SEED)
+        rng.shuffle(cols)
 
-    # Round 1: Fast heats, relaxed alpha
-    heat_survivors = []
-    heat_alpha = alpha * 2  # More permissive in heats to avoid dropping good features
-    heat_runs = run_plan['heat_runs']
+        chunks = [cols[i:i + tournament_chunk]
+                  for i in range(0, len(cols), tournament_chunk)]
 
-    for ci, chunk in enumerate(chunks, 1):
-        chunk_shadow_cap = _adaptive_boruta_shadow_cap(len(chunk))
-        logger.info(f"   Heat {ci}/{len(chunks)}: "
-                    f"{len(chunk)} features × {heat_runs} runs...")
-        survivors = _boruta_core(
-            X_curr[chunk],
-            y_curr,
-            n_runs=heat_runs,
-            alpha=heat_alpha,
-            max_shadows=chunk_shadow_cap,
-        )
-        heat_survivors.extend(survivors)
-        logger.info(f"   Heat {ci}: {len(survivors)} survived")
+        # Round 1: Fast heats, relaxed alpha
+        heat_survivors = []
+        heat_alpha = alpha * 2  # More permissive in heats to avoid dropping good features
+        heat_runs = run_plan['heat_runs']
 
-    heat_survivors = sorted(set(heat_survivors))
-    logger.info(f"   Round 1 total survivors: {len(heat_survivors)}")
+        for ci, chunk in enumerate(chunks, 1):
+            chunk_shadow_cap = _adaptive_boruta_shadow_cap(len(chunk))
+            logger.info(f"   Heat {ci}/{len(chunks)}: "
+                        f"{len(chunk)} features × {heat_runs} runs...")
+            with perf_phase(
+                "fs.boruta.tournament.heat",
+                heat_idx=ci,
+                chunk_size=len(chunk),
+                n_runs=heat_runs,
+            ):
+                survivors = _boruta_core(
+                    X_curr[chunk],
+                    y_curr,
+                    n_runs=heat_runs,
+                    alpha=heat_alpha,
+                    max_shadows=chunk_shadow_cap,
+                )
+            heat_survivors.extend(survivors)
+            logger.info(f"   Heat {ci}: {len(survivors)} survived")
 
-    if len(heat_survivors) == 0:
-        logger.info("   WARNING: No features survived tournament heats.")
-        return []
+        heat_survivors = sorted(set(heat_survivors))
+        inc_counter("fs.boruta.tournament.survivors_after_heats", len(heat_survivors))
+        logger.info(f"   Round 1 total survivors: {len(heat_survivors)}")
 
-    # Round 2: Rigorous final, strict alpha
-    final_runs = run_plan['final_runs']
-    final_shadow_cap = _adaptive_boruta_shadow_cap(len(heat_survivors))
-    logger.info(f"   Final round: {len(heat_survivors)} features × {final_runs} runs")
-    final = _boruta_core(
-        X_curr[heat_survivors],
-        y_curr,
-        n_runs=final_runs,
-        alpha=alpha,
-        max_shadows=final_shadow_cap,
-    )
-    logger.info(f"   Final survivors: {len(final)}")
-    return final
+        if len(heat_survivors) == 0:
+            logger.info("   WARNING: No features survived tournament heats.")
+            return []
+
+        # Round 2: Rigorous final, strict alpha
+        final_runs = run_plan['final_runs']
+        final_shadow_cap = _adaptive_boruta_shadow_cap(len(heat_survivors))
+        logger.info(f"   Final round: {len(heat_survivors)} features × {final_runs} runs")
+        with perf_phase(
+            "fs.boruta.tournament.final",
+            n_features=len(heat_survivors),
+            n_runs=final_runs,
+        ):
+            final = _boruta_core(
+                X_curr[heat_survivors],
+                y_curr,
+                n_runs=final_runs,
+                alpha=alpha,
+                max_shadows=final_shadow_cap,
+            )
+        logger.info(f"   Final survivors: {len(final)}")
+        return final
 
 
 # =============================================================================
@@ -1355,86 +1399,95 @@ def cluster_redundancy(X, feature_list, target_series,
       (which biases against features with many NaNs) with LightGBM gain
       importance, which handles NaN natively and reflects actual model usage.
     """
-    if len(feature_list) <= 2:
-        return feature_list
+    with perf_phase("fs.cluster_redundancy.total", n_features=len(feature_list)):
+        inc_counter("fs.cluster_redundancy.calls", 1)
 
-    X_curr = X[feature_list].copy()
-    common = X_curr.index.intersection(target_series.index)
-    X_curr = X_curr.loc[common]
-    y_curr = target_series.loc[common]
+        if len(feature_list) <= 2:
+            return feature_list
 
-    valid_target = y_curr.notna()
-    X_curr = X_curr.loc[valid_target]
-    y_curr = y_curr.loc[valid_target]
+        X_curr = X[feature_list].copy()
+        common = X_curr.index.intersection(target_series.index)
+        X_curr = X_curr.loc[common]
+        y_curr = target_series.loc[common]
 
-    corr = X_curr.corr(method='spearman')
-    corr = corr.fillna(0)
+        valid_target = y_curr.notna()
+        X_curr = X_curr.loc[valid_target]
+        y_curr = y_curr.loc[valid_target]
 
-    # Vectorized pairwise overlap: notna_matrix.T @ notna_matrix gives full
-    # overlap counts in one call — replaces the O(p²) Python loop.
-    notna_mat = X_curr.notna().values.astype(np.float32)
-    overlap_matrix = notna_mat.T @ notna_mat  # shape (p, p)
+        with perf_phase("fs.cluster_redundancy.corr_matrix"):
+            corr = X_curr.corr(method='spearman')
+            corr = corr.fillna(0)
 
-    # Zero out correlations where overlap is insufficient
-    low_overlap = overlap_matrix < min_overlap
-    np.fill_diagonal(low_overlap, False)  # diagonal is self-overlap, always fine
-    corr_values = corr.values
-    corr_values[low_overlap] = 0.0
-    corr = pd.DataFrame(corr_values, index=corr.index, columns=corr.columns)
+        with perf_phase("fs.cluster_redundancy.overlap_matrix"):
+            # Vectorized pairwise overlap: notna_matrix.T @ notna_matrix gives full
+            # overlap counts in one call — replaces the O(p²) Python loop.
+            notna_mat = X_curr.notna().values.astype(np.float32)
+            overlap_matrix = notna_mat.T @ notna_mat  # shape (p, p)
 
-    abs_corr = corr.abs().values
-    high_corr = abs_corr >= min_corr_to_cluster
-    np.fill_diagonal(high_corr, False)
+            # Zero out correlations where overlap is insufficient
+            low_overlap = overlap_matrix < min_overlap
+            np.fill_diagonal(low_overlap, False)  # diagonal is self-overlap, always fine
+            corr_values = corr.values
+            corr_values[low_overlap] = 0.0
+            corr = pd.DataFrame(corr_values, index=corr.index, columns=corr.columns)
 
-    # No strong redundancy detected: preserve all features.
-    if not high_corr.any():
-        return feature_list
+        abs_corr = corr.abs().values
+        high_corr = abs_corr >= min_corr_to_cluster
+        np.fill_diagonal(high_corr, False)
 
-    redundant_mask = high_corr.any(axis=0)
-    redundant_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
-                          if is_redundant]
-    independent_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
-                            if not is_redundant]
+        # No strong redundancy detected: preserve all features.
+        if not high_corr.any():
+            return feature_list
 
-    if len(redundant_features) <= 1:
-        return feature_list
+        redundant_mask = high_corr.any(axis=0)
+        redundant_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
+                              if is_redundant]
+        independent_features = [feature_list[i] for i, is_redundant in enumerate(redundant_mask)
+                                if not is_redundant]
 
-    corr_red = corr.loc[redundant_features, redundant_features]
-    dist_matrix = 1 - corr_red.abs().values
-    np.fill_diagonal(dist_matrix, 0)
-    dist_matrix = np.maximum(dist_matrix, 0)
-    dist_matrix = (dist_matrix + dist_matrix.T) / 2
-    condensed = squareform(dist_matrix, checks=False)
-    linkage = hierarchy.ward(condensed)
+        if len(redundant_features) <= 1:
+            return feature_list
 
-    dist_threshold = max(0.0, 1.0 - float(min_corr_to_cluster))
-    cluster_ids = hierarchy.fcluster(linkage, t=dist_threshold, criterion='distance')
+        with perf_phase("fs.cluster_redundancy.clustering_prep", n_redundant=len(redundant_features)):
+            corr_red = corr.loc[redundant_features, redundant_features]
+            dist_matrix = 1 - corr_red.abs().values
+            np.fill_diagonal(dist_matrix, 0)
+            dist_matrix = np.maximum(dist_matrix, 0)
+            dist_matrix = (dist_matrix + dist_matrix.T) / 2
+            condensed = squareform(dist_matrix, checks=False)
+            linkage = hierarchy.ward(condensed)
 
-    n_clusters = len(np.unique(cluster_ids))
-    redundant_guardrail = min(max_clusters, len(redundant_features))
-    redundant_guardrail = max(redundant_guardrail, 1)
-    if n_clusters > redundant_guardrail and len(redundant_features) > redundant_guardrail:
-        logger.info(f"   Redundancy guardrail: {n_clusters} clusters in redundant subset "
-                    f"→ capped to {redundant_guardrail}")
-        cluster_ids = hierarchy.fcluster(linkage, t=redundant_guardrail, criterion='maxclust')
+            dist_threshold = max(0.0, 1.0 - float(min_corr_to_cluster))
+            cluster_ids = hierarchy.fcluster(linkage, t=dist_threshold, criterion='distance')
 
-    # Use LightGBM gain importance for cluster representative selection.
-    # This avoids median imputation bias and reflects actual model usage of
-    # features with NaN patterns that LightGBM handles natively.
-    model = lgb.LGBMRegressor(**LGB_PARAMS)
-    _safe_lgb_fit(model, X_curr, y_curr)
-    importance_series = pd.Series(model.feature_importances_, index=feature_list)
+            n_clusters = len(np.unique(cluster_ids))
+            redundant_guardrail = min(max_clusters, len(redundant_features))
+            redundant_guardrail = max(redundant_guardrail, 1)
+            if n_clusters > redundant_guardrail and len(redundant_features) > redundant_guardrail:
+                logger.info(f"   Redundancy guardrail: {n_clusters} clusters in redundant subset "
+                            f"→ capped to {redundant_guardrail}")
+                cluster_ids = hierarchy.fcluster(linkage, t=redundant_guardrail, criterion='maxclust')
 
-    selected_redundant = []
-    for cluster_id in np.unique(cluster_ids):
-        members = [redundant_features[i]
-                   for i, c in enumerate(cluster_ids) if c == cluster_id]
-        best = importance_series[members].idxmax()
-        selected_redundant.append(best)
+        inc_counter("fs.cluster_redundancy.clusters_total", len(np.unique(cluster_ids)))
 
-    selected_set = set(independent_features) | set(selected_redundant)
-    selected = [f for f in feature_list if f in selected_set]
-    return selected
+        # Use LightGBM gain importance for cluster representative selection.
+        # This avoids median imputation bias and reflects actual model usage of
+        # features with NaN patterns that LightGBM handles natively.
+        with perf_phase("fs.cluster_redundancy.representative_model_fit"):
+            model = lgb.LGBMRegressor(**LGB_PARAMS)
+            _safe_lgb_fit(model, X_curr, y_curr)
+            importance_series = pd.Series(model.feature_importances_, index=feature_list)
+
+        selected_redundant = []
+        for cluster_id in np.unique(cluster_ids):
+            members = [redundant_features[i]
+                       for i, c in enumerate(cluster_ids) if c == cluster_id]
+            best = importance_series[members].idxmax()
+            selected_redundant.append(best)
+
+        selected_set = set(independent_features) | set(selected_redundant)
+        selected = [f for f in feature_list if f in selected_set]
+        return selected
 
 
 # =============================================================================
@@ -1496,152 +1549,177 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
     - **Cached baseline MAE**: the baseline_with_singles MAE in Phase 2 is
       computed once outside the loop instead of redundantly per iteration.
     """
-    common = X.index.intersection(y.index)
-    X_curr = X.loc[common]
-    y_curr = y.loc[common]
+    with perf_phase(
+        "fs.interaction_rescue.total",
+        n_confirmed=len(confirmed_features),
+        n_rejected_pool=len(rejected_pool),
+    ):
+        inc_counter("fs.interaction_rescue.calls", 1)
 
-    if trial_eval_workers is None:
-        trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
-    trial_eval_workers = max(1, int(trial_eval_workers))
+        common = X.index.intersection(y.index)
+        X_curr = X.loc[common]
+        y_curr = y.loc[common]
 
-    rejected = [f for f in rejected_pool
-                if f in X_curr.columns and f not in confirmed_features]
+        if trial_eval_workers is None:
+            trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
+        trial_eval_workers = max(1, int(trial_eval_workers))
 
-    if not rejected:
-        return []
+        rejected = [f for f in rejected_pool
+                    if f in X_curr.columns and f not in confirmed_features]
 
-    fold_indices = list(TimeSeriesSplit(n_splits=n_splits, gap=gap).split(X_curr))
+        if not rejected:
+            return []
 
-    def _cv_mae_raw(feature_set):
-        X_sub = X_curr[feature_set]
-        maes = []
-        for train_idx, test_idx in fold_indices:
-            model = lgb.LGBMRegressor(**LGB_PARAMS)
-            _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
-            preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
-            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
-        return np.mean(maes)
+        inc_counter("fs.interaction_rescue.rejected_candidates_total", len(rejected))
+        fold_indices = list(TimeSeriesSplit(n_splits=n_splits, gap=gap).split(X_curr))
 
-    mae_cache = {}
-    mae_cache_lock = Lock()
+        def _cv_mae_raw(feature_set):
+            with perf_phase("fs.interaction_rescue.cv_eval", n_features=len(feature_set)):
+                inc_counter("fs.interaction_rescue.cv_calls", 1)
+                inc_counter("fs.interaction_rescue.cv_folds_total", len(fold_indices))
+                X_sub = X_curr[feature_set]
+                maes = []
+                for train_idx, test_idx in fold_indices:
+                    model = lgb.LGBMRegressor(**LGB_PARAMS)
+                    _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
+                    preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
+                    maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
+                return np.mean(maes)
 
-    def _cv_mae(feature_set):
-        return _memoized_score(
-            feature_set,
-            scorer=_cv_mae_raw,
-            cache=mae_cache,
-            cache_lock=mae_cache_lock,
-        )
+        mae_cache = {}
+        mae_cache_lock = Lock()
 
-    baseline_mae = _cv_mae(confirmed_features)
-
-    trial_pool_cm = (
-        ThreadPoolExecutor(max_workers=trial_eval_workers)
-        if trial_eval_workers > 1 else nullcontext(None)
-    )
-    with trial_pool_cm as trial_pool:
-        # === Phase 1: Single-feature conditional rescue ===
-        # Pre-screen rejected features by LightGBM gain in a single full model
-        # to avoid O(|rejected| × n_splits) CV fits for every rejected feature.
-        if len(rejected) > max_phase1_screen:
-            all_phase1_feats = confirmed_features + rejected
-            all_phase1_feats = list(dict.fromkeys(all_phase1_feats))
-            screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
-            _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr)
-            screen_imp = pd.Series(
-                screen_model.feature_importances_, index=all_phase1_feats
+        def _cv_mae(feature_set):
+            return _memoized_score(
+                feature_set,
+                scorer=_cv_mae_raw,
+                cache=mae_cache,
+                cache_lock=mae_cache_lock,
             )
-            # Rank only rejected features by gain, take top-N
-            rejected_imp = screen_imp[rejected].sort_values(ascending=False)
-            rejected = rejected_imp.head(max_phase1_screen).index.tolist()
-            logger.info(f"   Phase 1 pre-screen: {len(rejected_pool)} rejected "
-                        f"→ top {len(rejected)} by LightGBM gain")
 
-        single_trials = [
-            (feat, confirmed_features + [feat])
-            for feat in rejected
-        ]
-        trial_scores = _parallel_trial_scores(
-            single_trials,
-            scorer=_cv_mae,
-            max_workers=trial_eval_workers,
-            executor=trial_pool,
+        with perf_phase("fs.interaction_rescue.phase1.baseline_cv", n_features=len(confirmed_features)):
+            baseline_mae = _cv_mae(confirmed_features)
+
+        trial_pool_cm = (
+            ThreadPoolExecutor(max_workers=trial_eval_workers)
+            if trial_eval_workers > 1 else nullcontext(None)
         )
-    single_improvements = {}
-    for feat, trial_mae in trial_scores:
-        improvement = (baseline_mae - trial_mae) / (baseline_mae + 1e-12)
-        if improvement > 0:
-            single_improvements[feat] = improvement
+        with trial_pool_cm as trial_pool:
+            # === Phase 1: Single-feature conditional rescue ===
+            # Pre-screen rejected features by LightGBM gain in a single full model
+            # to avoid O(|rejected| × n_splits) CV fits for every rejected feature.
+            if len(rejected) > max_phase1_screen:
+                with perf_phase("fs.interaction_rescue.phase1.prescreen_fit", n_candidates=len(rejected)):
+                    all_phase1_feats = confirmed_features + rejected
+                    all_phase1_feats = list(dict.fromkeys(all_phase1_feats))
+                    screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
+                    _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr)
+                    screen_imp = pd.Series(
+                        screen_model.feature_importances_, index=all_phase1_feats
+                    )
+                    # Rank only rejected features by gain, take top-N
+                    rejected_imp = screen_imp[rejected].sort_values(ascending=False)
+                    rejected = rejected_imp.head(max_phase1_screen).index.tolist()
+                    logger.info(f"   Phase 1 pre-screen: {len(rejected_pool)} rejected "
+                                f"→ top {len(rejected)} by LightGBM gain")
 
-    single_rescued = sorted(
-        single_improvements.items(), key=lambda x: x[1], reverse=True
-    )[:top_k]
+            single_trials = [
+                (feat, confirmed_features + [feat])
+                for feat in rejected
+            ]
+            with perf_phase("fs.interaction_rescue.phase1.trials", n_trials=len(single_trials)):
+                trial_scores = _parallel_trial_scores(
+                    single_trials,
+                    scorer=_cv_mae,
+                    max_workers=trial_eval_workers,
+                    executor=trial_pool,
+                )
 
-    for feat, imp in single_rescued:
-        logger.info(f"   Rescued (single): {feat} "
-                     f"(delta MAE = {imp:.4f})")
+        single_improvements = {}
+        for feat, trial_mae in trial_scores:
+            improvement = (baseline_mae - trial_mae) / (baseline_mae + 1e-12)
+            if improvement > 0:
+                single_improvements[feat] = improvement
 
-    # === Phase 2: Split-pair detection ===
-    all_feats = [f for f in X_curr.columns
-                 if f in confirmed_features or f in rejected]
+        single_rescued = sorted(
+            single_improvements.items(), key=lambda x: x[1], reverse=True
+        )[:top_k]
+        inc_counter("fs.interaction_rescue.single_rescued_total", len(single_rescued))
 
-    model_full = lgb.LGBMRegressor(
-        **{**LGB_PARAMS, 'n_estimators': 200, 'num_leaves': 63, 'max_depth': 6}
-    )
-    _safe_lgb_fit(model_full, X_curr[all_feats], y_curr)
+        for feat, imp in single_rescued:
+            logger.info(f"   Rescued (single): {feat} "
+                         f"(delta MAE = {imp:.4f})")
 
-    pair_counts = _extract_split_pairs(model_full, all_feats)
+        # === Phase 2: Split-pair detection ===
+        all_feats = [f for f in X_curr.columns
+                     if f in confirmed_features or f in rejected]
 
-    rejected_set = set(rejected)
-    single_rescued_set = {f for f, _ in single_rescued}
-    pair_rescued = []
+        with perf_phase("fs.interaction_rescue.phase2.full_model_fit", n_features=len(all_feats)):
+            model_full = lgb.LGBMRegressor(
+                **{**LGB_PARAMS, 'n_estimators': 200, 'num_leaves': 63, 'max_depth': 6}
+            )
+            _safe_lgb_fit(model_full, X_curr[all_feats], y_curr)
 
-    # Cache the baseline_with_singles MAE (does not change between iterations)
-    baseline_with_singles = list(dict.fromkeys(
-        confirmed_features + [f for f, _ in single_rescued]
-    ))
-    baseline_singles_mae = _cv_mae(baseline_with_singles)
+        with perf_phase("fs.interaction_rescue.phase2.extract_pairs"):
+            pair_counts = _extract_split_pairs(model_full, all_feats)
+        inc_counter("fs.interaction_rescue.pair_candidates_total", len(pair_counts))
 
-    for (feat_a, feat_b), count in pair_counts.most_common():
-        if len(pair_rescued) >= top_k:
-            break
+        rejected_set = set(rejected)
+        single_rescued_set = {f for f, _ in single_rescued}
+        pair_rescued = []
 
-        new_feats = []
-        if feat_a in rejected_set and feat_a not in single_rescued_set:
-            new_feats.append(feat_a)
-        if feat_b in rejected_set and feat_b not in single_rescued_set:
-            new_feats.append(feat_b)
-
-        if not new_feats:
-            continue
-
-        trial_feats = list(dict.fromkeys(
-            baseline_with_singles + new_feats
+        # Cache the baseline_with_singles MAE (does not change between iterations)
+        baseline_with_singles = list(dict.fromkeys(
+            confirmed_features + [f for f, _ in single_rescued]
         ))
-        trial_mae = _cv_mae(trial_feats)
+        with perf_phase(
+            "fs.interaction_rescue.phase2.baseline_with_singles_cv",
+            n_features=len(baseline_with_singles),
+        ):
+            baseline_singles_mae = _cv_mae(baseline_with_singles)
 
-        improvement = ((baseline_singles_mae - trial_mae)
-                       / (baseline_singles_mae + 1e-12))
-        if improvement > 0:
-            pair_rescued_set = {pf for pf, _ in pair_rescued}
-            for f in new_feats:
-                if f not in pair_rescued_set:
-                    pair_rescued.append((f, improvement))
-                    other = feat_a if f != feat_a else feat_b
-                    logger.info(f"   Rescued (pair w/ {other}, "
-                                f"co-occur={count}): {f} "
-                                f"(delta = {improvement:.4f})")
+        with perf_phase("fs.interaction_rescue.phase2.pair_trials", n_pairs=len(pair_counts)):
+            for (feat_a, feat_b), count in pair_counts.most_common():
+                if len(pair_rescued) >= top_k:
+                    break
 
-    all_rescued = ([f for f, _ in single_rescued]
-                   + [f for f, _ in pair_rescued])
-    seen = set()
-    result = []
-    for f in all_rescued:
-        if f not in seen:
-            seen.add(f)
-            result.append(f)
+                new_feats = []
+                if feat_a in rejected_set and feat_a not in single_rescued_set:
+                    new_feats.append(feat_a)
+                if feat_b in rejected_set and feat_b not in single_rescued_set:
+                    new_feats.append(feat_b)
 
-    return result
+                if not new_feats:
+                    continue
+
+                trial_feats = list(dict.fromkeys(
+                    baseline_with_singles + new_feats
+                ))
+                trial_mae = _cv_mae(trial_feats)
+
+                improvement = ((baseline_singles_mae - trial_mae)
+                               / (baseline_singles_mae + 1e-12))
+                if improvement > 0:
+                    pair_rescued_set = {pf for pf, _ in pair_rescued}
+                    for f in new_feats:
+                        if f not in pair_rescued_set:
+                            pair_rescued.append((f, improvement))
+                            other = feat_a if f != feat_a else feat_b
+                            logger.info(f"   Rescued (pair w/ {other}, "
+                                        f"co-occur={count}): {f} "
+                                        f"(delta = {improvement:.4f})")
+
+        all_rescued = ([f for f, _ in single_rescued]
+                       + [f for f, _ in pair_rescued])
+        seen = set()
+        result = []
+        for f in all_rescued:
+            if f not in seen:
+                seen.add(f)
+                result.append(f)
+
+        inc_counter("fs.interaction_rescue.total_rescued_features", len(result))
+        return result
 
 
 # =============================================================================
@@ -1666,183 +1744,255 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
       step, which can discover feature pairs that are weak individually but
       strong together.
     """
-    if not candidate_features:
-        return []
+    with perf_phase("fs.sfs.total", n_candidates=len(candidate_features)):
+        inc_counter("fs.sfs.calls", 1)
 
-    common = X.index.intersection(y.index)
-    X_curr = X.loc[common]
-    y_curr = y.loc[common]
-    candidate_features = [f for f in candidate_features if f in X_curr.columns]
-    if not candidate_features:
-        return []
+        if not candidate_features:
+            return []
 
-    if trial_eval_workers is None:
-        trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
-    trial_eval_workers = max(1, int(trial_eval_workers))
+        common = X.index.intersection(y.index)
+        X_curr = X.loc[common]
+        y_curr = y.loc[common]
+        candidate_features = [f for f in candidate_features if f in X_curr.columns]
+        if not candidate_features:
+            return []
 
-    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
-    # Pre-compute fold indices once (they only depend on array length)
-    fold_indices = list(tscv.split(X_curr))
+        if trial_eval_workers is None:
+            trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
+        trial_eval_workers = max(1, int(trial_eval_workers))
 
-    def _cv_mae_raw(feature_set):
-        if not feature_set:
-            return float('inf')
-        X_sub = X_curr[feature_set]
-        maes = []
-        for train_idx, test_idx in fold_indices:
-            model = lgb.LGBMRegressor(**LGB_PARAMS)
-            _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
-            preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
-            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
-        return np.mean(maes)
-
-    mae_cache = {}
-    mae_cache_lock = Lock()
-
-    def _cv_mae(feature_set):
-        return _memoized_score(
-            feature_set,
-            scorer=_cv_mae_raw,
-            cache=mae_cache,
-            cache_lock=mae_cache_lock,
-        )
-
-    # --- Pre-screen candidates by LightGBM gain ---
-    # Fit one model on all candidates to get a rough importance ranking.
-    # This lets us prioritise the most promising features in the beam search.
-    screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
-    _safe_lgb_fit(screen_model, X_curr[candidate_features], y_curr)
-    gain_rank = pd.Series(
-        screen_model.feature_importances_, index=candidate_features
-    ).sort_values(ascending=False)
-
-    if boruta_hits is not None:
-        # Combine Boruta hit rank with gain rank (average rank)
-        boruta_rank = pd.Series(boruta_hits).reindex(candidate_features).fillna(0)
-        boruta_rank = boruta_rank.rank(ascending=False)
-        gain_rank_r = gain_rank.rank(ascending=False)
-        combined = ((boruta_rank + gain_rank_r) / 2).sort_values()
-        candidates = combined.index.tolist()
-    else:
-        candidates = gain_rank.index.tolist()
-
-    if not candidates:
-        return []
-
-    # Start with best single feature (test top 20)
-    best_single_mae = float('inf')
-    best_single = candidates[0]
-    for feat in candidates[:min(20, len(candidates))]:
-        mae = _cv_mae([feat])
-        if mae < best_single_mae:
-            best_single_mae = mae
-            best_single = feat
-
-    # --- Beam search ---
-    # Each beam entry: (selected_list, current_mae)
-    beams = [([best_single], best_single_mae)]
-    all_remaining = [f for f in candidates if f != best_single]
-
-    logger.info(f"   SFS start: {best_single} (MAE={best_single_mae:.2f}), "
-                f"beam_width={beam_width}")
-
-    consecutive_failures = 0
-    trial_pool_cm = (
-        ThreadPoolExecutor(max_workers=trial_eval_workers)
-        if trial_eval_workers > 1 else nullcontext(None)
-    )
-    with trial_pool_cm as trial_pool:
-        while all_remaining:
-            next_beams = []
-
-            for selected, current_mae in beams:
-                remaining = [f for f in all_remaining if f not in selected]
-                if not remaining:
-                    next_beams.append((selected, current_mae))
-                    continue
-
-                # Evaluate each candidate feature added to this beam's selection
-                trial_defs = [
-                    (feat, selected + [feat])
-                    for feat in remaining
-                ]
-                trials = _parallel_trial_scores(
-                    trial_defs,
-                    scorer=_cv_mae,
-                    max_workers=trial_eval_workers,
-                    executor=trial_pool,
+        tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
+        # Pre-compute fold indices once (they only depend on array length)
+        fold_indices = list(tscv.split(X_curr))
+        use_precomputed_fold_targets = os.getenv("NFP_SFS_PRECOMPUTE_Y", "1").strip() != "0"
+        if use_precomputed_fold_targets:
+            inc_counter("fs.sfs.precompute_y_enabled", 1)
+        else:
+            inc_counter("fs.sfs.precompute_y_disabled", 1)
+        use_precomputed_fold_features = os.getenv("NFP_SFS_PRECOMPUTE_X", "1").strip() != "0"
+        if use_precomputed_fold_features:
+            inc_counter("fs.sfs.precompute_x_enabled", 1)
+        else:
+            inc_counter("fs.sfs.precompute_x_disabled", 1)
+        # Phase 2 SFS optimization (parity-safe): precompute target vectors for
+        # each fold once per SFS invocation. This removes thousands of repeated
+        # y_curr.iloc[...] slices in the inner CV loop while preserving
+        # identical fold membership and MAE math.
+        fold_data = []
+        if use_precomputed_fold_targets:
+            y_values = y_curr.to_numpy()
+            for train_idx, test_idx in fold_indices:
+                train_idx_arr = np.asarray(train_idx, dtype=np.int64)
+                test_idx_arr = np.asarray(test_idx, dtype=np.int64)
+                fold_data.append(
+                    (
+                        train_idx_arr,
+                        test_idx_arr,
+                        y_values[train_idx_arr],
+                        y_values[test_idx_arr],
+                    )
                 )
 
-                # Sort by MAE (ascending = best first)
-                trials.sort(key=lambda x: x[1])
+        def _cv_mae_raw(feature_set):
+            with perf_phase("fs.sfs.cv_eval", n_features=len(feature_set)):
+                inc_counter("fs.sfs.cv_calls", 1)
+                inc_counter(
+                    "fs.sfs.cv_folds_total",
+                    len(fold_data) if use_precomputed_fold_targets else len(fold_indices),
+                )
+                if not feature_set:
+                    return float('inf')
+                maes = []
+                if use_precomputed_fold_features:
+                    # Phase 2 SFS optimization (parity-safe): build the feature
+                    # matrix once per subset evaluation and slice rows via NumPy.
+                    # This preserves exact row/column ordering while avoiding
+                    # repeated DataFrame iloc construction in the hot CV loop.
+                    X_sub_arr = X_curr.loc[:, feature_set].to_numpy(copy=False)
+                    if use_precomputed_fold_targets:
+                        for train_idx, test_idx, y_train_fold, y_test_fold in fold_data:
+                            model = lgb.LGBMRegressor(**LGB_PARAMS)
+                            model.fit(X_sub_arr[train_idx], y_train_fold)
+                            preds = model.predict(X_sub_arr[test_idx])
+                            maes.append(np.mean(np.abs(y_test_fold - preds)))
+                    else:
+                        for train_idx, test_idx in fold_indices:
+                            model = lgb.LGBMRegressor(**LGB_PARAMS)
+                            model.fit(X_sub_arr[train_idx], y_curr.iloc[train_idx])
+                            preds = model.predict(X_sub_arr[test_idx])
+                            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
+                else:
+                    X_sub = X_curr[feature_set]
+                    if use_precomputed_fold_targets:
+                        for train_idx, test_idx, y_train_fold, y_test_fold in fold_data:
+                            model = lgb.LGBMRegressor(**LGB_PARAMS)
+                            _safe_lgb_fit(model, X_sub.iloc[train_idx], y_train_fold)
+                            preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
+                            maes.append(np.mean(np.abs(y_test_fold - preds)))
+                    else:
+                        for train_idx, test_idx in fold_indices:
+                            model = lgb.LGBMRegressor(**LGB_PARAMS)
+                            _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
+                            preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
+                            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
+                return np.mean(maes)
 
-                # Keep top beam_width expansions from this beam
-                for feat, mae in trials[:beam_width]:
-                    next_beams.append((selected + [feat], mae))
+        mae_cache = {}
+        mae_cache_lock = Lock()
 
-            if not next_beams:
-                break
+        def _cv_mae(feature_set):
+            return _memoized_score(
+                feature_set,
+                scorer=_cv_mae_raw,
+                cache=mae_cache,
+                cache_lock=mae_cache_lock,
+            )
 
-            # Deduplicate beams by frozen feature set, keeping lowest MAE
-            seen_sets = {}
-            for sel, mae in next_beams:
-                key = frozenset(sel)
-                if key not in seen_sets or mae < seen_sets[key][1]:
-                    seen_sets[key] = (sel, mae)
+        # --- Pre-screen candidates by LightGBM gain ---
+        # Fit one model on all candidates to get a rough importance ranking.
+        # This lets us prioritise the most promising features in the beam search.
+        with perf_phase("fs.sfs.prescreen_fit", n_features=len(candidate_features)):
+            screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
+            _safe_lgb_fit(screen_model, X_curr[candidate_features], y_curr)
+            gain_rank = pd.Series(
+                screen_model.feature_importances_, index=candidate_features
+            ).sort_values(ascending=False)
 
-            # Keep top beam_width beams overall
-            ranked_beams = sorted(seen_sets.values(), key=lambda x: x[1])
-            ranked_beams = ranked_beams[:beam_width]
+        if boruta_hits is not None:
+            # Combine Boruta hit rank with gain rank (average rank)
+            boruta_rank = pd.Series(boruta_hits).reindex(candidate_features).fillna(0)
+            boruta_rank = boruta_rank.rank(ascending=False)
+            gain_rank_r = gain_rank.rank(ascending=False)
+            combined = ((boruta_rank + gain_rank_r) / 2).sort_values()
+            candidates = combined.index.tolist()
+        else:
+            candidates = gain_rank.index.tolist()
 
-            # Check improvement of the best beam vs previous best
-            best_beam_sel, best_beam_mae = ranked_beams[0]
-            prev_best_mae = beams[0][1]
+        if not candidates:
+            return []
 
-            improvement = ((prev_best_mae - best_beam_mae)
-                           / (prev_best_mae + 1e-12))
+        # Start with best single feature (test top 20)
+        best_single_mae = float('inf')
+        best_single = candidates[0]
+        with perf_phase("fs.sfs.best_single_scan", n_candidates=min(20, len(candidates))):
+            for feat in candidates[:min(20, len(candidates))]:
+                mae = _cv_mae([feat])
+                if mae < best_single_mae:
+                    best_single_mae = mae
+                    best_single = feat
 
-            # Log the best addition this round
-            new_feat = [f for f in best_beam_sel if f not in beams[0][0]]
-            new_feat_str = new_feat[0] if new_feat else "?"
+        # --- Beam search ---
+        # Each beam entry: (selected_list, current_mae)
+        beams = [([best_single], best_single_mae)]
+        all_remaining = [f for f in candidates if f != best_single]
 
-            if improvement < min_improvement:
-                consecutive_failures += 1
-                if (len(best_beam_sel) >= min_features
-                        and consecutive_failures >= patience):
-                    logger.info(f"   SFS stop: {patience} consecutive improvements "
-                                f"< {min_improvement:.4f}")
-                    break
-                logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
-                            f"delta={improvement:.4f}, "
-                            f"patience {consecutive_failures}/{patience})")
-            else:
-                consecutive_failures = 0
-                logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
-                            f"delta={improvement:.4f})")
+        logger.info(f"   SFS start: {best_single} (MAE={best_single_mae:.2f}), "
+                    f"beam_width={beam_width}")
 
-            if best_beam_mae >= prev_best_mae:
-                # No beam improved — check forced add for min_features
-                if len(beams[0][0]) < min_features:
-                    forced = all_remaining[0]
-                    beams = [(beams[0][0] + [forced], prev_best_mae)]
-                    all_remaining.remove(forced)
-                    logger.info(f"   SFS +{forced} (forced, "
-                                f"MAE~{prev_best_mae:.2f}, "
-                                f"below min_features={min_features})")
-                    continue
+        consecutive_failures = 0
+        round_idx = 0
+        trial_pool_cm = (
+            ThreadPoolExecutor(max_workers=trial_eval_workers)
+            if trial_eval_workers > 1 else nullcontext(None)
+        )
+        with trial_pool_cm as trial_pool:
+            while all_remaining:
+                round_idx += 1
+                inc_counter("fs.sfs.rounds_total", 1)
+                with perf_phase("fs.sfs.beam_round", round=round_idx, remaining=len(all_remaining)):
+                    next_beams = []
 
-            beams = ranked_beams
+                    for selected, current_mae in beams:
+                        remaining = [f for f in all_remaining if f not in selected]
+                        if not remaining:
+                            next_beams.append((selected, current_mae))
+                            continue
 
-            # Update remaining pool: remove features selected by ANY beam
-            all_selected = set()
-            for sel, _ in beams:
-                all_selected.update(sel)
-            all_remaining = [f for f in all_remaining if f not in all_selected]
+                        # Evaluate each candidate feature added to this beam's selection
+                        trial_defs = [
+                            (feat, selected + [feat])
+                            for feat in remaining
+                        ]
+                        inc_counter("fs.sfs.trials_total", len(trial_defs))
+                        with perf_phase("fs.sfs.beam_round.trials", n_trials=len(trial_defs)):
+                            trials = _parallel_trial_scores(
+                                trial_defs,
+                                scorer=_cv_mae,
+                                max_workers=trial_eval_workers,
+                                executor=trial_pool,
+                            )
 
-    # Return the best beam
-    best_selected, best_mae = min(beams, key=lambda x: x[1])
-    logger.info(f"   SFS final: {len(best_selected)} features, MAE={best_mae:.2f}")
-    return best_selected
+                        # Sort by MAE (ascending = best first)
+                        trials.sort(key=lambda x: x[1])
+
+                        # Keep top beam_width expansions from this beam
+                        for feat, mae in trials[:beam_width]:
+                            next_beams.append((selected + [feat], mae))
+
+                    if not next_beams:
+                        break
+
+                    # Deduplicate beams by frozen feature set, keeping lowest MAE
+                    seen_sets = {}
+                    for sel, mae in next_beams:
+                        key = frozenset(sel)
+                        if key not in seen_sets or mae < seen_sets[key][1]:
+                            seen_sets[key] = (sel, mae)
+
+                    # Keep top beam_width beams overall
+                    ranked_beams = sorted(seen_sets.values(), key=lambda x: x[1])
+                    ranked_beams = ranked_beams[:beam_width]
+
+                    # Check improvement of the best beam vs previous best
+                    best_beam_sel, best_beam_mae = ranked_beams[0]
+                    prev_best_mae = beams[0][1]
+
+                    improvement = ((prev_best_mae - best_beam_mae)
+                                   / (prev_best_mae + 1e-12))
+
+                    # Log the best addition this round
+                    new_feat = [f for f in best_beam_sel if f not in beams[0][0]]
+                    new_feat_str = new_feat[0] if new_feat else "?"
+
+                    if improvement < min_improvement:
+                        consecutive_failures += 1
+                        if (len(best_beam_sel) >= min_features
+                                and consecutive_failures >= patience):
+                            logger.info(f"   SFS stop: {patience} consecutive improvements "
+                                        f"< {min_improvement:.4f}")
+                            break
+                        logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
+                                    f"delta={improvement:.4f}, "
+                                    f"patience {consecutive_failures}/{patience})")
+                    else:
+                        consecutive_failures = 0
+                        logger.info(f"   SFS +{new_feat_str} (MAE={best_beam_mae:.2f}, "
+                                    f"delta={improvement:.4f})")
+
+                    if best_beam_mae >= prev_best_mae:
+                        # No beam improved — check forced add for min_features
+                        if len(beams[0][0]) < min_features:
+                            forced = all_remaining[0]
+                            beams = [(beams[0][0] + [forced], prev_best_mae)]
+                            all_remaining.remove(forced)
+                            logger.info(f"   SFS +{forced} (forced, "
+                                        f"MAE~{prev_best_mae:.2f}, "
+                                        f"below min_features={min_features})")
+                            continue
+
+                    beams = ranked_beams
+
+                    # Update remaining pool: remove features selected by ANY beam
+                    all_selected = set()
+                    for sel, _ in beams:
+                        all_selected.update(sel)
+                    all_remaining = [f for f in all_remaining if f not in all_selected]
+
+        # Return the best beam
+        best_selected, best_mae = min(beams, key=lambda x: x[1])
+        logger.info(f"   SFS final: {len(best_selected)} features, MAE={best_mae:.2f}")
+        inc_counter("fs.sfs.selected_features_total", len(best_selected))
+        return best_selected
 
 
 def should_keep_change(
@@ -1884,161 +2034,186 @@ def should_keep_change(
 # Full Pipeline Orchestrator
 # =============================================================================
 
+@profiled("feature_selection_engine.run_pipeline")
 def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups):
     """Execute stages 1-6 for a single target on one source."""
-    pipeline_start = time.time()
-    y_target = winsorize_covid_period(y_target)
+    with perf_phase("fs.run_pipeline.total", source=source_name):
+        pipeline_start = time.time()
+        inc_counter("fs.run_pipeline.calls", 1)
+        y_target = winsorize_covid_period(y_target)
 
-    # ===== Stage 0: Global Pre-Funnel (Variance + Dedup) =====
-    t0 = time.time()
-    n_cols_before = snap_wide.shape[1]
-    
-    # Memory Watchdog
-    mem_pct = psutil.virtual_memory().percent
-    if mem_pct > 80:
-        logger.warning(f"CRITICAL MEMORY: system at {mem_pct}% full before {source_name} pipeline!")
+        # ===== Stage 0: Global Pre-Funnel (Variance + Dedup) =====
+        with perf_phase("fs.run_pipeline.stage0_prefunnel", source=source_name):
+            t0 = time.time()
+            n_cols_before = snap_wide.shape[1]
 
-    if n_cols_before > 500:
-        logger.info(f"0. Pre-funnel: {n_cols_before} features...")
-        snap_wide = _variance_filter(snap_wide)
-    logger.info(f"   > Pre-funnel: {n_cols_before} → {snap_wide.shape[1]} features "
-                f"({time.time() - t0:.1f}s)")
-                
-    gc.collect()
+            # Memory Watchdog
+            mem_pct = psutil.virtual_memory().percent
+            if mem_pct > 80:
+                logger.warning(f"CRITICAL MEMORY: system at {mem_pct}% full before {source_name} pipeline!")
 
-    # ===== Stage 1: Group-wise Dual Filter (Linear + LightGBM) =====
-    stage1_candidates = []
-    t0 = time.time()
-    n_groups = len(series_groups)
-    logger.info(f"1. Group-wise Dual Filter "
-                f"(Purged Corr + Random Subspace LightGBM) — {n_groups} groups...")
-    for gi, (group_name, series_list) in enumerate(series_groups.items(), 1):
-        gt0 = time.time()
-        wide_group = _select_wide(snap_wide, series_list)
-        if wide_group.empty:
-            continue
-        wide_group = winsorize_covid_period(wide_group)
+            if n_cols_before > 500:
+                logger.info(f"0. Pre-funnel: {n_cols_before} features...")
+                snap_wide = _variance_filter(snap_wide)
+            logger.info(f"   > Pre-funnel: {n_cols_before} → {snap_wide.shape[1]} features "
+                        f"({time.time() - t0:.1f}s)")
 
-        # Intra-group deduplication for large groups
-        n_before_dedup = wide_group.shape[1]
-        if n_before_dedup > 50:
-            logger.debug(f"    [{group_name}] Starting dedup on {n_before_dedup} features...")
-            wide_group = _deduplicate_group(wide_group, threshold=0.92)
-            logger.debug(f"    [{group_name}] Dedup finished.")
+        gc.collect()
 
-        logger.debug(f"    [{group_name}] Starting filter_group_data_purged...")
-        selected = filter_group_data_purged(
-            wide_group, y_target, group_name
-        )
-        stage1_candidates.extend(selected)
-        logger.info(f"    [{group_name}] ({gi}/{n_groups}) "
-                    f"{len(series_list)} features → {len(selected)} survived "
-                    f"({time.time() - gt0:.1f}s)")
+        # ===== Stage 1: Group-wise Dual Filter (Linear + LightGBM) =====
+        stage1_candidates = []
+        with perf_phase("fs.run_pipeline.stage1_group_dual_filter", source=source_name):
+            t0 = time.time()
+            n_groups = len(series_groups)
+            logger.info(f"1. Group-wise Dual Filter "
+                        f"(Purged Corr + Random Subspace LightGBM) — {n_groups} groups...")
+            for gi, (group_name, series_list) in enumerate(series_groups.items(), 1):
+                with perf_phase(
+                    "fs.run_pipeline.stage1_group",
+                    source=source_name,
+                    group=group_name,
+                    group_idx=gi,
+                ):
+                    gt0 = time.time()
+                    wide_group = _select_wide(snap_wide, series_list)
+                    if wide_group.empty:
+                        continue
+                    wide_group = winsorize_covid_period(wide_group)
 
-    stage1_candidates = sorted(list(set(stage1_candidates)))
-    logger.info(f"   > Stage 1 Survivors: {len(stage1_candidates)} features "
-                f"({time.time() - t0:.1f}s)")
+                    # Intra-group deduplication for large groups
+                    n_before_dedup = wide_group.shape[1]
+                    if n_before_dedup > 50:
+                        logger.debug(f"    [{group_name}] Starting dedup on {n_before_dedup} features...")
+                        wide_group = _deduplicate_group(wide_group, threshold=0.92)
+                        logger.debug(f"    [{group_name}] Dedup finished.")
 
-    if len(stage1_candidates) == 0:
-        logger.info("   WARNING: No features survived Stage 1. Skipping pipeline.")
-        return []
+                    logger.debug(f"    [{group_name}] Starting filter_group_data_purged...")
+                    selected = filter_group_data_purged(
+                        wide_group, y_target, group_name
+                    )
+                    stage1_candidates.extend(selected)
+                    logger.info(f"    [{group_name}] ({gi}/{n_groups}) "
+                                f"{len(series_list)} features → {len(selected)} survived "
+                                f"({time.time() - gt0:.1f}s)")
 
-    # Aggressively release memory
-    X_stage2 = _select_wide(snap_wide, stage1_candidates)
-    X_stage2 = winsorize_covid_period(X_stage2)
-    gc.collect()
+            stage1_candidates = sorted(list(set(stage1_candidates)))
+            logger.info(f"   > Stage 1 Survivors: {len(stage1_candidates)} features "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage1_survivors_total", len(stage1_candidates))
 
-    # ===== Stage 2: Boruta Importance =====
-    t0 = time.time()
-    logger.info("2. Boruta Feature Selection (shadow features)...")
+        if len(stage1_candidates) == 0:
+            logger.info("   WARNING: No features survived Stage 1. Skipping pipeline.")
+            return []
 
-    stage2_candidates = get_boruta_importance(
-        X_stage2, y_target
-    )
-    logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
-                f"({time.time() - t0:.1f}s)")
-    gc.collect()
+        # Aggressively release memory
+        X_stage2 = _select_wide(snap_wide, stage1_candidates)
+        X_stage2 = winsorize_covid_period(X_stage2)
+        gc.collect()
 
-    if len(stage2_candidates) == 0:
-        logger.info("   WARNING: No features survived Boruta. "
-                     "Falling back to Stage 1 top 30.")
-        common = X_stage2.index.intersection(y_target.index)
-        corrs = X_stage2.loc[common].corrwith(
-            y_target.loc[common]
-        ).abs()
-        stage2_candidates = corrs.nlargest(30).index.tolist()
+        # ===== Stage 2: Boruta Importance =====
+        with perf_phase("fs.run_pipeline.stage2_boruta", source=source_name):
+            t0 = time.time()
+            logger.info("2. Boruta Feature Selection (shadow features)...")
 
-    # ===== Stage 3: Vintage Stability =====
-    t0 = time.time()
-    logger.info("3. Vintage Stability "
-                "(exponential recency weights, min 2 snapshots)...")
-    weighted_scores = get_vintage_stability(
-        stage2_candidates, y_target, snapshots_dir, snap_wide
-    )
+            stage2_candidates = get_boruta_importance(
+                X_stage2, y_target
+            )
+            logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage2_survivors_total", len(stage2_candidates))
+        gc.collect()
 
-    if len(weighted_scores) == 0:
-        logger.info("   WARNING: No features survived vintage stability. "
-                     "Using all Stage 2.")
-        stage3_candidates = stage2_candidates
-    else:
-        # Keep features with any positive weighted importance (replaces
-        # the old median×0.5 which was arbitrary and overly permissive)
-        stage3_candidates = weighted_scores[
-            weighted_scores > 0
-        ].index.tolist()
-    logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
-                f"({time.time() - t0:.1f}s)")
-    gc.collect()
+        if len(stage2_candidates) == 0:
+            with perf_phase("fs.run_pipeline.stage2_boruta_fallback", source=source_name):
+                logger.info("   WARNING: No features survived Boruta. "
+                            "Falling back to Stage 1 top 30.")
+                common = X_stage2.index.intersection(y_target.index)
+                corrs = X_stage2.loc[common].corrwith(
+                    y_target.loc[common]
+                ).abs()
+                stage2_candidates = corrs.nlargest(30).index.tolist()
+                inc_counter("fs.run_pipeline.stage2_fallback_used", 1)
 
-    # ===== Stage 4: Cluster Redundancy =====
-    t0 = time.time()
-    logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
-    stage4_candidates = cluster_redundancy(
-        X_stage2, stage3_candidates, y_target
-    )
-    logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
-                f"({time.time() - t0:.1f}s)")
-    gc.collect()
+        # ===== Stage 3: Vintage Stability =====
+        with perf_phase("fs.run_pipeline.stage3_vintage_stability", source=source_name):
+            t0 = time.time()
+            logger.info("3. Vintage Stability "
+                        "(exponential recency weights, min 2 snapshots)...")
+            weighted_scores = get_vintage_stability(
+                stage2_candidates, y_target, snapshots_dir, snap_wide
+            )
 
-    # ===== Stage 5: Interaction Rescue (two-phase) =====
-    t0 = time.time()
-    logger.info("5. Interaction Rescue "
-                "(single-feature + split-pair detection)...")
-    rescued = interaction_rescue(
-        X_stage2, y_target,
-        confirmed_features=stage4_candidates,
-        rejected_pool=stage1_candidates,
-        top_k=10
-    )
-    stage5_candidates = stage4_candidates + rescued
-    seen = set()
-    stage5_candidates = [
-        f for f in stage5_candidates
-        if f not in seen and not seen.add(f)
-    ]
-    logger.info(f"   > Stage 5 Candidates: {len(stage5_candidates)} "
-                f"({len(stage4_candidates)} confirmed "
-                f"+ {len(rescued)} rescued) "
-                f"({time.time() - t0:.1f}s)")
+            if len(weighted_scores) == 0:
+                logger.info("   WARNING: No features survived vintage stability. "
+                            "Using all Stage 2.")
+                stage3_candidates = stage2_candidates
+            else:
+                # Keep features with any positive weighted importance (replaces
+                # the old median×0.5 which was arbitrary and overly permissive)
+                stage3_candidates = weighted_scores[
+                    weighted_scores > 0
+                ].index.tolist()
+            logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage3_survivors_total", len(stage3_candidates))
+        gc.collect()
 
-    # ===== Stage 6: Sequential Forward Selection =====
-    t0 = time.time()
-    logger.info("6. Sequential Forward Selection "
-                "(walk-forward CV with embargo)...")
-    final_list = sequential_forward_selection(
-        X_stage2, y_target, stage5_candidates,
-        n_splits=8, gap=3,
-        min_improvement=0.001,
-        patience=3,
-        min_features=3,
-    )
-    logger.info(f"   > Final Count: {len(final_list)} "
-                f"({time.time() - t0:.1f}s)")
+        # ===== Stage 4: Cluster Redundancy =====
+        with perf_phase("fs.run_pipeline.stage4_cluster_redundancy", source=source_name):
+            t0 = time.time()
+            logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
+            stage4_candidates = cluster_redundancy(
+                X_stage2, stage3_candidates, y_target
+            )
+            logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage4_survivors_total", len(stage4_candidates))
+        gc.collect()
 
-    logger.info(f"   TOTAL PIPELINE: {(time.time() - pipeline_start) / 60:.1f} min")
-    return final_list
+        # ===== Stage 5: Interaction Rescue (two-phase) =====
+        with perf_phase("fs.run_pipeline.stage5_interaction_rescue", source=source_name):
+            t0 = time.time()
+            logger.info("5. Interaction Rescue "
+                        "(single-feature + split-pair detection)...")
+            rescued = interaction_rescue(
+                X_stage2, y_target,
+                confirmed_features=stage4_candidates,
+                rejected_pool=stage1_candidates,
+                top_k=10
+            )
+            stage5_candidates = stage4_candidates + rescued
+            seen = set()
+            stage5_candidates = [
+                f for f in stage5_candidates
+                if f not in seen and not seen.add(f)
+            ]
+            logger.info(f"   > Stage 5 Candidates: {len(stage5_candidates)} "
+                        f"({len(stage4_candidates)} confirmed "
+                        f"+ {len(rescued)} rescued) "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage5_candidates_total", len(stage5_candidates))
+
+        # ===== Stage 6: Sequential Forward Selection =====
+        with perf_phase("fs.run_pipeline.stage6_sfs_final_selection", source=source_name):
+            t0 = time.time()
+            logger.info("6. Sequential Forward Selection "
+                        "(walk-forward CV with embargo)...")
+            final_list = sequential_forward_selection(
+                X_stage2, y_target, stage5_candidates,
+                n_splits=8, gap=3,
+                min_improvement=0.001,
+                patience=3,
+                min_features=3,
+            )
+            logger.info(f"   > Final Count: {len(final_list)} "
+                        f"({time.time() - t0:.1f}s)")
+            inc_counter("fs.run_pipeline.stage6_selected_total", len(final_list))
+
+        logger.info(f"   TOTAL PIPELINE: {(time.time() - pipeline_start) / 60:.1f} min")
+        return final_list
 
 
+@profiled("feature_selection_engine.run_full_source_pipeline")
 def run_full_source_pipeline(snap_wide, target_mom,
                              source_name, snapshots_dir, series_groups):
     """

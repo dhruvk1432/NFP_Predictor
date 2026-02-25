@@ -15,11 +15,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UNIFIER_TOKEN, UNIFIER_USER
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 # OPTIMIZATION: Use shared utility for snapshot path
 from Data_ETA_Pipeline.utils import get_snapshot_path
 from utils.transforms import add_symlog_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("load_prosper_data", output_dir=TEMP_DIR / "perf")
 
 # OPTIMIZATION [H3]: Rate limiter for API calls (max 10 req/sec to avoid throttling)
 class RateLimiter:
@@ -255,6 +262,7 @@ def merge_employment_series(combined_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@profiled("load_prosper_data.fetch_prosper_snapshots")
 def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers: int = 4):
     """
     Fetch Prosper survey data from the Unifier API and generate point-in-time snapshots.

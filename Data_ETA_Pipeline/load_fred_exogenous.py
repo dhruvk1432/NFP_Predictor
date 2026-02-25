@@ -17,11 +17,18 @@ from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
 # INT1: Import all NFP utilities at module level for consistency
 from Data_ETA_Pipeline.fred_employment_pipeline import load_nfp_releases, get_nfp_release_map, apply_nfp_relative_adjustment
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 # OPTIMIZATION: Use shared utilities for snapshot path and MultiIndex flattening
 from Data_ETA_Pipeline.utils import get_snapshot_path, flatten_multiindex_columns
 from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("load_fred_exogenous", output_dir=TEMP_DIR / "perf")
 
 
 # =============================================================================
@@ -255,6 +262,7 @@ def load_nfp_release_schedule():
         logger.error("NFP release schedule not found")
         return None
 
+@profiled("load_fred_exogenous.aggregate_weekly_to_monthly_nfp_based")
 def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
     """
     Aggregate weekly data into monthly buckets based strictly on NFP release windows.
@@ -360,6 +368,7 @@ def aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_schedule):
 
     return monthly_agg
 
+@profiled("load_fred_exogenous.aggregate_weekly_to_monthly_nfp_based_custom")
 def aggregate_weekly_to_monthly_nfp_based_custom(weekly_df, nfp_schedule, agg_func='mean'):
     """
     Aggregate weekly data into monthly buckets based on NFP release windows with custom aggregation function.
@@ -457,6 +466,7 @@ def aggregate_weekly_to_monthly_nfp_based_custom(weekly_df, nfp_schedule, agg_fu
 
     return monthly_agg
 
+@profiled("load_fred_exogenous.calculate_weekly_spike_stats")
 def calculate_weekly_spike_stats(weekly_df, nfp_schedule):
     """
     Calculate maximum weekly spike and persistence metrics per NFP target month.
@@ -950,6 +960,7 @@ def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, c
         return (name, None)
 
 
+@profiled("load_fred_exogenous.fetch_fred_exogenous_snapshots")
 def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max_workers=3):
     """
     Master orchestrator for producing point-in-time accurate snapshots of non-NFP FRED data.

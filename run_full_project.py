@@ -44,8 +44,9 @@ USAGE (importable):
 PIPELINE STAGES:
 ----------------
 1. LOAD DATA: Fetch raw data from external sources (FRED, ADP, NOAA, etc.)
-2. PREPARE DATA: Transform and consolidate data into master snapshots
-3. TRAIN: Train first release NFP models (nsa_first, sa_first), generate predictions and backtests
+2. PREPARE DATA: Run feature selection engine and build master snapshots (quad-track)
+3. TRAIN: Train all 4 NFP model variants (NSA/SA × first_release/revised),
+          generate backtests, scorecards, and comparison output
 
 Author: NFP Predictor Team
 """
@@ -142,22 +143,26 @@ PREPARE_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
         "master_snapshots",
         "Data_ETA_Pipeline/create_master_snapshots.py",
-        "Consolidate all exogenous data into master snapshots",
+        "Run feature selection engine and build master snapshots (quad-track: {nsa,sa} × {first_release,revised})",
         [],
     ),
 ]
 
 
 def _build_train_steps(no_tune: bool = False) -> List[Tuple[str, str, str, List[str]]]:
-    """Build training step definitions, optionally disabling Optuna tuning."""
-    train_args = ["--train", "--target", "nsa", "--release", "first"]
+    """Build training step definitions, optionally disabling Optuna tuning.
+
+    Trains all 4 model variants (NSA/SA × first_release/revised) and generates
+    a comparative scorecard via --train-all.
+    """
+    train_args = ["--train-all"]
     if no_tune:
         train_args.append("--no-tune")
     return [
         (
             "train_all_models",
             "Train/train_lightgbm_nfp.py",
-            "Train NSA + SA first-release models, backtest, and generate output",
+            "Train all 4 model variants (NSA/SA × first_release/revised), backtest, and generate comparison",
             train_args,
         ),
     ]
@@ -365,8 +370,11 @@ def _print_summary(
 
     print(f"\n{Colors.CYAN}Output Locations:{Colors.ENDC}")
     print(f"  Models:      {OUTPUT_DIR}/models/lightgbm_nfp/")
-    print(f"  Backtests:   {OUTPUT_DIR}/backtest_results/")
-    print(f"  Master Data: {DATA_PATH}/Exogenous_data/master_snapshots/")
+    print(f"  Predictions: {OUTPUT_DIR}/Predictions/")
+    print(f"  NSA diag:    {OUTPUT_DIR}/NSA_prediction/")
+    print(f"  SA diag:     {OUTPUT_DIR}/SA_prediction/")
+    print(f"  Scorecard:   {OUTPUT_DIR}/models/lightgbm_nfp/")
+    print(f"  Master Data: {DATA_PATH}/master_snapshots/")
     print(f"  Targets:     {DATA_PATH}/NFP_target/")
     print()
 

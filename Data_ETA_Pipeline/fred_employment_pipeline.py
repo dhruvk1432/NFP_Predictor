@@ -1076,6 +1076,34 @@ def month_file_path(as_of: pd.Timestamp) -> Path:
     _ensure_dir(out_dir)
     return out_dir / f"{as_of.strftime('%Y-%m')}.parquet"
 
+
+def _target_file_covers_window(path: Path, start_date: str, end_date: str) -> bool:
+    """
+    Validate that an existing target parquet spans the requested window.
+
+    This prevents stale target files (e.g., previously built from 2001) from
+    passing the skip-if-exists check when the requested START_DATE is earlier.
+    """
+    if not path.exists():
+        return False
+    try:
+        df = pd.read_parquet(path, columns=["ds"])
+    except Exception:
+        return False
+    if "ds" not in df.columns or df.empty:
+        return False
+
+    ds = pd.to_datetime(df["ds"], errors="coerce").dropna()
+    if ds.empty:
+        return False
+
+    min_ds = ds.min().to_period("M").to_timestamp()
+    max_ds = ds.max().to_period("M").to_timestamp()
+    window_start = pd.to_datetime(start_date).to_period("M").to_timestamp()
+    window_end = pd.to_datetime(end_date).to_period("M").to_timestamp()
+    return (min_ds <= window_start) and (max_ds >= window_end)
+
+
 def _write_parquet(df: pd.DataFrame, path: Path, dict_cols: Optional[list[str]] = None) -> None:
     _ensure_dir(path.parent)
     df.to_parquet(
@@ -1198,11 +1226,14 @@ def impute_target_release_date_complex(df: pd.DataFrame, snapshot_date: pd.Times
     cutoff_date = pd.Timestamp("2009-01-01")
 
     # 1. Identify rows that need imputation
-    # Condition: Missing OR > 12 months after data date
+    # Pre-2009 data quality is weaker; treat missing or implausibly-late release
+    # dates (>14 days after month-end) as imputable.
     one_year_later = df["ds"] + DateOffset(years=1)
+    month_end = df["ds"] + MonthEnd(0)
+    late_release = df["release_date"] > (month_end + pd.Timedelta(days=14))
 
     # Only consider imputation for dates before 2009-01-01
-    needs_imputation = ((df["release_date"].isna()) | (df["release_date"] > one_year_later)) & (df["ds"] < cutoff_date)
+    needs_imputation = ((df["release_date"].isna()) | late_release) & (df["ds"] < cutoff_date)
 
     if not needs_imputation.any():
         df["release_date"] = pd.to_datetime(df["release_date"])
@@ -1226,9 +1257,10 @@ def impute_target_release_date_complex(df: pd.DataFrame, snapshot_date: pd.Times
 
     # Gate 1: Snapshot is > 1 year after data date
     # OR
-    # Gate 2: Snapshot includes next Feb (Snapshot >= cand_feb_next_year)
+    # Gate 2: Snapshot is strictly after next Feb first-Friday anchor.
+    # Use strict > to stay consistent with downstream strict "< as_of_cutoff".
     # ACTION: Use cand_feb_next_year
-    gate_1_2 = (snapshot_date > one_year_later) | (snapshot_date >= cand_feb_next_year)
+    gate_1_2 = (snapshot_date > one_year_later) | (snapshot_date > cand_feb_next_year)
 
     # Gate 3: Snapshot is closer (Option 3 logic)
     gate_3 = (~gate_1_2)
@@ -1248,8 +1280,8 @@ def impute_target_release_date_complex(df: pd.DataFrame, snapshot_date: pd.Times
             "m3": cand_m3[mask_3]
         }, index=df.index[mask_3])
 
-        # Filter: Set dates > snapshot_date to NaT
-        candidates[candidates > snapshot_date] = pd.NaT
+        # Filter: candidates must be strictly BEFORE snapshot_date.
+        candidates[candidates >= snapshot_date] = pd.NaT
 
         # Take the Max (latest valid date)
         best_date = candidates.max(axis=1)
@@ -1275,11 +1307,14 @@ def calculate_complex_release_date(
     cutoff_date = pd.Timestamp("2009-01-01")
 
     # 1. Identify rows that need imputation
-    # Condition: Missing OR > 12 months after data date
+    # Pre-2009 data quality is weaker; treat missing or implausibly-late release
+    # dates (>14 days after month-end) as imputable.
     one_year_later = df["date"] + DateOffset(years=1)
+    month_end = df["date"] + MonthEnd(0)
+    late_release = df["release_date"] > (month_end + pd.Timedelta(days=14))
 
     # Only consider imputation for dates before 2009-01-01
-    needs_imputation = ((df["release_date"].isna()) | (df["release_date"] > one_year_later)) & (df["date"] < cutoff_date)
+    needs_imputation = ((df["release_date"].isna()) | late_release) & (df["date"] < cutoff_date)
 
     if not needs_imputation.any():
         return df, 0
@@ -1307,12 +1342,13 @@ def calculate_complex_release_date(
 
     # Gate 1: Snapshot is > 1 year after data date
     # OR
-    # Gate 2: Snapshot includes next Feb (Snapshot >= cand_feb_next_year)
+    # Gate 2: Snapshot is strictly after next Feb first-Friday anchor.
+    # Use strict > to stay consistent with downstream strict "< as_of_cutoff".
     # ACTION: Use cand_feb_next_year
-    gate_1_2 = (snapshot_date > one_year_later) | (snapshot_date >= cand_feb_next_year)
+    gate_1_2 = (snapshot_date > one_year_later) | (snapshot_date > cand_feb_next_year)
 
     # Gate 3: Snapshot is closer (Option 3 logic)
-    # Take latest of m1, m2, m3 AS LONG AS it is <= snapshot_date
+    # Take latest of m1, m2, m3 strictly before snapshot_date.
     gate_3 = ~gate_1_2
 
     # Apply Option 1 & 2
@@ -1320,7 +1356,7 @@ def calculate_complex_release_date(
     df.loc[mask_1_2, "release_date"] = cand_feb_next_year[mask_1_2]
 
     # Apply Option 3
-    # We need to find Max(m1, m2, m3) where date <= snapshot_date
+    # We need to find Max(m1, m2, m3) where date < snapshot_date
     if gate_3.any():
         mask_3 = needs_imputation & gate_3
 
@@ -1331,8 +1367,8 @@ def calculate_complex_release_date(
             "m3": cand_m3[mask_3]
         }, index=df.index[mask_3]) # Ensure index alignment
 
-        # Filter: Set dates > snapshot_date to NaT
-        candidates[candidates > snapshot_date] = pd.NaT
+        # Filter: candidates must be strictly BEFORE snapshot_date.
+        candidates[candidates >= snapshot_date] = pd.NaT
 
         # Take the Max (latest valid date)
         best_date = candidates.max(axis=1)
@@ -2280,7 +2316,18 @@ def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existi
             NFP_target_DIR / "total_nsa_first_release.parquet",
             NFP_target_DIR / "total_sa_first_release.parquet",
         ]
-        all_targets_exist = all(f.exists() for f in nfp_target_files)
+        targets_exist = all(f.exists() for f in nfp_target_files)
+        targets_cover_window = (
+            targets_exist and
+            all(_target_file_covers_window(f, start_date, end_date) for f in nfp_target_files)
+        )
+        all_targets_exist = targets_exist and targets_cover_window
+
+        if targets_exist and not targets_cover_window:
+            logger.info(
+                "Existing NFP target files do not span requested window "
+                f"{pd.to_datetime(start_date).strftime('%Y-%m')}..{pd.to_datetime(end_date).strftime('%Y-%m')}; rebuilding."
+            )
 
         # Can only check snapshot completeness if targets exist (provides release map)
         if all_targets_exist:

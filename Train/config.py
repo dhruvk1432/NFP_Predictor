@@ -2,19 +2,24 @@
 LightGBM NFP Model Configuration
 
 Centralized configuration constants and path definitions for the NFP prediction model.
-This file acts as the single source of truth for all hyperparameter bounds, valid 
+This file acts as the single source of truth for all hyperparameter bounds, valid
 target configurations, and file paths used during the data loading and training phases.
 
 TARGET TYPES:
     - target_type: 'nsa' (non-seasonally adjusted) or 'sa' (seasonally adjusted)
-    - release_type: 'first' (initial release) only - last release is disabled
+    - release_type: 'first' (initial release)
+    - target_source: 'first_release' or 'revised'
 
-This creates 2 model variants (first release only):
-    - nsa_first: NSA with first release data
-    - sa_first: SA with first release data
+This creates 4 model variants:
+    - nsa_first: NSA target trained on first-release features
+    - nsa_first_revised: NSA target trained on revised features
+    - sa_first: SA target trained on first-release features
+    - sa_first_revised: SA target trained on revised features
 
-NOTE: Last release models (nsa_last, sa_last) are disabled as they represent a backward-looking 
-ideal state rather than point-in-time actionable predictions.
+The first-release models are the operationally deployable variants (real-time actionable).
+The revised models serve as an upper-bound benchmark for predictability using hindsight-
+corrected data, useful for diagnosing whether model error comes from data noise vs.
+structural model weakness.
 """
 
 from pathlib import Path
@@ -44,17 +49,19 @@ VALID_TARGET_SOURCES = ('first_release', 'revised')
 REVISED_TARGET_SERIES = {'nsa': 'total_nsa', 'sa': 'total'}
 """Dictionary mapping target types to their corresponding raw FRED series names used for target construction."""
 
-# Target combinations - FIRST RELEASE ONLY
-# Only training nsa_first and sa_first models.
-# Last release models are disabled and commented out because they represent hindsight data.
+# Target combinations — all 4 variants trained and operationally deployable.
+# first_release models: predict the initial BLS print (available on NFP release day).
+# revised models: predict once-revised MoM (available ~1 month after first_release,
+#   i.e., after the M+1 NFP release). MUST check operational_available_date before use.
+#   predict_nfp_mom() enforces this via RuntimeError if called too early.
 ALL_TARGET_CONFIGS = [
-    ('nsa', 'first'),
-    ('sa', 'first'),
-    # DISABLED: Last release models - do not uncomment
-    # ('nsa', 'last'),  # Disabled - last release not supported
-    # ('sa', 'last'),   # Disabled - last release not supported
+    ('nsa', 'first', 'first_release'),
+    ('nsa', 'first', 'revised'),
+    ('sa',  'first', 'first_release'),
+    ('sa',  'first', 'revised'),
 ]
-"""List of valid target combinations to be trained. Currently restricted to first releases only."""
+"""All 4 model variants (NSA/SA × first_release/revised). All are operationally deployable;
+revised models require operational_available_date to have passed (enforced at inference)."""
 
 
 # =============================================================================
@@ -263,6 +270,44 @@ TUNE_EVERY_N_MONTHS = 12   # Re-tune hyperparameters every N months in backtest
 # =============================================================================
 
 CONFIDENCE_LEVELS = [0.50, 0.80, 0.95]
+
+
+# =============================================================================
+# UNION-FIRST CANDIDATE POOL + SHORT-PASS SELECTION
+# =============================================================================
+
+# =============================================================================
+# FEATURE SELECTION STAGE TIERS (Data_ETA_Pipeline)
+# =============================================================================
+# Controlled at ETL time via NFP_FS_STAGES env var (comma-separated ints).
+# These constants document the available tier definitions.
+#
+# Stage 0 includes a vectorized Spearman pre-screen (BH-FDR α=0.30) that
+# automatically activates when a source has >5,000 features (e.g. FRED
+# Employment at 17k). This reduces Stage 1 input by ~78%, cutting its
+# runtime from ~10+ min to ~2 min with zero signal loss.
+#
+# Stages 5 (Interaction Rescue) and 6 (SFS) are omitted from the default
+# because their signal is redundant with the train-time short-pass, which
+# re-derives a top-60 feature subset every backtest step via LightGBM gain.
+
+FS_STAGES_DEFAULT = (0, 1, 2, 3, 4)
+"""Default pipeline: Pre-screen → Dual Filter → Boruta → Vintage → Cluster.
+Drops only Stages 5 (Interaction Rescue) and 6 (SFS), whose signal is
+redundant with the train-time short-pass. ~5 min/source."""
+
+FS_STAGES_FULL = (0, 1, 2, 3, 4, 5, 6)
+"""All 7 stages. Use for benchmarking or validation only. ~10 min/source."""
+
+FS_STAGES_FAST = (0, 1, 4)
+"""Minimal: Pre-screen → Dual Filter → Cluster Redundancy. ~3 min/source.
+Skips Boruta and Vintage — suitable for rapid iteration and A/B testing."""
+
+FS_STAGES_FAST_VINTAGE = (0, 1, 3, 4)
+"""Fast + Vintage Stability for temporal robustness. ~3 min/source."""
+
+FS_STAGES_FAST_BORUTA = (0, 1, 2, 4)
+"""Fast + Boruta for label-permutation robustness. ~4 min/source."""
 
 
 # =============================================================================

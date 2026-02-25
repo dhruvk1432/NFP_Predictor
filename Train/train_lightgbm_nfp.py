@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import sys
 import os
+import json
 import warnings
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -426,6 +427,9 @@ def run_expanding_window_backtest(
     # Store results
     results = []
     all_residuals = []
+    # Tracking vars for directional acceleration accuracy
+    last_actual: float = np.nan
+    last_prediction: float = np.nan
 
     # Static fallback params (used when tune=False)
     static_params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
@@ -438,6 +442,10 @@ def run_expanding_window_backtest(
         logger.info(f"Union candidate pool loaded: {len(candidate_pool)} features")
 
     tuned_params = None  # Cached tuned hyperparameters
+
+    # ── Short-pass stability tracking ──
+    step_feature_sets: list[set] = []
+    step_jaccards: list[float] = []
 
     logger.info(f"Running {len(backtest_months)} predictions "
                 f"({'with' if tune else 'without'} hyperparameter tuning)...")
@@ -526,6 +534,16 @@ def run_expanding_window_backtest(
             else:
                 feature_cols = candidate_in_data
                 logger.info(f"Pool intersection ({len(candidate_in_data)}) <= top_k, using all")
+
+        # ── Track short-pass stability (Jaccard similarity) ──
+        current_set = set(feature_cols)
+        step_feature_sets.append(current_set)
+        if len(step_feature_sets) >= 2:
+            prev = step_feature_sets[-2]
+            union_size = len(prev | current_set)
+            jaccard = len(prev & current_set) / union_size if union_size > 0 else 1.0
+            step_jaccards.append(jaccard)
+            logger.info(f"Short-pass Jaccard vs prev step: {jaccard:.3f}")
 
         # Prepare training data with cleaned features
         X_train_selected = X_train_valid[feature_cols]
@@ -625,6 +643,18 @@ def run_expanding_window_backtest(
             in_80 = np.nan if is_future else (lower_80 <= actual <= upper_80)
             in_95 = np.nan if is_future else (lower_95 <= actual <= upper_95)
 
+            # ── P1-1: Directional accuracy ──
+            dir_correct = np.nan if is_future else int(np.sign(actual) == np.sign(prediction))
+
+            # ── P1-2: Directional acceleration accuracy ──
+            # accel_actual = MoM[t] - MoM[t-1]; accel_pred = pred[t] - pred[t-1]
+            if not is_future and not np.isnan(last_actual) and not np.isnan(last_prediction):
+                accel_actual = float(actual) - last_actual
+                accel_pred   = float(prediction) - last_prediction
+                accel_correct = int(np.sign(accel_actual) == np.sign(accel_pred))
+            else:
+                accel_correct = np.nan
+
         result_row = {
             'ds': target_month,
             'actual': actual,
@@ -641,6 +671,8 @@ def run_expanding_window_backtest(
             'in_95_interval': in_95,
             'n_train_samples': len(train_idx_valid),
             'n_features': len(feature_cols),
+            'dir_correct': dir_correct,
+            'accel_correct': accel_correct,
         }
 
         # Add baseline predictions and errors (error = actual - baseline_pred)
@@ -653,6 +685,11 @@ def run_expanding_window_backtest(
                     result_row[f'{bname}_error'] = np.nan
 
         results.append(result_row)
+
+        # Update acceleration tracking vars
+        if not is_future:
+            last_actual = float(actual)
+            last_prediction = float(prediction)
 
         # Progress logging — every prediction with elapsed/ETA
         _elapsed = _time.time() - _backtest_t0
@@ -676,21 +713,84 @@ def run_expanding_window_backtest(
 
     # Log summary statistics
     if not results_df.empty:
-        backtest_rows = results_df[~results_df['error'].isna()]
+        backtest_rows = results_df[~results_df['error'].isna()].copy()
         future_rows = results_df[results_df['error'].isna()]
 
         if not backtest_rows.empty:
             rmse = np.sqrt(np.mean(backtest_rows['error'] ** 2))
-            mae = np.mean(np.abs(backtest_rows['error']))
+            mae  = np.mean(np.abs(backtest_rows['error']))
+            bias = backtest_rows['error'].mean()
+            dir_acc   = backtest_rows['dir_correct'].dropna().mean()
+            accel_acc = backtest_rows['accel_correct'].dropna().mean()
 
             logger.info("\n" + "=" * 60)
             logger.info("EXPANDING WINDOW BACKTEST RESULTS")
             logger.info("=" * 60)
             logger.info(f"Predictions: {len(backtest_rows)} backtest, {len(future_rows)} future")
-            logger.info(f"RMSE: {rmse:.2f}, MAE: {mae:.2f}")
-            logger.info(f"Coverage: 50%={backtest_rows['in_50_interval'].mean()*100:.1f}%, "
-                       f"80%={backtest_rows['in_80_interval'].mean()*100:.1f}%, "
-                       f"95%={backtest_rows['in_95_interval'].mean()*100:.1f}%")
+            logger.info(f"RMSE: {rmse:.2f}  MAE: {mae:.2f}  Bias: {bias:+.2f}")
+            logger.info(f"Directional Accuracy:      {dir_acc:.1%}")
+            logger.info(f"Acceleration Accuracy:     {accel_acc:.1%}")
+            logger.info(f"Coverage: 50%={backtest_rows['in_50_interval'].mean()*100:.1f}%  "
+                        f"80%={backtest_rows['in_80_interval'].mean()*100:.1f}%  "
+                        f"95%={backtest_rows['in_95_interval'].mean()*100:.1f}%")
+
+            # ── P1-4: Bias warning ──
+            if abs(bias) > 0.2 * mae:
+                logger.warning(f"BIAS WARNING: |bias|/MAE = {abs(bias)/mae:.0%} — model is systematically "
+                               f"{'under' if bias < 0 else 'over'}-predicting")
+
+            # ── P1-7: Calibration warnings ──
+            for nominal, col in [
+                (0.50, 'in_50_interval'), (0.80, 'in_80_interval'), (0.95, 'in_95_interval')
+            ]:
+                empirical = backtest_rows[col].dropna().mean()
+                if abs(nominal - empirical) > 0.10:
+                    logger.warning(
+                        f"CALIBRATION WARNING: {nominal:.0%} nominal → {empirical:.1%} empirical coverage "
+                        f"({'anti-conservative' if empirical < nominal else 'conservative'})"
+                    )
+
+            # ── P1-3: Stratified metrics ──
+            logger.info("\nStratified Metrics:")
+            strata = [
+                ('ALL',                    pd.Series(True,  index=backtest_rows.index)),
+                ('non-COVID',              backtest_rows['ds'].dt.year != 2020),
+                ('post-2021',              backtest_rows['ds'] >= pd.Timestamp('2021-01-01')),
+                ('large-print (|y|>200K)', backtest_rows['actual'].abs() > 200),
+            ]
+            for label, mask in strata:
+                sub = backtest_rows[mask]
+                if sub.empty:
+                    continue
+                s_rmse  = np.sqrt((sub['error'] ** 2).mean())
+                s_mae   = sub['error'].abs().mean()
+                s_dir   = sub['dir_correct'].dropna().mean()
+                s_accel = sub['accel_correct'].dropna().mean()
+                logger.info(
+                    f"  [{label}] n={len(sub)}  RMSE={s_rmse:.1f}  MAE={s_mae:.1f}  "
+                    f"Dir={s_dir:.1%}  Accel={s_accel:.1%}"
+                )
+
+            # ── P1-5: Rolling 12-month MAE ──
+            backtest_rows['rolling_12m_mae'] = (
+                backtest_rows['error'].abs().rolling(12, min_periods=6).mean()
+            )
+            trailing_mae = backtest_rows['rolling_12m_mae'].iloc[-1]
+            logger.info(f"\nTrailing-12m MAE: {trailing_mae:.1f}K")
+            results_df = results_df.merge(
+                backtest_rows[['ds', 'rolling_12m_mae']], on='ds', how='left'
+            )
+
+            # Store aggregate metrics for JSON persistence (accessed in train_and_evaluate)
+            results_df.attrs['summary_metrics'] = {
+                'rmse': float(rmse), 'mae': float(mae), 'bias': float(bias),
+                'dir_acc': float(dir_acc), 'accel_acc': float(accel_acc),
+                'coverage_50': float(backtest_rows['in_50_interval'].mean()),
+                'coverage_80': float(backtest_rows['in_80_interval'].mean()),
+                'coverage_95': float(backtest_rows['in_95_interval'].mean()),
+                'trailing_12m_mae': float(trailing_mae),
+                'n_backtest': int(len(backtest_rows)),
+            }
 
         if not future_rows.empty:
             logger.info("\nFuture Predictions:")
@@ -761,6 +861,41 @@ def run_expanding_window_backtest(
                 f"Keep-rule skipped: only {len(backtest_only)} OOS months "
                 f"(need >= {KEEP_RULE_WINDOW_M})"
             )
+
+    # ── Short-pass stability summary ──
+    if step_jaccards:
+        mean_j = np.mean(step_jaccards)
+        min_j = np.min(step_jaccards)
+        max_j = np.max(step_jaccards)
+        logger.info(f"Short-pass stability: Jaccard mean={mean_j:.3f}, "
+                    f"min={min_j:.3f}, max={max_j:.3f} "
+                    f"({len(step_jaccards)} transitions)")
+
+        # Feature tenure: count how many steps each feature was selected
+        from collections import Counter as _Counter
+        tenure = _Counter()
+        for fs in step_feature_sets:
+            tenure.update(fs)
+        top_10 = tenure.most_common(10)
+        logger.info(f"Most stable features (top 10 by tenure): "
+                    f"{[(f, c) for f, c in top_10]}")
+
+        # Save stability report
+        import json as _json
+        stability_dir = OUTPUT_DIR / "models" / "lightgbm_nfp" / model_id
+        stability_dir.mkdir(parents=True, exist_ok=True)
+        stability_path = stability_dir / "shortpass_stability.json"
+        stability_data = {
+            "jaccard_mean": round(mean_j, 4),
+            "jaccard_min": round(min_j, 4),
+            "jaccard_max": round(max_j, 4),
+            "n_steps": len(step_feature_sets),
+            "top_10_by_tenure": [(f, c) for f, c in top_10],
+            "full_tenure": dict(tenure.most_common()),
+        }
+        with open(stability_path, 'w') as _f:
+            _json.dump(stability_data, _f, indent=2)
+        logger.info(f"Saved stability report to {stability_path}")
 
     return results_df, X_full, y_full
 
@@ -897,6 +1032,39 @@ def train_and_evaluate(
             release_type=release_type,
         )
 
+    # ── P1-6: Persist OOS metrics as structured JSON ──
+    _metrics_dir = OUTPUT_DIR / "backtest"
+    _metrics_dir.mkdir(parents=True, exist_ok=True)
+    _metrics_path = _metrics_dir / f"{model_id}_metrics.json"
+
+    try:
+        _summary = backtest_results.attrs.get('summary_metrics', {})
+        _per_month = []
+        for _, _row in backtest_results.iterrows():
+            if pd.isna(_row.get('error')):
+                continue
+            _per_month.append({
+                'ds':           _row['ds'].strftime('%Y-%m'),
+                'actual':       None if pd.isna(_row['actual']) else float(_row['actual']),
+                'predicted':    float(_row['predicted']),
+                'error':        None if pd.isna(_row['error']) else float(_row['error']),
+                'dir_correct':  None if pd.isna(_row.get('dir_correct', np.nan)) else int(_row['dir_correct']),
+                'accel_correct':None if pd.isna(_row.get('accel_correct', np.nan)) else int(_row['accel_correct']),
+            })
+
+        _metrics_payload = {
+            'model_id':        model_id,
+            'run_date':        str(pd.Timestamp.now().date()),
+            'backtest_months': BACKTEST_MONTHS,
+            'overall':         _summary,
+            'per_month':       _per_month,
+        }
+        with open(_metrics_path, 'w') as _f:
+            json.dump(_metrics_payload, _f, indent=2)
+        logger.info(f"OOS metrics saved → {_metrics_path}")
+    except Exception as _e:
+        logger.warning(f"Could not save metrics JSON: {_e}")
+
     # ── Perf dump (env-gated: NFP_PERF=1 only) ──
     dump_perf_json(
         stage_name="train",
@@ -943,6 +1111,23 @@ def predict_nfp_mom(
 
     # Normalize target_month to first of month
     target_month = pd.Timestamp(target_month).replace(day=1)
+
+    # ── P2-4: Revised-model timing guard ──
+    # The revised label for month M is only available after the M+1 NFP release.
+    # Calling this with target_source='revised' before that date is a data error.
+    if target_source == 'revised':
+        try:
+            rev_df = load_target_data(target_type, release_type=release_type, target_source='revised')
+            match = rev_df[rev_df['ds'] == target_month]
+            if not match.empty and 'operational_available_date' in match.columns:
+                op_date = pd.to_datetime(match['operational_available_date'].iloc[0])
+                if pd.notna(op_date) and pd.Timestamp.now() < op_date:
+                    raise RuntimeError(
+                        f"Revised target for {target_month:%Y-%m} is not yet observable "
+                        f"(available from {op_date:%Y-%m-%d}). Use first_release model instead."
+                    )
+        except FileNotFoundError:
+            pass  # Revised cache missing — let load_target_data raise below
 
     # Load model if not provided
     if model is None or metadata is None:

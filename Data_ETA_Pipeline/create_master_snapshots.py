@@ -52,6 +52,23 @@ register_atexit_dump("create_master_snapshots", output_dir=TEMP_DIR / "perf")
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 MASTER_BASE = DATA_PATH / "master_snapshots"
+
+# ── Feature selection stage control ──
+# Default: (0,1,2,3,4) — skips Stages 5 (Interaction Rescue) and 6 (SFS),
+# which are redundant with the train-time short-pass.
+# Override via env var: NFP_FS_STAGES="0,1,4" for fast mode,
+#                       NFP_FS_STAGES="0,1,2,3,4,5,6" for full benchmarking.
+_FS_STAGES_DEFAULT = (0, 1, 2, 3, 4)
+_fs_stages_env = os.getenv("NFP_FS_STAGES", "").strip()
+FS_STAGES: tuple[int, ...] = (
+    tuple(int(s) for s in _fs_stages_env.split(",") if s.strip().isdigit())
+    if _fs_stages_env else _FS_STAGES_DEFAULT
+)
+if _fs_stages_env:
+    logger.info(f"NFP_FS_STAGES override: running stages {FS_STAGES}")
+else:
+    logger.info(f"Feature selection stages: {FS_STAGES} (default)")
+
 REGIME_CACHE_SCHEMA_VERSION = "2026-02-24-regime-cache-v1"
 FEATURE_SELECTION_REGIME_REFRESH_MONTHS = 12
 HARD_CODED_REGIME_STARTS = [
@@ -421,8 +438,13 @@ def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
 @profiled("create_master_snapshots._process_source_features")
 def _process_source_features(source_name: str, source_dir: Path,
                              target_cat: str, target_source: str,
-                             asof_month: pd.Timestamp | None = None) -> list[str]:
-    """Worker function for ProcessPoolExecutor to run the 6-stage engine on one source."""
+                             asof_month: pd.Timestamp | None = None,
+                             stages: tuple | None = None) -> list[str]:
+    """Worker function for ProcessPoolExecutor to run the feature selection engine on one source.
+
+    Args:
+        stages: Tuple of stage numbers (0-6) to execute, or None for all.
+    """
     label = f"{target_cat.upper()}/{target_source}"
     asof_label = _month_key(asof_month) if asof_month is not None else "latest"
 
@@ -504,7 +526,8 @@ def _process_source_features(source_name: str, source_dir: Path,
                 f"Starting 6-stage pipeline...")
     try:
         survivors = run_full_source_pipeline(
-            snap_wide, y_mom, source_name, source_dir, series_groups
+            snap_wide, y_mom, source_name, source_dir, series_groups,
+            stages=stages,
         )
         logger.info(f"[{label}] [{source_name}] Engine returned {len(survivors)} features.")
         return survivors
@@ -520,6 +543,7 @@ def _run_parallel_feature_selection(
     target_cat: str,
     target_source: str,
     asof_month: pd.Timestamp | None = None,
+    stages: tuple | None = None,
 ) -> list[str]:
     label = f"{target_cat.upper()}/{target_source}"
     asof_label = _month_key(asof_month) if asof_month is not None else "latest"
@@ -554,7 +578,8 @@ def _run_parallel_feature_selection(
         if cached is not None:
             return cached
         feats = _process_source_features(
-            name, SOURCES[name], target_cat, target_source, asof_month=asof_month
+            name, SOURCES[name], target_cat, target_source,
+            asof_month=asof_month, stages=stages,
         )
         _save_source_cache(feats, name, target_cat, target_source, asof_month=asof_month)
         return feats
@@ -611,6 +636,7 @@ def _run_parallel_feature_selection(
                                 target_cat,
                                 target_source,
                                 asof_month=asof_month,
+                                stages=stages,
                             )
                         _save_source_cache(
                             feats, name, target_cat, target_source, asof_month=asof_month
@@ -625,7 +651,7 @@ def _run_parallel_feature_selection(
                 with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
                     futures = {
                         executor.submit(_process_source_features, name, SOURCES[name],
-                                        target_cat, target_source, asof_month): name
+                                        target_cat, target_source, asof_month, stages): name
                         for name in uncached_small
                     }
                     for future in as_completed(futures):
@@ -822,6 +848,7 @@ def create_master_snapshots(
     target_source_scope: str | None = None,
     asof_start: str | None = None,
     asof_end: str | None = None,
+    skip_feature_selection: bool = False,
 ):
     """
     Args:
@@ -831,6 +858,10 @@ def create_master_snapshots(
                     Default None = no lower bound.
         asof_end: Optional YYYY-MM upper bound for as-of months to process (inclusive).
                   Default None = no upper bound.
+        skip_feature_selection: If True, load features from existing
+                    selected_features_{cat}_{source}.json instead of running
+                    feature selection. Uses one global feature set for all months.
+                    For profiling / fast rebuilds only.
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
@@ -866,42 +897,66 @@ def create_master_snapshots(
         logger.info(f"========== COMMENCING BRANCH: {label} ==========")
         target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
 
-        # 1. Build leakage-safe regime feature sets (as-of cutoffs only).
+        # 1. Build feature sets for this branch.
         all_branch_months = [obs for obs, _ in snapshot_pairs]
-        regime_cutoffs = _build_feature_selection_regimes(all_branch_months)
-        if not regime_cutoffs:
-            logger.error(f"[{label}] No regime cutoffs could be constructed. Skipping branch.")
-            continue
 
-        cutoff_keys = [_month_key(c) for c in regime_cutoffs]
-        logger.info(f"[{label}] Building {len(regime_cutoffs)} hard-coded feature regimes: "
-                    f"{cutoff_keys}")
-        regime_feature_sets: dict[str, set[str]] = {}
-        last_nonempty: set[str] | None = None
+        if skip_feature_selection:
+            # Fast path: load a single global feature set from existing cache.
+            cache_path = _get_cache_path(target_cat, target_source)
+            if not cache_path.exists():
+                logger.error(f"[{label}] --skip-feature-selection requires "
+                             f"{cache_path}, but it does not exist. Skipping branch.")
+                continue
+            with open(cache_path) as f:
+                cached = json.load(f)
+            static_features = set(cached.get("features", []))
+            logger.info(f"[{label}] skip-feature-selection: using {len(static_features)} "
+                        f"static features from {cache_path.name}")
 
-        for cutoff in regime_cutoffs:
-            cutoff_key = _month_key(cutoff)
-            allowed_list = _check_regime_cache(target_cat, target_source, cutoff)
-            if allowed_list is None:
-                logger.info(f"[{label}] Executing selection for regime cutoff {cutoff_key}...")
-                allowed_list = _run_parallel_feature_selection(
-                    target_cat, target_source, asof_month=cutoff
-                )
-                _save_regime_cache(allowed_list, target_cat, target_source, cutoff)
-
-            allowed_set = set(allowed_list)
-            if not allowed_set and last_nonempty:
-                logger.warning(f"[{label}] Regime {cutoff_key} produced 0 features. "
-                               f"Reusing prior regime set ({len(last_nonempty)} features).")
-                allowed_set = set(last_nonempty)
-
-            if not allowed_set:
-                logger.error(f"[{label}] Regime {cutoff_key} produced no usable features.")
+            # Build a single-regime feature set covering all months.
+            regime_cutoffs = _build_feature_selection_regimes(all_branch_months)
+            if not regime_cutoffs:
+                regime_cutoffs = [all_branch_months[0]]
+            regime_feature_sets: dict[str, set[str]] = {
+                _month_key(c): static_features for c in regime_cutoffs
+            }
+        else:
+            # Normal path: leakage-safe regime feature sets (as-of cutoffs only).
+            regime_cutoffs = _build_feature_selection_regimes(all_branch_months)
+            if not regime_cutoffs:
+                logger.error(f"[{label}] No regime cutoffs could be constructed. Skipping branch.")
                 continue
 
-            regime_feature_sets[cutoff_key] = allowed_set
-            last_nonempty = allowed_set
-            logger.info(f"[{label}] Regime {cutoff_key}: {len(allowed_set)} whitelisted features.")
+            cutoff_keys = [_month_key(c) for c in regime_cutoffs]
+            logger.info(f"[{label}] Building {len(regime_cutoffs)} hard-coded feature regimes: "
+                        f"{cutoff_keys}")
+            regime_feature_sets: dict[str, set[str]] = {}
+            last_nonempty: set[str] | None = None
+
+            for cutoff in regime_cutoffs:
+                cutoff_key = _month_key(cutoff)
+                allowed_list = _check_regime_cache(target_cat, target_source, cutoff)
+                if allowed_list is None:
+                    logger.info(f"[{label}] Executing selection for regime cutoff {cutoff_key}...")
+                    allowed_list = _run_parallel_feature_selection(
+                        target_cat, target_source, asof_month=cutoff,
+                        stages=FS_STAGES,
+                    )
+                    _save_regime_cache(allowed_list, target_cat, target_source, cutoff)
+
+                allowed_set = set(allowed_list)
+                if not allowed_set and last_nonempty:
+                    logger.warning(f"[{label}] Regime {cutoff_key} produced 0 features. "
+                                   f"Reusing prior regime set ({len(last_nonempty)} features).")
+                    allowed_set = set(last_nonempty)
+
+                if not allowed_set:
+                    logger.error(f"[{label}] Regime {cutoff_key} produced no usable features.")
+                    continue
+
+                regime_feature_sets[cutoff_key] = allowed_set
+                last_nonempty = allowed_set
+                logger.info(f"[{label}] Regime {cutoff_key}: {len(allowed_set)} whitelisted features.")
 
         if not regime_feature_sets:
             logger.error(f"[{label}] All regimes failed to produce features. Skipping branch.")
@@ -1062,6 +1117,12 @@ if __name__ == "__main__":
         default=None,
         help='Upper bound for as-of months (YYYY-MM, inclusive). Default: no bound.',
     )
+    parser.add_argument(
+        '--skip-feature-selection',
+        action='store_true',
+        help='Skip feature selection; use existing selected_features_*.json. '
+             'For profiling / fast rebuilds only.',
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -1070,5 +1131,6 @@ if __name__ == "__main__":
         target_source_scope=args.target_source_scope,
         asof_start=args.asof_start,
         asof_end=args.asof_end,
+        skip_feature_selection=args.skip_feature_selection,
     )
     logger.info(f"Total Master Time: {(time.time() - start_time)/60:.1f} minutes")

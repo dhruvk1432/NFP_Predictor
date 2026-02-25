@@ -278,5 +278,95 @@ class TestCacheFunctions:
         clear_target_cache()
 
 
+class TestRevisedTargetCache:
+    """
+    Tests for the revised-target cache fast-path and legacy fallback in load_target_data().
+
+    Cache contract (load_target_data with target_source='revised'):
+    - If  data/NFP_target/y_{type}_revised.parquet EXISTS  → load it (fast path, ~3ms)
+    - If  the cache file is ABSENT                          → call build_revised_target() (legacy, ~1.2s)
+
+    Both branches must produce a well-formed DataFrame with the expected columns.
+    These tests are fully mocked (no filesystem / parquet reads).
+    """
+
+    @pytest.fixture
+    def minimal_revised_df(self):
+        """Minimal DataFrame matching build_revised_target() output shape."""
+        dates = pd.date_range('2022-01-01', periods=12, freq='MS')
+        np.random.seed(0)
+        df = pd.DataFrame({
+            'ds': dates,
+            'y': np.random.randn(12) * 100 + 150_000,
+            'y_mom': np.random.randn(12) * 50,
+            'release_date': dates + pd.Timedelta(days=5),
+            'y_rolling_3m': np.random.randn(12),
+            'y_rolling_6m': np.random.randn(12),
+            'y_rolling_12m': np.random.randn(12),
+            'y_mom_rolling_3m': np.random.randn(12),
+            'y_mom_rolling_6m': np.random.randn(12),
+            'divergence_3m': np.random.randn(12),
+            'divergence_6m': np.random.randn(12),
+            'acceleration': np.random.randn(12),
+            'y_yoy': np.random.randn(12),
+            'y_mom_yoy': np.random.randn(12),
+        })
+        return df
+
+    def test_cache_hit_path_reads_parquet_not_legacy(self, minimal_revised_df, tmp_path):
+        """
+        When the revised-target parquet exists, load_target_data must read it
+        and must NOT call build_revised_target().
+        """
+        cache_file = tmp_path / 'y_nsa_revised.parquet'
+        minimal_revised_df.to_parquet(cache_file, index=False)
+
+        with (
+            patch('Train.data_loader.NFP_TARGET_DIR', tmp_path),
+            patch('Train.data_loader.build_revised_target') as mock_build,
+            patch('Train.data_loader.clear_target_cache'),
+        ):
+            from Train.data_loader import _target_cache, clear_target_cache
+            _target_cache.clear()
+
+            result = load_target_data('nsa', release_type='first',
+                                      target_source='revised', use_cache=False)
+
+        # build_revised_target must NOT have been called (fast path only)
+        mock_build.assert_not_called()
+
+        # Result must be a non-empty DataFrame
+        assert isinstance(result, pd.DataFrame)
+        assert not result.empty
+        assert 'ds' in result.columns
+        assert 'y_mom' in result.columns
+
+    def test_cache_miss_fallback_calls_legacy_build(self, minimal_revised_df, tmp_path):
+        """
+        When the revised-target parquet is absent, load_target_data must
+        fall back to build_revised_target() and return its output unchanged.
+        """
+        # tmp_path is empty — no cache file exists
+        with (
+            patch('Train.data_loader.NFP_TARGET_DIR', tmp_path),
+            patch('Train.data_loader.build_revised_target',
+                  return_value=minimal_revised_df.copy()) as mock_build,
+        ):
+            from Train.data_loader import _target_cache
+            _target_cache.clear()
+
+            result = load_target_data('nsa', release_type='first',
+                                      target_source='revised', use_cache=False)
+
+        # build_revised_target must have been called exactly once (legacy fallback)
+        mock_build.assert_called_once_with('nsa')
+
+        # Result must match what build_revised_target returned
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == len(minimal_revised_df)
+        assert 'y_mom' in result.columns
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

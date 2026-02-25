@@ -49,6 +49,15 @@ TRIAL_EVAL_MAX_WORKERS_DEFAULT = 4
 BORUTA_SHADOW_CAP_MAX = 500
 DEFAULT_RECENCY_MONTHS = 3
 NOAA_RECENCY_MONTHS = 6
+USE_STAGE1_PURGED_SEARCHSORTED = (
+    os.getenv("NFP_STAGE1_PURGED_SEARCHSORTED", "0").strip() == "1"
+)
+USE_STAGE1_REUSE_TARGET_INDEX = (
+    os.getenv("NFP_STAGE1_REUSE_TARGET_INDEX", "0").strip() == "1"
+)
+USE_STAGE1_REUSE_FEATURE_INDEX = (
+    os.getenv("NFP_STAGE1_REUSE_FEATURE_INDEX", "0").strip() == "1"
+)
 
 LGB_PARAMS = {
     'objective': 'regression',
@@ -378,52 +387,74 @@ def _lgb_importances(model, mapping):
 # =============================================================================
 
 def _purged_expanding_corr(feature_series, target_series,
-                           min_window=60, purge_months=3):
+                           min_window=60, purge_months=3,
+                           target_non_na_index=None,
+                           feature_non_na_index=None):
     """
     Compute weighted-average correlation using expanding windows with a purge gap.
     Handles staggered start dates: only uses dates where the feature has data.
     """
-    common = feature_series.dropna().index.intersection(target_series.dropna().index)
-    common = common.sort_values()
+    with perf_phase("fs.stage1.purged_corr.total"):
+        with perf_phase("fs.stage1.purged_corr.target_index_prep"):
+            # Stage-1 target-index reuse chunk (guarded at call-site): when a
+            # precomputed non-NaN target index is provided, reuse it across all
+            # feature columns in this group. Intersection and all downstream
+            # correlation math remain unchanged.
+            if target_non_na_index is None:
+                target_non_na_index = target_series.dropna().index
+            if feature_non_na_index is None:
+                with perf_phase("fs.stage1.purged_corr.feature_index_prep"):
+                    feature_non_na_index = feature_series.dropna().index
+            common = feature_non_na_index.intersection(target_non_na_index)
+            common = common.sort_values()
 
-    if len(common) < min_window:
-        return np.nan, 0
+        if len(common) < min_window:
+            return np.nan, 0
 
-    eval_points = np.linspace(
-        min_window, len(common) - 1,
-        min(5, len(common) - min_window), dtype=int
-    )
-    eval_points = sorted(set(eval_points))
+        eval_points = np.linspace(
+            min_window, len(common) - 1,
+            min(5, len(common) - min_window), dtype=int
+        )
+        eval_points = sorted(set(eval_points))
 
-    if not eval_points:
-        return np.nan, 0
+        if not eval_points:
+            return np.nan, 0
 
-    correlations = []
-    window_sizes = []
-    for end_idx in eval_points:
-        eval_date = common[end_idx]
-        purge_cutoff = eval_date - pd.DateOffset(months=purge_months)
-        train_dates = common[common < purge_cutoff]
+        correlations = []
+        window_sizes = []
+        use_searchsorted_windows = USE_STAGE1_PURGED_SEARCHSORTED
+        for end_idx in eval_points:
+            eval_date = common[end_idx]
+            purge_cutoff = eval_date - pd.DateOffset(months=purge_months)
+            with perf_phase("fs.stage1.purged_corr.window_index_prep"):
+                if use_searchsorted_windows:
+                    # Stage-1 purged-corr chunk (guarded): build the train window via
+                    # index boundary lookup instead of per-iteration boolean masking.
+                    # This preserves the exact "< purge_cutoff" date semantics.
+                    cutoff_pos = common.searchsorted(purge_cutoff, side='left')
+                    train_dates = common[:cutoff_pos]
+                else:
+                    train_dates = common[common < purge_cutoff]
 
-        if len(train_dates) < min_window // 2:
-            continue
-        x_train = feature_series.loc[train_dates]
-        y_train = target_series.loc[train_dates]
+            if len(train_dates) < min_window // 2:
+                continue
+            x_train = feature_series.loc[train_dates]
+            y_train = target_series.loc[train_dates]
 
-        if len(x_train) >= 30 and x_train.std() > 0:
-            r = x_train.corr(y_train)
-            if not np.isnan(r):
-                correlations.append(r)
-                window_sizes.append(len(x_train))
+            if len(x_train) >= 30 and x_train.std() > 0:
+                r = x_train.corr(y_train)
+                if not np.isnan(r):
+                    correlations.append(r)
+                    window_sizes.append(len(x_train))
 
-    if not correlations:
-        return np.nan, 0
+        if not correlations:
+            return np.nan, 0
 
-    weights = np.sqrt(window_sizes)
-    weighted_corr = np.average(correlations, weights=weights)
-    effective_n = int(np.mean(window_sizes))
+        weights = np.sqrt(window_sizes)
+        weighted_corr = np.average(correlations, weights=weights)
+        effective_n = int(np.mean(window_sizes))
 
-    return weighted_corr, effective_n
+        return weighted_corr, effective_n
 
 
 def _variance_filter(wide_df, max_same_frac=0.97, min_obs=30):
@@ -679,14 +710,36 @@ def _is_binary_feature(series, threshold=5):
 
 def _compute_purged_corr_for_col(args):
     """Worker for threaded purged correlation computation."""
-    col_name, col_values, y_local, min_window = args
-    avg_corr, eff_n = _purged_expanding_corr(col_values, y_local, min_window=min_window)
-    if np.isnan(avg_corr) or eff_n < min_window:
-        return None
-    denom = max(1 - avg_corr ** 2, 1e-8)
-    t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
-    p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
-    return (col_name, p_value)
+    with perf_phase("fs.stage1.purged_corr.compute_for_col"):
+        if len(args) == 5:
+            col_name, col_values, y_local, min_window, target_non_na_index = args
+            feature_non_na_index = None
+        elif len(args) == 6:
+            (
+                col_name,
+                col_values,
+                y_local,
+                min_window,
+                target_non_na_index,
+                feature_non_na_index,
+            ) = args
+        else:
+            col_name, col_values, y_local, min_window = args
+            target_non_na_index = None
+            feature_non_na_index = None
+        avg_corr, eff_n = _purged_expanding_corr(
+            col_values,
+            y_local,
+            min_window=min_window,
+            target_non_na_index=target_non_na_index,
+            feature_non_na_index=feature_non_na_index,
+        )
+        if np.isnan(avg_corr) or eff_n < min_window:
+            return None
+        denom = max(1 - avg_corr ** 2, 1e-8)
+        t_stat = avg_corr * np.sqrt((eff_n - 2) / denom)
+        p_value = 2 * (1 - t_dist.cdf(abs(t_stat), df=eff_n - 2))
+        return (col_name, p_value)
 
 
 def _bh_fdr_select(feature_pvalues: dict[str, float], fdr_alpha: float) -> list[str]:
@@ -707,6 +760,104 @@ def _bh_fdr_select(feature_pvalues: dict[str, float], fdr_alpha: float) -> list[
         return []
 
     return [feat for feat, _ in sorted_features[:max_pass_rank]]
+
+
+def _vectorized_target_prescreen(
+    snap_wide: pd.DataFrame,
+    y_target: pd.Series,
+    fdr_alpha: float = 0.30,
+    min_corr_obs: int = 30,
+) -> list[str]:
+    """
+    Fast O(n×p) vectorized Spearman pre-screen against the prediction target.
+
+    Designed as a coarse pre-filter before Stage 1's expensive per-feature
+    purged expanding correlation. Rank-transforms the full feature matrix once
+    (vectorized), then calls corrwith() — completing in ~5-15s even at 17k
+    features vs. the ~10+ min Stage 1 would need on the same input.
+
+    Uses BH-FDR at a deliberately permissive alpha to minimize false negatives;
+    Stage 1 (purged expanding corr + LGB subspace) remains the rigorous gate.
+
+    Only triggered when n_cols > 5000 (guarded in run_pipeline Stage 0).
+    Small sources (NOAA, Prosper, ADP, Unifier) are never affected.
+
+    Args:
+        snap_wide: Wide feature DataFrame (DatetimeIndex × features),
+            post-variance-filter.
+        y_target: Target Series (DatetimeIndex), already winsorized.
+        fdr_alpha: BH-FDR threshold. Default 0.30 is intentionally permissive
+            to minimize false negatives in this coarse pre-screen stage.
+        min_corr_obs: Minimum non-NaN overlap with target required for a
+            feature to be eligible for correlation scoring. Features below
+            this threshold receive p-value = 1.0 and are excluded.
+
+    Returns:
+        List of surviving feature names (order not guaranteed).
+    """
+    with perf_phase("fs.stage0.prescreen"):
+        inc_counter("fs.stage0.prescreen.calls", 1)
+
+        # Align on dates where y_target is valid (no NaN in y after this)
+        y_valid_idx = y_target.dropna().index
+        common = snap_wide.index.intersection(y_valid_idx)
+
+        if len(common) < min_corr_obs:
+            logger.warning(
+                f"   Pre-screen: only {len(common)} common dates with target "
+                f"(< {min_corr_obs} floor). Returning all features."
+            )
+            return list(snap_wide.columns)
+
+        X = snap_wide.loc[common]
+        y = y_target.loc[common]
+
+        # Per-column non-NaN count — denominator for per-feature t-stats.
+        # y has no NaN here (restricted to y_valid_idx), so this is the
+        # correct effective-n for each pairwise correlation.
+        n_obs = X.notna().sum()
+
+        # Rank-transform for Spearman via rank-Pearson.
+        # na_option='keep' preserves NaN positions; corrwith handles them
+        # pairwise (excludes NaN rows per column, matching n_obs above).
+        with perf_phase("fs.stage0.prescreen.rank"):
+            X_ranked = X.rank(pct=True, na_option='keep')
+            y_ranked = y.rank(pct=True)
+
+        # Vectorized pairwise Spearman: one corrwith call for all p columns.
+        with perf_phase("fs.stage0.prescreen.corrwith"):
+            corrs = X_ranked.corrwith(y_ranked)
+
+        # Vectorized t-stat → two-tailed p-value.
+        # corrs.fillna(0) handles constant columns (undefined correlation).
+        r = corrs.fillna(0.0).values
+        n = n_obs.reindex(corrs.index).fillna(0).values.astype(float)
+
+        # Flag features whose overlap with target is insufficient
+        insufficient = n < min_corr_obs
+
+        denom = np.maximum(1.0 - r ** 2, 1e-8)
+        df = np.maximum(n - 2.0, 1.0)
+        t_stat = np.nan_to_num(r * np.sqrt(df) / np.sqrt(denom), nan=0.0)
+        # sf (survival function) is numerically superior to 1-cdf in tails
+        p_vals = 2.0 * t_dist.sf(np.abs(t_stat), df=df)
+        p_vals[insufficient] = 1.0
+
+        # BH-FDR selection using existing pipeline helper
+        feature_pvalues = dict(zip(corrs.index.tolist(), p_vals.tolist()))
+        survivors = _bh_fdr_select(feature_pvalues, fdr_alpha=fdr_alpha)
+
+        n_total = len(corrs)
+        abs_r = np.abs(r)
+        logger.info(
+            f"   Pre-screen stats: |ρ| mean={abs_r.mean():.3f} "
+            f"median={np.median(abs_r):.3f} max={abs_r.max():.3f} | "
+            f"dropped {n_total - len(survivors)}/{n_total}"
+        )
+        inc_counter("fs.stage0.prescreen.features_dropped", n_total - len(survivors))
+        inc_counter("fs.stage0.prescreen.features_surviving", len(survivors))
+
+        return survivors
 
 
 def _feature_set_cache_key(feature_set) -> tuple[str, ...]:
@@ -786,7 +937,16 @@ def filter_group_data_purged(wide_df, target_series, group_name,
     Binary regime groups are handled with relaxed min_window.
     """
     common = wide_df.index.intersection(target_series.index)
-    X_local = wide_df.loc[common].copy()
+    use_copyless_xlocal = os.getenv("NFP_STAGE1_COPYLESS_XLOCAL", "0").strip() == "1"
+    if use_copyless_xlocal:
+        inc_counter("fs.stage1.copyless_xlocal_enabled", 1)
+        # Stage-1 chunk optimization: avoid eager DataFrame copy during the
+        # initial common-index alignment. Downstream logic rebinds X_local and
+        # does not mutate wide_df in place, so this should preserve parity.
+        X_local = wide_df.loc[common]
+    else:
+        inc_counter("fs.stage1.copyless_xlocal_disabled", 1)
+        X_local = wide_df.loc[common].copy()
     y_local = target_series.loc[common]
 
     if X_local.empty:
@@ -830,13 +990,51 @@ def filter_group_data_purged(wide_df, target_series, group_name,
     n_cols = X_path_a.shape[1]
     n_threads = min(os.cpu_count() or 4, max(1, n_cols // 10))
     feature_pvalues = {}
+    use_reuse_target_index = USE_STAGE1_REUSE_TARGET_INDEX
+    if use_reuse_target_index:
+        inc_counter("fs.stage1.reuse_target_index.enabled", 1)
+        target_non_na_index = y_local.dropna().index
+    else:
+        inc_counter("fs.stage1.reuse_target_index.disabled", 1)
+        target_non_na_index = None
+    use_reuse_feature_index = USE_STAGE1_REUSE_FEATURE_INDEX
+    if use_reuse_feature_index:
+        inc_counter("fs.stage1.reuse_feature_index.enabled", 1)
+        # Stage-1 feature-index reuse chunk (guarded): precompute per-feature
+        # non-NaN indices once for this group and reuse inside purged-corr.
+        # This preserves exact row alignment because each index is derived from
+        # the same Series used by the legacy in-function dropna() path.
+        feature_non_na_indices = {
+            col: X_path_a[col].dropna().index for col in X_path_a.columns
+        }
+    else:
+        inc_counter("fs.stage1.reuse_feature_index.disabled", 1)
+        feature_non_na_indices = None
     if n_cols > 0:
         if n_cols > 50 and n_threads > 1:
             # Parallel path
-            args_list = [
-                (col, X_path_a[col], y_local, min_window)
-                for col in X_path_a.columns
-            ]
+            if use_reuse_feature_index:
+                args_list = [
+                    (
+                        col,
+                        X_path_a[col],
+                        y_local,
+                        min_window,
+                        target_non_na_index if use_reuse_target_index else None,
+                        feature_non_na_indices[col],
+                    )
+                    for col in X_path_a.columns
+                ]
+            elif use_reuse_target_index:
+                args_list = [
+                    (col, X_path_a[col], y_local, min_window, target_non_na_index)
+                    for col in X_path_a.columns
+                ]
+            else:
+                args_list = [
+                    (col, X_path_a[col], y_local, min_window)
+                    for col in X_path_a.columns
+                ]
             with ThreadPoolExecutor(max_workers=n_threads) as pool:
                 for result in pool.map(_compute_purged_corr_for_col, args_list):
                     if result is not None:
@@ -845,7 +1043,13 @@ def filter_group_data_purged(wide_df, target_series, group_name,
             # Sequential path for small groups
             for col in X_path_a.columns:
                 avg_corr, eff_n = _purged_expanding_corr(
-                    X_path_a[col], y_local, min_window=min_window
+                    X_path_a[col],
+                    y_local,
+                    min_window=min_window,
+                    target_non_na_index=target_non_na_index if use_reuse_target_index else None,
+                    feature_non_na_index=(
+                        feature_non_na_indices[col] if use_reuse_feature_index else None
+                    ),
                 )
                 if np.isnan(avg_corr) or eff_n < min_window:
                     continue
@@ -2035,32 +2239,81 @@ def should_keep_change(
 # =============================================================================
 
 @profiled("feature_selection_engine.run_pipeline")
-def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups):
-    """Execute stages 1-6 for a single target on one source."""
+def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
+                 stages=None):
+    """Execute feature selection stages for a single target on one source.
+
+    Args:
+        stages: Tuple/list of stage numbers (0-6) to execute.
+            ``None`` (default) runs all stages for backward compatibility.
+            Tier 1 minimal set: ``(0, 1, 4)``.
+            Skipped stages pass their input through to the next active stage.
+    """
+    active = set(stages) if stages is not None else {0, 1, 2, 3, 4, 5, 6}
+
     with perf_phase("fs.run_pipeline.total", source=source_name):
         pipeline_start = time.time()
         inc_counter("fs.run_pipeline.calls", 1)
+        inc_counter("fs.run_pipeline.stages_config", len(active))
+        logger.info(f"Active stages: {sorted(active)}")
         y_target = winsorize_covid_period(y_target)
 
-        # ===== Stage 0: Global Pre-Funnel (Variance + Dedup) =====
-        with perf_phase("fs.run_pipeline.stage0_prefunnel", source=source_name):
-            t0 = time.time()
-            n_cols_before = snap_wide.shape[1]
+        # ===== Stage 0: Global Pre-Funnel (Variance + Spearman Pre-Screen) =====
+        if 0 in active:
+            with perf_phase("fs.run_pipeline.stage0_prefunnel", source=source_name):
+                t0 = time.time()
+                n_cols_before = snap_wide.shape[1]
 
-            # Memory Watchdog
-            mem_pct = psutil.virtual_memory().percent
-            if mem_pct > 80:
-                logger.warning(f"CRITICAL MEMORY: system at {mem_pct}% full before {source_name} pipeline!")
+                # Memory Watchdog
+                mem_pct = psutil.virtual_memory().percent
+                if mem_pct > 80:
+                    logger.warning(f"CRITICAL MEMORY: system at {mem_pct}% full before {source_name} pipeline!")
 
-            if n_cols_before > 500:
-                logger.info(f"0. Pre-funnel: {n_cols_before} features...")
-                snap_wide = _variance_filter(snap_wide)
-            logger.info(f"   > Pre-funnel: {n_cols_before} → {snap_wide.shape[1]} features "
-                        f"({time.time() - t0:.1f}s)")
+                if n_cols_before > 500:
+                    logger.info(f"0. Pre-funnel: {n_cols_before} features...")
+                    snap_wide = _variance_filter(snap_wide)
+
+                # Fast Spearman pre-screen for very large sources (e.g. FRED_Employment_NSA).
+                # Runs only when n_cols > 5000 after variance filter; small sources are unaffected.
+                # Uses BH-FDR at fdr_alpha=0.30 (permissive) — Stage 1 remains the rigorous gate.
+                # Safety floor: if fewer than 500 features survive, skip and log a warning.
+                _PRESCREEN_THRESHOLD = 5000
+                _PRESCREEN_MIN_SURVIVORS = 500
+                n_after_variance = snap_wide.shape[1]
+                if n_after_variance > _PRESCREEN_THRESHOLD:
+                    with perf_phase("fs.run_pipeline.stage0_prescreen", source=source_name):
+                        t_pre = time.time()
+                        logger.info(
+                            f"   Pre-screen: {n_after_variance} features — "
+                            f"running vectorized Spearman target filter (fdr_alpha=0.30)..."
+                        )
+                        pre_survivors = _vectorized_target_prescreen(
+                            snap_wide, y_target, fdr_alpha=0.30, min_corr_obs=30
+                        )
+                        if len(pre_survivors) >= _PRESCREEN_MIN_SURVIVORS:
+                            snap_wide = snap_wide[pre_survivors]
+                            logger.info(
+                                f"   > Pre-screen: {n_after_variance} → {snap_wide.shape[1]} features "
+                                f"({time.time() - t_pre:.1f}s)"
+                            )
+                            inc_counter("fs.run_pipeline.stage0_prescreen_survivors",
+                                        snap_wide.shape[1])
+                        else:
+                            logger.warning(
+                                f"   Pre-screen produced only {len(pre_survivors)} survivors "
+                                f"(< {_PRESCREEN_MIN_SURVIVORS} floor). Skipping pre-screen."
+                            )
+                            inc_counter("fs.run_pipeline.stage0_prescreen_skipped", 1)
+
+                logger.info(f"   > Pre-funnel total: {n_cols_before} → {snap_wide.shape[1]} features "
+                            f"({time.time() - t0:.1f}s)")
+        else:
+            logger.info("0. Pre-funnel: SKIPPED")
 
         gc.collect()
 
         # ===== Stage 1: Group-wise Dual Filter (Linear + LightGBM) =====
+        # Stage 1 is always required — it produces the candidate list.
         stage1_candidates = []
         with perf_phase("fs.run_pipeline.stage1_group_dual_filter", source=source_name):
             t0 = time.time()
@@ -2110,114 +2363,144 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups)
         X_stage2 = winsorize_covid_period(X_stage2)
         gc.collect()
 
+        # Track the running candidate list through optional stages.
+        # Each stage narrows (or rescues into) this list; skipped stages pass through.
+        candidates = list(stage1_candidates)
+
         # ===== Stage 2: Boruta Importance =====
-        with perf_phase("fs.run_pipeline.stage2_boruta", source=source_name):
-            t0 = time.time()
-            logger.info("2. Boruta Feature Selection (shadow features)...")
+        if 2 in active:
+            with perf_phase("fs.run_pipeline.stage2_boruta", source=source_name):
+                t0 = time.time()
+                logger.info("2. Boruta Feature Selection (shadow features)...")
 
-            stage2_candidates = get_boruta_importance(
-                X_stage2, y_target
-            )
-            logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
-                        f"({time.time() - t0:.1f}s)")
-            inc_counter("fs.run_pipeline.stage2_survivors_total", len(stage2_candidates))
-        gc.collect()
+                stage2_candidates = get_boruta_importance(
+                    X_stage2, y_target
+                )
+                logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
+                            f"({time.time() - t0:.1f}s)")
+                inc_counter("fs.run_pipeline.stage2_survivors_total", len(stage2_candidates))
+            gc.collect()
 
-        if len(stage2_candidates) == 0:
-            with perf_phase("fs.run_pipeline.stage2_boruta_fallback", source=source_name):
-                logger.info("   WARNING: No features survived Boruta. "
-                            "Falling back to Stage 1 top 30.")
-                common = X_stage2.index.intersection(y_target.index)
-                corrs = X_stage2.loc[common].corrwith(
-                    y_target.loc[common]
-                ).abs()
-                stage2_candidates = corrs.nlargest(30).index.tolist()
-                inc_counter("fs.run_pipeline.stage2_fallback_used", 1)
+            if len(stage2_candidates) == 0:
+                with perf_phase("fs.run_pipeline.stage2_boruta_fallback", source=source_name):
+                    logger.info("   WARNING: No features survived Boruta. "
+                                "Falling back to Stage 1 top 30.")
+                    common = X_stage2.index.intersection(y_target.index)
+                    corrs = X_stage2.loc[common].corrwith(
+                        y_target.loc[common]
+                    ).abs()
+                    stage2_candidates = corrs.nlargest(30).index.tolist()
+                    inc_counter("fs.run_pipeline.stage2_fallback_used", 1)
+
+            candidates = stage2_candidates
+        else:
+            logger.info("2. Boruta: SKIPPED")
 
         # ===== Stage 3: Vintage Stability =====
-        with perf_phase("fs.run_pipeline.stage3_vintage_stability", source=source_name):
-            t0 = time.time()
-            logger.info("3. Vintage Stability "
-                        "(exponential recency weights, min 2 snapshots)...")
-            weighted_scores = get_vintage_stability(
-                stage2_candidates, y_target, snapshots_dir, snap_wide
-            )
+        if 3 in active:
+            with perf_phase("fs.run_pipeline.stage3_vintage_stability", source=source_name):
+                t0 = time.time()
+                logger.info("3. Vintage Stability "
+                            "(exponential recency weights, min 2 snapshots)...")
+                weighted_scores = get_vintage_stability(
+                    candidates, y_target, snapshots_dir, snap_wide
+                )
 
-            if len(weighted_scores) == 0:
-                logger.info("   WARNING: No features survived vintage stability. "
-                            "Using all Stage 2.")
-                stage3_candidates = stage2_candidates
-            else:
-                # Keep features with any positive weighted importance (replaces
-                # the old median×0.5 which was arbitrary and overly permissive)
-                stage3_candidates = weighted_scores[
-                    weighted_scores > 0
-                ].index.tolist()
-            logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
-                        f"({time.time() - t0:.1f}s)")
-            inc_counter("fs.run_pipeline.stage3_survivors_total", len(stage3_candidates))
-        gc.collect()
+                if len(weighted_scores) == 0:
+                    logger.info("   WARNING: No features survived vintage stability. "
+                                "Using all previous stage output.")
+                    stage3_candidates = candidates
+                else:
+                    # Keep features with any positive weighted importance (replaces
+                    # the old median×0.5 which was arbitrary and overly permissive)
+                    stage3_candidates = weighted_scores[
+                        weighted_scores > 0
+                    ].index.tolist()
+                logger.info(f"   > Stage 3 Survivors: {len(stage3_candidates)} features "
+                            f"({time.time() - t0:.1f}s)")
+                inc_counter("fs.run_pipeline.stage3_survivors_total", len(stage3_candidates))
+            gc.collect()
+            candidates = stage3_candidates
+        else:
+            logger.info("3. Vintage Stability: SKIPPED")
 
         # ===== Stage 4: Cluster Redundancy =====
-        with perf_phase("fs.run_pipeline.stage4_cluster_redundancy", source=source_name):
-            t0 = time.time()
-            logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
-            stage4_candidates = cluster_redundancy(
-                X_stage2, stage3_candidates, y_target
-            )
-            logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
-                        f"({time.time() - t0:.1f}s)")
-            inc_counter("fs.run_pipeline.stage4_survivors_total", len(stage4_candidates))
-        gc.collect()
+        if 4 in active:
+            with perf_phase("fs.run_pipeline.stage4_cluster_redundancy", source=source_name):
+                t0 = time.time()
+                logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
+                stage4_candidates = cluster_redundancy(
+                    X_stage2, candidates, y_target
+                )
+                logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
+                            f"({time.time() - t0:.1f}s)")
+                inc_counter("fs.run_pipeline.stage4_survivors_total", len(stage4_candidates))
+            gc.collect()
+            candidates = stage4_candidates
+        else:
+            logger.info("4. Cluster Redundancy: SKIPPED")
 
         # ===== Stage 5: Interaction Rescue (two-phase) =====
-        with perf_phase("fs.run_pipeline.stage5_interaction_rescue", source=source_name):
-            t0 = time.time()
-            logger.info("5. Interaction Rescue "
-                        "(single-feature + split-pair detection)...")
-            rescued = interaction_rescue(
-                X_stage2, y_target,
-                confirmed_features=stage4_candidates,
-                rejected_pool=stage1_candidates,
-                top_k=10
-            )
-            stage5_candidates = stage4_candidates + rescued
-            seen = set()
-            stage5_candidates = [
-                f for f in stage5_candidates
-                if f not in seen and not seen.add(f)
-            ]
-            logger.info(f"   > Stage 5 Candidates: {len(stage5_candidates)} "
-                        f"({len(stage4_candidates)} confirmed "
-                        f"+ {len(rescued)} rescued) "
-                        f"({time.time() - t0:.1f}s)")
-            inc_counter("fs.run_pipeline.stage5_candidates_total", len(stage5_candidates))
+        if 5 in active:
+            with perf_phase("fs.run_pipeline.stage5_interaction_rescue", source=source_name):
+                t0 = time.time()
+                logger.info("5. Interaction Rescue "
+                            "(single-feature + split-pair detection)...")
+                rescued = interaction_rescue(
+                    X_stage2, y_target,
+                    confirmed_features=candidates,
+                    rejected_pool=stage1_candidates,
+                    top_k=10
+                )
+                stage5_candidates = candidates + rescued
+                seen = set()
+                stage5_candidates = [
+                    f for f in stage5_candidates
+                    if f not in seen and not seen.add(f)
+                ]
+                logger.info(f"   > Stage 5 Candidates: {len(stage5_candidates)} "
+                            f"({len(candidates)} confirmed "
+                            f"+ {len(rescued)} rescued) "
+                            f"({time.time() - t0:.1f}s)")
+                inc_counter("fs.run_pipeline.stage5_candidates_total", len(stage5_candidates))
+            candidates = stage5_candidates
+        else:
+            logger.info("5. Interaction Rescue: SKIPPED")
 
         # ===== Stage 6: Sequential Forward Selection =====
-        with perf_phase("fs.run_pipeline.stage6_sfs_final_selection", source=source_name):
-            t0 = time.time()
-            logger.info("6. Sequential Forward Selection "
-                        "(walk-forward CV with embargo)...")
-            final_list = sequential_forward_selection(
-                X_stage2, y_target, stage5_candidates,
-                n_splits=8, gap=3,
-                min_improvement=0.001,
-                patience=3,
-                min_features=3,
-            )
-            logger.info(f"   > Final Count: {len(final_list)} "
-                        f"({time.time() - t0:.1f}s)")
-            inc_counter("fs.run_pipeline.stage6_selected_total", len(final_list))
+        if 6 in active:
+            with perf_phase("fs.run_pipeline.stage6_sfs_final_selection", source=source_name):
+                t0 = time.time()
+                logger.info("6. Sequential Forward Selection "
+                            "(walk-forward CV with embargo)...")
+                final_list = sequential_forward_selection(
+                    X_stage2, y_target, candidates,
+                    n_splits=8, gap=3,
+                    min_improvement=0.001,
+                    patience=3,
+                    min_features=3,
+                )
+                logger.info(f"   > Final Count: {len(final_list)} "
+                            f"({time.time() - t0:.1f}s)")
+                inc_counter("fs.run_pipeline.stage6_selected_total", len(final_list))
+            candidates = final_list
+        else:
+            logger.info("6. Sequential Forward Selection: SKIPPED")
 
         logger.info(f"   TOTAL PIPELINE: {(time.time() - pipeline_start) / 60:.1f} min")
-        return final_list
+        logger.info(f"   FINAL: {len(candidates)} features selected")
+        return candidates
 
 
 @profiled("feature_selection_engine.run_full_source_pipeline")
 def run_full_source_pipeline(snap_wide, target_mom,
-                             source_name, snapshots_dir, series_groups):
+                             source_name, snapshots_dir, series_groups,
+                             stages=None):
     """
-    Run the 6-stage pipeline on a single source for the MoM target.
+    Run the feature selection pipeline on a single source for the MoM target.
+
+    Args:
+        stages: Tuple/list of stage numbers (0-6) to execute, or None for all.
     Returns the selected features.
     """
     y_clean = target_mom.dropna()
@@ -2231,7 +2514,8 @@ def run_full_source_pipeline(snap_wide, target_mom,
     logger.info(f"{'=' * 60}")
 
     final_feats = run_pipeline(
-        snap_wide, y_clean, source_name, snapshots_dir, series_groups
+        snap_wide, y_clean, source_name, snapshots_dir, series_groups,
+        stages=stages,
     )
 
     logger.info(f"\n  [{source_name}] Selected: {len(final_feats)} features (MoM only)")

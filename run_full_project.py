@@ -61,13 +61,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from settings import DATA_PATH, OUTPUT_DIR
+from settings import DATA_PATH, OUTPUT_DIR, TEMP_DIR
+from Data_ETA_Pipeline.perf_stats import (
+    dump_perf_json,
+    install_hooks,
+    is_perf_enabled,
+    profiled,
+    register_atexit_dump,
+    reset_perf_data,
+)
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+install_hooks()
+register_atexit_dump("run_full_project", output_dir=TEMP_DIR / "perf")
 
 DATA_DIRECTORIES = [
     DATA_PATH / "fred_data",
@@ -218,6 +229,7 @@ def delete_directories(directories: List[Path], verbose: bool = False) -> None:
             print(f"  Skipping (not found): {directory}")
 
 
+@profiled("run_full_project.run_script")
 def run_script(
     script_path: str,
     args: List[str] = None,
@@ -264,6 +276,7 @@ def run_script(
         return False, duration, str(e)
 
 
+@profiled("run_full_project.run_stage")
 def run_stage(
     stage_name: str,
     steps: List[Tuple[str, str, str, List[str]]],
@@ -303,6 +316,22 @@ def run_stage(
             failed += 1
 
         print()
+
+    if is_perf_enabled() and stage_name.strip().upper() in {"LOAD DATA", "PREPARE DATA"}:
+        stage_key = stage_name.strip().lower().replace(" ", "_")
+        dump_path = dump_perf_json(
+            stage_name=f"stage_{stage_key}",
+            output_dir=TEMP_DIR / "perf",
+            extra={
+                "successful_steps": successful,
+                "failed_steps": failed,
+                "duration_s": total_duration,
+                "skip_steps": list(skip_steps),
+            },
+            reset=True,
+        )
+        if dump_path is not None:
+            print(f"  Perf JSON: {dump_path}")
 
     return successful, failed, total_duration
 
@@ -346,6 +375,7 @@ def _print_summary(
 # PUBLIC API - importable functions for running individual stages
 # =============================================================================
 
+@profiled("run_full_project.run_data_pipeline")
 def run_data_pipeline(
     fresh: bool = False,
     skip_steps: List[str] = None,
@@ -361,6 +391,8 @@ def run_data_pipeline(
         True if all steps succeeded.
     """
     skip_steps = skip_steps or []
+    if is_perf_enabled():
+        reset_perf_data()
     start_time = time.time()
     total_successful = 0
     total_failed = 0

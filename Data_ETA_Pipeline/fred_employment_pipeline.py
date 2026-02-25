@@ -51,6 +51,11 @@ from settings import (
     DATA_PATH, START_DATE, END_DATE, FRED_API_KEY,
     REFRESH_CACHE, TEMP_DIR, OUTPUT_DIR, MODEL_TYPE, setup_logger
 )
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 def build_hierarchy_structure(series_list, include_nsa=True):
     """Filter series by NSA/SA suffix and return (hierarchy, ordered, bottom_series)."""
     if include_nsa:
@@ -100,6 +105,8 @@ def build_hierarchy_structure(series_list, include_nsa=True):
     return hierarchy, ordered, bottom_series
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("fred_employment_pipeline", output_dir=TEMP_DIR / "perf")
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
@@ -1693,6 +1700,7 @@ def _rate_limited_fetch(fred, fid, uid, as_of_str, per_request_delay, max_retrie
         _last_request_time[0] = time.time()
     return _fetch_with_retry(fred, fid, uid, as_of_str, max_retries)
 
+@profiled("fred_employment_pipeline.download_master_audit")
 def download_master_audit(
     end_date: str = END_DATE,
     codes: Dict[str, Optional[str]] = FRED_EMPLOYMENT_CODES,
@@ -2248,6 +2256,7 @@ def build_monthly_snapshots_from_audit(audit, start_date, end_date, refresh_exis
         return None, None
     return sched[0][0], sched[-1][0]
 
+@profiled("fred_employment_pipeline.build_all_snapshots")
 def build_all_snapshots(start_date=START_DATE, end_date=END_DATE, refresh_existing=False):
     """
     Master orchestrator for the FRED Pipeline.
@@ -2448,6 +2457,7 @@ def _process_one_snapshot(args):
         return (obs_str, -1, -1, str(e))
 
 
+@profiled("fred_employment_pipeline.prepare_fred_snapshots")
 def prepare_fred_snapshots(
     apply_mom_conversion: bool = True,
     max_workers: int = 0,

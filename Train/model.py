@@ -24,6 +24,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import TEMP_DIR, setup_logger
+from Data_ETA_Pipeline.perf_stats import profiled, perf_phase
 from Train.config import (
     DEFAULT_LGBM_PARAMS,
     HUBER_DELTA,
@@ -80,6 +81,7 @@ def get_lgbm_params(
 # SAMPLE WEIGHTING
 # =============================================================================
 
+@profiled("train.model.calculate_sample_weights")
 def calculate_sample_weights(
     X: pd.DataFrame, 
     target_month: pd.Timestamp, 
@@ -123,6 +125,7 @@ def calculate_sample_weights(
 # MODEL TRAINING
 # =============================================================================
 
+@profiled("train.model.train_lightgbm_model")
 def train_lightgbm_model(
     X: pd.DataFrame,
     y: pd.Series,
@@ -349,6 +352,7 @@ def calculate_prediction_intervals(
     return intervals
 
 
+@profiled("train.model.predict_with_intervals")
 def predict_with_intervals(
     model: lgb.Booster,
     features: pd.DataFrame,

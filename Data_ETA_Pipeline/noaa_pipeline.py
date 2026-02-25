@@ -49,6 +49,11 @@ from fredapi import Fred
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import FRED_API_KEY, DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 
 from Data_ETA_Pipeline.fred_employment_pipeline import apply_nfp_relative_adjustment
 from Data_ETA_Pipeline.utils import get_snapshot_path
@@ -61,6 +66,8 @@ from utils.transforms import add_pct_change_copies, compute_all_features
 # LOGGER
 # =====================================================================
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("noaa_pipeline", output_dir=TEMP_DIR / "perf")
 
 # =====================================================================
 # CONSTANTS & USER PARAMETERS
@@ -596,6 +603,7 @@ def aggregate_to_state_monthly(
 # load_noaa_data() — main entry for Section 1
 # ---------------------------------------------------------------------
 
+@profiled("noaa_pipeline.load_noaa_data")
 def load_noaa_data():
     start_dt = parse_date(START_DATE)
     end_dt   = parse_date(END_DATE)
@@ -696,6 +704,7 @@ def load_noaa_data():
 #             (from Prepare_Data/create_noaa_master.py)
 # #####################################################################
 
+@profiled("noaa_pipeline.create_noaa_master")
 def create_noaa_master():
     """
     Create NOAA master file combining state-level and US national data.
@@ -1089,6 +1098,7 @@ def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:
     return nfp_releases
 
 
+@profiled("noaa_pipeline.create_noaa_weighted_snapshots")
 def create_noaa_weighted_snapshots(
     start_date: str = START_DATE,
     end_date: str = END_DATE

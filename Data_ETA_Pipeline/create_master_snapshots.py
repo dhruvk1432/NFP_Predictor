@@ -34,12 +34,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map
+from Data_ETA_Pipeline.perf_stats import (
+    inc_counter,
+    install_hooks,
+    perf_phase,
+    profiled,
+    register_atexit_dump,
+)
 from Data_ETA_Pipeline.feature_selection_engine import (
     load_snapshot_wide, _classify_series, run_full_source_pipeline, MIN_VALID_OBS
 )
 from Train.data_loader import load_target_data
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("create_master_snapshots", output_dir=TEMP_DIR / "perf")
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 MASTER_BASE = DATA_PATH / "master_snapshots"
@@ -175,13 +184,20 @@ def _get_cache_path(target_cat: str, target_source: str) -> Path:
 
 def _check_cache(target_cat: str, target_source: str) -> list[str]:
     """Return cached features if generated within the last 30 days."""
+    inc_counter("master_snapshot.cache.branch.lookup", 1)
     cache_path = _get_cache_path(target_cat, target_source)
     if not cache_path.exists():
+        inc_counter("master_snapshot.cache.branch.miss", 1)
         return None
 
     try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
+        with perf_phase(
+            "master_snapshot.cache.branch.read",
+            target_cat=target_cat,
+            target_source=target_source,
+        ):
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
 
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
@@ -191,14 +207,19 @@ def _check_cache(target_cat: str, target_source: str) -> list[str]:
                 and days_old < 30):
             logger.info(f"[{target_cat.upper()}/{target_source}] Using cached features "
                         f"(Age: {days_old} days).")
+            inc_counter("master_snapshot.cache.branch.hit", 1)
             return data.get("features", [])
 
         logger.info(f"[{target_cat.upper()}/{target_source}] Cache expired "
                     f"(Age: {days_old} days). Rebuilding...")
+        inc_counter("master_snapshot.cache.branch.miss", 1)
+        inc_counter("master_snapshot.cache.branch.expired", 1)
         return None
 
     except Exception as e:
         logger.warning(f"Failed to read feature cache: {e}")
+        inc_counter("master_snapshot.cache.branch.miss", 1)
+        inc_counter("master_snapshot.cache.branch.read_error", 1)
         return None
 
 
@@ -210,8 +231,15 @@ def _save_cache(features: list[str], target_cat: str, target_source: str) -> Non
         "target_cat": target_cat,
         "features": sorted(list(set(features))),
     }
-    with open(cache_path, 'w') as f:
-        json.dump(data, f, indent=4)
+    with perf_phase(
+        "master_snapshot.cache.branch.write",
+        target_cat=target_cat,
+        target_source=target_source,
+        n_features=len(features),
+    ):
+        with open(cache_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    inc_counter("master_snapshot.cache.branch.write", 1)
     logger.info(f"Saved {len(features)} selected features to cache: {cache_path}")
 
 
@@ -229,13 +257,21 @@ def _check_regime_cache(
     regime_cutoff: pd.Timestamp,
 ) -> list[str] | None:
     """Load regime cache if TTL checks pass."""
+    inc_counter("master_snapshot.cache.regime.lookup", 1)
     cache_path = _get_regime_cache_path(target_cat, target_source, regime_cutoff)
     if not cache_path.exists():
+        inc_counter("master_snapshot.cache.regime.miss", 1)
         return None
 
     try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
+        with perf_phase(
+            "master_snapshot.cache.regime.read",
+            target_cat=target_cat,
+            target_source=target_source,
+            regime_cutoff=_month_key(regime_cutoff),
+        ):
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
 
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
@@ -245,11 +281,16 @@ def _check_regime_cache(
             feats = data.get("features", [])
             logger.info(f"[{target_cat.upper()}/{target_source}] Regime {data.get('regime_cutoff_month')} "
                         f"loaded from cache ({len(feats)} features, {days_old} days old).")
+            inc_counter("master_snapshot.cache.regime.hit", 1)
             return feats
 
+        inc_counter("master_snapshot.cache.regime.miss", 1)
+        inc_counter("master_snapshot.cache.regime.expired", 1)
         return None
 
     except Exception:
+        inc_counter("master_snapshot.cache.regime.miss", 1)
+        inc_counter("master_snapshot.cache.regime.read_error", 1)
         return None
 
 
@@ -269,8 +310,16 @@ def _save_regime_cache(
         "regime_cutoff_month": _month_key(regime_cutoff),
         "features": sorted(list(set(features))),
     }
-    with open(cache_path, 'w') as f:
-        json.dump(data, f, indent=4)
+    with perf_phase(
+        "master_snapshot.cache.regime.write",
+        target_cat=target_cat,
+        target_source=target_source,
+        regime_cutoff=_month_key(regime_cutoff),
+        n_features=len(features),
+    ):
+        with open(cache_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    inc_counter("master_snapshot.cache.regime.write", 1)
     logger.info(f"[{target_cat.upper()}/{target_source}] Saved regime cache "
                 f"{data['regime_cutoff_month']} with {len(features)} features.")
 
@@ -301,21 +350,35 @@ def _check_source_cache(
     asof_month: pd.Timestamp | None = None,
 ) -> list[str] | None:
     """Return source cache if TTL checks pass."""
+    inc_counter("master_snapshot.cache.source.lookup", 1)
     cache_path = _get_source_cache_path(source_name, target_cat, target_source, asof_month=asof_month)
     if not cache_path.exists():
+        inc_counter("master_snapshot.cache.source.miss", 1)
         return None
     try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
+        with perf_phase(
+            "master_snapshot.cache.source.read",
+            source=source_name,
+            target_cat=target_cat,
+            target_source=target_source,
+            asof_month=_month_key(asof_month) if asof_month is not None else "latest",
+        ):
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
         if days_old < 30:
             feats = data.get("features", [])
             logger.info(f"[{source_name}] Using cached source features "
                         f"({len(feats)} features, {days_old} days old)")
+            inc_counter("master_snapshot.cache.source.hit", 1)
             return feats
+        inc_counter("master_snapshot.cache.source.miss", 1)
+        inc_counter("master_snapshot.cache.source.expired", 1)
         return None
     except Exception:
+        inc_counter("master_snapshot.cache.source.miss", 1)
+        inc_counter("master_snapshot.cache.source.read_error", 1)
         return None
 
 
@@ -331,8 +394,17 @@ def _save_source_cache(features: list[str], source_name: str,
         "target_source": target_source,
         "features": sorted(list(set(features))),
     }
-    with open(cache_path, 'w') as f:
-        json.dump(data, f, indent=4)
+    with perf_phase(
+        "master_snapshot.cache.source.write",
+        source=source_name,
+        target_cat=target_cat,
+        target_source=target_source,
+        asof_month=_month_key(asof_month) if asof_month is not None else "latest",
+        n_features=len(features),
+    ):
+        with open(cache_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    inc_counter("master_snapshot.cache.source.write", 1)
     logger.info(f"[{source_name}] Saved {len(features)} features to source cache")
 
 
@@ -346,6 +418,7 @@ def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
     return base_dir / decade / year / f"{date_ts.strftime('%Y-%m')}.parquet"
 
 
+@profiled("create_master_snapshots._process_source_features")
 def _process_source_features(source_name: str, source_dir: Path,
                              target_cat: str, target_source: str,
                              asof_month: pd.Timestamp | None = None) -> list[str]:
@@ -397,11 +470,27 @@ def _process_source_features(source_name: str, source_dir: Path,
     logger.info(f"[{label}] [{source_name}] Loading targets...")
     if target_source == 'revised':
         from Train.data_loader import build_revised_target
-        target_df = build_revised_target(target_cat)
-        target_df['ds'] = pd.to_datetime(target_df['ds'])
-        target_df = target_df.sort_values('ds')
+        inc_counter("master_snapshot.target.build_revised.invoked", 1)
+        inc_counter("master_snapshot.cache.target_load.miss", 1)
+        with perf_phase(
+            "master_snapshot.fs.target.build_revised_target",
+            source=source_name,
+            target_cat=target_cat,
+            target_source=target_source,
+        ):
+            target_df = build_revised_target(target_cat)
+            target_df['ds'] = pd.to_datetime(target_df['ds'])
+            target_df = target_df.sort_values('ds')
     else:
-        target_df = load_target_data(target_type=target_cat, release_type='first', use_cache=False)
+        # use_cache=False is intentional for strict point-in-time behavior in FS prep path.
+        inc_counter("master_snapshot.cache.target_load.miss", 1)
+        with perf_phase(
+            "master_snapshot.fs.target.load_target_data",
+            source=source_name,
+            target_cat=target_cat,
+            target_source=target_source,
+        ):
+            target_df = load_target_data(target_type=target_cat, release_type='first', use_cache=False)
 
     if target_df.empty or 'y_mom' not in target_df.columns:
         logger.error(f"[{label}] [{source_name}] Failed to load valid targets.")
@@ -426,6 +515,7 @@ def _process_source_features(source_name: str, source_dir: Path,
         return []
 
 
+@profiled("create_master_snapshots._run_parallel_feature_selection")
 def _run_parallel_feature_selection(
     target_cat: str,
     target_source: str,
@@ -435,6 +525,14 @@ def _run_parallel_feature_selection(
     asof_label = _month_key(asof_month) if asof_month is not None else "latest"
     logger.info(f"[{label}] Starting Feature Selection Across All Sources (as-of {asof_label})...")
     all_selected = []
+
+    force_serial_small = (
+        os.getenv("NFP_PERF_SERIAL_FS", "").strip() == "1"
+        or os.getenv("NFP_PREPARE_FORCE_SERIAL", "").strip() == "1"
+    )
+    if force_serial_small:
+        logger.info(f"[{label}] Profiling serial fallback enabled for small-source FS section.")
+        inc_counter("master_snapshot.fs.serial_fallback_enabled", 1)
 
     # OOM Protection Strategy:
     # Massive datasets (FRED) chew up ~15-20GB of RAM *per worker*.
@@ -462,49 +560,91 @@ def _run_parallel_feature_selection(
         return feats
 
     # 1. Run massive sources sequentially (skip the irrelevant FRED branch)
-    for name in massive_sources:
-        if name == skip_source:
-            logger.info(f"[{label}] Skipping '{name}' (not needed for {target_cat} branch)")
-            continue
-        if name in SOURCES:
-            logger.info(f"[{label}] Executing massive dataset '{name}' sequentially to prevent OOM...")
-            try:
-                feats = _run_or_load_source(name)
-                all_selected.extend(feats)
-                logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
-            except Exception as e:
-                logger.error(f"--- [{label}] {name} failed: {e}")
+    with perf_phase("master_snapshot.fs.massive_sources_sequential", target_cat=target_cat, target_source=target_source):
+        for name in massive_sources:
+            if name == skip_source:
+                logger.info(f"[{label}] Skipping '{name}' (not needed for {target_cat} branch)")
+                continue
+            if name in SOURCES:
+                logger.info(f"[{label}] Executing massive dataset '{name}' sequentially to prevent OOM...")
+                try:
+                    with perf_phase(
+                        "master_snapshot.fs.massive_source",
+                        source=name,
+                        target_cat=target_cat,
+                        target_source=target_source,
+                    ):
+                        feats = _run_or_load_source(name)
+                    all_selected.extend(feats)
+                    logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
+                except Exception as e:
+                    logger.error(f"--- [{label}] {name} failed: {e}")
 
     # 2. Run small sources in parallel (cache-aware)
     # Separate cached vs uncached sources to avoid spawning workers unnecessarily
     uncached_small = []
-    for name in small_sources:
-        cached = _check_source_cache(name, target_cat, target_source, asof_month=asof_month)
-        if cached is not None:
-            all_selected.extend(cached)
-            logger.info(f"+++ [{label}] {name} loaded from cache. Added {len(cached)} features.")
-        else:
-            uncached_small.append(name)
+    with perf_phase("master_snapshot.fs.small_sources_cache_scan", target_cat=target_cat, target_source=target_source):
+        for name in small_sources:
+            cached = _check_source_cache(name, target_cat, target_source, asof_month=asof_month)
+            if cached is not None:
+                all_selected.extend(cached)
+                logger.info(f"+++ [{label}] {name} loaded from cache. Added {len(cached)} features.")
+            else:
+                uncached_small.append(name)
 
     if uncached_small:
-        logger.info(f"[{label}] Executing {len(uncached_small)} uncached smaller datasets in parallel...")
-        with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
-            futures = {
-                executor.submit(_process_source_features, name, SOURCES[name],
-                                target_cat, target_source, asof_month): name
-                for name in uncached_small
-            }
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    feats = future.result()
-                    _save_source_cache(
-                        feats, name, target_cat, target_source, asof_month=asof_month
-                    )
-                    all_selected.extend(feats)
-                    logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
-                except Exception as e:
-                    logger.error(f"--- [{label}] {name} spawned an exception: {e}")
+        inc_counter("master_snapshot.fs.small_sources_uncached", len(uncached_small))
+        if force_serial_small:
+            logger.info(f"[{label}] Executing {len(uncached_small)} uncached smaller datasets serially (profiling fallback)...")
+            with perf_phase("master_snapshot.fs.small_sources_serial", n_sources=len(uncached_small)):
+                for name in uncached_small:
+                    try:
+                        with perf_phase(
+                            "master_snapshot.fs.small_source_serial",
+                            source=name,
+                            target_cat=target_cat,
+                            target_source=target_source,
+                        ):
+                            feats = _process_source_features(
+                                name,
+                                SOURCES[name],
+                                target_cat,
+                                target_source,
+                                asof_month=asof_month,
+                            )
+                        _save_source_cache(
+                            feats, name, target_cat, target_source, asof_month=asof_month
+                        )
+                        all_selected.extend(feats)
+                        logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
+                    except Exception as e:
+                        logger.error(f"--- [{label}] {name} failed in serial fallback: {e}")
+        else:
+            logger.info(f"[{label}] Executing {len(uncached_small)} uncached smaller datasets in parallel...")
+            with perf_phase("master_snapshot.fs.small_sources_parallel", n_sources=len(uncached_small)):
+                with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
+                    futures = {
+                        executor.submit(_process_source_features, name, SOURCES[name],
+                                        target_cat, target_source, asof_month): name
+                        for name in uncached_small
+                    }
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        try:
+                            with perf_phase(
+                                "master_snapshot.fs.small_source_future_result",
+                                source=name,
+                                target_cat=target_cat,
+                                target_source=target_source,
+                            ):
+                                feats = future.result()
+                            _save_source_cache(
+                                feats, name, target_cat, target_source, asof_month=asof_month
+                            )
+                            all_selected.extend(feats)
+                            logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
+                        except Exception as e:
+                            logger.error(f"--- [{label}] {name} spawned an exception: {e}")
 
     all_selected = list(set(all_selected))
     logger.info(f"[{label}] Feature Selection Complete. Total surviving features: {len(all_selected)}")
@@ -531,6 +671,7 @@ def _normalize_to_wide(df):
     return wide
 
 
+@profiled("create_master_snapshots._batch_load_source")
 def _batch_load_source(source_name: str, source_dir: Path,
                        snapshot_months: list[pd.Timestamp],
                        allowed_features: set) -> dict[str, pd.DataFrame]:
@@ -563,6 +704,7 @@ def _batch_load_source(source_name: str, source_dir: Path,
     return result
 
 
+@profiled("create_master_snapshots._load_all_sources_from_cache")
 def _load_all_sources_from_cache(obs_month: pd.Timestamp,
                                  source_caches: dict[str, dict],
                                  ) -> pd.DataFrame:
@@ -674,14 +816,39 @@ def _resolve_regime_cutoff(
     return selected
 
 
+@profiled("create_master_snapshots.create_master_snapshots")
 def create_master_snapshots(
     skip_existing: bool = False,
     target_source_scope: str | None = None,
+    asof_start: str | None = None,
+    asof_end: str | None = None,
 ):
+    """
+    Args:
+        skip_existing: Skip months where master snapshot already exists.
+        target_source_scope: Branch scope ('auto', 'all', 'revised', 'first_release').
+        asof_start: Optional YYYY-MM lower bound for as-of months to process (inclusive).
+                    Default None = no lower bound.
+        asof_end: Optional YYYY-MM upper bound for as-of months to process (inclusive).
+                  Default None = no upper bound.
+    """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
     nfp_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
     snapshot_pairs = sorted(nfp_map.items(), key=lambda x: x[0])
+
+    # Bounded-run filtering: restrict which as-of months are processed.
+    # Outputs for included months are identical to an unbounded run.
+    if asof_start:
+        asof_start_ts = pd.Timestamp(asof_start)
+        before_count = len(snapshot_pairs)
+        snapshot_pairs = [(obs, snap) for obs, snap in snapshot_pairs if obs >= asof_start_ts]
+        logger.info(f"Bounded start filter: {before_count} -> {len(snapshot_pairs)} months (>= {asof_start})")
+    if asof_end:
+        asof_end_ts = pd.Timestamp(asof_end) + pd.offsets.MonthEnd(0)
+        before_count = len(snapshot_pairs)
+        snapshot_pairs = [(obs, snap) for obs, snap in snapshot_pairs if obs <= asof_end_ts]
+        logger.info(f"Bounded end filter: {before_count} -> {len(snapshot_pairs)} months (<= {asof_end})")
 
     if not snapshot_pairs:
         logger.info("No NFP release dates found.")
@@ -885,11 +1052,23 @@ if __name__ == "__main__":
         help=("Branch scope: auto (short windows -> revised-only), all, "
               "revised, or first_release"),
     )
+    parser.add_argument(
+        '--asof-start',
+        default=None,
+        help='Lower bound for as-of months (YYYY-MM, inclusive). Default: no bound.',
+    )
+    parser.add_argument(
+        '--asof-end',
+        default=None,
+        help='Upper bound for as-of months (YYYY-MM, inclusive). Default: no bound.',
+    )
     args = parser.parse_args()
 
     start_time = time.time()
     create_master_snapshots(
         skip_existing=args.skip_existing,
         target_source_scope=args.target_source_scope,
+        asof_start=args.asof_start,
+        asof_end=args.asof_end,
     )
     logger.info(f"Total Master Time: {(time.time() - start_time)/60:.1f} minutes")

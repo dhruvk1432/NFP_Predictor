@@ -12,11 +12,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from settings import DATA_PATH, TEMP_DIR, setup_logger, START_DATE, END_DATE, UNIFIER_TOKEN, UNIFIER_USER
 # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
 from Data_ETA_Pipeline.fred_employment_pipeline import get_nfp_release_map, calculate_median_offset_from_nfp, apply_nfp_relative_adjustment
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 # OPTIMIZATION: Use shared utility for snapshot path
 from Data_ETA_Pipeline.utils import get_snapshot_path
 from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("load_unifier_data", output_dir=TEMP_DIR / "perf")
 
 # Series where pct_change is meaningless due to zero-centered or near-zero values
 # - Empire_State_Mfg: diffusion index centered at 0, frequently crosses zero
@@ -149,6 +156,7 @@ def get_effective_release_and_value(row, snap_date, median_lag_days, nfp_offset_
         return first_release_date, first_release_value
 
 
+@profiled("load_unifier_data.get_effective_release_and_value_vectorized")
 def get_effective_release_and_value_vectorized(df, snap_date, median_lag_days, nfp_offset_days=None):
     """
     Vectorized logic to strictly determine what data was known on `snap_date`.
@@ -224,6 +232,7 @@ def get_effective_release_and_value_vectorized(df, snap_date, median_lag_days, n
 
     return result[['date', 'release_date', 'value']]
 
+@profiled("load_unifier_data.fetch_unifier_snapshots")
 def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
     """
     Master orchestrator for producing point-in-time accurate snapshots of Unifier data.

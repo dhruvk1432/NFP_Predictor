@@ -263,3 +263,26 @@ TUNE_EVERY_N_MONTHS = 12   # Re-tune hyperparameters every N months in backtest
 # =============================================================================
 
 CONFIDENCE_LEVELS = [0.50, 0.80, 0.95]
+
+
+# =============================================================================
+# UNION-FIRST CANDIDATE POOL + SHORT-PASS SELECTION
+# =============================================================================
+
+USE_UNION_POOL = True               # Master toggle for union pool + short-pass
+UNION_POOL_MAX = 200                # Max features in the global candidate pool
+SHORTPASS_TOPK = 60                 # Features selected per backtest step (40-80 range)
+SHORTPASS_METHOD = 'lgbm_gain'      # 'lgbm_gain' or 'weighted_corr'
+SHORTPASS_HALF_LIFE = None          # None = reuse backtest step half_life
+
+
+# =============================================================================
+# BASELINE KEEP-RULE
+# =============================================================================
+
+ENABLE_BASELINE_TRACKING = True     # Compute baselines alongside model
+BASELINE_ROLLING_WINDOW = 6         # Months for rolling_mean baseline
+KEEP_RULE_ENABLED = True            # Enforce hard keep-rule gating
+KEEP_RULE_WINDOW_M = 12             # Trailing OOS months to evaluate
+KEEP_RULE_TOLERANCE = 0.0           # Max allowed MAE degradation vs best baseline
+KEEP_RULE_ACTION = 'skip_save'      # 'fail' | 'fallback_to_baseline' | 'skip_save'

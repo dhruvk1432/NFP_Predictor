@@ -25,6 +25,7 @@ import re
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, TEMP_DIR, setup_logger
+from Data_ETA_Pipeline.perf_stats import inc_counter, install_hooks, profiled, perf_phase
 from Train.config import (
     MASTER_SNAPSHOTS_BASE,
     FRED_SNAPSHOTS_DIR,
@@ -38,6 +39,7 @@ from Train.config import (
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
 
 # Module-level cache for loaded data
 _snapshot_cache: Dict[str, pd.DataFrame] = {}
@@ -175,7 +177,8 @@ def load_fred_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> O
     cache_key = f"fred_{snapshot_date.strftime('%Y-%m')}"
 
     if use_cache and cache_key in _snapshot_cache:
-        return _snapshot_cache[cache_key].copy()
+        cached = _snapshot_cache[cache_key]
+        return cached.copy() if cached is not None else None
 
     path = get_fred_snapshot_path(snapshot_date)
     if not path.exists():
@@ -204,6 +207,7 @@ def load_fred_snapshot(snapshot_date: pd.Timestamp, use_cache: bool = True) -> O
     return df.copy() if use_cache else df
 
 
+@profiled("train.data_loader.load_master_snapshot")
 def load_master_snapshot(snapshot_date: pd.Timestamp,
                         target_type: str = 'nsa',
                         target_source: str = 'first_release',
@@ -263,6 +267,7 @@ def clear_snapshot_cache() -> None:
     logger.info("Snapshot cache cleared")
 
 
+@profiled("data_loader.load_target_data")
 def load_target_data(
     target_type: str = 'nsa',
     release_type: str = 'first',
@@ -297,11 +302,17 @@ def load_target_data(
     cache_key = f"target_{get_model_id(target_type, release_type, target_source)}"
 
     if use_cache and cache_key in _target_cache:
+        inc_counter("data_loader.target_cache.hit", 1)
         return _target_cache[cache_key].copy()
+    if use_cache:
+        inc_counter("data_loader.target_cache.miss", 1)
+    else:
+        inc_counter("data_loader.target_cache.bypass", 1)
 
     # Revised target: build from raw FRED snapshots instead of loading parquet
     if target_source == 'revised':
         logger.info(f"Building revised {target_type.upper()} target from raw FRED snapshots...")
+        inc_counter("data_loader.revised_target.build_invoked", 1)
         df = build_revised_target(target_type)
         model_id = get_model_id(target_type, release_type, target_source)
         if use_cache:
@@ -379,6 +390,7 @@ def load_all_target_data(release_type: str = 'first',
     return nsa_df, sa_df
 
 
+@profiled("data_loader.build_revised_target")
 def build_revised_target(target_type: str = 'nsa') -> pd.DataFrame:
     """
     Build revised target data from raw FRED snapshots.
@@ -409,16 +421,16 @@ def build_revised_target(target_type: str = 'nsa') -> pd.DataFrame:
         m = row['ds']
         release_date = row.get('release_date', pd.NaT)
 
-        # Load M+1 raw snapshot (levels)
+        # Load M+1 raw snapshot (levels) — use cached loader to avoid
+        # redundant parquet reads when called for both NSA and SA targets
         snapshot_date = m + pd.DateOffset(months=1)
-        snapshot_path = get_fred_snapshot_path(snapshot_date)
+        snap = load_fred_snapshot(snapshot_date, use_cache=True)
 
-        if not snapshot_path.exists():
+        if snap is None:
             records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,
                             'release_date': release_date})
             continue
 
-        snap = pd.read_parquet(snapshot_path)
         series_data = snap[snap['series_name'] == series_name]
         if series_data.empty:
             records.append({'ds': m, 'y': np.nan, 'y_mom': np.nan,
@@ -551,6 +563,7 @@ def get_lagged_target_features(
     return features
 
 
+@profiled("train.data_loader.batch_lagged_target_features")
 def batch_lagged_target_features(
     target_df: pd.DataFrame,
     prefix: str = 'nfp',
@@ -657,6 +670,7 @@ def prefilter_snapshot(
         return df[df['series_name'].isin(set(allowed_raw))]
 
 
+@profiled("train.data_loader.pivot_snapshot_to_wide")
 def pivot_snapshot_to_wide(
     snapshot_df: pd.DataFrame,
     target_month: pd.Timestamp,

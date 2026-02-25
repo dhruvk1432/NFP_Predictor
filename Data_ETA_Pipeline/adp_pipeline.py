@@ -20,9 +20,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, START_DATE, END_DATE, TEMP_DIR, setup_logger
+from Data_ETA_Pipeline.perf_stats import (
+    install_hooks,
+    profiled,
+    register_atexit_dump,
+)
 from utils.transforms import add_symlog_copies, add_pct_change_copies, compute_all_features
 
 logger = setup_logger(__file__, TEMP_DIR)
+install_hooks()
+register_atexit_dump("adp_pipeline", output_dir=TEMP_DIR / "perf")
 
 # =============================================================================
 # PATHS
@@ -44,6 +51,7 @@ ADP_API_URL = "https://endpoints.investing.com/pd-instruments/v1/calendars/econo
 # SECTION 1: API FETCHING
 # =============================================================================
 
+@profiled("adp_pipeline.fetch_adp_from_api")
 def fetch_adp_from_api() -> pd.DataFrame:
     """
     Fetch raw ADP national employment change data from the investing.com REST API.
@@ -143,6 +151,7 @@ def fetch_adp_from_api() -> pd.DataFrame:
 # SECTION 2: DATA LOADING
 # =============================================================================
 
+@profiled("adp_pipeline.load_adp_data")
 def load_adp_data() -> None:
     """
     Fetch ADP data from investing.com API and save to parquet.
@@ -208,6 +217,7 @@ def load_nfp_release_dates(start_date: str, end_date: str) -> pd.DataFrame:
     return nfp_releases
 
 
+@profiled("adp_pipeline.create_adp_snapshots")
 def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE):
     """
     Generate point-in-time master snapshots of the ADP data, precisely synchronized 

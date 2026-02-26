@@ -20,7 +20,9 @@ from Train.data_loader import (
     get_fred_snapshot_path,
     get_master_snapshot_path,
     load_target_data,
+    build_revised_target,
     get_lagged_target_features,
+    batch_lagged_target_features,
     pivot_snapshot_to_wide,
     clear_snapshot_cache,
     clear_target_cache,
@@ -113,7 +115,7 @@ class TestLaggedTargetFeatures:
         assert 'nfp_mom_lag12' in features
 
     def test_rolling_mean_features(self, sample_target_df):
-        """Test that rolling mean features are generated."""
+        """Test that rolling MoM trend features are generated."""
         target_month = pd.Timestamp('2020-06-01')
         features = get_lagged_target_features(
             sample_target_df,
@@ -121,9 +123,49 @@ class TestLaggedTargetFeatures:
             prefix='nfp'
         )
 
-        assert 'nfp_rolling_3m' in features
-        assert 'nfp_rolling_6m' in features
-        assert 'nfp_rolling_12m' in features
+        assert 'nfp_mom_rolling_3m' in features
+        assert 'nfp_mom_rolling_6m' in features
+        assert 'nfp_mom_rolling_12m' in features
+
+    def test_batch_includes_new_target_features(self, sample_target_df):
+        """Batch lookup should include all newly added lagged target features."""
+        target_month = pd.Timestamp('2020-12-01')
+        lookup = batch_lagged_target_features(sample_target_df, prefix='nfp')
+        features = lookup[target_month]
+
+        expected = {
+            'nfp_mom_lag2',
+            'nfp_mom_rolling_3m',
+            'nfp_mom_rolling_6m',
+            'nfp_mom_rolling_12m',
+            'nfp_mom_vol_6m',
+            'nfp_mom_vol_12m',
+            'nfp_mom_vs_trend',
+            'nfp_mom_yoy',
+            'nfp_positive_months_6m',
+        }
+        missing = expected - set(features.keys())
+        assert not missing, f"Missing expected features: {sorted(missing)}"
+
+    def test_get_lagged_matches_batch_for_existing_month(self, sample_target_df):
+        """Single-month helper and batch lookup should produce the same feature values."""
+        target_month = pd.Timestamp('2020-10-01')
+        batch_lookup = batch_lagged_target_features(sample_target_df, prefix='nfp')
+        expected = batch_lookup[target_month]
+        actual = get_lagged_target_features(sample_target_df, target_month, prefix='nfp')
+
+        assert set(actual.keys()) == set(expected.keys())
+        for key, value in expected.items():
+            assert np.isclose(actual[key], value)
+
+    def test_future_month_uses_latest_available_history(self, sample_target_df):
+        """Future months not present in target_df should still get PIT-safe lagged features."""
+        target_month = pd.Timestamp('2021-01-01')  # one month after fixture end
+        features = get_lagged_target_features(sample_target_df, target_month, prefix='nfp')
+        expected_lag1 = sample_target_df[sample_target_df['ds'] == '2020-12-01']['y_mom'].iloc[0]
+
+        assert 'nfp_mom_lag1' in features
+        assert np.isclose(features['nfp_mom_lag1'], expected_lag1)
 
     def test_no_look_ahead_bias(self, sample_target_df):
         """Test that only data before target month is used."""
@@ -367,6 +409,47 @@ class TestRevisedTargetCache:
         assert 'y_mom' in result.columns
 
 
+class TestBuildRevisedTarget:
+    """Tests for revised target construction from audit vintages."""
+
+    def test_build_revised_target_includes_cutoff_day_vintage(self, tmp_path):
+        """
+        Revised target should include vintages released exactly on cutoff day
+        (<= cutoff), not drop them as strict < cutoff.
+        """
+        first_release_path = tmp_path / "y_nsa_first_release.parquet"
+        first_release_df = pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2008-12-01", "2009-01-01", "2009-02-01"]),
+                "y": [136119.0, 132347.0, 132900.0],
+                "release_date": pd.to_datetime(["2009-01-09", "2009-02-06", "2009-03-06"]),
+            }
+        )
+        first_release_df.to_parquet(first_release_path, index=False)
+
+        audit_series = pd.DataFrame(
+            {
+                "ds": pd.to_datetime(
+                    ["2008-12-01", "2008-12-01", "2009-01-01", "2009-01-01", "2009-02-01"]
+                ),
+                "y": [136119.0, 135917.0, 132347.0, 132400.0, 132900.0],
+                "realtime_start": pd.to_datetime(
+                    ["2009-01-09", "2009-03-06", "2009-03-06", "2009-04-03", "2009-04-03"]
+                ),
+            }
+        )
+
+        with (
+            patch("Train.data_loader.get_target_path", return_value=first_release_path),
+            patch("Train.data_loader._load_revised_target_audit_cache", return_value={"total_nsa": audit_series}),
+        ):
+            out = build_revised_target("nsa")
+
+        row = out[out["ds"] == pd.Timestamp("2009-01-01")].iloc[0]
+        assert row["y"] == 132347.0
+        # 132347 - 135917 (both available exactly at 2009-03-06 cutoff)
+        assert row["y_mom"] == -3570.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

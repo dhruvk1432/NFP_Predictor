@@ -977,19 +977,21 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
     Outputs are fully-featured `.parquet` snapshots ready for direct modeling.
     """
     if not FRED_API_KEY:
-        logger.error("FRED_API_KEY not found")
-        return
+        raise RuntimeError("FRED_API_KEY not found")
     fred = Fred(api_key=FRED_API_KEY)
 
     # Load NFP schedule for weekly data aggregation AND snapshot alignment
     # OPTIMIZATION: Uses shared nfp_relative_timing module (cached)
     nfp_schedule = load_nfp_release_schedule()
     if nfp_schedule is None:
-        logger.error("NFP release schedule not found")
-        return
+        raise RuntimeError("NFP release schedule not found")
 
     # OPTIMIZATION: Use shared utility for release map (cached)
     nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+    if not nfp_release_map:
+        raise RuntimeError(
+            f"NFP release map is empty for requested window {start_date}..{end_date}"
+        )
 
     base_dir = DATA_PATH / "Exogenous_data" / "exogenous_fred_data"
 
@@ -1037,6 +1039,8 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
             except Exception as e:
                 logger.error(f"Failed to fetch {name}: {e}")
 
+    if not history_cache:
+        raise RuntimeError("No exogenous FRED series could be fetched")
 
     # 2. Generate Snapshots aligned with NFP release dates
     # OPTIMIZATION: Batch check existing snapshots to avoid 400+ filesystem calls
@@ -1070,6 +1074,7 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
         elif name == "Oil_Prices":
             daily_features_cache[name] = compute_oil_daily_features(df)
 
+    snapshots_written = 0
     for obs_month, snap_date in nfp_release_map.items():
         snap_date = pd.Timestamp(snap_date)
         obs_month = pd.Timestamp(obs_month)
@@ -1302,9 +1307,13 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
                     logger.warning(f"Unexpected: {len(unexpected_months)} past months filtered")
 
             full_snap.to_parquet(save_path)
+            snapshots_written += 1
 
         if obs_month.month == 12:
             logger.info(f"Saved {obs_month.year} snapshots")
+
+    if snapshots_written == 0:
+        raise RuntimeError("No exogenous FRED snapshots were written")
 
     logger.info("✓ FRED exogenous data download complete")
 

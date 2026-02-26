@@ -77,7 +77,7 @@ def _process_single_month_task(
 
     This function sequentially:
     1. Extracts calendar metrics (survey weeks, seasonality).
-    2. Collects historical NFP target lags (1m, 2m, 3m, 6m, 12m).
+    2. Collects historical NFP target lags/trend/regime features.
     3. Pivots the wide-format Master Snapshot for just this date cutoff.
     4. Computes short-term data revision metrics by comparing master[M] vs master[M-1].
 
@@ -249,7 +249,7 @@ def build_training_dataset(
     all_targets = []
     valid_dates = []
 
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     # Load both NSA and SA target data ONCE (cached) - use same release_type and target_source
     source_label = "revised" if target_source == "revised" else f"{release_type} release"
@@ -1030,6 +1030,7 @@ def train_and_evaluate(
             importance,
             target_type=target_type,
             release_type=release_type,
+            target_source=target_source,
         )
 
     # ── P1-6: Persist OOS metrics as structured JSON ──
@@ -1131,7 +1132,11 @@ def predict_nfp_mom(
 
     # Load model if not provided
     if model is None or metadata is None:
-        model, metadata = load_model(target_type=target_type, release_type=release_type)
+        model, metadata = load_model(
+            target_type=target_type,
+            release_type=release_type,
+            target_source=target_source,
+        )
 
     feature_cols = metadata['feature_cols']
     residuals = metadata['residuals']
@@ -1145,9 +1150,9 @@ def predict_nfp_mom(
     if snapshot_df is None or snapshot_df.empty:
         raise FileNotFoundError(f"No master snapshot available for {snapshot_date}")
 
-    # Load target data for lagged features - use same release_type
-    nsa_target_full = load_target_data('nsa', release_type=release_type)
-    sa_target_full = load_target_data('sa', release_type=release_type)
+    # Load target data for lagged features - use same release_type and target_source
+    nsa_target_full = load_target_data('nsa', release_type=release_type, target_source=target_source)
+    sa_target_full = load_target_data('sa', release_type=release_type, target_source=target_source)
 
     # Use NFP release date as strict cutoff when available
     target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
@@ -1215,17 +1220,30 @@ def convert_mom_to_level(
     return previous_level + mom_prediction
 
 
-def get_latest_prediction(target_type: str = 'nsa', release_type: str = 'first') -> Dict:
+def get_latest_prediction(
+    target_type: str = 'nsa',
+    release_type: str = 'first',
+    target_source: str = 'first_release',
+) -> Dict:
     """Get prediction for the most recent available month."""
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     # Find latest snapshot available
-    target_df = load_target_data(target_type=target_type, release_type=release_type)
+    target_df = load_target_data(
+        target_type=target_type,
+        release_type=release_type,
+        target_source=target_source,
+    )
     latest_target = target_df['ds'].max()
 
     logger.info(f"Making {model_id.upper()} prediction for latest available month: {latest_target}")
 
-    return predict_nfp_mom(latest_target, target_type=target_type, release_type=release_type)
+    return predict_nfp_mom(
+        latest_target,
+        target_type=target_type,
+        release_type=release_type,
+        target_source=target_source,
+    )
 
 
 # All 4 model combos for --train-all
@@ -1235,6 +1253,102 @@ ALL_COMBOS = [
     ('sa',  'first', 'first_release'),
     ('sa',  'first', 'revised'),
 ]
+
+
+def validate_post_train_all_artifacts(
+    run_model_ids: Optional[List[str]] = None,
+    combos: List[Tuple[str, str, str]] = ALL_COMBOS,
+    model_save_dir: Path = MODEL_SAVE_DIR,
+    metrics_dir: Path = OUTPUT_DIR / "backtest",
+    output_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Validate that train-all produced complete production artifacts.
+
+    Required artifacts:
+      1) 4 model files + 4 metadata files
+      2) 4 per-model metrics JSON files
+      3) model_comparison.csv/html
+      4) first_release and revised output bundles under _Output/
+    """
+    if output_root is None:
+        output_root = Path(__file__).resolve().parent.parent / "_Output"
+
+    required: List[Tuple[str, Path]] = []
+    optional: List[Tuple[str, Path]] = []
+    missing_required: List[str] = []
+    missing_optional: List[str] = []
+
+    expected_model_ids = [get_model_id(tt, rt, ts) for tt, rt, ts in combos]
+    if run_model_ids is not None:
+        missing_run_ids = sorted(set(expected_model_ids) - set(run_model_ids))
+        for mid in missing_run_ids:
+            missing_required.append(f"run_result::{mid}")
+
+    for model_id in expected_model_ids:
+        model_dir = model_save_dir / model_id
+        required.append((f"model::{model_id}", model_dir / f"lightgbm_{model_id}_model.txt"))
+        required.append((f"metadata::{model_id}", model_dir / f"lightgbm_{model_id}_metadata.pkl"))
+        required.append((f"metrics::{model_id}", metrics_dir / f"{model_id}_metrics.json"))
+
+    required.append(("comparison::csv", model_save_dir / "model_comparison.csv"))
+    required.append(("comparison::html", model_save_dir / "model_comparison.html"))
+
+    for target_source, suffix in [("first_release", ""), ("revised", "_revised")]:
+        required.append((
+            f"output::{target_source}::NSA_prediction",
+            output_root / f"NSA_prediction{suffix}" / "backtest_results.csv",
+        ))
+        required.append((
+            f"output::{target_source}::NSA_metrics",
+            output_root / f"NSA_prediction{suffix}" / "summary_statistics.csv",
+        ))
+        required.append((
+            f"output::{target_source}::NSA_importance",
+            output_root / f"NSA_prediction{suffix}" / "feature_importance.csv",
+        ))
+        required.append((
+            f"output::{target_source}::SA_prediction",
+            output_root / f"SA_prediction{suffix}" / "backtest_results.csv",
+        ))
+        required.append((
+            f"output::{target_source}::SA_metrics",
+            output_root / f"SA_prediction{suffix}" / "summary_statistics.csv",
+        ))
+        required.append((
+            f"output::{target_source}::SA_importance",
+            output_root / f"SA_prediction{suffix}" / "feature_importance.csv",
+        ))
+        required.append((
+            f"output::{target_source}::adjustment_prediction",
+            output_root / f"NSA_plus_adjustment{suffix}" / "backtest_results.csv",
+        ))
+        required.append((
+            f"output::{target_source}::adjustment_metrics",
+            output_root / f"NSA_plus_adjustment{suffix}" / "summary_statistics.csv",
+        ))
+
+        # predictions.csv can be absent when there are no future (NaN) months left.
+        optional.append((
+            f"output::{target_source}::forward_predictions",
+            output_root / f"Predictions{suffix}" / "predictions.csv",
+        ))
+
+    for label, path in required:
+        if not path.exists():
+            missing_required.append(f"{label}::{path}")
+
+    for label, path in optional:
+        if not path.exists():
+            missing_optional.append(f"{label}::{path}")
+
+    return {
+        "ok": len(missing_required) == 0,
+        "required_checked": len(required),
+        "optional_checked": len(optional),
+        "missing_required": missing_required,
+        "missing_optional": missing_optional,
+    }
 
 
 if __name__ == "__main__":
@@ -1394,6 +1508,21 @@ Examples:
                 )
 
         _total_elapsed = _time.time() - _train_all_t0
+        validation = validate_post_train_all_artifacts(
+            run_model_ids=list(all_train_results.keys()),
+        )
+        if not validation["ok"]:
+            logger.error("Post-train artifact validation FAILED.")
+            for missing in validation["missing_required"]:
+                logger.error(f"  MISSING REQUIRED: {missing}")
+            raise RuntimeError("Post-train artifact validation failed")
+        logger.info(
+            "Post-train artifact validation passed "
+            f"({validation['required_checked']} required artifacts found)."
+        )
+        for missing_opt in validation["missing_optional"]:
+            logger.warning(f"  MISSING OPTIONAL: {missing_opt}")
+
         logger.info(f"\n{'=' * 70}")
         logger.info(f"ALL 4 MODELS COMPLETE ({_total_elapsed / 60:.1f} minutes total)")
         logger.info(f"{'=' * 70}")
@@ -1456,7 +1585,8 @@ Examples:
         result = predict_nfp_mom(
             target_month,
             target_type=args.target,
-            release_type=args.release
+            release_type=args.release,
+            target_source=target_source,
         )
         print(f"\n{'='*60}")
         print(f"NFP {model_id.upper()} MoM Change Prediction for {target_month.strftime('%Y-%m')}")
@@ -1469,7 +1599,11 @@ Examples:
         print(f"Features Used: {result['features_used']}")
 
     elif args.latest:
-        result = get_latest_prediction(target_type=args.target, release_type=args.release)
+        result = get_latest_prediction(
+            target_type=args.target,
+            release_type=args.release,
+            target_source=target_source,
+        )
         print(f"\n{'='*60}")
         print(f"NFP {model_id.upper()} MoM Change Prediction for {result['target_month'].strftime('%Y-%m')}")
         print(f"{'='*60}")

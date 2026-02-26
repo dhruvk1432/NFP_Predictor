@@ -2,286 +2,167 @@
 """
 Predict Next NFP
 
-Production script to generate NFP predictions for the upcoming month.
-This script is the final deployment artifact that consumes the master snapshot,
-loads the latest LightGBM model (either NSA or SA), builds the exact feature set 
-expected by the model, handles missing feature imputation, and outputs the 
-final prediction along with dynamic confidence intervals (50%, 80%, 95%) 
-based on the model's historical OOS residuals.
-
-Usage:
-    python scripts/predict_next_nfp.py --target nsa
-    python scripts/predict_next_nfp.py --target sa --output report.json
+Production prediction entrypoint that delegates inference to the canonical
+Train/train_lightgbm_nfp.py pipeline.
 """
 
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
-import json
 import argparse
+import json
 import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
+
+import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, OUTPUT_DIR, TEMP_DIR, setup_logger
-from Train.config import MODEL_SAVE_DIR
-from Train.model import load_model, predict_with_intervals
+from settings import TEMP_DIR, setup_logger
+from Train.config import get_model_id
+from Train.train_lightgbm_nfp import get_latest_prediction, predict_nfp_mom
 
 logger = setup_logger(__file__, TEMP_DIR)
 
 
-def get_latest_snapshot_date() -> pd.Timestamp:
-    """
-    Find the most recent master snapshot available in the file system.
-    
-    Searches the `MASTER_SNAPSHOTS_DIR` for `.parquet` files, extracting
-    their YYYY-MM prefixes to determine the absolute latest snapshot month 
-    available for prediction.
-    
-    Returns:
-        pd.Timestamp: The exact month of the latest snapshot (e.g., '2024-11-01').
-        
-    Raises:
-        FileNotFoundError: If no master snapshots exist.
-        ValueError: If filenames cannot be parsed.
-    """
-    from Train.config import MASTER_SNAPSHOTS_DIR
-    
-    all_files = list(MASTER_SNAPSHOTS_DIR.rglob("*.parquet"))
-    
-    if not all_files:
-        raise FileNotFoundError("No master snapshots found")
-    
-    # Extract dates from filenames
-    dates = []
-    for f in all_files:
-        try:
-            date_str = f.stem  # e.g., "2024-11"
-            date = pd.to_datetime(date_str + "-01")
-            dates.append(date)
-        except:
-            continue
-    
-    if not dates:
-        raise ValueError("Could not parse snapshot dates")
-    
-    return max(dates)
+def _parse_target_month(month_text: str) -> pd.Timestamp:
+    """Parse YYYY-MM (or YYYY-MM-DD) into first-of-month Timestamp."""
+    month_text = month_text.strip()
+    if len(month_text) == 7:
+        month_text = f"{month_text}-01"
+    return pd.Timestamp(month_text).replace(day=1)
 
 
-def load_latest_snapshot(snapshot_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    Load the most recent master snapshot DataFrame for the given date.
-    
-    Args:
-        snapshot_date (pd.Timestamp): The date identified by `get_latest_snapshot_date`.
-        
-    Returns:
-        pd.DataFrame: The loaded master snapshot containing all economic series.
-        
-    Raises:
-        FileNotFoundError: If the exact snapshot file does not exist.
-    """
-    from Train.data_loader import load_master_snapshot
-    
-    snapshot = load_master_snapshot(snapshot_date)
-    
-    if snapshot is None:
-        raise FileNotFoundError(f"Snapshot not found for {snapshot_date}")
-    
-    return snapshot
+def _format_result(raw_result: Dict, target_source: str) -> Dict:
+    """Format canonical prediction output for script JSON/report compatibility."""
+    target_month = pd.Timestamp(raw_result["target_month"])
+    intervals = raw_result["intervals"]
 
-
-def build_prediction_features(
-    snapshot_df: pd.DataFrame,
-    target_month: pd.Timestamp,
-    target_type: str = 'nsa'
-) -> pd.DataFrame:
-    """
-    Build feature row for prediction from snapshot data.
-    
-    Args:
-        snapshot_df: Master snapshot DataFrame
-        target_month: Month to predict
-        target_type: 'nsa' or 'sa'
-        
-    Returns:
-        Single-row DataFrame with all features
-    """
-    from Train.data_loader import (
-        pivot_snapshot_to_wide,
-        get_lagged_target_features,
-        load_target_data
-    )
-    from Train.feature_engineering import add_calendar_features, get_calendar_features_dict
-
-    # Pivot snapshot to wide format
-    features = {}
-
-    # Get latest value for each series
-    for series_name in snapshot_df['series_name'].unique():
-        series_data = snapshot_df[snapshot_df['series_name'] == series_name]
-        if not series_data.empty:
-            features[f"{series_name}_latest"] = series_data['value'].iloc[-1]
-
-    # Add calendar features using the dict function
-    calendar_features = get_calendar_features_dict(target_month)
-    features.update(calendar_features)
-    
-    # Add lagged target features
-    try:
-        target_df = load_target_data(target_type)
-        prefix = f'nfp_{target_type}'
-        lagged = get_lagged_target_features(target_df, target_month, prefix)
-        features.update(lagged)
-    except Exception as e:
-        logger.warning(f"Could not load target data for lags: {e}")
-    
-    features['ds'] = target_month
-    
-    return pd.DataFrame([features])
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "target_month": target_month.strftime("%Y-%m"),
+        "target_type": raw_result["target_type"].upper(),
+        "release_type": raw_result["release_type"],
+        "target_source": target_source,
+        "model_id": raw_result["model_id"],
+        "prediction": {
+            "point_estimate": round(float(raw_result["prediction"]), 0),
+            "unit": "thousands of jobs (MoM change)",
+            "confidence_intervals": {
+                "50%": [round(float(intervals["50%"][0]), 0), round(float(intervals["50%"][1]), 0)],
+                "80%": [round(float(intervals["80%"][0]), 0), round(float(intervals["80%"][1]), 0)],
+                "95%": [round(float(intervals["95%"][0]), 0), round(float(intervals["95%"][1]), 0)],
+            },
+        },
+        "model_info": {
+            "features_used": int(raw_result.get("features_used", 0)),
+            "std": float(raw_result.get("std", 0.0)),
+            "mean_residual_bias": float(raw_result.get("mean_residual_bias", 0.0)),
+        },
+    }
 
 
 def generate_prediction(
-    target_type: str = 'nsa',
-    output_path: Path = None
-) -> dict:
+    target_type: str = "nsa",
+    release_type: str = "first",
+    target_source: str = "first_release",
+    target_month: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> Dict:
     """
-    Generate NFP prediction for the upcoming month.
-    
-    Args:
-        target_type: 'nsa' or 'sa'
-        output_path: Optional path to save JSON report
-        
-    Returns:
-        Dictionary with prediction results
+    Generate NFP prediction from the canonical train/inference pipeline.
     """
-    logger.info(f"Generating {target_type.upper()} prediction...")
-    
-    # Load model
-    try:
-        model, metadata = load_model(target_type=target_type)
-        logger.info("Model loaded successfully")
-    except FileNotFoundError:
-        logger.error(f"No trained model found for {target_type}")
-        return {'error': 'Model not found. Train a model first.'}
-    
-    feature_cols = metadata.get('feature_cols', [])
-    residuals = metadata.get('residuals', [])
-    
-    # Get latest snapshot
-    snapshot_date = get_latest_snapshot_date()
-    logger.info(f"Latest snapshot: {snapshot_date.strftime('%Y-%m')}")
-    
-    snapshot_df = load_latest_snapshot(snapshot_date)
-    
-    # Target month is the snapshot month (we predict current month's NFP)
-    target_month = snapshot_date
-    
-    # Build features
-    features_df = build_prediction_features(snapshot_df, target_month, target_type)
-    
-    # Check for missing features
-    available_cols = [c for c in feature_cols if c in features_df.columns]
-    missing_cols = [c for c in feature_cols if c not in features_df.columns]
-    
-    if missing_cols:
-        logger.warning(f"Missing {len(missing_cols)} features, using NaN")
-        for col in missing_cols:
-            features_df[col] = np.nan
-    
-    # Make prediction
-    X = features_df[feature_cols].values.reshape(1, -1)
-    
-    # Handle NaN with median imputation
-    X = np.nan_to_num(X, nan=0)
-    
-    prediction = model.predict(X)[0]
-    
-    # Calculate intervals
-    from Train.model import calculate_prediction_intervals
-    intervals = calculate_prediction_intervals(residuals, prediction)
-    
-    # Build result
-    result = {
-        'timestamp': datetime.now().isoformat(),
-        'target_type': target_type.upper(),
-        'target_month': target_month.strftime('%Y-%m'),
-        'prediction': {
-            'point_estimate': round(prediction, 0),
-            'unit': 'thousands of jobs (MoM change)',
-            'confidence_intervals': {
-                '50%': [round(intervals[0.50][0], 0), round(intervals[0.50][1], 0)],
-                '80%': [round(intervals[0.80][0], 0), round(intervals[0.80][1], 0)],
-                '95%': [round(intervals[0.95][0], 0), round(intervals[0.95][1], 0)],
-            }
-        },
-        'model_info': {
-            'features_used': len(available_cols),
-            'features_missing': len(missing_cols),
-            'residuals_count': len(residuals),
-        },
-        'snapshot_date': snapshot_date.strftime('%Y-%m')
-    }
-    
-    # Save if output path provided
+    model_id = get_model_id(target_type, release_type, target_source)
+    logger.info(f"Generating prediction using model {model_id.upper()}")
+
+    if target_month:
+        month_ts = _parse_target_month(target_month)
+        raw_result = predict_nfp_mom(
+            month_ts,
+            target_type=target_type,
+            release_type=release_type,
+            target_source=target_source,
+        )
+    else:
+        raw_result = get_latest_prediction(
+            target_type=target_type,
+            release_type=release_type,
+            target_source=target_source,
+        )
+
+    result = _format_result(raw_result, target_source=target_source)
+
     if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w') as f:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as f:
             json.dump(result, f, indent=2)
-        logger.info(f"Saved report to {output_path}")
-    
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"NFP PREDICTION: {target_month.strftime('%B %Y')}")
-    print(f"{'='*60}")
-    print(f"Type: {target_type.upper()}")
-    print(f"Point Estimate: {prediction:+,.0f}K jobs")
-    print(f"\nConfidence Intervals:")
-    print(f"  50%: [{intervals[0.50][0]:+,.0f}K, {intervals[0.50][1]:+,.0f}K]")
-    print(f"  80%: [{intervals[0.80][0]:+,.0f}K, {intervals[0.80][1]:+,.0f}K]")
-    print(f"  95%: [{intervals[0.95][0]:+,.0f}K, {intervals[0.95][1]:+,.0f}K]")
-    print(f"\nGenerated: {result['timestamp']}")
-    print(f"{'='*60}")
-    
+        logger.info(f"Saved prediction report to {out}")
+
+    ci = result["prediction"]["confidence_intervals"]
+    point = result["prediction"]["point_estimate"]
+    print(f"\n{'=' * 60}")
+    print(f"NFP PREDICTION: {result['target_month']} [{result['model_id'].upper()}]")
+    print(f"{'=' * 60}")
+    print(f"Point Estimate: {point:+,.0f}K jobs")
+    print(f"50% CI: [{ci['50%'][0]:+,.0f}K, {ci['50%'][1]:+,.0f}K]")
+    print(f"80% CI: [{ci['80%'][0]:+,.0f}K, {ci['80%'][1]:+,.0f}K]")
+    print(f"95% CI: [{ci['95%'][0]:+,.0f}K, {ci['95%'][1]:+,.0f}K]")
+    print(f"{'=' * 60}")
+
     return result
 
 
-def main():
-    """
-    CLI entry point. 
-    
-    Parses command-line arguments to determine the target type (nsa/sa) 
-    and optional JSON output paths, then triggers the prediction generation.
-    Returns standard exit codes (0 for success, 1 for failure/errors).
-    """
-    parser = argparse.ArgumentParser(
-        description="Generate NFP prediction for upcoming month"
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate NFP prediction")
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="nsa",
+        choices=["nsa", "sa"],
+        help="Target type (default: nsa)",
     )
     parser.add_argument(
-        '--target', type=str, default='nsa',
-        choices=['nsa', 'sa'],
-        help="Target type (default: nsa)"
+        "--release",
+        type=str,
+        default="first",
+        choices=["first", "last"],
+        help="Release type (default: first)",
     )
     parser.add_argument(
-        '--output', type=str, default=None,
-        help="Output path for JSON report"
+        "--revised",
+        action="store_true",
+        help="Use revised target-source model variant",
     )
-    
+    parser.add_argument(
+        "--month",
+        type=str,
+        default=None,
+        help="Predict specific month (YYYY-MM). Defaults to latest available.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional path for JSON report",
+    )
+
     args = parser.parse_args()
-    
-    result = generate_prediction(
-        target_type=args.target,
-        output_path=args.output
-    )
-    
-    if 'error' in result:
-        print(f"\nError: {result['error']}")
+    target_source = "revised" if args.revised else "first_release"
+
+    try:
+        generate_prediction(
+            target_type=args.target,
+            release_type=args.release,
+            target_source=target_source,
+            target_month=args.month,
+            output_path=args.output,
+        )
+        return 0
+    except Exception as exc:
+        logger.error(f"Prediction failed: {exc}")
+        print(f"\nError: {exc}")
         return 1
-    
-    return 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())

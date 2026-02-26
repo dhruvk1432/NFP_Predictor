@@ -287,6 +287,7 @@ def run_stage(
     steps: List[Tuple[str, str, str, List[str]]],
     skip_steps: List[str] = None,
     fresh: bool = False,
+    stop_on_failure: bool = False,
 ) -> Tuple[int, int, float]:
     """Run all steps in a pipeline stage. Returns (successful, failed, duration)."""
     skip_steps = skip_steps or []
@@ -319,6 +320,10 @@ def run_stage(
         else:
             print_error(f"Failed after {format_duration(duration)}")
             failed += 1
+            if stop_on_failure:
+                print_error(f"Aborting stage '{stage_name}' after failure in step '{name}'")
+                print()
+                break
 
         print()
 
@@ -419,13 +424,15 @@ def run_data_pipeline(
         print()
 
     # Load
-    s, f, d = run_stage("LOAD DATA", LOAD_DATA_STEPS, skip_steps, fresh=fresh)
+    s, f, d = run_stage("LOAD DATA", LOAD_DATA_STEPS, skip_steps, fresh=fresh, stop_on_failure=True)
     total_successful += s
     total_failed += f
     stage_durations["Load Data"] = d
 
     if f > 0:
-        print_warning("Some load steps failed. Continuing to prepare stage...")
+        print_error("Load stage failed. Aborting data pipeline before prepare stage.")
+        _print_summary(stage_durations, total_successful, total_failed, time.time() - start_time)
+        return False
 
     # Prepare
     s, f, d = run_stage("PREPARE DATA", PREPARE_DATA_STEPS, skip_steps, fresh=fresh)
@@ -524,12 +531,16 @@ def run_full_pipeline(
 
     # Stage 1: Load Data
     if stage is None or stage == "load":
-        s, f, d = run_stage("LOAD DATA", LOAD_DATA_STEPS, skip_steps, fresh=fresh)
+        s, f, d = run_stage("LOAD DATA", LOAD_DATA_STEPS, skip_steps, fresh=fresh, stop_on_failure=True)
         total_successful += s
         total_failed += f
         stage_durations["Load Data"] = d
-        if f > 0 and stage is None:
-            print_warning("Some load steps failed. Continuing to prepare stage...")
+        if f > 0:
+            if stage is None:
+                print_error("Load stage failed. Aborting full pipeline before prepare/train stages.")
+            total_duration = time.time() - start_time
+            _print_summary(stage_durations, total_successful, total_failed, total_duration)
+            return False
 
     # Stage 2: Prepare Data
     if stage is None or stage == "prepare":

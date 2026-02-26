@@ -425,6 +425,7 @@ def save_model(
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
     release_type: str = 'first',
+    target_source: str = 'first_release',
 ) -> None:
     """
     Save model and associated metadata.
@@ -437,8 +438,9 @@ def save_model(
         save_dir: Base directory for model storage
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
+        target_source: 'first_release' or 'revised'
     """
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
 
     # Create subdirectory for this model variant
     model_dir = save_dir / model_id
@@ -454,6 +456,7 @@ def save_model(
         'importance': importance,
         'target_type': target_type,
         'release_type': release_type,
+        'target_source': target_source,
         'model_id': model_id,
     }
 
@@ -466,7 +469,8 @@ def save_model(
 def load_model(
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
-    release_type: str = 'first'
+    release_type: str = 'first',
+    target_source: str = 'first_release',
 ) -> Tuple[lgb.Booster, Dict]:
     """
     Load model and associated metadata.
@@ -475,18 +479,26 @@ def load_model(
         save_dir: Base directory for model storage
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
+        target_source: 'first_release' or 'revised'
 
     Returns:
         Tuple of (model, metadata)
     """
-    model_id = get_model_id(target_type, release_type)
+    model_id = get_model_id(target_type, release_type, target_source)
     model_dir = save_dir / model_id
 
     model_path = model_dir / f"lightgbm_{model_id}_model.txt"
     metadata_path = model_dir / f"lightgbm_{model_id}_metadata.pkl"
 
-    # Fallback to legacy paths for backward compatibility
+    # Fallback to legacy paths for backward compatibility.
+    # Legacy models have no target_source dimension and therefore map only
+    # to first_release behavior.
     if not model_path.exists():
+        if target_source != 'first_release':
+            raise FileNotFoundError(
+                f"Model not found for {model_id}: {model_path}. "
+                "Train and save the revised model variant explicitly."
+            )
         # Try legacy path format
         legacy_model_path = save_dir / f"lightgbm_{target_type}_model.txt"
         legacy_metadata_path = save_dir / f"lightgbm_{target_type}_metadata.pkl"
@@ -502,6 +514,8 @@ def load_model(
 
     with open(metadata_path, 'rb') as f:
         metadata = pickle.load(f)
+    if isinstance(metadata, dict):
+        metadata.setdefault('target_source', target_source)
 
     logger.info(f"Model {model_id.upper()} loaded from {model_dir}")
 

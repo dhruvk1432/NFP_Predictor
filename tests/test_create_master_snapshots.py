@@ -36,6 +36,7 @@ from Data_ETA_Pipeline.create_master_snapshots import (
     MASTER_BASE,
     HARD_CODED_REGIME_STARTS,
 )
+from Train.data_loader import sanitize_feature_name
 
 
 # =============================================================================
@@ -252,6 +253,78 @@ class TestBatchLoadSource:
         )
         assert result == {}
 
+    def test_matches_sanitized_feature_names_and_outputs_sanitized_columns(self, tmp_path):
+        """Selected sanitized names should map to raw columns and output sanitized columns."""
+        month = pd.Timestamp('2020-06-01')
+        path = _snapshot_path(tmp_path, month)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        raw_1 = "Prosper Consumer Spending Forecast|Consumer Spending Forecast (18-34)"
+        raw_2 = (
+            "Regarding the U.S. employment environment over the next six (6) months, "
+            "do you think that there will be more, the same, or fewer layoffs than at "
+            "present? Same (Males) diff"
+        )
+
+        df = pd.DataFrame(
+            {
+                'date': pd.date_range('2019-01-01', periods=3, freq='MS'),
+                raw_1: [1.0, 2.0, 3.0],
+                raw_2: [10.0, 11.0, 12.0],
+                'other_feature': [99.0, 98.0, 97.0],
+            }
+        )
+        df.to_parquet(path, index=False)
+
+        s1 = sanitize_feature_name(raw_1)
+        s2 = sanitize_feature_name(raw_2)
+        out = _batch_load_source(
+            'TestSource',
+            tmp_path,
+            [month],
+            allowed_features={s1, s2},
+        )
+
+        assert '2020-06' in out
+        wide = out['2020-06']
+        assert s1 in wide.columns
+        assert s2 in wide.columns
+        assert raw_1 not in wide.columns
+        assert raw_2 not in wide.columns
+        assert 'other_feature' not in wide.columns
+        assert wide[s1].tolist() == [1.0, 2.0, 3.0]
+        assert wide[s2].tolist() == [10.0, 11.0, 12.0]
+
+    def test_handles_sanitized_name_collisions_with_first_non_null(self, tmp_path):
+        """If two raw columns sanitize to same key, output should use first non-null value."""
+        month = pd.Timestamp('2020-07-01')
+        path = _snapshot_path(tmp_path, month)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        raw_a = "a.b"
+        raw_b = "a|b"
+        sanitized = sanitize_feature_name(raw_a)
+        assert sanitized == sanitize_feature_name(raw_b)
+
+        df = pd.DataFrame(
+            {
+                'date': pd.date_range('2019-01-01', periods=2, freq='MS'),
+                raw_a: [np.nan, 2.0],
+                raw_b: [1.0, np.nan],
+            }
+        )
+        df.to_parquet(path, index=False)
+
+        out = _batch_load_source(
+            'TestSource',
+            tmp_path,
+            [month],
+            allowed_features={sanitized},
+        )
+        wide = out['2020-07']
+        assert sanitized in wide.columns
+        assert wide[sanitized].tolist() == [1.0, 2.0]
+
 
 class TestLoadAllSourcesFromCache:
     """Tests for _load_all_sources_from_cache assembly."""
@@ -463,7 +536,7 @@ class TestRegimeSelection:
         )
         monkeypatch.setattr(cms, "_check_regime_cache", lambda *args, **kwargs: None)
 
-        def fake_parallel_selection(target_cat, target_source, asof_month=None):
+        def fake_parallel_selection(target_cat, target_source, asof_month=None, stages=None):
             asof_key = pd.Timestamp(asof_month).strftime("%Y-%m")
             return ["feat_old"] if asof_key == "2020-01" else ["feat_new"]
 
@@ -535,6 +608,110 @@ class TestTargetScopeResolution:
         assert combos == [("nsa", "revised"), ("sa", "revised")]
 
 
+class TestSkipFeatureSelectionFastPath:
+    """Tests for skip-feature-selection parallel fast-path activation/fallback."""
+
+    def test_dispatches_to_fast_path_when_enabled(self, tmp_path, monkeypatch):
+        import Data_ETA_Pipeline.create_master_snapshots as cms
+
+        master_base = tmp_path / "master_snapshots"
+        monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
+        monkeypatch.setattr(cms, "END_DATE", "2020-01-01")
+        monkeypatch.setattr(
+            cms,
+            "get_nfp_release_map",
+            lambda start_date, end_date: {
+                pd.Timestamp("2020-01-01"): pd.Timestamp("2020-01-10")
+            },
+        )
+        monkeypatch.setattr(
+            cms,
+            "_resolve_target_combos",
+            lambda start_dt, end_dt, scope: list(cms.DEFAULT_TARGET_COMBOS),
+        )
+
+        called = {}
+
+        def fake_fast_path(target_combos, snapshot_pairs, skip_existing):
+            called["target_combos"] = list(target_combos)
+            called["snapshot_pairs"] = list(snapshot_pairs)
+            called["skip_existing"] = skip_existing
+            return True
+
+        monkeypatch.setattr(cms, "_run_skip_fs_parallel_fast_path", fake_fast_path)
+
+        cms.create_master_snapshots(skip_feature_selection=True, skip_existing=True)
+
+        assert called["target_combos"] == list(cms.DEFAULT_TARGET_COMBOS)
+        assert called["snapshot_pairs"] == [
+            (pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+        ]
+        assert called["skip_existing"] is True
+
+    def test_falls_back_to_legacy_skip_fs_when_fast_path_unavailable(self, tmp_path, monkeypatch):
+        import Data_ETA_Pipeline.create_master_snapshots as cms
+
+        master_base = tmp_path / "master_snapshots"
+        source_dir = tmp_path / "mock_sources" / "adp" / "decades"
+        target_obs = pd.Timestamp("2020-01-01")
+        target_snap = pd.Timestamp("2020-01-10")
+
+        monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "first_release")])
+        monkeypatch.setattr(cms, "SOURCES", {"ADP": source_dir})
+        monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
+        monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
+        monkeypatch.setattr(cms, "END_DATE", "2020-01-01")
+        monkeypatch.setattr(
+            cms,
+            "get_nfp_release_map",
+            lambda start_date, end_date: {target_obs: target_snap},
+        )
+        monkeypatch.setattr(
+            cms,
+            "_resolve_target_combos",
+            lambda start_dt, end_dt, scope: [("nsa", "first_release")],
+        )
+        monkeypatch.setattr(cms, "_run_skip_fs_parallel_fast_path", lambda *args, **kwargs: False)
+
+        cache_path = master_base / "selected_features_nsa_first_release.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(
+                {
+                    "last_run_date": "2026-01-01",
+                    "target_source": "first_release",
+                    "target_cat": "nsa",
+                    "features": ["feat_a"],
+                },
+                f,
+            )
+
+        def fake_batch_load(source_name, source_dir, snapshot_months, allowed_features):
+            result = {}
+            for month in snapshot_months:
+                result[month.strftime("%Y-%m")] = pd.DataFrame(
+                    {
+                        "date": pd.date_range(month, periods=2, freq="MS"),
+                        "feat_a": [1.0, 2.0],
+                    }
+                )
+            return result
+
+        monkeypatch.setattr(cms, "_batch_load_source", fake_batch_load)
+
+        cms.create_master_snapshots(skip_feature_selection=True, skip_existing=False)
+
+        out_path = cms._snapshot_path(
+            master_base / "nsa" / "first_release" / "decades",
+            target_obs,
+        )
+        assert out_path.exists()
+        out_df = pd.read_parquet(out_path)
+        assert "feat_a" in out_df.columns
+
+
 class TestSourceSpecificMinObs:
     """Tests for source-specific short-history filtering."""
 
@@ -571,7 +748,7 @@ class TestSourceSpecificMinObs:
 
         captured = {}
 
-        def fake_pipeline(snap_wide, y_mom, source_name, snapshots_dir, series_groups):
+        def fake_pipeline(snap_wide, y_mom, source_name, snapshots_dir, series_groups, stages=None):
             captured["cols"] = list(snap_wide.columns)
             return list(snap_wide.columns)
 

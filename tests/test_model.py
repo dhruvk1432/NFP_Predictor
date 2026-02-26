@@ -7,6 +7,7 @@ Tests for LightGBM model training, prediction, and persistence functions.
 import pytest
 import pandas as pd
 import numpy as np
+import pickle
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -19,6 +20,7 @@ from Train.model import (
     calculate_prediction_intervals,
     get_model_id,
     LIGHTGBM_AVAILABLE,
+    save_model,
 )
 
 from Train.config import (
@@ -215,6 +217,37 @@ class TestLightGBMAvailability:
     def test_lightgbm_available_is_bool(self):
         """Test that LIGHTGBM_AVAILABLE is a boolean."""
         assert isinstance(LIGHTGBM_AVAILABLE, bool)
+
+
+class TestSaveModelMetadata:
+    """Tests for save_model metadata payload behavior."""
+
+    def test_save_model_persists_extra_metadata(self, tmp_path):
+        """extra_metadata fields should be saved into metadata.pkl."""
+
+        class DummyModel:
+            def save_model(self, path):
+                Path(path).write_text("dummy-model")
+
+        save_model(
+            model=DummyModel(),
+            feature_cols=["f1", "f2"],
+            residuals=[1.0, -1.0],
+            importance={"f1": 10.0, "f2": 0.0},
+            save_dir=tmp_path,
+            target_type="nsa",
+            release_type="first",
+            target_source="revised",
+            extra_metadata={"production_eligible": False, "keep_rule_failed": True},
+        )
+
+        meta_path = tmp_path / "nsa_first_revised" / "lightgbm_nsa_first_revised_metadata.pkl"
+        assert meta_path.exists()
+        with open(meta_path, "rb") as f:
+            payload = pickle.load(f)
+
+        assert payload["production_eligible"] is False
+        assert payload["keep_rule_failed"] is True
 
 
 if __name__ == "__main__":

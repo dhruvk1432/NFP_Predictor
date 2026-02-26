@@ -40,6 +40,7 @@ from Train.config import (
     VALID_RELEASE_TYPES,
     get_model_id,
     get_target_path,
+    load_selected_features,
     USE_HUBER_LOSS_DEFAULT,
     HUBER_DELTA,
     TUNE_EVERY_N_MONTHS,
@@ -65,8 +66,7 @@ def _process_single_month_task(
     target_type: str,
     release_type: str,
     target_source: str,
-    nsa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
-    sa_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
+    target_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """
     Helper function to process the feature engineering for a single month in parallel.
@@ -77,7 +77,7 @@ def _process_single_month_task(
 
     This function sequentially:
     1. Extracts calendar metrics (survey weeks, seasonality).
-    2. Collects historical NFP target lags/trend/regime features.
+    2. Collects historical branch-target lag/trend/regime features.
     3. Pivots the wide-format Master Snapshot for just this date cutoff.
     4. Computes short-term data revision metrics by comparing master[M] vs master[M-1].
 
@@ -89,8 +89,7 @@ def _process_single_month_task(
         target_type: 'nsa' or 'sa'.
         release_type: 'first' or 'last'.
         target_source: 'first_release' or 'revised'.
-        nsa_lags_lookup: Pre-computed dictionary of NSA target lags.
-        sa_lags_lookup: Pre-computed dictionary of SA target lags.
+        target_lags_lookup: Pre-computed dictionary of branch-target lags.
 
     Returns:
         Tuple of (feature dict, target value). None if snapshot missing.
@@ -102,9 +101,8 @@ def _process_single_month_task(
     cal_features = get_calendar_features_dict(target_month)
     features.update(cal_features)
 
-    # 2. Add Lagged Target Features (NSA & SA) — O(1) dict lookup
-    features.update(nsa_lags_lookup.get(target_month, {}))
-    features.update(sa_lags_lookup.get(target_month, {}))
+    # 2. Add branch-target lagged features — O(1) dict lookup
+    features.update(target_lags_lookup.get(target_month, {}))
 
     # 3. Load pre-merged, pre-selected master snapshot (contains ALL sources)
     snapshot_df = load_master_snapshot(snapshot_date, target_type=target_type,
@@ -154,6 +152,13 @@ from Train.config import (
     USE_UNION_POOL, UNION_POOL_MAX, SHORTPASS_TOPK, SHORTPASS_METHOD,
     SHORTPASS_HALF_LIFE, ENABLE_BASELINE_TRACKING, BASELINE_ROLLING_WINDOW,
     KEEP_RULE_ENABLED, KEEP_RULE_WINDOW_M, KEEP_RULE_TOLERANCE, KEEP_RULE_ACTION,
+    USE_BRANCH_TARGET_FS, BRANCH_TARGET_FS_TOPK, BRANCH_TARGET_FS_METHOD,
+    BRANCH_TARGET_FS_CORR_THRESHOLD, BRANCH_TARGET_FS_MIN_OVERLAP,
+)
+
+from Train.branch_target_selection import (
+    partition_feature_columns,
+    select_branch_target_features_for_step,
 )
 
 from Train.model import (
@@ -213,6 +218,18 @@ def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> Lis
     return list(X_work.columns)
 
 
+def _merge_unique_feature_lists(*groups: List[str]) -> List[str]:
+    """Merge feature name groups while preserving input order and uniqueness."""
+    merged: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for feature in group:
+            if feature not in seen:
+                seen.add(feature)
+                merged.append(feature)
+    return merged
+
+
 @profiled("train.build_training_dataset")
 def build_training_dataset(
     target_df: pd.DataFrame,
@@ -231,7 +248,7 @@ def build_training_dataset(
 
     Uses the NFP release_date as the data cutoff (e.g., May 3rd for April NFP),
     matching inference behavior so the model learns from intra-month data.
-    Includes lagged target features from BOTH NSA and SA data.
+    Includes lagged target features from the branch's own target history.
 
     Args:
         target_df: Target DataFrame with y_mom column (the prediction target)
@@ -251,17 +268,18 @@ def build_training_dataset(
 
     model_id = get_model_id(target_type, release_type, target_source)
 
-    # Load both NSA and SA target data ONCE (cached) - use same release_type and target_source
+    # Load branch target data once (cached) for lag feature engineering
     source_label = "revised" if target_source == "revised" else f"{release_type} release"
-    logger.info(f"Loading NSA and SA {source_label} target data for feature engineering...")
-    nsa_target_full = load_target_data('nsa', release_type=release_type, target_source=target_source)
-    sa_target_full = load_target_data('sa', release_type=release_type, target_source=target_source)
+    logger.info(f"Loading {target_type.upper()} {source_label} target data for feature engineering...")
+    branch_target_full = load_target_data(
+        target_type, release_type=release_type, target_source=target_source
+    )
 
-    # Pre-compute ALL lagged target features vectorized (shift/rolling) instead
-    # of per-worker filtering. Produces lightweight dicts for O(1) worker lookup.
-    logger.info("Pre-computing vectorized lagged target features...")
-    nsa_lags_lookup = batch_lagged_target_features(nsa_target_full, prefix='nfp_nsa')
-    sa_lags_lookup = batch_lagged_target_features(sa_target_full, prefix='nfp_sa')
+    # Pre-compute branch-target lagged features vectorized (shift/rolling)
+    # instead of per-worker filtering. Produces O(1) worker lookups.
+    target_prefix = f"nfp_{target_type}"
+    logger.info(f"Pre-computing vectorized lagged target features ({target_prefix})...")
+    target_lags_lookup = batch_lagged_target_features(branch_target_full, prefix=target_prefix)
 
     # Filter target data by date range
     filtered_df = target_df.copy()
@@ -277,7 +295,7 @@ def build_training_dataset(
     _build_t0 = _time.time()
 
     # Build release_date lookup (vectorized — no iterrows)
-    target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
+    target_ref = branch_target_full
     release_date_map = {}
     if 'release_date' in target_ref.columns:
         valid_mask = target_ref['release_date'].notna()
@@ -297,7 +315,7 @@ def build_training_dataset(
             release_date_map.get(tm, tm),
             tm + pd.offsets.MonthEnd(0),
             target_type, release_type, target_source,
-            nsa_lags_lookup, sa_lags_lookup,
+            target_lags_lookup,
         ))
 
     logger.info(f"Starting parallel feature engineering for {len(tasks)} months using all processors...")
@@ -405,9 +423,8 @@ def run_expanding_window_backtest(
 
     logger.info(f"Backtest period: {BACKTEST_MONTHS} months ({backtest_months[0].strftime('%Y-%m')} to {backtest_months[-1].strftime('%Y-%m')})")
 
-    # Load target data for lagged features (cached) - use same release_type and target_source
-    load_target_data('nsa', release_type=release_type, target_source=target_source)
-    load_target_data('sa', release_type=release_type, target_source=target_source)
+    # Warm branch-target cache used in lagged feature engineering
+    load_target_data(target_type, release_type=release_type, target_source=target_source)
 
     # Build FULL feature dataset once
     logger.info("Building full feature dataset...")
@@ -440,6 +457,16 @@ def run_expanding_window_backtest(
         from Train.candidate_pool import load_or_build_union_pool
         candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
         logger.info(f"Union candidate pool loaded: {len(candidate_pool)} features")
+
+    # Baseline branch snapshot feature set (expected ~50 from master snapshots).
+    # These are kept as the structural base; derived features are additive.
+    master_snapshot_base_features = load_selected_features(
+        target_type=target_type, target_source=target_source
+    )
+    logger.info(
+        f"Loaded master snapshot base feature set for {model_id}: "
+        f"{len(master_snapshot_base_features)} features"
+    )
 
     tuned_params = None  # Cached tuned hyperparameters
 
@@ -505,35 +532,105 @@ def run_expanding_window_backtest(
         with perf_phase("train.backtest.step.clean_features", step=i):
             # Recompute clean_features every step (feature availability changes as window expands)
             cleaned_features = clean_features(X_train_valid, y_train_valid)
-            feature_cols = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
+            cleaned_features = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
+
+        # Partition features so branch models keep their own target-derived signals
+        groups = partition_feature_columns(cleaned_features, target_type=target_type)
+        snapshot_candidates = groups['snapshot_features']
+        branch_target_candidates = groups['target_branch_features']
+        dropped_cross_target = groups['other_target_features']
+        always_keep = _merge_unique_feature_lists(
+            groups['calendar_features'],
+            groups['revision_features'],
+        )
+
+        # Keep branch base snapshot features (from selected_features_*.json) even
+        # if sparse in the current window; LightGBM handles NaN natively.
+        snapshot_base_features = [
+            f for f in master_snapshot_base_features if f in X_train_valid.columns and f != 'ds'
+        ]
+        if not snapshot_base_features:
+            # Safety fallback for unexpected cache/schema mismatch.
+            snapshot_base_features = [c for c in snapshot_candidates if c in X_train_valid.columns]
 
         # Compute default sample weights for initial/static use
         default_half_life = 60.0
         weights = calculate_sample_weights(X_train_valid, target_month, default_half_life)
 
-        # ── Short-pass selection from union candidate pool ──
-        if USE_UNION_POOL and candidate_pool is not None:
-            candidate_in_data = [f for f in candidate_pool if f in feature_cols]
-            logger.info(f"Feature pipeline: clean={len(feature_cols)}, pool={len(candidate_pool)}, "
-                        f"intersection={len(candidate_in_data)}")
+        # Shared weights for short-pass rankers (snapshot + branch-target)
+        _current_params = tuned_params if (tune and tuned_params is not None) else static_params
+        sp_half_life = SHORTPASS_HALF_LIFE or _current_params.get('half_life_months', default_half_life)
+        sp_weights = calculate_sample_weights(X_train_valid, target_month, sp_half_life)
 
-            if len(candidate_in_data) > SHORTPASS_TOPK:
-                with perf_phase("train.backtest.step.short_pass", step=i):
-                    from Train.short_pass_selection import select_features_for_step
-                    _current_params = tuned_params if (tune and tuned_params is not None) else static_params
-                    sp_half_life = SHORTPASS_HALF_LIFE or _current_params.get('half_life_months', default_half_life)
-                    sp_weights = calculate_sample_weights(X_train_valid, target_month, sp_half_life)
-                    feature_cols = select_features_for_step(
-                        X_train_valid[candidate_in_data], y_train_valid,
-                        candidate_features=candidate_in_data,
-                        top_k=SHORTPASS_TOPK,
-                        method=SHORTPASS_METHOD,
-                        sample_weights=sp_weights,
-                    )
-                    logger.info(f"Short-pass selected {len(feature_cols)} features")
+        # ── Snapshot feature selection (base 50 + optional extra short-pass) ──
+        snapshot_selected = snapshot_base_features
+        snapshot_base_set = set(snapshot_base_features)
+        snapshot_extra_candidates = [
+            c for c in snapshot_candidates if c in X_train_valid.columns and c not in snapshot_base_set
+        ]
+
+        if USE_UNION_POOL and candidate_pool is not None:
+            candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
+            logger.info(
+                f"Snapshot pool (extras): base={len(snapshot_base_features)}, "
+                f"extra_candidates={len(snapshot_extra_candidates)}, pool={len(candidate_pool)}, "
+                f"intersection={len(candidate_in_data)}"
+            )
+
+            if candidate_in_data:
+                if len(candidate_in_data) > SHORTPASS_TOPK:
+                    with perf_phase("train.backtest.step.short_pass", step=i):
+                        from Train.short_pass_selection import select_features_for_step
+                        snapshot_extra_selected = select_features_for_step(
+                            X_train_valid[candidate_in_data], y_train_valid,
+                            candidate_features=candidate_in_data,
+                            top_k=SHORTPASS_TOPK,
+                            method=SHORTPASS_METHOD,
+                            sample_weights=sp_weights,
+                        )
+                        logger.info(f"Snapshot short-pass selected {len(snapshot_extra_selected)} extra features")
+                else:
+                    snapshot_extra_selected = candidate_in_data
+                    logger.info(f"Snapshot pool intersection ({len(candidate_in_data)}) <= top_k, using all")
+                snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
             else:
-                feature_cols = candidate_in_data
-                logger.info(f"Pool intersection ({len(candidate_in_data)}) <= top_k, using all")
+                logger.warning(
+                    "Union pool had no overlap with snapshot extra candidates; using base snapshot features."
+                )
+
+        # ── Branch-target derived feature selection ──
+        if USE_BRANCH_TARGET_FS and branch_target_candidates:
+            with perf_phase("train.backtest.step.branch_target_fs", step=i):
+                branch_target_selected = select_branch_target_features_for_step(
+                    X_train=X_train_valid,
+                    y_train=y_train_valid,
+                    target_type=target_type,
+                    candidate_features=branch_target_candidates,
+                    top_k=BRANCH_TARGET_FS_TOPK,
+                    method=BRANCH_TARGET_FS_METHOD,
+                    corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
+                    min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
+                    sample_weights=sp_weights,
+                )
+        else:
+            branch_target_selected = branch_target_candidates
+
+        feature_cols = _merge_unique_feature_lists(
+            snapshot_selected,
+            branch_target_selected,
+            always_keep,
+        )
+        logger.info(
+            f"Feature pipeline: snapshot={len(snapshot_selected)} "
+            f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
+            f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)}, "
+            f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
+            f"final={len(feature_cols)}"
+        )
+
+        if not feature_cols:
+            logger.warning("No features selected for this step; skipping month.")
+            continue
 
         # ── Track short-pass stability (Jaccard similarity) ──
         current_set = set(feature_cols)
@@ -973,19 +1070,107 @@ def train_and_evaluate(
 
     logger.info(f"Total observations: {len(X_full)}, Valid for training: {len(X_full_valid)}")
 
-    # Basic feature cleaning (no feature selection)
+    # Final target_month anchor for the production model is simply the most recent date available
+    # or equivalently, a future date where we plan to predict. But to be safe, we anchor it to 
+    # the max date in the data (most recent NFP print).
+    final_target_month = pd.to_datetime(X_full_valid['ds'].max())
+
+    # Final feature selection mirrors backtest policy:
+    # snapshot features (+ optional union short-pass) + selected branch-target derived features
     cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
-    feature_cols = cleaned_feature_cols
+    cleaned_feature_cols = [c for c in cleaned_feature_cols if c in X_full_valid.columns and c != 'ds']
+    groups = partition_feature_columns(cleaned_feature_cols, target_type=target_type)
+
+    snapshot_candidates = groups['snapshot_features']
+    master_snapshot_base_features = load_selected_features(
+        target_type=target_type, target_source=target_source
+    )
+    snapshot_base_features = [
+        f for f in master_snapshot_base_features if f in X_full_valid.columns and f != 'ds'
+    ]
+    if not snapshot_base_features:
+        snapshot_base_features = [c for c in snapshot_candidates if c in X_full_valid.columns]
+
+    snapshot_base_set = set(snapshot_base_features)
+    snapshot_extra_candidates = [
+        c for c in snapshot_candidates if c in X_full_valid.columns and c not in snapshot_base_set
+    ]
+
+    branch_target_candidates = groups['target_branch_features']
+    always_keep = _merge_unique_feature_lists(
+        groups['calendar_features'],
+        groups['revision_features'],
+    )
+    dropped_cross_target = groups['other_target_features']
+
+    fs_half_life = SHORTPASS_HALF_LIFE or 60.0
+    fs_weights = calculate_sample_weights(X_full_valid, final_target_month, fs_half_life)
+
+    snapshot_selected = snapshot_base_features
+    if USE_UNION_POOL:
+        from Train.candidate_pool import load_or_build_union_pool
+        from Train.short_pass_selection import select_features_for_step
+
+        candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
+        candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
+        logger.info(
+            f"Final snapshot pool (extras): base={len(snapshot_base_features)}, "
+            f"extra_candidates={len(snapshot_extra_candidates)}, pool={len(candidate_pool)}, "
+            f"intersection={len(candidate_in_data)}"
+        )
+        if candidate_in_data:
+            if len(candidate_in_data) > SHORTPASS_TOPK:
+                snapshot_extra_selected = select_features_for_step(
+                    X_full_valid[candidate_in_data], y_full_valid,
+                    candidate_features=candidate_in_data,
+                    top_k=SHORTPASS_TOPK,
+                    method=SHORTPASS_METHOD,
+                    sample_weights=fs_weights,
+                )
+            else:
+                snapshot_extra_selected = candidate_in_data
+            snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
+        else:
+            logger.warning(
+                "Final union pool had no overlap with snapshot extra candidates; using base snapshot features."
+            )
+
+    if USE_BRANCH_TARGET_FS and branch_target_candidates:
+        branch_target_selected = select_branch_target_features_for_step(
+            X_train=X_full_valid,
+            y_train=y_full_valid,
+            target_type=target_type,
+            candidate_features=branch_target_candidates,
+            top_k=BRANCH_TARGET_FS_TOPK,
+            method=BRANCH_TARGET_FS_METHOD,
+            corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
+            min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
+            sample_weights=fs_weights,
+        )
+    else:
+        branch_target_selected = branch_target_candidates
+
+    feature_cols = _merge_unique_feature_lists(
+        snapshot_selected,
+        branch_target_selected,
+        always_keep,
+    )
+    logger.info(
+        f"Final feature set: snapshot={len(snapshot_selected)} "
+        f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
+        f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)}, "
+        f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
+        f"final={len(feature_cols)}"
+    )
+
+    if not feature_cols:
+        raise ValueError("Final feature selection produced no features.")
 
     X_train = X_full_valid[['ds'] + [c for c in feature_cols if c in X_full_valid.columns]].copy()
     logger.info(f"Training final model with {len(feature_cols)} features")
 
     # Tune hyperparameters on all available data for the production model
     final_params = None
-    # Final target_month anchor for the production model is simply the most recent date available
-    # or equivalently, a future date where we plan to predict. But to be safe, we anchor it to 
-    # the max date in the data (most recent NFP print).
-    final_target_month = pd.to_datetime(X_train['ds'].max())
 
     if tune:
         logger.info("Tuning hyperparameters for final production model...")
@@ -1016,22 +1201,28 @@ def train_and_evaluate(
         params_override=final_params,
     )
 
-    # Save production model (unless keep-rule flagged skip_save)
-    if backtest_results.attrs.get('skip_save', False):
+    # Persist current-run artifacts even if keep-rule failed to avoid stale files.
+    # production_eligible communicates deployment readiness.
+    keep_rule_failed = bool(backtest_results.attrs.get('skip_save', False))
+    if keep_rule_failed:
         logger.warning(
-            f"SKIPPING production model save for {model_id.upper()} "
-            f"due to keep-rule failure (model underperforms baseline)"
+            f"Keep-rule flagged {model_id.upper()} as non-production-eligible; "
+            "saving artifacts with production_eligible=False."
         )
-    else:
-        save_model(
-            model,
-            feature_cols,
-            residuals,
-            importance,
-            target_type=target_type,
-            release_type=release_type,
-            target_source=target_source,
-        )
+
+    save_model(
+        model,
+        feature_cols,
+        residuals,
+        importance,
+        target_type=target_type,
+        release_type=release_type,
+        target_source=target_source,
+        extra_metadata={
+            'production_eligible': not keep_rule_failed,
+            'keep_rule_failed': keep_rule_failed,
+        },
+    )
 
     # ── P1-6: Persist OOS metrics as structured JSON ──
     _metrics_dir = OUTPUT_DIR / "backtest"
@@ -1150,12 +1341,13 @@ def predict_nfp_mom(
     if snapshot_df is None or snapshot_df.empty:
         raise FileNotFoundError(f"No master snapshot available for {snapshot_date}")
 
-    # Load target data for lagged features - use same release_type and target_source
-    nsa_target_full = load_target_data('nsa', release_type=release_type, target_source=target_source)
-    sa_target_full = load_target_data('sa', release_type=release_type, target_source=target_source)
+    # Load branch target data for lagged features
+    target_full = load_target_data(
+        target_type, release_type=release_type, target_source=target_source
+    )
 
     # Use NFP release date as strict cutoff when available
-    target_ref = nsa_target_full if target_type == 'nsa' else sa_target_full
+    target_ref = target_full
     cutoff_date = target_month
     if 'release_date' in target_ref.columns:
         match = target_ref[target_ref['ds'] == target_month]
@@ -1172,15 +1364,16 @@ def predict_nfp_mom(
 
     features = add_calendar_features(features, target_month)
 
-    # Add lagged target features - use same release_type
-    nsa_target_features = get_lagged_target_features(nsa_target_full, target_month, 'nfp_nsa')
-    sa_target_features = get_lagged_target_features(sa_target_full, target_month, 'nfp_sa')
-    for k, v in {**nsa_target_features, **sa_target_features}.items():
+    # Add branch-target lagged features
+    target_lag_features = get_lagged_target_features(
+        target_full, target_month, f'nfp_{target_type}'
+    )
+    for k, v in target_lag_features.items():
         features[k] = v
 
     # Add cross-snapshot revision features (master[M] vs master[M-1])
     prev_month = target_month - pd.DateOffset(months=1)
-    target_ref_df = nsa_target_full if target_type == 'nsa' else sa_target_full
+    target_ref_df = target_full
     prev_row = target_ref_df[target_ref_df['ds'] == prev_month]
     if not prev_row.empty and 'release_date' in prev_row.columns:
         prev_release = prev_row.iloc[0]['release_date']

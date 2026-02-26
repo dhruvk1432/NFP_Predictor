@@ -426,6 +426,7 @@ def save_model(
     target_type: str = 'nsa',
     release_type: str = 'first',
     target_source: str = 'first_release',
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Save model and associated metadata.
@@ -439,6 +440,7 @@ def save_model(
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
         target_source: 'first_release' or 'revised'
+        extra_metadata: Optional additional metadata fields
     """
     model_id = get_model_id(target_type, release_type, target_source)
 
@@ -459,6 +461,8 @@ def save_model(
         'target_source': target_source,
         'model_id': model_id,
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
 
     with open(model_dir / f"lightgbm_{model_id}_metadata.pkl", 'wb') as f:
         pickle.dump(metadata, f)

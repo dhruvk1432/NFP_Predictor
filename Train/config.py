@@ -320,6 +320,14 @@ SHORTPASS_TOPK = 60                 # Features selected per backtest step (40-80
 SHORTPASS_METHOD = 'lgbm_gain'      # 'lgbm_gain' or 'weighted_corr'
 SHORTPASS_HALF_LIFE = None          # None = reuse backtest step half_life
 
+# Branch-target derived features (nfp_{target_type}_*) are selected separately
+# and then merged on top of snapshot features.
+USE_BRANCH_TARGET_FS = True         # Master toggle for branch-target feature selection
+BRANCH_TARGET_FS_TOPK = 8           # Keep up to this many branch-target derived features
+BRANCH_TARGET_FS_METHOD = 'weighted_corr'  # 'lgbm_gain' or 'weighted_corr'
+BRANCH_TARGET_FS_CORR_THRESHOLD = 0.90     # Redundancy pruning threshold
+BRANCH_TARGET_FS_MIN_OVERLAP = 24          # Minimum overlap for corr pruning
+
 
 # =============================================================================
 # BASELINE KEEP-RULE

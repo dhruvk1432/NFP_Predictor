@@ -95,7 +95,9 @@ def _load_selected_features(master_snapshots_dir: Path, json_name: str) -> Set[s
     features = payload.get("features")
     if not isinstance(features, list) or not all(isinstance(x, str) for x in features):
         raise ValueError(f"Invalid feature payload in {path}")
-    return set(features)
+    # Normalize JSON feature names into the same namespace used for snapshot columns.
+    sanitized = {sanitize_feature_name(str(x)) for x in features}
+    return sanitized
 
 
 def _collect_branch_files(branch_dir: Path) -> List[Path]:
@@ -111,7 +113,18 @@ def _process_file(path: Path, selected_set: Set[str], branch: str, dry_run: bool
     expected_selected = {sanitized_map[c] for c in keep_cols}
 
     rewritten = False
-    if not dry_run and keep_cols != original_cols:
+    if dry_run:
+        return FileResult(
+            branch=branch,
+            path=path,
+            original_count=len(original_cols),
+            kept_count=len(keep_cols),
+            selected_hits=len(expected_selected),
+            matched_selected=expected_selected,
+            rewritten=False,
+        )
+
+    if keep_cols != original_cols:
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         table = pq.read_table(path, columns=keep_cols)
         try:
@@ -122,7 +135,7 @@ def _process_file(path: Path, selected_set: Set[str], branch: str, dry_run: bool
                 tmp_path.unlink()
         rewritten = True
 
-    post_cols = original_cols if dry_run else pq.ParquetFile(path).schema_arrow.names
+    post_cols = pq.ParquetFile(path).schema_arrow.names
     post_sanitized = {sanitize_feature_name(str(c)) for c in post_cols}
     if post_sanitized != expected_selected:
         raise ValueError(

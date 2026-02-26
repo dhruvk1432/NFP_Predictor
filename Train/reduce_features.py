@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import shap
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
@@ -42,7 +43,6 @@ from Train.config import (
     ALL_TARGET_CONFIGS,
     DEFAULT_LGBM_PARAMS,
     MASTER_SNAPSHOTS_BASE,
-    load_selected_features,
 )
 from Train.data_loader import load_target_data, sanitize_feature_name
 
@@ -72,6 +72,7 @@ BORUTA_LGB_PARAMS = {
 }
 
 BORUTA_NUM_ROUNDS = 100
+NOAA_STALENESS_SUFFIX = "__staleness_months"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +480,7 @@ def _load_training_data(
     target_source: str,
     pit_cutoff: str,
     cache_dir: Optional[Path] = None,
+    force_rebuild: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Load or build training dataset for a branch, restricted to pre-cutoff data.
@@ -488,10 +490,14 @@ def _load_training_data(
     Returns:
         (X, y) where X has feature columns only (no ds), y is non-NaN target.
     """
-    # Check for cached version
+    cache_x = None
+    cache_y = None
     if cache_dir:
         cache_x = cache_dir / f"X_{target_type}_{target_source}.parquet"
         cache_y = cache_dir / f"y_{target_type}_{target_source}.parquet"
+
+    # Check for cached version
+    if cache_dir and not force_rebuild:
         if cache_x.exists() and cache_y.exists():
             logger.info(f"Loading cached training data from {cache_dir}")
             X = pd.read_parquet(cache_x)
@@ -531,6 +537,89 @@ def _load_training_data(
     return X, y
 
 
+def _collect_snapshot_schema_features_pre_cutoff(
+    target_type: str,
+    target_source: str,
+    pit_cutoff: str,
+) -> set[str]:
+    """
+    Collect sanitized feature names present in branch snapshot schemas up to pit_cutoff month.
+
+    Uses parquet schema reads only (fast, no table load).
+    """
+    base_dir = MASTER_SNAPSHOTS_BASE / target_type / target_source / "decades"
+    cutoff_month = pd.Timestamp(pit_cutoff).replace(day=1)
+    features: set[str] = set()
+    scanned = 0
+
+    for path in sorted(base_dir.rglob("*.parquet")):
+        try:
+            month = pd.Timestamp(path.stem).replace(day=1)
+        except Exception:
+            continue
+
+        if month > cutoff_month:
+            continue
+
+        try:
+            cols = pq.ParquetFile(path).schema_arrow.names
+        except Exception as e:
+            logger.warning(f"Failed to read schema for {path}: {e}")
+            continue
+
+        scanned += 1
+        for col in cols:
+            if col in {"date", "snapshot_date"}:
+                continue
+            features.add(sanitize_feature_name(str(col)))
+
+    logger.info(
+        f"[{target_type}_{target_source}] Pre-cutoff snapshot schema universe: "
+        f"{len(features)} features from {scanned} files (<= {cutoff_month.strftime('%Y-%m')})"
+    )
+    return features
+
+
+def _load_feature_universe_for_reduction(
+    target_type: str,
+    target_source: str,
+    target_n: int,
+) -> tuple[list[str], str]:
+    """
+    Load the feature universe to reduce from.
+
+    Prefer the branch cache JSON by default. If that file already appears reduced
+    (e.g., output of this script), fallback to the latest regime cache snapshot,
+    which preserves the original 400-500 ETL feature universe.
+    """
+    branch_cache = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_{target_source}.json"
+    with open(branch_cache, "r") as f:
+        branch_payload = json.load(f)
+    branch_features = branch_payload.get("features", [])
+    if not isinstance(branch_features, list) or not all(isinstance(x, str) for x in branch_features):
+        raise ValueError(f"Invalid feature payload in {branch_cache}")
+
+    reduction_method = str(branch_payload.get("reduction_method", "") or "")
+    appears_reduced = reduction_method == "boruta_shap_3stage" or len(branch_features) <= target_n
+    if not appears_reduced:
+        return branch_features, str(branch_cache)
+
+    regime_dir = MASTER_SNAPSHOTS_BASE / "regime_caches"
+    regime_candidates = sorted(regime_dir.glob(f"selected_features_{target_type}_{target_source}_*.json"))
+    if not regime_candidates:
+        return branch_features, str(branch_cache)
+
+    latest_regime = regime_candidates[-1]
+    with open(latest_regime, "r") as f:
+        regime_payload = json.load(f)
+    regime_features = regime_payload.get("features", [])
+    if isinstance(regime_features, list) and all(isinstance(x, str) for x in regime_features):
+        if len(regime_features) > len(branch_features):
+            return regime_features, str(latest_regime)
+
+    return branch_features, str(branch_cache)
+
+
 def reduce_features_for_branch(
     target_type: str,
     target_source: str,
@@ -541,6 +630,7 @@ def reduce_features_for_branch(
     pit_cutoff: str = DEFAULT_PIT_CUTOFF,
     dry_run: bool = False,
     output_base: Optional[Path] = None,
+    refresh_training_cache: bool = False,
 ) -> List[str]:
     """
     Full 3-stage feature reduction for a single branch.
@@ -571,13 +661,25 @@ def reduce_features_for_branch(
     logger.info(f"FEATURE REDUCTION: {branch_label.upper()}")
     logger.info("=" * 70)
 
-    # ── Load current feature list from JSON (for metadata only) ──
-    current_features = load_selected_features(target_type, target_source)
-    logger.info(f"[{branch_label}] Current JSON feature count: {len(current_features)}")
+    # ── Load feature universe for reduction (prefer full pre-reduction universe) ──
+    current_features, current_feature_source = _load_feature_universe_for_reduction(
+        target_type=target_type, target_source=target_source, target_n=target_n
+    )
+    logger.info(
+        f"[{branch_label}] Reduction feature universe count: {len(current_features)} "
+        f"(source: {current_feature_source})"
+    )
 
     # ── Load training data ──
     t0 = time.time()
-    X, y = _load_training_data(target_type, release_type, target_source, pit_cutoff, cache_dir)
+    X, y = _load_training_data(
+        target_type,
+        release_type,
+        target_source,
+        pit_cutoff,
+        cache_dir,
+        force_rebuild=refresh_training_cache,
+    )
     logger.info(f"[{branch_label}] Training data: {X.shape[0]} samples, {X.shape[1]} columns "
                 f"({time.time() - t0:.1f}s)")
 
@@ -604,7 +706,57 @@ def reduce_features_for_branch(
         logger.error(f"[{branch_label}] No data features found in X! Aborting.")
         return []
 
-    X_feat = X[feature_cols]
+    # ── Strict candidate universe: original branch feature set ∩ pre-cutoff snapshot schema ──
+    # Normalize feature-universe names to the same sanitized namespace used by X columns.
+    current_feature_set = {sanitize_feature_name(str(f)) for f in current_features}
+    schema_feature_set = _collect_snapshot_schema_features_pre_cutoff(
+        target_type=target_type, target_source=target_source, pit_cutoff=pit_cutoff
+    )
+
+    dropped_not_in_json = [c for c in feature_cols if c not in current_feature_set]
+    dropped_not_in_schema = [c for c in feature_cols if c in current_feature_set and c not in schema_feature_set]
+    dropped_synthetic = [c for c in feature_cols if c.endswith(NOAA_STALENESS_SUFFIX)]
+
+    eligible_features = [
+        c for c in feature_cols
+        if c in current_feature_set
+        and c in schema_feature_set
+        and not c.endswith(NOAA_STALENESS_SUFFIX)
+    ]
+
+    if len(current_feature_set) != len(current_features):
+        logger.warning(
+            f"[{branch_label}] Sanitization collapsed feature-universe names: "
+            f"raw={len(current_features)} -> sanitized={len(current_feature_set)}"
+        )
+    logger.info(
+        f"[{branch_label}] Eligible feature universe: {len(eligible_features)} "
+        f"(from X={len(feature_cols)}, in_json_sanitized={len(current_feature_set)}, "
+        f"in_schema={len(schema_feature_set)})"
+    )
+    if dropped_not_in_json:
+        logger.info(
+            f"[{branch_label}] Dropped not in current JSON universe: {len(dropped_not_in_json)} "
+            f"(sample: {dropped_not_in_json[:5]})"
+        )
+    if dropped_not_in_schema:
+        logger.info(
+            f"[{branch_label}] Dropped not in pre-cutoff snapshot schema: {len(dropped_not_in_schema)} "
+            f"(sample: {dropped_not_in_schema[:5]})"
+        )
+    if dropped_synthetic:
+        logger.info(
+            f"[{branch_label}] Dropped synthetic (non-snapshot) features: {len(dropped_synthetic)} "
+            f"(sample: {dropped_synthetic[:5]})"
+        )
+
+    if len(eligible_features) < target_n:
+        raise ValueError(
+            f"[{branch_label}] Only {len(eligible_features)} eligible features available, "
+            f"cannot select target_n={target_n}"
+        )
+
+    X_feat = X[eligible_features]
 
     # ── Stage 1: Correlation Clustering ──
     survivors_s1 = stage_correlation_clustering(
@@ -620,19 +772,44 @@ def reduce_features_for_branch(
     X_s2 = X_s1[survivors_s2]
 
     # ── Stage 3: Final SHAP Ranking ──
+    # If Boruta is overly strict (< target_n), fallback to Stage-1 survivors to still output target_n.
+    stage3_input = X_s2
+    stage3_source = "stage2"
+    if X_s2.shape[1] < target_n:
+        logger.warning(
+            f"[{branch_label}] Stage 2 returned {X_s2.shape[1]} features (< {target_n}); "
+            f"falling back to Stage 1 survivors for final ranking."
+        )
+        stage3_input = X_s1
+        stage3_source = "stage1_fallback"
+
     final_features = stage_final_shap_ranking(
-        X_s2, y, target_n=target_n, output_dir=output_dir, branch_label=branch_label,
+        stage3_input, y, target_n=target_n, output_dir=output_dir, branch_label=branch_label,
     )
     final_features.sort()
+
+    # Final safety check: selected features must be inside original branch feature universe.
+    invalid_final = [f for f in final_features if f not in current_feature_set]
+    if invalid_final:
+        raise ValueError(
+            f"[{branch_label}] Final features not in original JSON universe: {invalid_final[:10]}"
+        )
+    invalid_schema = [f for f in final_features if f not in schema_feature_set]
+    if invalid_schema:
+        raise ValueError(
+            f"[{branch_label}] Final features not in pre-cutoff snapshot schema: {invalid_schema[:10]}"
+        )
 
     # ── Save summary ──
     summary = {
         'branch': branch_label,
         'pit_cutoff': pit_cutoff,
         'original_json_count': len(current_features),
-        'stage1_input': len(feature_cols),
+        'stage1_input': len(eligible_features),
         'stage1_output': len(survivors_s1),
         'stage2_output': len(survivors_s2),
+        'stage3_input_source': stage3_source,
+        'stage3_input_count': int(stage3_input.shape[1]),
         'final_count': len(final_features),
         'target_n': target_n,
         'corr_threshold': corr_threshold,
@@ -710,6 +887,10 @@ def main():
         '--pit-cutoff', type=str, default=DEFAULT_PIT_CUTOFF,
         help=f'Point-in-time cutoff date YYYY-MM-DD (default: {DEFAULT_PIT_CUTOFF})',
     )
+    parser.add_argument(
+        '--refresh-training-cache', action='store_true',
+        help='Rebuild X/y training caches from current master snapshots instead of reusing cached parquet.',
+    )
 
     args = parser.parse_args()
 
@@ -751,6 +932,7 @@ def main():
                 boruta_alpha=args.boruta_alpha,
                 pit_cutoff=args.pit_cutoff,
                 dry_run=args.dry_run,
+                refresh_training_cache=args.refresh_training_cache,
             )
             results[branch_label] = len(features)
         except Exception as e:

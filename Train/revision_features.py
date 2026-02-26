@@ -68,6 +68,10 @@ def compute_revision_features(
     if overlap:
         curr_vals = features_current[overlap].iloc[0]
         prev_vals = features_prev[overlap].iloc[0]
+        # Filter to numeric-only to avoid Timestamp-Timestamp -> Timedelta errors
+        numeric_mask = curr_vals.apply(lambda v: isinstance(v, (int, float, np.integer, np.floating)))
+        curr_vals = curr_vals[numeric_mask]
+        prev_vals = prev_vals[numeric_mask.index[numeric_mask]]
         diffs = curr_vals - prev_vals
         diffs = diffs.dropna()
         revisions = diffs.to_dict()

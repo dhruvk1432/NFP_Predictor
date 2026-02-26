@@ -26,7 +26,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 # Add parent directory to FRONT of path so project-level packages (utils/, settings)
 # take priority over local files
@@ -44,7 +44,7 @@ from Data_ETA_Pipeline.perf_stats import (
 from Data_ETA_Pipeline.feature_selection_engine import (
     load_snapshot_wide, _classify_series, run_full_source_pipeline, MIN_VALID_OBS
 )
-from Train.data_loader import load_target_data
+from Train.data_loader import load_target_data, sanitize_feature_name
 
 logger = setup_logger(__file__, TEMP_DIR)
 install_hooks()
@@ -491,18 +491,22 @@ def _process_source_features(source_name: str, source_dir: Path,
     # 4. Load targets (MoM only)
     logger.info(f"[{label}] [{source_name}] Loading targets...")
     if target_source == 'revised':
-        from Train.data_loader import build_revised_target
-        inc_counter("master_snapshot.target.build_revised.invoked", 1)
+        # Revised targets must be pre-built in data/NFP_target by the load stage.
+        # Do not regenerate here; load strictly from cache files.
+        inc_counter("master_snapshot.target.load_revised.invoked", 1)
         inc_counter("master_snapshot.cache.target_load.miss", 1)
         with perf_phase(
-            "master_snapshot.fs.target.build_revised_target",
+            "master_snapshot.fs.target.load_target_data_revised",
             source=source_name,
             target_cat=target_cat,
             target_source=target_source,
         ):
-            target_df = build_revised_target(target_cat)
-            target_df['ds'] = pd.to_datetime(target_df['ds'])
-            target_df = target_df.sort_values('ds')
+            target_df = load_target_data(
+                target_type=target_cat,
+                release_type='first',
+                target_source='revised',
+                use_cache=False,
+            )
     else:
         # use_cache=False is intentional for strict point-in-time behavior in FS prep path.
         inc_counter("master_snapshot.cache.target_load.miss", 1)
@@ -705,8 +709,14 @@ def _batch_load_source(source_name: str, source_dir: Path,
 
     Returns a dict mapping month-key (YYYY-MM) to a filtered wide DataFrame.
     This eliminates redundant file reads when iterating over months.
+    Output feature columns are always sanitized to match selected_features JSONs.
+    Matching accepts either raw feature names or sanitized names in allowed_features.
     """
     result = {}
+    allowed_set = {str(f) for f in allowed_features}
+    if not allowed_set:
+        return result
+
     for obs_month in snapshot_months:
         path = _snapshot_path(source_dir, obs_month)
         if not path.exists():
@@ -720,12 +730,35 @@ def _batch_load_source(source_name: str, source_dir: Path,
             continue
 
         wide = _normalize_to_wide(df)
-        keep_cols = [c for c in wide.columns
-                     if c in allowed_features or c in ['date', 'snapshot_date']]
-        wide = wide[keep_cols]
+        meta_cols = [c for c in ['date', 'snapshot_date'] if c in wide.columns]
+        raw_feature_cols = [c for c in wide.columns if c not in meta_cols]
+        if not raw_feature_cols:
+            continue
 
-        if not wide.drop(columns=['date', 'snapshot_date'], errors='ignore').empty:
-            result[obs_month.strftime('%Y-%m')] = wide
+        # Map each raw source column to sanitized feature name used by JSON caches.
+        # Keep columns when either raw or sanitized name matches the allow-list.
+        sanitized_to_raw: dict[str, list[str]] = defaultdict(list)
+        for raw_col in raw_feature_cols:
+            raw_name = str(raw_col)
+            sanitized_name = sanitize_feature_name(raw_name)
+            if raw_name in allowed_set or sanitized_name in allowed_set:
+                sanitized_to_raw[sanitized_name].append(raw_col)
+
+        if not sanitized_to_raw:
+            continue
+
+        filtered = wide[meta_cols].copy()
+        for sanitized_name, raw_cols in sanitized_to_raw.items():
+            if len(raw_cols) == 1:
+                filtered[sanitized_name] = wide[raw_cols[0]]
+            else:
+                # Rare collision guard: if multiple raw names sanitize to the same
+                # key, use first non-null value across those raw columns.
+                filtered[sanitized_name] = wide[raw_cols].bfill(axis=1).iloc[:, 0]
+
+        feature_only = filtered.drop(columns=meta_cols, errors='ignore')
+        if not feature_only.empty:
+            result[obs_month.strftime('%Y-%m')] = filtered
 
     return result
 
@@ -790,6 +823,300 @@ def _clear_progress(target_cat: str, target_source: str) -> None:
     path = _get_progress_path(target_cat, target_source)
     if path.exists():
         path.unlink()
+
+
+def _all_skip_fs_json_caches_exist() -> bool:
+    """
+    True only when all 4 canonical selected-feature JSON caches exist.
+
+    This guards the skip-feature-selection parallel fast path.
+    """
+    missing = []
+    for target_cat, target_source in DEFAULT_TARGET_COMBOS:
+        cache_path = _get_cache_path(target_cat, target_source)
+        if not cache_path.exists():
+            missing.append(cache_path.name)
+
+    if missing:
+        logger.info(
+            "Skip-FS fast path disabled: missing selected-feature caches: "
+            f"{', '.join(sorted(missing))}"
+        )
+        return False
+
+    return True
+
+
+def _load_skip_fs_branch_feature_sets(
+    target_combos: list[tuple[str, str]],
+) -> dict[tuple[str, str], set[str]] | None:
+    """Load static selected-feature sets for requested branches from cache JSONs."""
+    out: dict[tuple[str, str], set[str]] = {}
+    for target_cat, target_source in target_combos:
+        cache_path = _get_cache_path(target_cat, target_source)
+        if not cache_path.exists():
+            logger.error(f"[{target_cat.upper()}/{target_source}] Missing cache: {cache_path}")
+            return None
+        try:
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"[{target_cat.upper()}/{target_source}] Failed to read {cache_path}: {e}")
+            return None
+
+        features = data.get("features", [])
+        if not isinstance(features, list):
+            logger.error(
+                f"[{target_cat.upper()}/{target_source}] Invalid cache format in {cache_path} "
+                "(expected a list under 'features')."
+            )
+            return None
+
+        out[(target_cat, target_source)] = set(features)
+
+    return out
+
+
+def _resolve_skip_fs_branch_workers(n_branches: int) -> int:
+    """Resolve process count for branch-parallel skip-FS path."""
+    env_val = os.getenv("NFP_MASTER_SKIP_FS_BRANCH_WORKERS", "").strip()
+    if env_val.isdigit():
+        parsed = int(env_val)
+        if parsed > 0:
+            return max(1, min(n_branches, parsed))
+    return max(1, min(n_branches, 4, os.cpu_count() or 1))
+
+
+def _resolve_skip_fs_month_workers() -> int:
+    """Resolve per-branch thread count for month materialization in skip-FS fast path."""
+    env_val = os.getenv("NFP_MASTER_SKIP_FS_MONTH_WORKERS", "").strip()
+    if env_val.isdigit():
+        parsed = int(env_val)
+        if parsed > 0:
+            return parsed
+    # Conservative default to avoid oversubscription when 4 branch processes run.
+    return max(1, min(2, os.cpu_count() or 1))
+
+
+def _materialize_single_master_snapshot(
+    target_master_dir: Path,
+    obs_month: pd.Timestamp,
+    snap_date: pd.Timestamp,
+    source_caches: dict[str, dict[str, pd.DataFrame]],
+) -> tuple[str, int]:
+    """
+    Build and persist one master snapshot from pre-loaded source caches.
+
+    Returns:
+        (month_key, n_cols_written). n_cols_written=0 indicates no valid data.
+    """
+    month_key = obs_month.strftime('%Y-%m')
+    master = _load_all_sources_from_cache(obs_month, source_caches)
+    if master.empty:
+        return month_key, 0
+
+    master['date'] = pd.to_datetime(master['date'])
+    master['snapshot_date'] = snap_date
+
+    save_path = _snapshot_path(target_master_dir, obs_month)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    master.to_parquet(save_path, index=False)
+    return month_key, int(master.shape[1])
+
+
+@profiled("create_master_snapshots._run_skip_fs_branch")
+def _run_skip_fs_branch(
+    target_cat: str,
+    target_source: str,
+    snapshot_pairs: list[tuple[pd.Timestamp, pd.Timestamp]],
+    static_features: list[str],
+    skip_existing: bool,
+) -> dict[str, int | str]:
+    """
+    Process one branch using static feature JSONs (skip-feature-selection mode).
+
+    This path is used only in the fast skip-FS mode and parallelized across branches.
+    """
+    label = f"{target_cat.upper()}/{target_source}"
+    target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
+    static_feature_set = set(static_features)
+
+    completed_months = _load_progress(target_cat, target_source)
+    branch_snapshot_pairs = []
+    for obs, snap in snapshot_pairs:
+        month_key = obs.strftime('%Y-%m')
+        if month_key in completed_months:
+            continue
+        if skip_existing and _snapshot_path(target_master_dir, obs).exists():
+            completed_months.add(month_key)
+            continue
+        branch_snapshot_pairs.append((obs, snap))
+
+    if not branch_snapshot_pairs:
+        _clear_progress(target_cat, target_source)
+        logger.info(f"[{label}] All months already completed. Skipping.")
+        return {
+            "label": label,
+            "total": 0,
+            "processed": 0,
+            "written": 0,
+            "empty": 0,
+        }
+
+    branch_snapshot_pairs = sorted(branch_snapshot_pairs, key=lambda x: x[0])
+    branch_months = [obs for obs, _ in branch_snapshot_pairs]
+    logger.info(f"[{label}] skip-feature-selection fast path: {len(branch_snapshot_pairs)} months to generate")
+
+    skip_source = None
+    if target_cat == 'nsa':
+        skip_source = 'FRED_Employment_SA'
+    elif target_cat == 'sa':
+        skip_source = 'FRED_Employment_NSA'
+
+    source_caches: dict[str, dict[str, pd.DataFrame]] = {}
+    for name, sdir in SOURCES.items():
+        if name == skip_source:
+            continue
+        source_caches[name] = _batch_load_source(name, sdir, branch_months, static_feature_set)
+
+    total = len(branch_snapshot_pairs)
+    processed = 0
+    written = 0
+    empty = 0
+    month_workers = _resolve_skip_fs_month_workers()
+
+    if month_workers <= 1:
+        for obs_month, snap_date in branch_snapshot_pairs:
+            month_key = obs_month.strftime('%Y-%m')
+            try:
+                _, n_cols = _materialize_single_master_snapshot(
+                    target_master_dir, obs_month, snap_date, source_caches
+                )
+                completed_months.add(month_key)
+                processed += 1
+                if n_cols > 0:
+                    written += 1
+                else:
+                    empty += 1
+                if processed % 12 == 0 or processed == total:
+                    logger.info(
+                        f"[{label}] Generated {obs_month.date()} "
+                        f"({processed}/{total}, Cols: {n_cols})"
+                    )
+                    _save_progress(target_cat, target_source, completed_months)
+            except Exception as e:
+                logger.error(f"[{label}] Error processing {obs_month.date()}: {e}")
+                _save_progress(target_cat, target_source, completed_months)
+    else:
+        with ThreadPoolExecutor(max_workers=month_workers) as executor:
+            futures = {
+                executor.submit(
+                    _materialize_single_master_snapshot,
+                    target_master_dir,
+                    obs_month,
+                    snap_date,
+                    source_caches,
+                ): obs_month
+                for obs_month, snap_date in branch_snapshot_pairs
+            }
+            for future in as_completed(futures):
+                obs_month = futures[future]
+                month_key = obs_month.strftime('%Y-%m')
+                try:
+                    _, n_cols = future.result()
+                    completed_months.add(month_key)
+                    processed += 1
+                    if n_cols > 0:
+                        written += 1
+                    else:
+                        empty += 1
+                    if processed % 12 == 0 or processed == total:
+                        logger.info(
+                            f"[{label}] Generated {obs_month.date()} "
+                            f"({processed}/{total}, Cols: {n_cols})"
+                        )
+                        _save_progress(target_cat, target_source, completed_months)
+                except Exception as e:
+                    logger.error(f"[{label}] Error processing {obs_month.date()}: {e}")
+                    _save_progress(target_cat, target_source, completed_months)
+
+    _clear_progress(target_cat, target_source)
+    logger.info(
+        f"[{label}] skip-feature-selection fast path complete: "
+        f"processed={processed}, written={written}, empty={empty}"
+    )
+    return {
+        "label": label,
+        "total": total,
+        "processed": processed,
+        "written": written,
+        "empty": empty,
+    }
+
+
+@profiled("create_master_snapshots._run_skip_fs_parallel_fast_path")
+def _run_skip_fs_parallel_fast_path(
+    target_combos: list[tuple[str, str]],
+    snapshot_pairs: list[tuple[pd.Timestamp, pd.Timestamp]],
+    skip_existing: bool,
+) -> bool:
+    """
+    Parallel fast path for skip-feature-selection runs.
+
+    Returns:
+        True if the fast path was executed; False means caller should fall back.
+    """
+    if not target_combos:
+        return True
+
+    if not _all_skip_fs_json_caches_exist():
+        return False
+
+    branch_feature_sets = _load_skip_fs_branch_feature_sets(target_combos)
+    if branch_feature_sets is None:
+        return False
+
+    branch_workers = _resolve_skip_fs_branch_workers(len(target_combos))
+    logger.info(
+        "Skip-FS fast path enabled: running branches in parallel "
+        f"(workers={branch_workers}, branches={len(target_combos)})"
+    )
+
+    if branch_workers <= 1 or len(target_combos) <= 1:
+        for target_cat, target_source in target_combos:
+            _run_skip_fs_branch(
+                target_cat=target_cat,
+                target_source=target_source,
+                snapshot_pairs=snapshot_pairs,
+                static_features=sorted(branch_feature_sets[(target_cat, target_source)]),
+                skip_existing=skip_existing,
+            )
+        return True
+
+    with ProcessPoolExecutor(max_workers=branch_workers) as executor:
+        futures = {
+            executor.submit(
+                _run_skip_fs_branch,
+                target_cat,
+                target_source,
+                snapshot_pairs,
+                sorted(branch_feature_sets[(target_cat, target_source)]),
+                skip_existing,
+            ): (target_cat, target_source)
+            for target_cat, target_source in target_combos
+        }
+
+        for future in as_completed(futures):
+            target_cat, target_source = futures[future]
+            label = f"{target_cat.upper()}/{target_source}"
+            try:
+                summary = future.result()
+                logger.info(f"[{label}] Fast-path summary: {summary}")
+            except Exception as e:
+                logger.error(f"[{label}] Fast-path branch worker failed: {e}")
+                raise
+
+    return True
 
 
 def _build_feature_selection_regimes(
@@ -861,7 +1188,9 @@ def create_master_snapshots(
         skip_feature_selection: If True, load features from existing
                     selected_features_{cat}_{source}.json instead of running
                     feature selection. Uses one global feature set for all months.
-                    For profiling / fast rebuilds only.
+                    For profiling / fast rebuilds only. When all four canonical
+                    selected_features_*.json files exist, a branch-parallel fast
+                    path is used.
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
@@ -890,6 +1219,19 @@ def create_master_snapshots(
 
     logger.info(f"Target scope resolved to '{scope}'. Running {len(target_combos)} branch(es): "
                 f"{target_combos}")
+
+    # Fast path for data-refresh runs:
+    # If skip-feature-selection is requested AND all canonical branch JSON caches
+    # are present, process independent branches in parallel.
+    if skip_feature_selection:
+        fast_path_ran = _run_skip_fs_parallel_fast_path(
+            target_combos=target_combos,
+            snapshot_pairs=snapshot_pairs,
+            skip_existing=skip_existing,
+        )
+        if fast_path_ran:
+            logger.info("Master Snapshots generation completely finished for all branches.")
+            return
 
     # Each branch runs its own independent feature selection
     for target_cat, target_source in target_combos:

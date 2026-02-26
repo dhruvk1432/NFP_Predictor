@@ -256,6 +256,10 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
 
     # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
     nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+    if not nfp_release_map:
+        raise RuntimeError(
+            f"NFP release map is empty for requested window {start_date}..{end_date}"
+        )
 
     base_dir = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data"
 
@@ -323,8 +327,7 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             logger.error(f"Error fetching {name}: {e}")
 
     if not all_series_data:
-        logger.error("No data fetched from Unifier")
-        return
+        raise RuntimeError("No data fetched from Unifier")
 
     # Calculate NFP-relative timing offsets for each series (for backfill consistency)
     # Uses imported calculate_median_offset_from_nfp from nfp_relative_timing
@@ -343,6 +346,7 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             series_nfp_offsets[name] = None
 
     # Now create monthly snapshots aligned with NFP release dates
+    snapshots_written = 0
     for obs_month, nfp_release_date in nfp_release_map.items():
         snap_date = pd.Timestamp(nfp_release_date)
 
@@ -412,9 +416,13 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             full_snap = compute_all_features(full_snap)
 
             full_snap.to_parquet(save_path)
+            snapshots_written += 1
 
         if obs_month.month == 12:
             logger.info(f"Saved {obs_month.year} snapshots")
+
+    if snapshots_written == 0:
+        raise RuntimeError("No Unifier snapshots were written")
 
     logger.info("✓ Unifier data download complete")
 

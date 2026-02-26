@@ -52,7 +52,8 @@
       "WebFetch(domain:optuna-integration.readthedocs.io)",
       "WebFetch(domain:github.com)",
       "Bash(jobs -l)",
-      "Bash(NFP_FS_STAGES=\"0,1,4\" python3 -c \":*)"
+      "Bash(NFP_FS_STAGES=\"0,1,4\" python3 -c \":*)",
+      "Bash(jobs)"
     ]
   }
 }

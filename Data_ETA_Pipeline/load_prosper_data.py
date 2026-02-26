@@ -285,6 +285,10 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
 
     # OPTIMIZATION: Use shared NFP loading utility (cached, avoids redundant file reads)
     nfp_release_map = get_nfp_release_map(start_date=start_date, end_date=end_date)
+    if not nfp_release_map:
+        raise RuntimeError(
+            f"NFP release map is empty for requested window {start_date}..{end_date}"
+        )
 
     base_dir = Path(DATA_PATH) / "Exogenous_data" / "prosper"
 
@@ -346,8 +350,7 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
                 logger.error(f"Error processing key {key}: {e}")
 
     if not all_prosper_data:
-        logger.error("No prosper data collected")
-        return
+        raise RuntimeError("No prosper data collected")
 
     # Combine all data
     combined_df = pd.concat(all_prosper_data, ignore_index=True)
@@ -374,6 +377,7 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
 
     # Now create monthly snapshots aligned with NFP release dates
     # Each snapshot contains ALL data with release_date < snapshot_date
+    snapshots_written = 0
     for obs_month, nfp_release_date in nfp_release_map.items():
         snap_date = pd.Timestamp(nfp_release_date)
 
@@ -397,9 +401,13 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
             snap_data = compute_all_features(snap_data)
 
             snap_data.to_parquet(save_path, index=False)
+            snapshots_written += 1
 
         if obs_month.month == 12:
             logger.info(f"Saved {obs_month.year} snapshots")
+
+    if snapshots_written == 0:
+        raise RuntimeError("No Prosper snapshots were written")
 
     logger.info("✓ Prosper data download complete")
 

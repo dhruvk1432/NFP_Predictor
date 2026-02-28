@@ -33,6 +33,10 @@ from Data_ETA_Pipeline.create_master_snapshots import (
     _clear_progress,
     _get_progress_path,
     _resolve_target_combos,
+    _apply_target_combo_filters,
+    _resolve_selection_target_mode,
+    _build_selection_target,
+    _parse_fs_stages_arg,
     MASTER_BASE,
     HARD_CODED_REGIME_STARTS,
 )
@@ -161,6 +165,18 @@ class TestPerSourceCache:
         _save_source_cache([], 'Prosper', 'nsa', 'first_release')
         result = _check_source_cache('Prosper', 'nsa', 'first_release')
         assert result == []
+
+    def test_cache_mode_mismatch_returns_none(self, source_cache_dir):
+        """Cache built for one selection-target mode must not leak into another mode."""
+        _save_source_cache(
+            ['feat_a'], 'ADP', 'sa', 'revised',
+            selection_target_mode='mom',
+        )
+        result = _check_source_cache(
+            'ADP', 'sa', 'revised',
+            selection_target_mode='model_aligned',
+        )
+        assert result is None
 
 # =============================================================================
 # Batch Loading
@@ -536,7 +552,7 @@ class TestRegimeSelection:
         )
         monkeypatch.setattr(cms, "_check_regime_cache", lambda *args, **kwargs: None)
 
-        def fake_parallel_selection(target_cat, target_source, asof_month=None, stages=None):
+        def fake_parallel_selection(target_cat, target_source, asof_month=None, stages=None, selection_target_mode='auto'):
             asof_key = pd.Timestamp(asof_month).strftime("%Y-%m")
             return ["feat_old"] if asof_key == "2020-01" else ["feat_new"]
 
@@ -606,6 +622,58 @@ class TestTargetScopeResolution:
             target_source_scope="revised",
         )
         assert combos == [("nsa", "revised"), ("sa", "revised")]
+
+
+class TestTargetComboFilters:
+    def test_target_type_scope_sa_filters_to_sa_branches(self):
+        filtered = _apply_target_combo_filters(
+            target_combos=[
+                ("nsa", "first_release"),
+                ("nsa", "revised"),
+                ("sa", "first_release"),
+                ("sa", "revised"),
+            ],
+            target_type_scope="sa",
+        )
+        assert filtered == [("sa", "first_release"), ("sa", "revised")]
+
+    def test_explicit_branches_override_scope(self):
+        filtered = _apply_target_combo_filters(
+            target_combos=[
+                ("nsa", "first_release"),
+                ("nsa", "revised"),
+                ("sa", "first_release"),
+                ("sa", "revised"),
+            ],
+            target_type_scope="all",
+            branches=["sa_revised"],
+        )
+        assert filtered == [("sa", "revised")]
+
+
+class TestSelectionTargetModes:
+    def test_auto_mode_prefers_model_aligned_for_sa(self):
+        assert _resolve_selection_target_mode("sa", "revised", "auto") == "model_aligned"
+
+    def test_auto_mode_prefers_mom_for_nsa(self):
+        assert _resolve_selection_target_mode("nsa", "first_release", "auto") == "mom"
+
+    def test_build_selection_target_model_aligned_shape(self):
+        idx = pd.date_range("2020-01-01", periods=24, freq="MS")
+        y = pd.Series(np.linspace(-100.0, 200.0, len(idx)), index=idx)
+        target, mode = _build_selection_target(
+            y, target_cat="sa", target_source="revised", selection_target_mode="model_aligned"
+        )
+        assert mode == "model_aligned"
+        assert target.index.equals(y.index)
+        assert target.notna().sum() >= len(y) - 1  # first diff row can be NaN
+
+
+class TestFsStageParsing:
+    def test_parse_fs_stages_arg(self):
+        assert _parse_fs_stages_arg("0,1,2,4") == (0, 1, 2, 4)
+        assert _parse_fs_stages_arg("0,1,1,2") == (0, 1, 2)
+        assert _parse_fs_stages_arg(None) is None
 
 
 class TestSkipFeatureSelectionFastPath:
@@ -765,3 +833,74 @@ class TestSourceSpecificMinObs:
         assert "feat_long" in selected
         assert "feat_short" not in selected
         assert captured["cols"] == ["feat_long"]
+
+
+class TestSingleAsOfSelection:
+    def test_single_selection_asof_and_stage_override(self, tmp_path, monkeypatch):
+        import Data_ETA_Pipeline.create_master_snapshots as cms
+
+        master_base = tmp_path / "master_snapshots"
+        monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr(cms, "SOURCES", {"ADP": tmp_path / "mock_sources" / "adp" / "decades"})
+        monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
+        monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
+        monkeypatch.setattr(cms, "END_DATE", "2020-02-01")
+        monkeypatch.setattr(
+            cms,
+            "get_nfp_release_map",
+            lambda start_date, end_date: {
+                pd.Timestamp("2020-01-01"): pd.Timestamp("2020-01-10"),
+                pd.Timestamp("2020-02-01"): pd.Timestamp("2020-02-07"),
+            },
+        )
+
+        captured = {"calls": []}
+
+        def fake_parallel_selection(
+            target_cat,
+            target_source,
+            asof_month=None,
+            stages=None,
+            selection_target_mode='auto',
+        ):
+            captured["calls"].append(
+                (
+                    target_cat,
+                    target_source,
+                    pd.Timestamp(asof_month),
+                    tuple(stages),
+                    selection_target_mode,
+                )
+            )
+            return ["feat_static"]
+
+        def fake_batch_load(source_name, source_dir, snapshot_months, allowed_features):
+            result = {}
+            for month in snapshot_months:
+                result[month.strftime("%Y-%m")] = pd.DataFrame(
+                    {
+                        "date": pd.date_range(month, periods=2, freq="MS"),
+                        "feat_static": [1.0, 2.0],
+                    }
+                )
+            return result
+
+        monkeypatch.setattr(cms, "_run_parallel_feature_selection", fake_parallel_selection)
+        monkeypatch.setattr(cms, "_batch_load_source", fake_batch_load)
+
+        cms.create_master_snapshots(
+            target_type_scope="sa",
+            branches=["sa_revised"],
+            selection_target_mode="model_aligned",
+            fs_stages_override=(0, 1, 2, 4),
+            single_selection_asof="2021-12",
+            skip_existing=False,
+        )
+
+        assert len(captured["calls"]) == 1
+        call = captured["calls"][0]
+        assert call[0] == "sa"
+        assert call[1] == "revised"
+        assert call[2] == pd.Timestamp("2021-12-01")
+        assert call[3] == (0, 1, 2, 4)
+        assert call[4] == "model_aligned"

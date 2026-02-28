@@ -28,7 +28,14 @@ from Train.config import (
     NUM_BOOST_ROUND,
     HALF_LIFE_MIN_MONTHS,
     HALF_LIFE_MAX_MONTHS,
+    VARIANCE_TAIL_QUANTILE,
+    TUNING_LAMBDA_STD_RATIO,
+    TUNING_LAMBDA_DIFF_STD_RATIO,
+    TUNING_LAMBDA_TAIL_MAE,
+    TUNING_LAMBDA_CORR_DIFF,
+    TUNING_LAMBDA_DIFF_SIGN,
 )
+from Train.variance_metrics import compute_variance_kpis, composite_objective_score
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -62,6 +69,19 @@ def tune_hyperparameters(
     timeout: int = OPTUNA_TIMEOUT,
     num_boost_round: int = NUM_BOOST_ROUND,
     early_stopping_rounds: int = 50,
+    objective_mode: str = 'mae',
+    lambda_std_ratio: float = TUNING_LAMBDA_STD_RATIO,
+    lambda_diff_std_ratio: float = TUNING_LAMBDA_DIFF_STD_RATIO,
+    lambda_tail_mae: float = TUNING_LAMBDA_TAIL_MAE,
+    lambda_corr_diff: float = TUNING_LAMBDA_CORR_DIFF,
+    lambda_diff_sign: float = TUNING_LAMBDA_DIFF_SIGN,
+    tail_quantile: float = VARIANCE_TAIL_QUANTILE,
+    tail_weighting: bool = False,
+    tail_weight_abs_level_quantile: float = 0.80,
+    tail_weight_abs_diff_quantile: float = 0.80,
+    tail_weight_level_boost: float = 1.35,
+    tail_weight_diff_boost: float = 1.35,
+    tail_weight_max_multiplier: float = 2.50,
 ) -> Dict:
     """
     Tune LightGBM hyperparameters using Optuna to find the optimal model configuration 
@@ -114,7 +134,7 @@ def tune_hyperparameters(
             trial (optuna.Trial): The current Optuna trial object suggesting params.
 
         Returns:
-            float: The mean Absolute Error across all inner CV folds.
+            float: The mean fold score across inner CV folds.
         """
         params = {
             'objective': 'huber' if use_huber_loss else 'regression',
@@ -143,7 +163,7 @@ def tune_hyperparameters(
         # Import locally to avoid circular import since model.py imports config.py
         from Train.model import calculate_sample_weights
 
-        fold_maes = []
+        fold_scores = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(inner_cv.split(X)):
             X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -156,6 +176,22 @@ def tune_hyperparameters(
             fold_target_month = pd.to_datetime(X.iloc[val_idx]['ds'].max())
             
             w_tr = calculate_sample_weights(X_tr, fold_target_month, half_life_months)
+            if tail_weighting and len(y_tr) > 0:
+                y_arr = y_tr.values.astype(float)
+                mult = np.ones_like(y_arr, dtype=float)
+
+                abs_y = np.abs(y_arr)
+                level_thr = float(np.quantile(abs_y, tail_weight_abs_level_quantile))
+                mult[abs_y >= level_thr] *= tail_weight_level_boost
+
+                abs_dy = np.abs(np.diff(y_arr, prepend=y_arr[0]))
+                diff_thr = float(np.quantile(abs_dy, tail_weight_abs_diff_quantile))
+                mult[abs_dy >= diff_thr] *= tail_weight_diff_boost
+
+                mult = np.clip(mult, 1.0, tail_weight_max_multiplier)
+                w_tr = w_tr * mult
+                if float(np.mean(w_tr)) > 0:
+                    w_tr = w_tr / float(np.mean(w_tr))
 
             # Drop 'ds' for LightGBM
             X_tr_feats = X_tr.drop(columns=['ds'])
@@ -183,9 +219,28 @@ def tune_hyperparameters(
 
             preds = model.predict(X_val_feats)
             fold_mae = np.mean(np.abs(y_val.values - preds))
-            fold_maes.append(fold_mae)
+            if objective_mode == 'composite':
+                kpis = compute_variance_kpis(
+                    y_val.values, preds, tail_quantile=tail_quantile
+                )
+                fold_score = composite_objective_score(
+                    mae=float(fold_mae),
+                    std_ratio=float(kpis['std_ratio']),
+                    diff_std_ratio=float(kpis['diff_std_ratio']),
+                    tail_mae=float(kpis['tail_mae']),
+                    corr_diff=float(kpis['corr_diff']),
+                    diff_sign_accuracy=float(kpis['diff_sign_accuracy']),
+                    lambda_std_ratio=lambda_std_ratio,
+                    lambda_diff_std_ratio=lambda_diff_std_ratio,
+                    lambda_tail_mae=lambda_tail_mae,
+                    lambda_corr_diff=lambda_corr_diff,
+                    lambda_diff_sign=lambda_diff_sign,
+                )
+            else:
+                fold_score = float(fold_mae)
+            fold_scores.append(fold_score)
 
-        return np.mean(fold_maes)
+        return float(np.mean(fold_scores))
 
     def _counted_objective(trial: optuna.Trial) -> float:
         inc_counter("train.tuning.trials")
@@ -197,7 +252,7 @@ def tune_hyperparameters(
 
     import time as _time
     _tune_t0 = _time.time()
-    logger.info(f"Starting Optuna: {n_trials} trials, timeout={timeout}s, "
+    logger.info(f"Starting Optuna ({objective_mode} objective): {n_trials} trials, timeout={timeout}s, "
                 f"{len(X)} samples, {len(X.columns)} features, "
                 f"{n_inner_splits}-fold inner CV")
 
@@ -234,7 +289,7 @@ def tune_hyperparameters(
         pass
 
     logger.info(f"Optuna tuning complete in {_tune_str}: {len(study.trials)} trials, "
-                f"best MAE={best.value:.2f}")
+                f"best score={best.value:.2f}")
     logger.info(f"Best params: lr={best_params.get('learning_rate', '?'):.4f}, "
                 f"leaves={best_params.get('num_leaves', '?')}, "
                 f"depth={best_params.get('max_depth', '?')}, "

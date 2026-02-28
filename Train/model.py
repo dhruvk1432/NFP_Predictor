@@ -195,12 +195,35 @@ def train_lightgbm_model(
     # Note: `calculate_sample_weights` requires target_month, so we derive it from the dataset's max date
     # if it's not provided in params_override.
     # Extract custom keys without mutating the caller's dict
-    _NON_LGB_KEYS = {'target_month', 'half_life_months'}
+    _NON_LGB_KEYS = {
+        'target_month', 'half_life_months',
+        'tail_weighting', 'tail_weight_abs_level_quantile', 'tail_weight_abs_diff_quantile',
+        'tail_weight_level_boost', 'tail_weight_diff_boost', 'tail_weight_max_multiplier',
+    }
     target_month = params_override.get('target_month', pd.to_datetime(X['ds'].max())) if params_override else pd.to_datetime(X['ds'].max())
     half_life_months = params_override.get('half_life_months', 60.0) if params_override else 60.0
+    tail_weighting = bool(params_override.get('tail_weighting', False)) if params_override else False
+    tail_weight_abs_level_quantile = float(params_override.get('tail_weight_abs_level_quantile', 0.80)) if params_override else 0.80
+    tail_weight_abs_diff_quantile = float(params_override.get('tail_weight_abs_diff_quantile', 0.80)) if params_override else 0.80
+    tail_weight_level_boost = float(params_override.get('tail_weight_level_boost', 1.35)) if params_override else 1.35
+    tail_weight_diff_boost = float(params_override.get('tail_weight_diff_boost', 1.35)) if params_override else 1.35
+    tail_weight_max_multiplier = float(params_override.get('tail_weight_max_multiplier', 2.50)) if params_override else 2.50
     
     # Needs the full dataframe with 'ds' attached for weight calculation
     weights = calculate_sample_weights(X_clean_with_ds, target_month, half_life_months)
+    if tail_weighting and len(y_clean) > 0:
+        y_arr = y_clean.values.astype(float)
+        mult = np.ones_like(y_arr, dtype=float)
+        abs_y = np.abs(y_arr)
+        level_thr = float(np.quantile(abs_y, tail_weight_abs_level_quantile))
+        mult[abs_y >= level_thr] *= tail_weight_level_boost
+        abs_dy = np.abs(np.diff(y_arr, prepend=y_arr[0]))
+        diff_thr = float(np.quantile(abs_dy, tail_weight_abs_diff_quantile))
+        mult[abs_dy >= diff_thr] *= tail_weight_diff_boost
+        mult = np.clip(mult, 1.0, tail_weight_max_multiplier)
+        weights = weights * mult
+        if float(np.mean(weights)) > 0:
+            weights = weights / float(np.mean(weights))
 
     # LightGBM parameters (use tuned params if provided, else static defaults)
     # Filter out non-LightGBM keys to prevent unknown parameter errors

@@ -94,3 +94,84 @@ def test_select_branch_target_features_for_step_keeps_signal_features():
 
     assert len(selected) == 2
     assert "nfp_nsa_signal_1" in selected
+
+
+def test_select_branch_target_features_dynamics_composite_prefers_turning_signal():
+    rng = np.random.RandomState(17)
+    n = 180
+
+    # Build a wavy target with turning points.
+    t = np.arange(n)
+    y = pd.Series(80.0 * np.sin(t / 6.0) + rng.randn(n) * 8.0, name="y_mom")
+    y_diff = y.diff().fillna(0.0).values
+
+    X = pd.DataFrame(
+        {
+            # Strong on direction / changes.
+            "nfp_nsa_turn_signal": y_diff + rng.randn(n) * 0.6,
+            # Mostly level-like.
+            "nfp_nsa_level_signal": y.values + rng.randn(n) * 10.0,
+            # Noise.
+            "nfp_nsa_noise_a": rng.randn(n) * 60.0,
+            "nfp_nsa_noise_b": rng.randn(n) * 70.0,
+        }
+    )
+
+    selected = select_branch_target_features_for_step(
+        X_train=X,
+        y_train=y,
+        target_type="nsa",
+        candidate_features=list(X.columns),
+        top_k=2,
+        method="dynamics_composite",
+        corr_threshold=0.98,
+        min_overlap=24,
+        dynamics_weight_level=0.2,
+        dynamics_weight_diff=0.65,
+        dynamics_weight_dir=0.15,
+    )
+
+    assert len(selected) == 2
+    assert "nfp_nsa_turn_signal" in selected
+
+
+def test_select_branch_target_features_dynamics_composite_uses_variance_terms():
+    rng = np.random.RandomState(29)
+    n = 200
+    vol_regime = (np.sin(np.arange(n) / 13.0) > 0).astype(float)
+    y_diff = rng.randn(n) * (2.0 + 5.0 * vol_regime)
+    y = pd.Series(np.cumsum(y_diff), name="y_mom")
+
+    random_sign = rng.choice([-1.0, 1.0], size=n)
+    amp_diff = random_sign * (np.abs(y_diff) + rng.randn(n) * 0.25)
+    amp_signal = np.cumsum(amp_diff)
+
+    X = pd.DataFrame(
+        {
+            # Strongly linked to change amplitude (|diff(y)|), weak on level.
+            "nfp_sa_amp_signal": amp_signal,
+            # Mostly level-like.
+            "nfp_sa_level_signal": y.values + rng.randn(n) * 8.0,
+            # Noise.
+            "nfp_sa_noise": rng.randn(n) * 60.0,
+        }
+    )
+
+    selected = select_branch_target_features_for_step(
+        X_train=X,
+        y_train=y,
+        target_type="sa",
+        candidate_features=list(X.columns),
+        top_k=1,
+        method="dynamics_composite",
+        corr_threshold=0.98,
+        min_overlap=24,
+        dynamics_weight_level=0.0,
+        dynamics_weight_diff=0.10,
+        dynamics_weight_dir=0.0,
+        dynamics_weight_amp=0.75,
+        dynamics_weight_sign=0.10,
+        dynamics_weight_tail=0.05,
+    )
+
+    assert selected == ["nfp_sa_amp_signal"]

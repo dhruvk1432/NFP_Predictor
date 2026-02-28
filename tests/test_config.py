@@ -14,6 +14,7 @@ from Train.config import (
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
     ALL_TARGET_CONFIGS,
+    VARIANCE_PRIORITY_TARGETS,
     get_target_path,
     get_model_id,
     parse_model_id,
@@ -39,10 +40,12 @@ class TestTargetConfiguration:
         assert len(VALID_RELEASE_TYPES) == 2
 
     def test_all_target_configs(self):
-        """Test that first release target configurations are defined."""
-        assert len(ALL_TARGET_CONFIGS) == 2
-        assert ('nsa', 'first') in ALL_TARGET_CONFIGS
-        assert ('sa', 'first') in ALL_TARGET_CONFIGS
+        """Test that all 4 branch target configurations are defined."""
+        assert len(ALL_TARGET_CONFIGS) == 4
+        assert ('nsa', 'first', 'first_release') in ALL_TARGET_CONFIGS
+        assert ('nsa', 'first', 'revised') in ALL_TARGET_CONFIGS
+        assert ('sa', 'first', 'first_release') in ALL_TARGET_CONFIGS
+        assert ('sa', 'first', 'revised') in ALL_TARGET_CONFIGS
 
 
 class TestGetTargetPath:
@@ -167,6 +170,15 @@ class TestHyperparameters:
         """Test that the default half-life bounds are reasonable."""
         assert HALF_LIFE_MIN_MONTHS >= 6  # At least 6 months
         assert HALF_LIFE_MAX_MONTHS <= 240  # Max 20 years
+
+
+class TestVariancePriorityTargets:
+    """Tests for variance-priority branch configuration."""
+
+    def test_sa_branches_are_variance_priority(self):
+        """SA first-release and revised should share variance-focused modeling."""
+        assert ('sa', 'first_release') in VARIANCE_PRIORITY_TARGETS
+        assert ('sa', 'revised') in VARIANCE_PRIORITY_TARGETS
 
 
 if __name__ == "__main__":

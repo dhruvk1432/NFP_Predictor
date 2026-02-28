@@ -113,9 +113,21 @@ def render_summary_table(
 
     # Build table data
     rows = []
-    rows.append(["RMSE", f"{metrics['RMSE']:.2f}"])
-    rows.append(["MAE", f"{metrics['MAE']:.2f}"])
-    rows.append(["MSE", f"{metrics['MSE']:.2f}"])
+    metric_order = [
+        ("RMSE", "{:.2f}"),
+        ("MAE", "{:.2f}"),
+        ("MSE", "{:.2f}"),
+        ("STD_Ratio", "{:.3f}"),
+        ("Diff_STD_Ratio", "{:.3f}"),
+        ("Corr_Level", "{:.3f}"),
+        ("Corr_Diff", "{:.3f}"),
+        ("Diff_Sign_Accuracy", "{:.2%}"),
+        ("Tail_MAE", "{:.2f}"),
+        ("Extreme_Hit_Rate", "{:.2%}"),
+    ]
+    for key, fmt in metric_order:
+        if key in metrics:
+            rows.append([key, fmt.format(metrics[key])])
     rows.append(["", ""])  # spacer
     rows.append(["Total Features", str(n_features)])
     rows.append(["", ""])  # spacer

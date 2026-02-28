@@ -675,6 +675,10 @@ def _build_lagged_target_feature_frame(
 
     result = pd.DataFrame(index=df.index)
 
+    def _safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
+        den_safe = den.where(den.abs() > 1e-9)
+        return num / den_safe
+
     # Canonical lag set
     result[f'{prefix}_mom_lag1'] = mom.shift(1)
     result[f'{prefix}_level_lag1'] = level.shift(1)
@@ -683,32 +687,174 @@ def _build_lagged_target_feature_frame(
     result[f'{prefix}_mom_lag6'] = mom.shift(6)
     result[f'{prefix}_mom_lag12'] = mom.shift(12)
 
-    # Acceleration lags
+    # Derivatives
     accel = mom.diff(1)
+    jerk = accel.diff(1)
     result[f'{prefix}_accel_lag1'] = accel.shift(1)
     result[f'{prefix}_accel_lag3'] = accel.shift(3)
     result[f'{prefix}_accel_lag6'] = accel.shift(6)
+    result[f'{prefix}_jerk_lag1'] = jerk.shift(1)
+    result[f'{prefix}_jerk_lag3'] = jerk.shift(3)
 
-    # Rolling momentum trend
+    # Rolling trend and volatility (all shifted to remain PIT-safe at month t)
     result[f'{prefix}_mom_rolling_3m'] = mom.rolling(3, min_periods=3).mean().shift(1)
     result[f'{prefix}_mom_rolling_6m'] = mom.rolling(6, min_periods=6).mean().shift(1)
     result[f'{prefix}_mom_rolling_12m'] = mom.rolling(12, min_periods=12).mean().shift(1)
-
-    # Rolling volatility regime
+    result[f'{prefix}_mom_vol_3m'] = mom.rolling(3, min_periods=3).std().shift(1)
     result[f'{prefix}_mom_vol_6m'] = mom.rolling(6, min_periods=6).std().shift(1)
     result[f'{prefix}_mom_vol_12m'] = mom.rolling(12, min_periods=12).std().shift(1)
+    result[f'{prefix}_accel_vol_3m'] = accel.rolling(3, min_periods=3).std().shift(1)
+    result[f'{prefix}_accel_vol_6m'] = accel.rolling(6, min_periods=6).std().shift(1)
+    result[f'{prefix}_accel_vol_12m'] = accel.rolling(12, min_periods=12).std().shift(1)
+    result[f'{prefix}_jerk_vol_6m'] = jerk.rolling(6, min_periods=6).std().shift(1)
+    result[f'{prefix}_jerk_vol_12m'] = jerk.rolling(12, min_periods=12).std().shift(1)
 
-    # Last print vs recent trend
+    mom_abs = mom.abs()
+    accel_abs = accel.abs()
+    jerk_abs = jerk.abs()
+    result[f'{prefix}_mom_abs_lag1'] = mom_abs.shift(1)
+    result[f'{prefix}_mom_abs_rolling_6m'] = mom_abs.rolling(6, min_periods=6).mean().shift(1)
+    result[f'{prefix}_mom_abs_rolling_12m'] = mom_abs.rolling(12, min_periods=12).mean().shift(1)
+    result[f'{prefix}_accel_abs_rolling_6m'] = accel_abs.rolling(6, min_periods=6).mean().shift(1)
+    result[f'{prefix}_jerk_abs_rolling_6m'] = jerk_abs.rolling(6, min_periods=6).mean().shift(1)
+
+    # Shock / z-score style features to capture non-drift moves.
     result[f'{prefix}_mom_vs_trend'] = (
         result[f'{prefix}_mom_lag1'] - result[f'{prefix}_mom_rolling_3m']
+    )
+    result[f'{prefix}_mom_z_3m'] = _safe_div(
+        result[f'{prefix}_mom_lag1'] - result[f'{prefix}_mom_rolling_3m'],
+        result[f'{prefix}_mom_vol_3m'],
+    )
+    result[f'{prefix}_mom_z_6m'] = _safe_div(
+        result[f'{prefix}_mom_lag1'] - result[f'{prefix}_mom_rolling_6m'],
+        result[f'{prefix}_mom_vol_6m'],
+    )
+    result[f'{prefix}_mom_z_12m'] = _safe_div(
+        result[f'{prefix}_mom_lag1'] - result[f'{prefix}_mom_rolling_12m'],
+        result[f'{prefix}_mom_vol_12m'],
+    )
+
+    accel_roll_3m = accel.rolling(3, min_periods=3).mean().shift(1)
+    accel_roll_6m = accel.rolling(6, min_periods=6).mean().shift(1)
+    accel_roll_12m = accel.rolling(12, min_periods=12).mean().shift(1)
+    jerk_roll_6m = jerk.rolling(6, min_periods=6).mean().shift(1)
+    jerk_roll_12m = jerk.rolling(12, min_periods=12).mean().shift(1)
+    result[f'{prefix}_accel_rolling_3m'] = accel_roll_3m
+    result[f'{prefix}_accel_rolling_6m'] = accel_roll_6m
+    result[f'{prefix}_accel_rolling_12m'] = accel_roll_12m
+    result[f'{prefix}_accel_z_6m'] = _safe_div(
+        result[f'{prefix}_accel_lag1'] - accel_roll_6m,
+        result[f'{prefix}_accel_vol_6m'],
+    )
+    result[f'{prefix}_accel_z_12m'] = _safe_div(
+        result[f'{prefix}_accel_lag1'] - accel_roll_12m,
+        result[f'{prefix}_accel_vol_12m'],
+    )
+    result[f'{prefix}_jerk_rolling_6m'] = jerk_roll_6m
+    result[f'{prefix}_jerk_z_6m'] = _safe_div(
+        result[f'{prefix}_jerk_lag1'] - jerk_roll_6m,
+        result[f'{prefix}_jerk_vol_6m'],
+    )
+    result[f'{prefix}_jerk_z_12m'] = _safe_div(
+        result[f'{prefix}_jerk_lag1'] - jerk_roll_12m,
+        result[f'{prefix}_jerk_vol_12m'],
+    )
+
+    # Range / ratio features emphasize amplitude and variance state.
+    result[f'{prefix}_mom_range_6m'] = (
+        mom.rolling(6, min_periods=6).max() - mom.rolling(6, min_periods=6).min()
+    ).shift(1)
+    result[f'{prefix}_mom_range_12m'] = (
+        mom.rolling(12, min_periods=12).max() - mom.rolling(12, min_periods=12).min()
+    ).shift(1)
+    result[f'{prefix}_accel_range_6m'] = (
+        accel.rolling(6, min_periods=6).max() - accel.rolling(6, min_periods=6).min()
+    ).shift(1)
+    result[f'{prefix}_mom_vol_ratio_3_12'] = _safe_div(
+        result[f'{prefix}_mom_vol_3m'],
+        result[f'{prefix}_mom_vol_12m'],
+    )
+    result[f'{prefix}_accel_vol_ratio_3_12'] = _safe_div(
+        result[f'{prefix}_accel_vol_3m'],
+        result[f'{prefix}_accel_vol_12m'],
+    )
+    result[f'{prefix}_mom_abs_z_6m'] = _safe_div(
+        result[f'{prefix}_mom_abs_lag1'] - result[f'{prefix}_mom_abs_rolling_6m'],
+        result[f'{prefix}_mom_vol_6m'],
+    )
+    result[f'{prefix}_mom_abs_z_12m'] = _safe_div(
+        result[f'{prefix}_mom_abs_lag1'] - result[f'{prefix}_mom_abs_rolling_12m'],
+        result[f'{prefix}_mom_vol_12m'],
+    )
+    result[f'{prefix}_accel_to_mom_vol_ratio'] = _safe_div(
+        result[f'{prefix}_accel_lag1'].abs(),
+        result[f'{prefix}_mom_vol_6m'],
+    )
+    result[f'{prefix}_jerk_to_accel_vol_ratio'] = _safe_div(
+        result[f'{prefix}_jerk_lag1'].abs(),
+        result[f'{prefix}_accel_vol_6m'],
+    )
+    result[f'{prefix}_mom_abs_to_vol_ratio_6m'] = _safe_div(
+        result[f'{prefix}_mom_abs_lag1'],
+        result[f'{prefix}_mom_vol_6m'],
     )
 
     # Year-over-year change in momentum
     result[f'{prefix}_mom_yoy'] = mom.diff(12).shift(1)
 
-    # Expansion/stall regime indicator
-    result[f'{prefix}_positive_months_6m'] = (
-        (mom > 0).astype(float).rolling(6, min_periods=6).sum().shift(1)
+    # Expansion/stall regime and turn detection.
+    pos = (mom > 0).astype(float)
+    neg = (mom < 0).astype(float)
+    result[f'{prefix}_positive_ratio_3m'] = pos.rolling(3, min_periods=3).mean().shift(1)
+    result[f'{prefix}_positive_ratio_6m'] = pos.rolling(6, min_periods=6).mean().shift(1)
+    result[f'{prefix}_positive_months_6m'] = pos.rolling(6, min_periods=6).sum().shift(1)
+    result[f'{prefix}_positive_ratio_12m'] = pos.rolling(12, min_periods=12).mean().shift(1)
+    result[f'{prefix}_negative_ratio_12m'] = neg.rolling(12, min_periods=12).mean().shift(1)
+
+    mom_sign_lag1 = np.sign(result[f'{prefix}_mom_lag1'])
+    mom_sign_lag2 = np.sign(result[f'{prefix}_mom_lag2'])
+    accel_sign_lag1 = np.sign(result[f'{prefix}_accel_lag1'])
+    accel_sign_lag2 = np.sign(accel.shift(2))
+    result[f'{prefix}_mom_sign_lag1'] = mom_sign_lag1
+    result[f'{prefix}_accel_sign_lag1'] = accel_sign_lag1
+    result[f'{prefix}_mom_sign_balance_6m'] = np.sign(mom).rolling(6, min_periods=6).mean().shift(1)
+    turn_missing = result[f'{prefix}_mom_lag1'].isna() | result[f'{prefix}_mom_lag2'].isna()
+    turn_bool = (mom_sign_lag1 * mom_sign_lag2) < 0
+    turn_flag = np.where(turn_missing, np.nan, np.where(turn_bool, 1.0, 0.0))
+    result[f'{prefix}_turn_flag_lag1'] = pd.Series(turn_flag, index=result.index, dtype=float)
+    accel_missing = result[f'{prefix}_accel_lag1'].isna() | accel.shift(2).isna()
+    accel_bool = (accel_sign_lag1 * accel_sign_lag2) < 0
+    accel_flip = np.where(accel_missing, np.nan, np.where(accel_bool, 1.0, 0.0))
+    result[f'{prefix}_accel_sign_flip_lag1'] = pd.Series(accel_flip, index=result.index, dtype=float)
+
+    # Interactions between first and second derivatives.
+    result[f'{prefix}_mom_x_accel_lag1'] = (
+        result[f'{prefix}_mom_lag1'] * result[f'{prefix}_accel_lag1']
+    )
+    result[f'{prefix}_accel_x_jerk_lag1'] = (
+        result[f'{prefix}_accel_lag1'] * result[f'{prefix}_jerk_lag1']
+    )
+
+    # Seasonal same-month anchors from prior years only (PIT-safe via group shift).
+    month_groups = mom.groupby(df.index.month)
+    result[f'{prefix}_mom_same_month_lag1y'] = month_groups.shift(1)
+    result[f'{prefix}_mom_same_month_avg_5y'] = month_groups.transform(
+        lambda s: s.shift(1).rolling(5, min_periods=1).mean()
+    )
+    result[f'{prefix}_mom_same_month_std_5y'] = month_groups.transform(
+        lambda s: s.shift(1).rolling(5, min_periods=2).std()
+    )
+    result[f'{prefix}_mom_seasonal_dev'] = (
+        result[f'{prefix}_mom_lag12'] - result[f'{prefix}_mom_same_month_avg_5y']
+    )
+    result[f'{prefix}_mom_same_month_z_5y'] = _safe_div(
+        result[f'{prefix}_mom_same_month_lag1y'] - result[f'{prefix}_mom_same_month_avg_5y'],
+        result[f'{prefix}_mom_same_month_std_5y'],
+    )
+    result[f'{prefix}_mom_seasonal_z'] = _safe_div(
+        result[f'{prefix}_mom_seasonal_dev'],
+        result[f'{prefix}_mom_same_month_std_5y'],
     )
 
     return result

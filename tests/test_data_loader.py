@@ -140,9 +140,19 @@ class TestLaggedTargetFeatures:
             'nfp_mom_rolling_12m',
             'nfp_mom_vol_6m',
             'nfp_mom_vol_12m',
+            'nfp_accel_vol_6m',
+            'nfp_jerk_lag1',
+            'nfp_mom_abs_rolling_6m',
+            'nfp_positive_ratio_12m',
+            'nfp_mom_same_month_avg_5y',
             'nfp_mom_vs_trend',
             'nfp_mom_yoy',
             'nfp_positive_months_6m',
+            'nfp_mom_z_6m',
+            'nfp_accel_z_6m',
+            'nfp_mom_vol_ratio_3_12',
+            'nfp_turn_flag_lag1',
+            'nfp_mom_x_accel_lag1',
         }
         missing = expected - set(features.keys())
         assert not missing, f"Missing expected features: {sorted(missing)}"

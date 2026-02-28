@@ -323,10 +323,18 @@ SHORTPASS_HALF_LIFE = None          # None = reuse backtest step half_life
 # Branch-target derived features (nfp_{target_type}_*) are selected separately
 # and then merged on top of snapshot features.
 USE_BRANCH_TARGET_FS = True         # Master toggle for branch-target feature selection
-BRANCH_TARGET_FS_TOPK = 8           # Keep up to this many branch-target derived features
+BRANCH_TARGET_FS_TOPK = 8           # Default top-k for non-priority targets
+BRANCH_TARGET_FS_TOPK_VARIANCE = 20 # Wider pool for variance-priority targets
 BRANCH_TARGET_FS_METHOD = 'weighted_corr'  # 'lgbm_gain' or 'weighted_corr'
+BRANCH_TARGET_FS_METHOD_VARIANCE = 'dynamics_composite'  # prioritize change/direction signal
 BRANCH_TARGET_FS_CORR_THRESHOLD = 0.90     # Redundancy pruning threshold
 BRANCH_TARGET_FS_MIN_OVERLAP = 24          # Minimum overlap for corr pruning
+BRANCH_TARGET_FS_WEIGHT_LEVEL = 0.25       # Dynamics selector: corr(feature, level)
+BRANCH_TARGET_FS_WEIGHT_DIFF = 0.25        # Dynamics selector: corr(diff(feature), diff(target))
+BRANCH_TARGET_FS_WEIGHT_DIR = 0.15         # Dynamics selector: directional separation score
+BRANCH_TARGET_FS_WEIGHT_AMP = 0.20         # Dynamics selector: corr(|diff(feature)|, |diff(target)|)
+BRANCH_TARGET_FS_WEIGHT_SIGN = 0.10        # Dynamics selector: diff-sign coherence
+BRANCH_TARGET_FS_WEIGHT_TAIL = 0.05        # Dynamics selector: tail-amplitude alignment
 
 
 # =============================================================================
@@ -339,3 +347,83 @@ KEEP_RULE_ENABLED = True            # Enforce hard keep-rule gating
 KEEP_RULE_WINDOW_M = 12             # Trailing OOS months to evaluate
 KEEP_RULE_TOLERANCE = 0.0           # Max allowed MAE degradation vs best baseline
 KEEP_RULE_ACTION = 'skip_save'      # 'fail' | 'fallback_to_baseline' | 'skip_save'
+
+
+# =============================================================================
+# VARIANCE-CAPTURE ENHANCEMENTS (SA BRANCH PRIORITY)
+# =============================================================================
+
+# Target configs where variance capture is a hard requirement.
+# Each tuple is (target_type, target_source).
+VARIANCE_PRIORITY_TARGETS = (
+    ('sa', 'first_release'),
+    ('sa', 'revised'),
+)
+
+# KPI definitions
+VARIANCE_TAIL_QUANTILE = 0.75
+VARIANCE_EXTREME_QUANTILE = 0.90
+
+# Promotion gate thresholds (applied to VARIANCE_PRIORITY_TARGETS)
+ENABLE_VARIANCE_GATE = True
+VARIANCE_GATE_MIN_STD_RATIO = 0.60
+VARIANCE_GATE_MIN_DIFF_STD_RATIO = 0.45
+VARIANCE_GATE_MIN_CORR_DIFF = 0.25
+VARIANCE_GATE_MIN_DIFF_SIGN_ACC = 0.55
+VARIANCE_GATE_MIN_EXTREME_HIT_RATE = 0.25
+
+# Hyperparameter tuning objective
+TUNING_OBJECTIVE_MODE_DEFAULT = 'mae'       # 'mae' or 'composite'
+TUNING_OBJECTIVE_MODE_VARIANCE = 'composite'
+TUNING_LAMBDA_STD_RATIO = 25.0
+TUNING_LAMBDA_DIFF_STD_RATIO = 25.0
+TUNING_LAMBDA_TAIL_MAE = 0.20
+TUNING_LAMBDA_CORR_DIFF = 20.0
+TUNING_LAMBDA_DIFF_SIGN = 12.0
+
+# Sequential variance-enhancement stack (applied in this order)
+ENABLE_VARIANCE_ENHANCEMENTS = True
+ENHANCEMENT_SEQUENCE = ('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')
+ENHANCEMENT_MIN_IMPROVEMENT = 0.25  # Minimum composite-score improvement on validation
+
+# Stage A: amplitude calibration  y = a + b*y_hat
+ENABLE_AMPLITUDE_CALIBRATION = True
+AMPLITUDE_CAL_MIN_SAMPLES = 12
+AMPLITUDE_CAL_SLOPE_MIN = 0.50
+AMPLITUDE_CAL_SLOPE_MAX = 3.00
+
+# Stage B: residual shock model
+ENABLE_SHOCK_MODEL = True
+SHOCK_MODEL_NUM_BOOST_ROUND = 200
+SHOCK_MODEL_MAX_DEPTH = 3
+SHOCK_MODEL_NUM_LEAVES = 15
+
+# Stage C: acceleration target model (predict delta-MoM, then reconstruct MoM)
+ENABLE_ACCELERATION_MODEL = True
+ACCEL_MODEL_NUM_BOOST_ROUND = 200
+ACCEL_MODEL_MAX_DEPTH = 3
+ACCEL_MODEL_NUM_LEAVES = 15
+
+# Stage C2: multi-target dynamics model (level + delta + direction reconciliation)
+ENABLE_MULTI_TARGET_DYNAMICS = True
+DYNAMICS_MODEL_NUM_BOOST_ROUND = 220
+DYNAMICS_MODEL_MAX_DEPTH = 3
+DYNAMICS_MODEL_NUM_LEAVES = 15
+DYNAMICS_DELTA_BLEND = 0.70             # Blend between delta-model and current best delta
+DYNAMICS_DIRECTION_CONFIDENCE = 0.12    # Min |p_up - 0.5| to enforce classifier sign
+DYNAMICS_DIRECTION_BLEND = 0.80         # Max directional sign override strength
+DYNAMICS_MAGNITUDE_FLOOR = 1.0          # Avoid near-zero signed-delta collapse
+
+# Tail-aware objective weighting (applied to variance-priority targets only)
+ENABLE_TAIL_AWARE_WEIGHTING = True
+TAIL_WEIGHT_ABS_LEVEL_QUANTILE = 0.80
+TAIL_WEIGHT_ABS_DIFF_QUANTILE = 0.80
+TAIL_WEIGHT_LEVEL_BOOST = 1.35
+TAIL_WEIGHT_DIFF_BOOST = 1.35
+TAIL_WEIGHT_MAX_MULTIPLIER = 2.50
+
+# Stage D: low/high-vol regime experts + router probability blending
+ENABLE_REGIME_ROUTER = True
+REGIME_HIGHVOL_QUANTILE = 0.75
+REGIME_MIN_CLASS_SAMPLES = 20
+REGIME_MODEL_NUM_BOOST_ROUND = 150

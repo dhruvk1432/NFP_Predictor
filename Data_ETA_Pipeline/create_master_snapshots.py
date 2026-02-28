@@ -19,6 +19,7 @@ Critical Architecture:
 """
 
 import pandas as pd
+import numpy as np
 import sys
 import os
 import json
@@ -103,6 +104,193 @@ TARGET_COMBOS = [
 ]
 DEFAULT_TARGET_COMBOS = tuple(TARGET_COMBOS)
 FAST_VERIFY_MONTH_WINDOW = 36
+VALID_TARGET_TYPE_SCOPES = {'all', 'nsa', 'sa'}
+VALID_FS_TARGET_MODES = {'auto', 'mom', 'delta_mom', 'model_aligned'}
+VALID_FS_STAGE_IDS = set(range(0, 7))
+
+BRANCH_ALIAS_MAP = {
+    'nsa_first': ('nsa', 'first_release'),
+    'nsa_first_release': ('nsa', 'first_release'),
+    'nsa_revised': ('nsa', 'revised'),
+    'nsa_first_revised': ('nsa', 'revised'),
+    'sa_first': ('sa', 'first_release'),
+    'sa_first_release': ('sa', 'first_release'),
+    'sa_revised': ('sa', 'revised'),
+    'sa_first_revised': ('sa', 'revised'),
+}
+
+
+def _normalize_branch_alias(raw: str) -> str:
+    return str(raw).strip().lower().replace('-', '_')
+
+
+def _parse_branch_list(branches: list[str] | None) -> list[tuple[str, str]] | None:
+    """Parse explicit branch aliases, preserving input order and uniqueness."""
+    if not branches:
+        return None
+
+    parsed: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for token in branches:
+        norm = _normalize_branch_alias(token)
+        combo = BRANCH_ALIAS_MAP.get(norm)
+        if combo is None:
+            raise ValueError(
+                f"Invalid branch '{token}'. Expected one of: "
+                f"{', '.join(sorted(BRANCH_ALIAS_MAP.keys()))}"
+            )
+        if combo not in seen:
+            seen.add(combo)
+            parsed.append(combo)
+    return parsed
+
+
+def _apply_target_combo_filters(
+    target_combos: list[tuple[str, str]],
+    target_type_scope: str = 'all',
+    branches: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """
+    Filter base target combos by explicit branch list and/or target type scope.
+
+    Precedence:
+    1) explicit `branches` (if provided)
+    2) `target_type_scope` filter
+    """
+    explicit = _parse_branch_list(branches)
+    if explicit is not None:
+        return [combo for combo in explicit if combo in TARGET_COMBOS]
+
+    scope = str(target_type_scope or 'all').strip().lower()
+    if scope not in VALID_TARGET_TYPE_SCOPES:
+        raise ValueError(
+            f"Invalid target_type_scope='{target_type_scope}'. "
+            f"Expected one of: {sorted(VALID_TARGET_TYPE_SCOPES)}"
+        )
+    if scope == 'all':
+        return list(target_combos)
+    return [combo for combo in target_combos if combo[0] == scope]
+
+
+def _normalize_selection_target_mode(selection_target_mode: str | None) -> str:
+    mode = str(selection_target_mode or 'auto').strip().lower()
+    if mode not in VALID_FS_TARGET_MODES:
+        raise ValueError(
+            f"Invalid selection_target_mode='{selection_target_mode}'. "
+            f"Expected one of: {sorted(VALID_FS_TARGET_MODES)}"
+        )
+    return mode
+
+
+def _parse_fs_stages_arg(fs_stages_arg: str | None) -> tuple[int, ...] | None:
+    """
+    Parse --fs-stages CLI argument (comma-separated stage ids 0..6).
+    """
+    if fs_stages_arg is None:
+        return None
+    raw = str(fs_stages_arg).strip()
+    if raw == "":
+        return None
+
+    tokens = [t.strip() for t in raw.split(",") if t.strip() != ""]
+    if not tokens:
+        raise ValueError("Invalid --fs-stages value: empty list")
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for tok in tokens:
+        if not tok.isdigit():
+            raise ValueError(
+                f"Invalid stage id '{tok}' in --fs-stages. Expected integers in 0..6."
+            )
+        sid = int(tok)
+        if sid not in VALID_FS_STAGE_IDS:
+            raise ValueError(
+                f"Invalid stage id '{sid}' in --fs-stages. Expected one of {sorted(VALID_FS_STAGE_IDS)}."
+            )
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+
+    return tuple(out)
+
+
+def _resolve_selection_target_mode(
+    target_cat: str,
+    target_source: str,
+    selection_target_mode: str | None = 'auto',
+) -> str:
+    """
+    Resolve per-branch feature-selection target mode.
+
+    - auto: SA branches use model_aligned target; NSA branches use MoM level.
+    """
+    mode = _normalize_selection_target_mode(selection_target_mode)
+    if mode != 'auto':
+        return mode
+    _ = target_source
+    return 'model_aligned' if target_cat == 'sa' else 'mom'
+
+
+def _robust_zscore(values: pd.Series) -> pd.Series:
+    """Robust z-score with MAD fallback to std."""
+    s = pd.Series(values, copy=False).astype(float)
+    valid = s.dropna()
+    if valid.empty:
+        return s * np.nan
+    med = float(valid.median())
+    mad = float(np.median(np.abs(valid.values - med)))
+    scale = 1.4826 * mad if mad > 1e-12 else float(valid.std(ddof=0))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return s * 0.0
+    return (s - med) / scale
+
+
+def _build_selection_target(
+    target_mom: pd.Series,
+    target_cat: str,
+    target_source: str,
+    selection_target_mode: str | None = 'auto',
+) -> tuple[pd.Series, str]:
+    """
+    Build feature-selection target series aligned with model objective.
+
+    Leakage safety:
+    - Uses only month-t and lagged month-(t-1) target values.
+    - No future information is introduced.
+    """
+    mode = _resolve_selection_target_mode(
+        target_cat=target_cat,
+        target_source=target_source,
+        selection_target_mode=selection_target_mode,
+    )
+
+    y = pd.Series(target_mom, copy=True).astype(float)
+    if mode == 'mom':
+        return y, mode
+
+    dy = y.diff()
+    if mode == 'delta_mom':
+        return dy, mode
+
+    # model_aligned: blend level and acceleration structure to improve
+    # selection for variance-capture models (especially SA branches).
+    z_level = _robust_zscore(y)
+    z_diff = _robust_zscore(dy)
+    sign_diff = np.sign(dy).replace(0.0, np.nan).ffill().fillna(0.0)
+
+    if target_cat == 'sa':
+        w_level, w_diff, w_dir = 0.30, 0.55, 0.15
+    else:
+        w_level, w_diff, w_dir = 0.60, 0.30, 0.10
+
+    y_sel = (
+        w_level * z_level
+        + w_diff * z_diff
+        + w_dir * sign_diff
+    )
+    y_sel = y_sel.replace([np.inf, -np.inf], np.nan)
+    return y_sel, mode
 
 
 def _resolve_target_combos(
@@ -199,7 +387,11 @@ def _get_cache_path(target_cat: str, target_source: str) -> Path:
     return MASTER_BASE / f"selected_features_{target_cat}_{target_source}.json"
 
 
-def _check_cache(target_cat: str, target_source: str) -> list[str]:
+def _check_cache(
+    target_cat: str,
+    target_source: str,
+    selection_target_mode: str = 'mom',
+) -> list[str]:
     """Return cached features if generated within the last 30 days."""
     inc_counter("master_snapshot.cache.branch.lookup", 1)
     cache_path = _get_cache_path(target_cat, target_source)
@@ -219,16 +411,21 @@ def _check_cache(target_cat: str, target_source: str) -> list[str]:
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
 
+        cached_mode = str(data.get("selection_target_mode", "mom")).strip().lower()
         if (data.get("target_source") == target_source
                 and data.get("target_cat") == target_cat
+                and cached_mode == selection_target_mode
                 and days_old < 30):
             logger.info(f"[{target_cat.upper()}/{target_source}] Using cached features "
-                        f"(Age: {days_old} days).")
+                        f"(Age: {days_old} days, mode={cached_mode}).")
             inc_counter("master_snapshot.cache.branch.hit", 1)
             return data.get("features", [])
 
-        logger.info(f"[{target_cat.upper()}/{target_source}] Cache expired "
-                    f"(Age: {days_old} days). Rebuilding...")
+        logger.info(
+            f"[{target_cat.upper()}/{target_source}] Cache miss/expired "
+            f"(Age: {days_old} days, cached_mode={cached_mode}, "
+            f"required_mode={selection_target_mode}). Rebuilding..."
+        )
         inc_counter("master_snapshot.cache.branch.miss", 1)
         inc_counter("master_snapshot.cache.branch.expired", 1)
         return None
@@ -240,12 +437,18 @@ def _check_cache(target_cat: str, target_source: str) -> list[str]:
         return None
 
 
-def _save_cache(features: list[str], target_cat: str, target_source: str) -> None:
+def _save_cache(
+    features: list[str],
+    target_cat: str,
+    target_source: str,
+    selection_target_mode: str = 'mom',
+) -> None:
     cache_path = _get_cache_path(target_cat, target_source)
     data = {
         "last_run_date": datetime.now().strftime("%Y-%m-%d"),
         "target_source": target_source,
         "target_cat": target_cat,
+        "selection_target_mode": selection_target_mode,
         "features": sorted(list(set(features))),
     }
     with perf_phase(
@@ -272,6 +475,7 @@ def _check_regime_cache(
     target_cat: str,
     target_source: str,
     regime_cutoff: pd.Timestamp,
+    selection_target_mode: str = 'mom',
 ) -> list[str] | None:
     """Load regime cache if TTL checks pass."""
     inc_counter("master_snapshot.cache.regime.lookup", 1)
@@ -293,11 +497,14 @@ def _check_regime_cache(
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
 
+        cached_mode = str(data.get("selection_target_mode", "mom")).strip().lower()
         if (days_old < 30
+                and cached_mode == selection_target_mode
                 and data.get("regime_cutoff_month") == _month_key(regime_cutoff)):
             feats = data.get("features", [])
             logger.info(f"[{target_cat.upper()}/{target_source}] Regime {data.get('regime_cutoff_month')} "
-                        f"loaded from cache ({len(feats)} features, {days_old} days old).")
+                        f"loaded from cache ({len(feats)} features, {days_old} days old, "
+                        f"mode={cached_mode}).")
             inc_counter("master_snapshot.cache.regime.hit", 1)
             return feats
 
@@ -316,6 +523,7 @@ def _save_regime_cache(
     target_cat: str,
     target_source: str,
     regime_cutoff: pd.Timestamp,
+    selection_target_mode: str = 'mom',
 ) -> None:
     """Persist regime-selected features for one cutoff month."""
     cache_path = _get_regime_cache_path(target_cat, target_source, regime_cutoff)
@@ -324,6 +532,7 @@ def _save_regime_cache(
         "last_run_date": datetime.now().strftime("%Y-%m-%d"),
         "target_source": target_source,
         "target_cat": target_cat,
+        "selection_target_mode": selection_target_mode,
         "regime_cutoff_month": _month_key(regime_cutoff),
         "features": sorted(list(set(features))),
     }
@@ -365,6 +574,7 @@ def _check_source_cache(
     target_cat: str,
     target_source: str,
     asof_month: pd.Timestamp | None = None,
+    selection_target_mode: str = 'mom',
 ) -> list[str] | None:
     """Return source cache if TTL checks pass."""
     inc_counter("master_snapshot.cache.source.lookup", 1)
@@ -384,10 +594,11 @@ def _check_source_cache(
                 data = json.load(f)
         last_run = datetime.strptime(data.get("last_run_date", "2000-01-01"), "%Y-%m-%d")
         days_old = (datetime.now() - last_run).days
-        if days_old < 30:
+        cached_mode = str(data.get("selection_target_mode", "mom")).strip().lower()
+        if days_old < 30 and cached_mode == selection_target_mode:
             feats = data.get("features", [])
             logger.info(f"[{source_name}] Using cached source features "
-                        f"({len(feats)} features, {days_old} days old)")
+                        f"({len(feats)} features, {days_old} days old, mode={cached_mode})")
             inc_counter("master_snapshot.cache.source.hit", 1)
             return feats
         inc_counter("master_snapshot.cache.source.miss", 1)
@@ -401,7 +612,8 @@ def _check_source_cache(
 
 def _save_source_cache(features: list[str], source_name: str,
                        target_cat: str, target_source: str,
-                       asof_month: pd.Timestamp | None = None) -> None:
+                       asof_month: pd.Timestamp | None = None,
+                       selection_target_mode: str = 'mom') -> None:
     """Save a single source's feature selection results."""
     cache_path = _get_source_cache_path(source_name, target_cat, target_source, asof_month=asof_month)
     data = {
@@ -409,6 +621,7 @@ def _save_source_cache(features: list[str], source_name: str,
         "source_name": source_name,
         "target_cat": target_cat,
         "target_source": target_source,
+        "selection_target_mode": selection_target_mode,
         "features": sorted(list(set(features))),
     }
     with perf_phase(
@@ -439,7 +652,8 @@ def _snapshot_path(base_dir: Path, date_ts: pd.Timestamp) -> Path:
 def _process_source_features(source_name: str, source_dir: Path,
                              target_cat: str, target_source: str,
                              asof_month: pd.Timestamp | None = None,
-                             stages: tuple | None = None) -> list[str]:
+                             stages: tuple | None = None,
+                             selection_target_mode: str = 'auto') -> list[str]:
     """Worker function for ProcessPoolExecutor to run the feature selection engine on one source.
 
     Args:
@@ -488,7 +702,7 @@ def _process_source_features(source_name: str, source_dir: Path,
     logger.info(f"[{label}] [{source_name}] {len(series_groups)} groups, "
                 f"{snap_wide.shape[1]} total features")
 
-    # 4. Load targets (MoM only)
+    # 4. Load targets and construct leakage-safe selection target.
     logger.info(f"[{label}] [{source_name}] Loading targets...")
     if target_source == 'revised':
         # Revised targets must be pre-built in data/NFP_target by the load stage.
@@ -524,13 +738,23 @@ def _process_source_features(source_name: str, source_dir: Path,
 
     target_indexed = target_df.dropna(subset=['y_mom']).set_index('ds')
     y_mom = target_indexed['y_mom']
+    y_selection, resolved_mode = _build_selection_target(
+        target_mom=y_mom,
+        target_cat=target_cat,
+        target_source=target_source,
+        selection_target_mode=selection_target_mode,
+    )
+    logger.info(
+        f"[{label}] [{source_name}] Selection target mode={resolved_mode} "
+        f"(usable_obs={int(y_selection.dropna().shape[0])})."
+    )
 
     # 5. Run full pipeline (Stages 1-6: MoM only)
     logger.info(f"[{label}] [{source_name}] Matrix shape {snap_wide.shape}. "
                 f"Starting 6-stage pipeline...")
     try:
         survivors = run_full_source_pipeline(
-            snap_wide, y_mom, source_name, source_dir, series_groups,
+            snap_wide, y_selection, source_name, source_dir, series_groups,
             stages=stages,
         )
         logger.info(f"[{label}] [{source_name}] Engine returned {len(survivors)} features.")
@@ -548,10 +772,19 @@ def _run_parallel_feature_selection(
     target_source: str,
     asof_month: pd.Timestamp | None = None,
     stages: tuple | None = None,
+    selection_target_mode: str = 'auto',
 ) -> list[str]:
     label = f"{target_cat.upper()}/{target_source}"
     asof_label = _month_key(asof_month) if asof_month is not None else "latest"
-    logger.info(f"[{label}] Starting Feature Selection Across All Sources (as-of {asof_label})...")
+    resolved_mode = _resolve_selection_target_mode(
+        target_cat=target_cat,
+        target_source=target_source,
+        selection_target_mode=selection_target_mode,
+    )
+    logger.info(
+        f"[{label}] Starting Feature Selection Across All Sources "
+        f"(as-of {asof_label}, mode={resolved_mode})..."
+    )
     all_selected = []
 
     force_serial_small = (
@@ -578,14 +811,25 @@ def _run_parallel_feature_selection(
 
     def _run_or_load_source(name):
         """Check per-source cache first; run pipeline only if cache miss."""
-        cached = _check_source_cache(name, target_cat, target_source, asof_month=asof_month)
+        cached = _check_source_cache(
+            name,
+            target_cat,
+            target_source,
+            asof_month=asof_month,
+            selection_target_mode=resolved_mode,
+        )
         if cached is not None:
             return cached
         feats = _process_source_features(
             name, SOURCES[name], target_cat, target_source,
             asof_month=asof_month, stages=stages,
+            selection_target_mode=resolved_mode,
         )
-        _save_source_cache(feats, name, target_cat, target_source, asof_month=asof_month)
+        _save_source_cache(
+            feats, name, target_cat, target_source,
+            asof_month=asof_month,
+            selection_target_mode=resolved_mode,
+        )
         return feats
 
     # 1. Run massive sources sequentially (skip the irrelevant FRED branch)
@@ -614,7 +858,13 @@ def _run_parallel_feature_selection(
     uncached_small = []
     with perf_phase("master_snapshot.fs.small_sources_cache_scan", target_cat=target_cat, target_source=target_source):
         for name in small_sources:
-            cached = _check_source_cache(name, target_cat, target_source, asof_month=asof_month)
+            cached = _check_source_cache(
+                name,
+                target_cat,
+                target_source,
+                asof_month=asof_month,
+                selection_target_mode=resolved_mode,
+            )
             if cached is not None:
                 all_selected.extend(cached)
                 logger.info(f"+++ [{label}] {name} loaded from cache. Added {len(cached)} features.")
@@ -641,9 +891,12 @@ def _run_parallel_feature_selection(
                                 target_source,
                                 asof_month=asof_month,
                                 stages=stages,
+                                selection_target_mode=resolved_mode,
                             )
                         _save_source_cache(
-                            feats, name, target_cat, target_source, asof_month=asof_month
+                            feats, name, target_cat, target_source,
+                            asof_month=asof_month,
+                            selection_target_mode=resolved_mode,
                         )
                         all_selected.extend(feats)
                         logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
@@ -655,7 +908,7 @@ def _run_parallel_feature_selection(
                 with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
                     futures = {
                         executor.submit(_process_source_features, name, SOURCES[name],
-                                        target_cat, target_source, asof_month, stages): name
+                                        target_cat, target_source, asof_month, stages, resolved_mode): name
                         for name in uncached_small
                     }
                     for future in as_completed(futures):
@@ -669,7 +922,9 @@ def _run_parallel_feature_selection(
                             ):
                                 feats = future.result()
                             _save_source_cache(
-                                feats, name, target_cat, target_source, asof_month=asof_month
+                                feats, name, target_cat, target_source,
+                                asof_month=asof_month,
+                                selection_target_mode=resolved_mode,
                             )
                             all_selected.extend(feats)
                             logger.info(f"+++ [{label}] {name} completed successfully. Added {len(feats)} features.")
@@ -825,14 +1080,17 @@ def _clear_progress(target_cat: str, target_source: str) -> None:
         path.unlink()
 
 
-def _all_skip_fs_json_caches_exist() -> bool:
+def _all_skip_fs_json_caches_exist(
+    target_combos: list[tuple[str, str]] | None = None,
+) -> bool:
     """
     True only when all 4 canonical selected-feature JSON caches exist.
 
     This guards the skip-feature-selection parallel fast path.
     """
+    combos = target_combos if target_combos is not None else list(DEFAULT_TARGET_COMBOS)
     missing = []
-    for target_cat, target_source in DEFAULT_TARGET_COMBOS:
+    for target_cat, target_source in combos:
         cache_path = _get_cache_path(target_cat, target_source)
         if not cache_path.exists():
             missing.append(cache_path.name)
@@ -1069,7 +1327,7 @@ def _run_skip_fs_parallel_fast_path(
     if not target_combos:
         return True
 
-    if not _all_skip_fs_json_caches_exist():
+    if not _all_skip_fs_json_caches_exist(target_combos=target_combos):
         return False
 
     branch_feature_sets = _load_skip_fs_branch_feature_sets(target_combos)
@@ -1173,14 +1431,22 @@ def _resolve_regime_cutoff(
 def create_master_snapshots(
     skip_existing: bool = False,
     target_source_scope: str | None = None,
+    target_type_scope: str = 'all',
+    branches: list[str] | None = None,
     asof_start: str | None = None,
     asof_end: str | None = None,
     skip_feature_selection: bool = False,
+    selection_target_mode: str = 'auto',
+    fs_stages_override: tuple[int, ...] | None = None,
+    single_selection_asof: str | None = None,
 ):
     """
     Args:
         skip_existing: Skip months where master snapshot already exists.
         target_source_scope: Branch scope ('auto', 'all', 'revised', 'first_release').
+        target_type_scope: Target family scope ('all', 'nsa', 'sa').
+        branches: Optional explicit branch list (e.g. ['sa_revised'] or
+                  ['sa_first_release']). Overrides scope filters.
         asof_start: Optional YYYY-MM lower bound for as-of months to process (inclusive).
                     Default None = no lower bound.
         asof_end: Optional YYYY-MM upper bound for as-of months to process (inclusive).
@@ -1191,6 +1457,17 @@ def create_master_snapshots(
                     For profiling / fast rebuilds only. When all four canonical
                     selected_features_*.json files exist, a branch-parallel fast
                     path is used.
+        selection_target_mode: Feature-selection target mode:
+                    - auto (default): SA branches use model_aligned target,
+                      NSA branches use MoM level.
+                    - mom: optimize for MoM level drift only.
+                    - delta_mom: optimize for MoM first-difference signal.
+                    - model_aligned: blended level+delta+direction target.
+        fs_stages_override: Optional explicit stage tuple (0..6), e.g. (0,1,2,4)
+                    to skip vintage (stage 3) for faster but less robust selection.
+        single_selection_asof: Optional YYYY-MM cutoff used as the single
+                    feature-selection as-of month for all processed months.
+                    This is faster and less robust than regime-based refreshes.
     """
     start_dt = pd.to_datetime(START_DATE)
     end_dt = pd.to_datetime(END_DATE)
@@ -1215,10 +1492,35 @@ def create_master_snapshots(
         return
 
     scope = target_source_scope or os.getenv("MASTER_TARGET_SOURCE_SCOPE", "auto")
-    target_combos = _resolve_target_combos(start_dt, end_dt, scope)
+    base_target_combos = _resolve_target_combos(start_dt, end_dt, scope)
+    target_combos = _apply_target_combo_filters(
+        target_combos=base_target_combos,
+        target_type_scope=target_type_scope,
+        branches=branches,
+    )
+    if not target_combos:
+        logger.warning(
+            "No branches selected after applying filters "
+            f"(scope={scope}, target_type_scope={target_type_scope}, branches={branches})."
+        )
+        return
 
-    logger.info(f"Target scope resolved to '{scope}'. Running {len(target_combos)} branch(es): "
-                f"{target_combos}")
+    logger.info(
+        f"Target scope resolved to '{scope}'. "
+        f"Filtered branches={target_combos} "
+        f"(target_type_scope={target_type_scope}, branches={branches}, "
+        f"selection_target_mode={selection_target_mode})"
+    )
+    active_fs_stages = tuple(fs_stages_override) if fs_stages_override is not None else FS_STAGES
+    logger.info(f"Active feature-selection stages for this run: {active_fs_stages}")
+
+    single_selection_asof_ts: pd.Timestamp | None = None
+    if single_selection_asof is not None:
+        single_selection_asof_ts = pd.Timestamp(single_selection_asof).replace(day=1)
+        logger.info(
+            "Single as-of feature-selection mode enabled: "
+            f"all branch feature selection will use cutoff <= {single_selection_asof_ts:%Y-%m}"
+        )
 
     # Fast path for data-refresh runs:
     # If skip-feature-selection is requested AND all canonical branch JSON caches
@@ -1236,7 +1538,13 @@ def create_master_snapshots(
     # Each branch runs its own independent feature selection
     for target_cat, target_source in target_combos:
         label = f"{target_cat.upper()}/{target_source}"
+        branch_selection_mode = _resolve_selection_target_mode(
+            target_cat=target_cat,
+            target_source=target_source,
+            selection_target_mode=selection_target_mode,
+        )
         logger.info(f"========== COMMENCING BRANCH: {label} ==========")
+        logger.info(f"[{label}] Feature-selection target mode: {branch_selection_mode}")
         target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
 
         # 1. Build feature sets for this branch.
@@ -1264,7 +1572,10 @@ def create_master_snapshots(
             }
         else:
             # Normal path: leakage-safe regime feature sets (as-of cutoffs only).
-            regime_cutoffs = _build_feature_selection_regimes(all_branch_months)
+            if single_selection_asof_ts is not None:
+                regime_cutoffs = [single_selection_asof_ts]
+            else:
+                regime_cutoffs = _build_feature_selection_regimes(all_branch_months)
             if not regime_cutoffs:
                 logger.error(f"[{label}] No regime cutoffs could be constructed. Skipping branch.")
                 continue
@@ -1277,14 +1588,26 @@ def create_master_snapshots(
 
             for cutoff in regime_cutoffs:
                 cutoff_key = _month_key(cutoff)
-                allowed_list = _check_regime_cache(target_cat, target_source, cutoff)
+                allowed_list = _check_regime_cache(
+                    target_cat,
+                    target_source,
+                    cutoff,
+                    selection_target_mode=branch_selection_mode,
+                )
                 if allowed_list is None:
                     logger.info(f"[{label}] Executing selection for regime cutoff {cutoff_key}...")
                     allowed_list = _run_parallel_feature_selection(
                         target_cat, target_source, asof_month=cutoff,
-                        stages=FS_STAGES,
+                        stages=active_fs_stages,
+                        selection_target_mode=branch_selection_mode,
                     )
-                    _save_regime_cache(allowed_list, target_cat, target_source, cutoff)
+                    _save_regime_cache(
+                        allowed_list,
+                        target_cat,
+                        target_source,
+                        cutoff,
+                        selection_target_mode=branch_selection_mode,
+                    )
 
                 allowed_set = set(allowed_list)
                 if not allowed_set and last_nonempty:
@@ -1306,7 +1629,12 @@ def create_master_snapshots(
 
         # Preserve legacy cache contract for downstream consumers that load one list.
         latest_regime_key = sorted(regime_feature_sets.keys())[-1]
-        _save_cache(sorted(regime_feature_sets[latest_regime_key]), target_cat, target_source)
+        _save_cache(
+            sorted(regime_feature_sets[latest_regime_key]),
+            target_cat,
+            target_source,
+            selection_target_mode=branch_selection_mode,
+        )
 
         # 2. Determine which months to process (skip_existing + progress resume)
         completed_months = _load_progress(target_cat, target_source)
@@ -1450,6 +1778,20 @@ if __name__ == "__main__":
               "revised, or first_release"),
     )
     parser.add_argument(
+        '--target-type-scope',
+        choices=['all', 'nsa', 'sa'],
+        default='all',
+        help=("Target family scope: all, nsa, or sa. "
+              "Useful for SA-only feature-selection refreshes."),
+    )
+    parser.add_argument(
+        '--branches',
+        nargs='+',
+        default=None,
+        help=("Explicit branch list (overrides scope filters). "
+              "Examples: sa_revised sa_first_release"),
+    )
+    parser.add_argument(
         '--asof-start',
         default=None,
         help='Lower bound for as-of months (YYYY-MM, inclusive). Default: no bound.',
@@ -1465,14 +1807,39 @@ if __name__ == "__main__":
         help='Skip feature selection; use existing selected_features_*.json. '
              'For profiling / fast rebuilds only.',
     )
+    parser.add_argument(
+        '--selection-target-mode',
+        choices=['auto', 'mom', 'delta_mom', 'model_aligned'],
+        default='auto',
+        help=("Selection-target mode for feature selection: auto, mom, delta_mom, "
+              "or model_aligned."),
+    )
+    parser.add_argument(
+        '--fs-stages',
+        default=None,
+        help=("Comma-separated feature-selection stage ids (0..6) for this run. "
+              "Example to skip vintage: 0,1,2,4"),
+    )
+    parser.add_argument(
+        '--single-selection-asof',
+        default=None,
+        help=("Use one as-of month (YYYY-MM) for feature selection across all months. "
+              "Faster and less robust than regime-based selection."),
+    )
     args = parser.parse_args()
+    fs_stages_override = _parse_fs_stages_arg(args.fs_stages)
 
     start_time = time.time()
     create_master_snapshots(
         skip_existing=args.skip_existing,
         target_source_scope=args.target_source_scope,
+        target_type_scope=args.target_type_scope,
+        branches=args.branches,
         asof_start=args.asof_start,
         asof_end=args.asof_end,
         skip_feature_selection=args.skip_feature_selection,
+        selection_target_mode=args.selection_target_mode,
+        fs_stages_override=fs_stages_override,
+        single_selection_asof=args.single_selection_asof,
     )
     logger.info(f"Total Master Time: {(time.time() - start_time)/60:.1f} minutes")

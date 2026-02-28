@@ -1,13 +1,13 @@
 """
 Main output orchestrator.
 
-Generates the full _Output/ folder structure after training both NSA and SA models:
-  _Output/
-  ├── NSA_prediction/   (5 items)
-  ├── SA_prediction/    (5 items)
-  ├── NSA_plus_adjustment/  (3 items)
-  ├── Predictions/      (predictions.csv with forward predictions + CIs)
-  └── Archive/YYYY-MM-DD_HHMMSS/  (dated copy of all folders above)
+Generates output artifacts after training:
+  _output/
+  ├── NSA_prediction/          (single-branch or combined)
+  ├── SA_prediction/           (single-branch or combined)
+  ├── NSA_plus_adjustment/     (combined only)
+  ├── Predictions/             (combined only)
+  └── Archive/YYYY-MM-DD_HHMMSS/
 """
 
 import shutil
@@ -20,7 +20,7 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from settings import setup_logger, TEMP_DIR
+from settings import setup_logger, TEMP_DIR, OUTPUT_DIR
 
 from Train.Output_code.metrics import compute_metrics, save_metrics_csv
 from Train.Output_code.plots import (
@@ -73,7 +73,11 @@ def _generate_prediction_folder(
 
     # (b) Backtest results CSV (per-month predictions vs actuals)
     csv_cols = ["ds", "actual", "predicted", "error"]
-    optional_cols = ["lower_80", "upper_80", "lower_50", "upper_50", "lower_95", "upper_95"]
+    optional_cols = [
+        "lower_80", "upper_80", "lower_50", "upper_50", "lower_95", "upper_95",
+        "prediction_strategy", "strategy_selected_score", "strategy_applied_count",
+        "n_features", "n_train_samples",
+    ]
     csv_cols += [c for c in optional_cols if c in results_df.columns]
     results_df[csv_cols].to_csv(folder / "backtest_results.csv", index=False)
     logger.info(f"  Saved {label} backtest results CSV ({len(results_df)} rows)")
@@ -261,7 +265,7 @@ def generate_all_output(
     suffix: str = '',
 ) -> Path:
     """
-    Generate the complete _Output/ folder structure.
+    Generate the complete output folder structure.
 
     Args:
         nsa_results: NSA backtest results DataFrame.
@@ -276,14 +280,14 @@ def generate_all_output(
         sa_y_full: SA target series (to identify future months).
         nsa_residuals: NSA OOS residuals from backtest (for confidence intervals).
         sa_residuals: SA OOS residuals from backtest (for confidence intervals).
-        output_base: Base output directory. Defaults to project-level _Output/.
+        output_base: Base output directory. Defaults to settings.OUTPUT_DIR (_output/).
         suffix: Suffix appended to output folder names (e.g., '_revised').
 
     Returns:
         Path to the output directory.
     """
     if output_base is None:
-        output_base = Path(__file__).resolve().parent.parent.parent / "_Output"
+        output_base = OUTPUT_DIR
 
     logger.info("=" * 60)
     logger.info("GENERATING OUTPUT")
@@ -342,3 +346,58 @@ def generate_all_output(
     logger.info("=" * 60)
 
     return output_base
+
+
+def generate_single_branch_output(
+    results_df: pd.DataFrame,
+    model,
+    metadata: Dict,
+    X_full: pd.DataFrame,
+    target_type: str,
+    target_source: str = 'first_release',
+    output_base: Optional[Path] = None,
+    archive: bool = False,
+) -> Path:
+    """
+    Generate visualization artifacts for a single trained branch.
+
+    Writes:
+      - _output/NSA_prediction{_revised}/... OR
+      - _output/SA_prediction{_revised}/...
+    """
+    if output_base is None:
+        output_base = OUTPUT_DIR
+
+    suffix = '_revised' if target_source == 'revised' else ''
+    target_norm = str(target_type).strip().lower()
+    if target_norm not in {'nsa', 'sa'}:
+        raise ValueError(f"target_type must be 'nsa' or 'sa', got: {target_type}")
+
+    folder_name = f"{'NSA' if target_norm == 'nsa' else 'SA'}_prediction{suffix}"
+    label = f"{'NSA' if target_norm == 'nsa' else 'SA'}{suffix}"
+    branch_folder = output_base / folder_name
+
+    logger.info("=" * 60)
+    logger.info(f"GENERATING SINGLE-BRANCH OUTPUT: {folder_name}")
+    logger.info(f"Output directory: {output_base}")
+    logger.info("=" * 60)
+
+    _generate_prediction_folder(
+        results_df=results_df,
+        model=model,
+        metadata=metadata,
+        X_full=X_full,
+        folder=branch_folder,
+        label=label,
+    )
+
+    if archive:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        archive_folder = output_base / "Archive" / timestamp / folder_name
+        archive_folder.parent.mkdir(parents=True, exist_ok=True)
+        if archive_folder.exists():
+            shutil.rmtree(archive_folder)
+        shutil.copytree(branch_folder, archive_folder)
+        logger.info(f"Archived single-branch output → {archive_folder}")
+
+    return branch_folder

@@ -152,14 +152,36 @@ from Train.config import (
     USE_UNION_POOL, UNION_POOL_MAX, SHORTPASS_TOPK, SHORTPASS_METHOD,
     SHORTPASS_HALF_LIFE, ENABLE_BASELINE_TRACKING, BASELINE_ROLLING_WINDOW,
     KEEP_RULE_ENABLED, KEEP_RULE_WINDOW_M, KEEP_RULE_TOLERANCE, KEEP_RULE_ACTION,
-    USE_BRANCH_TARGET_FS, BRANCH_TARGET_FS_TOPK, BRANCH_TARGET_FS_METHOD,
+    USE_BRANCH_TARGET_FS, BRANCH_TARGET_FS_TOPK, BRANCH_TARGET_FS_TOPK_VARIANCE,
+    BRANCH_TARGET_FS_METHOD, BRANCH_TARGET_FS_METHOD_VARIANCE,
     BRANCH_TARGET_FS_CORR_THRESHOLD, BRANCH_TARGET_FS_MIN_OVERLAP,
+    BRANCH_TARGET_FS_WEIGHT_LEVEL, BRANCH_TARGET_FS_WEIGHT_DIFF, BRANCH_TARGET_FS_WEIGHT_DIR,
+    BRANCH_TARGET_FS_WEIGHT_AMP, BRANCH_TARGET_FS_WEIGHT_SIGN, BRANCH_TARGET_FS_WEIGHT_TAIL,
+    VARIANCE_PRIORITY_TARGETS, VARIANCE_TAIL_QUANTILE, VARIANCE_EXTREME_QUANTILE,
+    ENABLE_VARIANCE_GATE, VARIANCE_GATE_MIN_STD_RATIO, VARIANCE_GATE_MIN_DIFF_STD_RATIO,
+    VARIANCE_GATE_MIN_CORR_DIFF, VARIANCE_GATE_MIN_DIFF_SIGN_ACC, VARIANCE_GATE_MIN_EXTREME_HIT_RATE,
+    TUNING_OBJECTIVE_MODE_DEFAULT, TUNING_OBJECTIVE_MODE_VARIANCE,
+    TUNING_LAMBDA_STD_RATIO, TUNING_LAMBDA_DIFF_STD_RATIO, TUNING_LAMBDA_TAIL_MAE,
+    TUNING_LAMBDA_CORR_DIFF, TUNING_LAMBDA_DIFF_SIGN,
+    ENABLE_VARIANCE_ENHANCEMENTS, ENHANCEMENT_SEQUENCE, ENHANCEMENT_MIN_IMPROVEMENT,
+    ENABLE_AMPLITUDE_CALIBRATION, AMPLITUDE_CAL_MIN_SAMPLES,
+    AMPLITUDE_CAL_SLOPE_MIN, AMPLITUDE_CAL_SLOPE_MAX,
+    ENABLE_SHOCK_MODEL, SHOCK_MODEL_NUM_BOOST_ROUND, SHOCK_MODEL_MAX_DEPTH, SHOCK_MODEL_NUM_LEAVES,
+    ENABLE_ACCELERATION_MODEL, ACCEL_MODEL_NUM_BOOST_ROUND, ACCEL_MODEL_MAX_DEPTH, ACCEL_MODEL_NUM_LEAVES,
+    ENABLE_MULTI_TARGET_DYNAMICS, DYNAMICS_MODEL_NUM_BOOST_ROUND, DYNAMICS_MODEL_MAX_DEPTH,
+    DYNAMICS_MODEL_NUM_LEAVES, DYNAMICS_DELTA_BLEND, DYNAMICS_DIRECTION_CONFIDENCE,
+    DYNAMICS_DIRECTION_BLEND, DYNAMICS_MAGNITUDE_FLOOR,
+    ENABLE_TAIL_AWARE_WEIGHTING, TAIL_WEIGHT_ABS_LEVEL_QUANTILE, TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+    TAIL_WEIGHT_LEVEL_BOOST, TAIL_WEIGHT_DIFF_BOOST, TAIL_WEIGHT_MAX_MULTIPLIER,
+    ENABLE_REGIME_ROUTER, REGIME_HIGHVOL_QUANTILE, REGIME_MIN_CLASS_SAMPLES,
+    REGIME_MODEL_NUM_BOOST_ROUND,
 )
 
 from Train.branch_target_selection import (
     partition_feature_columns,
     select_branch_target_features_for_step,
 )
+from Train.variance_metrics import compute_variance_kpis, composite_objective_score
 
 from Train.model import (
     get_lgbm_params,
@@ -228,6 +250,453 @@ def _merge_unique_feature_lists(*groups: List[str]) -> List[str]:
                 seen.add(feature)
                 merged.append(feature)
     return merged
+
+
+def _is_variance_priority_target(target_type: str, target_source: str) -> bool:
+    return (target_type, target_source) in set(VARIANCE_PRIORITY_TARGETS)
+
+
+def _get_tuning_objective_mode(target_type: str, target_source: str) -> str:
+    if _is_variance_priority_target(target_type, target_source):
+        return TUNING_OBJECTIVE_MODE_VARIANCE
+    return TUNING_OBJECTIVE_MODE_DEFAULT
+
+
+def _get_branch_target_fs_method(target_type: str, target_source: str) -> str:
+    if _is_variance_priority_target(target_type, target_source):
+        return BRANCH_TARGET_FS_METHOD_VARIANCE
+    return BRANCH_TARGET_FS_METHOD
+
+
+def _get_branch_target_fs_top_k(target_type: str, target_source: str) -> int:
+    if _is_variance_priority_target(target_type, target_source):
+        return BRANCH_TARGET_FS_TOPK_VARIANCE
+    return BRANCH_TARGET_FS_TOPK
+
+
+def _validation_composite_score(y_true: pd.Series, y_pred: np.ndarray) -> Tuple[float, Dict[str, float]]:
+    yv = y_true.values.astype(float)
+    pv = np.asarray(y_pred, dtype=float)
+    mae = float(np.mean(np.abs(yv - pv)))
+    kpis = compute_variance_kpis(
+        yv, pv, tail_quantile=VARIANCE_TAIL_QUANTILE, extreme_quantile=VARIANCE_EXTREME_QUANTILE
+    )
+    score = composite_objective_score(
+        mae=mae,
+        std_ratio=float(kpis['std_ratio']),
+        diff_std_ratio=float(kpis['diff_std_ratio']),
+        tail_mae=float(kpis['tail_mae']),
+        corr_diff=float(kpis['corr_diff']),
+        diff_sign_accuracy=float(kpis['diff_sign_accuracy']),
+        lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
+        lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
+        lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
+        lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
+        lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
+    )
+    kpis['mae'] = mae
+    kpis['composite_score'] = score
+    return score, kpis
+
+
+def _compute_tail_weight_multiplier(y_values: np.ndarray) -> np.ndarray:
+    """
+    Build a multiplicative weight vector emphasizing large levels and changes.
+    """
+    y = np.asarray(y_values, dtype=float)
+    if y.size == 0:
+        return np.array([], dtype=float)
+
+    mult = np.ones_like(y, dtype=float)
+    abs_y = np.abs(y)
+    level_thr = float(np.quantile(abs_y, TAIL_WEIGHT_ABS_LEVEL_QUANTILE))
+    mult[abs_y >= level_thr] *= TAIL_WEIGHT_LEVEL_BOOST
+
+    abs_dy = np.abs(np.diff(y, prepend=y[0]))
+    diff_thr = float(np.quantile(abs_dy, TAIL_WEIGHT_ABS_DIFF_QUANTILE))
+    mult[abs_dy >= diff_thr] *= TAIL_WEIGHT_DIFF_BOOST
+
+    return np.clip(mult, 1.0, TAIL_WEIGHT_MAX_MULTIPLIER)
+
+
+def _apply_tail_aware_weighting(
+    weights: np.ndarray,
+    y_values: np.ndarray,
+    target_type: str,
+    target_source: str,
+) -> np.ndarray:
+    """
+    Apply tail-aware weighting only for variance-priority targets.
+    """
+    base = np.asarray(weights, dtype=float)
+    if (
+        not ENABLE_TAIL_AWARE_WEIGHTING
+        or not _is_variance_priority_target(target_type, target_source)
+        or base.size == 0
+    ):
+        return base
+
+    mult = _compute_tail_weight_multiplier(np.asarray(y_values, dtype=float))
+    if mult.size != base.size:
+        return base
+    out = base * mult
+    m = float(np.mean(out))
+    if m > 0:
+        out = out / m
+    return out
+
+
+def _fit_amplitude_calibration(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+) -> Optional[Tuple[float, float]]:
+    yv = y_true.values.astype(float)
+    pv = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(yv) & np.isfinite(pv)
+    if mask.sum() < AMPLITUDE_CAL_MIN_SAMPLES:
+        return None
+    p_valid = pv[mask]
+    y_valid = yv[mask]
+    if np.std(p_valid) < 1e-12:
+        return None
+    slope, intercept = np.polyfit(p_valid, y_valid, 1)
+    slope = float(np.clip(slope, AMPLITUDE_CAL_SLOPE_MIN, AMPLITUDE_CAL_SLOPE_MAX))
+    return float(intercept), slope
+
+
+def _apply_amplitude_calibration(
+    y_pred: np.ndarray,
+    intercept: float,
+    slope: float,
+) -> np.ndarray:
+    return intercept + slope * np.asarray(y_pred, dtype=float)
+
+
+def _train_simple_regressor(
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    num_boost_round: int,
+    max_depth: int,
+    num_leaves: int,
+    objective: str = 'regression',
+    train_weights: Optional[np.ndarray] = None,
+):
+    params = {
+        'objective': objective,
+        'metric': 'mae' if objective != 'binary' else 'binary_logloss',
+        'learning_rate': 0.05,
+        'max_depth': max_depth,
+        'num_leaves': num_leaves,
+        'feature_fraction': 0.9,
+        'bagging_fraction': 0.9,
+        'bagging_freq': 1,
+        'min_data_in_leaf': 5,
+        'verbosity': -1,
+        'random_state': 42,
+        'n_jobs': 1,
+    }
+    w = None if train_weights is None else np.asarray(train_weights, dtype=float)
+    if objective == 'binary':
+        # Rebalance minority direction class so the classifier does not collapse
+        # to mostly-positive sign predictions.
+        yb = np.asarray(y_tr, dtype=float)
+        pos = float(np.sum(yb > 0.5))
+        neg = float(np.sum(yb <= 0.5))
+        if pos > 0 and neg > 0:
+            pos_w = (pos + neg) / (2.0 * pos)
+            neg_w = (pos + neg) / (2.0 * neg)
+            class_w = np.where(yb > 0.5, pos_w, neg_w)
+            w = class_w if w is None else (w * class_w)
+
+    train_data = lgb.Dataset(X_tr, label=y_tr, weight=w, free_raw_data=False)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, free_raw_data=False)
+    model = lgb.train(
+        params,
+        train_data,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_data],
+        valid_names=['valid'],
+        callbacks=[lgb.early_stopping(20), lgb.log_evaluation(period=0)],
+    )
+    return model
+
+
+def _build_multi_target_dynamics_candidate(
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    X_pred: pd.DataFrame,
+    y_train_valid: pd.Series,
+    current_best_val: np.ndarray,
+    current_best_pred: float,
+) -> Optional[Tuple[np.ndarray, float, Dict[str, float]]]:
+    """
+    Build a candidate forecast using three targets:
+    1) level (current best prediction stream),
+    2) magnitude of delta (|MoM acceleration|),
+    3) direction of delta (sign).
+    """
+    if len(X_tr) < 24 or len(X_val) < 3:
+        return None
+
+    ytr = y_tr.values.astype(float)
+    yval = y_val.values.astype(float)
+    if ytr.size < 3:
+        return None
+
+    # Delta target: dy[t] = y[t] - y[t-1]
+    y_tr_diff = np.diff(ytr)
+    if y_tr_diff.size < 12:
+        return None
+    X_tr_diff = X_tr.iloc[1:]
+    prev_for_val = np.concatenate([np.array([ytr[-1]]), yval[:-1]])
+    y_val_diff = yval - prev_for_val
+
+    # Tail-aware emphasis on larger delta regimes for dynamics auxiliary models.
+    aux_w = _compute_tail_weight_multiplier(y_tr_diff)
+
+    # Magnitude model: |dy|
+    mag_train = np.abs(y_tr_diff)
+    mag_val_target = np.abs(y_val_diff)
+    mag_model = _train_simple_regressor(
+        X_tr_diff, mag_train, X_val, mag_val_target,
+        num_boost_round=DYNAMICS_MODEL_NUM_BOOST_ROUND,
+        max_depth=DYNAMICS_MODEL_MAX_DEPTH,
+        num_leaves=DYNAMICS_MODEL_NUM_LEAVES,
+        objective='regression',
+        train_weights=aux_w,
+    )
+    mag_val = np.maximum(np.asarray(mag_model.predict(X_val), dtype=float), DYNAMICS_MAGNITUDE_FLOOR)
+    mag_pred = float(max(float(mag_model.predict(X_pred)[0]), DYNAMICS_MAGNITUDE_FLOOR))
+
+    # Direction model: sign(dy)
+    dir_train = (y_tr_diff > 0.0).astype(float)
+    if np.unique(dir_train).size < 2:
+        sign_val = np.sign(np.asarray(current_best_val, dtype=float) - prev_for_val)
+        sign_val[sign_val == 0.0] = 1.0
+        sign_pred = np.sign(float(current_best_pred - float(y_train_valid.iloc[-1])))
+        if sign_pred == 0.0:
+            sign_pred = 1.0
+        p_up_val = np.where(sign_val > 0, 0.51, 0.49)
+        p_up_pred = 1.0 if sign_pred > 0 else 0.0
+    else:
+        dir_val_label = (y_val_diff > 0.0).astype(float)
+        dir_model = _train_simple_regressor(
+            X_tr_diff, dir_train, X_val, dir_val_label,
+            num_boost_round=DYNAMICS_MODEL_NUM_BOOST_ROUND,
+            max_depth=DYNAMICS_MODEL_MAX_DEPTH,
+            num_leaves=DYNAMICS_MODEL_NUM_LEAVES,
+            objective='binary',
+            train_weights=aux_w,
+        )
+        p_up_val = np.clip(np.asarray(dir_model.predict(X_val), dtype=float), 0.0, 1.0)
+        p_up_pred = float(np.clip(dir_model.predict(X_pred)[0], 0.0, 1.0))
+        sign_val = np.where(p_up_val >= 0.5, 1.0, -1.0)
+        sign_pred = 1.0 if p_up_pred >= 0.5 else -1.0
+
+    delta_signedmag_val = sign_val * mag_val
+    delta_signedmag_pred = float(sign_pred * mag_pred)
+
+    # Blend signed-magnitude delta with current best implied delta.
+    current_delta_val = np.asarray(current_best_val, dtype=float) - prev_for_val
+    last_known = float(y_train_valid.iloc[-1])
+    current_delta_pred = float(current_best_pred - last_known)
+    delta_core_val = (
+        DYNAMICS_DELTA_BLEND * delta_signedmag_val
+        + (1.0 - DYNAMICS_DELTA_BLEND) * current_delta_val
+    )
+    delta_core_pred = float(
+        DYNAMICS_DELTA_BLEND * delta_signedmag_pred
+        + (1.0 - DYNAMICS_DELTA_BLEND) * current_delta_pred
+    )
+
+    # Confidence-weighted sign enforcement from direction classifier.
+    conf_val = np.abs(p_up_val - 0.5)
+    conf_pred = abs(p_up_pred - 0.5)
+    denom = max(1e-9, 0.5 - DYNAMICS_DIRECTION_CONFIDENCE)
+    blend_val = np.clip((conf_val - DYNAMICS_DIRECTION_CONFIDENCE) / denom, 0.0, 1.0)
+    blend_val = DYNAMICS_DIRECTION_BLEND * blend_val
+    blend_pred = float(
+        DYNAMICS_DIRECTION_BLEND
+        * np.clip((conf_pred - DYNAMICS_DIRECTION_CONFIDENCE) / denom, 0.0, 1.0)
+    )
+
+    delta_enforced_val = sign_val * np.abs(delta_core_val)
+    delta_enforced_pred = float(sign_pred * abs(delta_core_pred))
+    delta_final_val = (1.0 - blend_val) * delta_core_val + blend_val * delta_enforced_val
+    delta_final_pred = float((1.0 - blend_pred) * delta_core_pred + blend_pred * delta_enforced_pred)
+
+    cand_val = prev_for_val + delta_final_val
+    cand_pred = float(last_known + delta_final_pred)
+    return cand_val, cand_pred, {
+        "direction_enforced_share_val": float(np.mean(blend_val > 0)) if blend_val.size else 0.0,
+        "direction_conf_pred": float(conf_pred),
+        "direction_model_used": 1.0,
+        "delta_signedmag_mean_abs": float(np.mean(np.abs(delta_signedmag_val))),
+    }
+
+
+def _run_variance_enhancement_sequence(
+    base_model: "lgb.Booster",
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    X_pred: pd.DataFrame,
+    y_train_valid: pd.Series,
+    target_type: str,
+    target_source: str,
+) -> Tuple[float, np.ndarray, str, Dict[str, Any]]:
+    """
+    Sequentially apply variance-enhancement stages and keep only improving stages.
+
+    Sequence: base -> amplitude -> shock -> dynamics -> acceleration -> regime.
+    """
+    base_val = base_model.predict(X_val)
+    base_pred = float(base_model.predict(X_pred)[0])
+    best_val = np.asarray(base_val, dtype=float)
+    best_pred = float(base_pred)
+    best_stage = 'base'
+    best_score, best_kpis = _validation_composite_score(y_val, best_val)
+
+    stage_report: Dict[str, Any] = {
+        'applied': [],
+        'scores': {'base': float(best_score)},
+        'kpis_base': best_kpis,
+    }
+
+    use_stack = ENABLE_VARIANCE_ENHANCEMENTS and _is_variance_priority_target(target_type, target_source)
+    if not use_stack:
+        return best_pred, best_val, best_stage, stage_report
+
+    for stage in ENHANCEMENT_SEQUENCE:
+        cand_val = None
+        cand_pred = None
+
+        try:
+            if stage == 'amplitude' and ENABLE_AMPLITUDE_CALIBRATION:
+                cal = _fit_amplitude_calibration(y_val, best_val)
+                if cal is not None:
+                    intercept, slope = cal
+                    cand_val = _apply_amplitude_calibration(best_val, intercept, slope)
+                    cand_pred = float(_apply_amplitude_calibration(np.array([best_pred]), intercept, slope)[0])
+
+            elif stage == 'shock' and ENABLE_SHOCK_MODEL:
+                base_tr = base_model.predict(X_tr)
+                base_val_now = base_model.predict(X_val)
+                residual_tr = y_tr.values.astype(float) - base_tr
+                residual_val = y_val.values.astype(float) - base_val_now
+                shock_model = _train_simple_regressor(
+                    X_tr, residual_tr, X_val, residual_val,
+                    num_boost_round=SHOCK_MODEL_NUM_BOOST_ROUND,
+                    max_depth=SHOCK_MODEL_MAX_DEPTH,
+                    num_leaves=SHOCK_MODEL_NUM_LEAVES,
+                    objective='regression',
+                )
+                shock_val = shock_model.predict(X_val)
+                shock_pred = float(shock_model.predict(X_pred)[0])
+                cand_val = best_val + shock_val
+                cand_pred = float(best_pred + shock_pred)
+
+            elif stage == 'dynamics' and ENABLE_MULTI_TARGET_DYNAMICS:
+                dynamic_candidate = _build_multi_target_dynamics_candidate(
+                    X_tr=X_tr,
+                    y_tr=y_tr,
+                    X_val=X_val,
+                    y_val=y_val,
+                    X_pred=X_pred,
+                    y_train_valid=y_train_valid,
+                    current_best_val=best_val,
+                    current_best_pred=best_pred,
+                )
+                if dynamic_candidate is not None:
+                    cand_val, cand_pred, dyn_meta = dynamic_candidate
+                    stage_report['dynamics_meta'] = dyn_meta
+
+            elif stage == 'acceleration' and ENABLE_ACCELERATION_MODEL:
+                if len(X_tr) >= 12 and len(X_val) >= 2:
+                    ytr = y_tr.values.astype(float)
+                    yval = y_val.values.astype(float)
+                    y_tr_acc = np.diff(ytr)
+                    X_tr_acc = X_tr.iloc[1:]
+                    prev_for_val = np.concatenate([np.array([ytr[-1]]), yval[:-1]])
+                    y_val_acc = yval - prev_for_val
+
+                    acc_model = _train_simple_regressor(
+                        X_tr_acc, y_tr_acc, X_val, y_val_acc,
+                        num_boost_round=ACCEL_MODEL_NUM_BOOST_ROUND,
+                        max_depth=ACCEL_MODEL_MAX_DEPTH,
+                        num_leaves=ACCEL_MODEL_NUM_LEAVES,
+                        objective='regression',
+                    )
+                    acc_val = acc_model.predict(X_val)
+                    acc_pred = float(acc_model.predict(X_pred)[0])
+                    cand_val = prev_for_val + acc_val
+                    last_known = float(y_train_valid.iloc[-1])
+                    cand_pred = float(last_known + acc_pred)
+
+            elif stage == 'regime' and ENABLE_REGIME_ROUTER:
+                ytr = y_tr.values.astype(float)
+                thr = float(np.quantile(np.abs(ytr), REGIME_HIGHVOL_QUANTILE))
+                high_mask = np.abs(ytr) >= thr
+                low_mask = ~high_mask
+                if high_mask.sum() >= REGIME_MIN_CLASS_SAMPLES and low_mask.sum() >= REGIME_MIN_CLASS_SAMPLES:
+                    low_model = _train_simple_regressor(
+                        X_tr[low_mask], ytr[low_mask], X_val, y_val.values.astype(float),
+                        num_boost_round=REGIME_MODEL_NUM_BOOST_ROUND,
+                        max_depth=3,
+                        num_leaves=15,
+                        objective='regression',
+                    )
+                    high_model = _train_simple_regressor(
+                        X_tr[high_mask], ytr[high_mask], X_val, y_val.values.astype(float),
+                        num_boost_round=REGIME_MODEL_NUM_BOOST_ROUND,
+                        max_depth=3,
+                        num_leaves=15,
+                        objective='regression',
+                    )
+                    router = _train_simple_regressor(
+                        X_tr, high_mask.astype(float), X_val, (np.abs(y_val.values.astype(float)) >= thr).astype(float),
+                        num_boost_round=REGIME_MODEL_NUM_BOOST_ROUND,
+                        max_depth=3,
+                        num_leaves=15,
+                        objective='binary',
+                    )
+                    p_high_val = np.clip(router.predict(X_val), 0.0, 1.0)
+                    p_high_pred = float(np.clip(router.predict(X_pred)[0], 0.0, 1.0))
+                    low_val = low_model.predict(X_val)
+                    high_val = high_model.predict(X_val)
+                    low_pred = float(low_model.predict(X_pred)[0])
+                    high_pred = float(high_model.predict(X_pred)[0])
+                    cand_val = (1.0 - p_high_val) * low_val + p_high_val * high_val
+                    cand_pred = float((1.0 - p_high_pred) * low_pred + p_high_pred * high_pred)
+
+        except Exception as exc:
+            logger.warning(f"Variance stage '{stage}' failed: {exc}")
+            cand_val = None
+            cand_pred = None
+
+        if cand_val is None or cand_pred is None:
+            stage_report['scores'][stage] = None
+            continue
+
+        cand_score, cand_kpis = _validation_composite_score(y_val, cand_val)
+        stage_report['scores'][stage] = float(cand_score)
+        improvement = best_score - cand_score
+        if improvement >= ENHANCEMENT_MIN_IMPROVEMENT:
+            best_score = cand_score
+            best_val = np.asarray(cand_val, dtype=float)
+            best_pred = float(cand_pred)
+            best_stage = stage
+            stage_report['applied'].append(stage)
+            stage_report[f'kpis_{stage}'] = cand_kpis
+
+    stage_report['selected_stage'] = best_stage
+    stage_report['selected_score'] = float(best_score)
+    return best_pred, best_val, best_stage, stage_report
 
 
 @profiled("train.build_training_dataset")
@@ -473,6 +942,7 @@ def run_expanding_window_backtest(
     # ── Short-pass stability tracking ──
     step_feature_sets: list[set] = []
     step_jaccards: list[float] = []
+    strategy_counts: Dict[str, int] = {}
 
     logger.info(f"Running {len(backtest_months)} predictions "
                 f"({'with' if tune else 'without'} hyperparameter tuning)...")
@@ -556,6 +1026,12 @@ def run_expanding_window_backtest(
         # Compute default sample weights for initial/static use
         default_half_life = 60.0
         weights = calculate_sample_weights(X_train_valid, target_month, default_half_life)
+        weights = _apply_tail_aware_weighting(
+            weights,
+            y_train_valid.values.astype(float),
+            target_type,
+            target_source,
+        )
 
         # Shared weights for short-pass rankers (snapshot + branch-target)
         _current_params = tuned_params if (tune and tuned_params is not None) else static_params
@@ -599,6 +1075,8 @@ def run_expanding_window_backtest(
                 )
 
         # ── Branch-target derived feature selection ──
+        branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
+        branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
         if USE_BRANCH_TARGET_FS and branch_target_candidates:
             with perf_phase("train.backtest.step.branch_target_fs", step=i):
                 branch_target_selected = select_branch_target_features_for_step(
@@ -606,11 +1084,17 @@ def run_expanding_window_backtest(
                     y_train=y_train_valid,
                     target_type=target_type,
                     candidate_features=branch_target_candidates,
-                    top_k=BRANCH_TARGET_FS_TOPK,
-                    method=BRANCH_TARGET_FS_METHOD,
+                    top_k=branch_fs_top_k,
+                    method=branch_fs_method,
                     corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
                     min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
                     sample_weights=sp_weights,
+                    dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
+                    dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
+                    dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
+                    dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
+                    dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
+                    dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
                 )
         else:
             branch_target_selected = branch_target_candidates
@@ -623,7 +1107,8 @@ def run_expanding_window_backtest(
         logger.info(
             f"Feature pipeline: snapshot={len(snapshot_selected)} "
             f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
-            f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)}, "
+            f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)} "
+            f"(method={branch_fs_method}, top_k={branch_fs_top_k}), "
             f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
             f"final={len(feature_cols)}"
         )
@@ -658,9 +1143,26 @@ def run_expanding_window_backtest(
             X_train_for_tuning = X_train_valid_with_ds[['ds'] + feature_cols]
 
             with perf_phase("train.backtest.step.tuning", step=i):
+                tuning_mode = _get_tuning_objective_mode(target_type, target_source)
                 tuned_params = tune_hyperparameters(
                     X_train_for_tuning, y_train_valid, target_month=target_month,
                     use_huber_loss=use_huber_loss,
+                    objective_mode=tuning_mode,
+                    lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
+                    lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
+                    lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
+                    lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
+                    lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
+                    tail_quantile=VARIANCE_TAIL_QUANTILE,
+                    tail_weighting=(
+                        ENABLE_TAIL_AWARE_WEIGHTING
+                        and _is_variance_priority_target(target_type, target_source)
+                    ),
+                    tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
+                    tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+                    tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
+                    tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
+                    tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
                 )
 
         params = tuned_params if tune and tuned_params is not None else static_params
@@ -670,6 +1172,12 @@ def run_expanding_window_backtest(
         
         # Recompute final training weights for the main model fit using the chosen half_life
         weights = calculate_sample_weights(X_train_valid_with_ds, target_month, final_half_life)
+        weights = _apply_tail_aware_weighting(
+            weights,
+            y_train_valid.values.astype(float),
+            target_type,
+            target_source,
+        )
 
         with perf_phase("train.backtest.step.fit", step=i):
             # Train-validation split (data already sorted by date above)
@@ -703,12 +1211,31 @@ def run_expanding_window_backtest(
         with perf_phase("train.backtest.step.predict", step=i):
             # PREDICTION: Get features for target month
             X_pred = X_full.iloc[[target_idx]].copy()
-
             X_pred = X_pred[feature_cols]
 
-            # Make prediction
-            prediction = model.predict(X_pred)[0]
+            # Base prediction
+            base_prediction = float(model.predict(X_pred)[0])
             actual = y_full.iloc[target_idx]
+
+            # Sequential variance enhancement stack (selected by validation composite score)
+            final_prediction = base_prediction
+            selected_val_preds = model.predict(X_val)
+            selected_strategy = 'base'
+            stage_report = {}
+            if len(X_val) >= 5:
+                final_prediction, selected_val_preds, selected_strategy, stage_report = _run_variance_enhancement_sequence(
+                    base_model=model,
+                    X_tr=X_tr,
+                    y_tr=y_tr,
+                    X_val=X_val,
+                    y_val=y_val,
+                    X_pred=X_pred,
+                    y_train_valid=y_train_valid,
+                    target_type=target_type,
+                    target_source=target_source,
+                )
+            prediction = final_prediction
+            strategy_counts[selected_strategy] = strategy_counts.get(selected_strategy, 0) + 1
 
         with perf_phase("train.backtest.step.intervals", step=i):
             # Calculate prediction intervals
@@ -721,9 +1248,8 @@ def run_expanding_window_backtest(
                 lower_95 = prediction + np.percentile(residual_array, 2.5)
                 upper_95 = prediction + np.percentile(residual_array, 97.5)
             else:
-                # Not enough OOS residuals yet; use validation-set residuals as initial estimate
-                val_preds = model.predict(X_val)
-                val_residuals = (y_val.values - val_preds).tolist()
+                # Not enough OOS residuals yet; use validation residuals from selected strategy
+                val_residuals = (y_val.values - selected_val_preds).tolist()
                 std_est = np.std(val_residuals) if val_residuals else 50
                 lower_50, upper_50 = prediction - 0.67*std_est, prediction + 0.67*std_est
                 lower_80, upper_80 = prediction - 1.28*std_est, prediction + 1.28*std_est
@@ -770,7 +1296,11 @@ def run_expanding_window_backtest(
             'n_features': len(feature_cols),
             'dir_correct': dir_correct,
             'accel_correct': accel_correct,
+            'prediction_strategy': selected_strategy,
         }
+        if stage_report:
+            result_row['strategy_selected_score'] = stage_report.get('selected_score', np.nan)
+            result_row['strategy_applied_count'] = len(stage_report.get('applied', []))
 
         # Add baseline predictions and errors (error = actual - baseline_pred)
         if ENABLE_BASELINE_TRACKING:
@@ -797,12 +1327,13 @@ def run_expanding_window_backtest(
 
         if is_future:
             logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
-                        f"Pred={prediction:.0f} (FUTURE) | "
+                        f"Pred={prediction:.0f} (FUTURE, strategy={selected_strategy}) | "
                         f"train={len(train_idx_valid)}, feats={len(feature_cols)} | "
                         f"elapsed={_elapsed_str}, ETA={_eta_str}")
         else:
             logger.info(f"[{i+1}/{len(backtest_months)}] {target_month.strftime('%Y-%m')}: "
-                        f"Actual={actual:.0f}, Pred={prediction:.0f}, Err={error:+.0f} | "
+                        f"Actual={actual:.0f}, Pred={prediction:.0f}, Err={error:+.0f}, "
+                        f"strategy={selected_strategy} | "
                         f"train={len(train_idx_valid)}, feats={len(feature_cols)} | "
                         f"elapsed={_elapsed_str}, ETA={_eta_str}")
 
@@ -819,6 +1350,12 @@ def run_expanding_window_backtest(
             bias = backtest_rows['error'].mean()
             dir_acc   = backtest_rows['dir_correct'].dropna().mean()
             accel_acc = backtest_rows['accel_correct'].dropna().mean()
+            variance_kpis = compute_variance_kpis(
+                backtest_rows['actual'].values.astype(float),
+                backtest_rows['predicted'].values.astype(float),
+                tail_quantile=VARIANCE_TAIL_QUANTILE,
+                extreme_quantile=VARIANCE_EXTREME_QUANTILE,
+            )
 
             logger.info("\n" + "=" * 60)
             logger.info("EXPANDING WINDOW BACKTEST RESULTS")
@@ -827,9 +1364,20 @@ def run_expanding_window_backtest(
             logger.info(f"RMSE: {rmse:.2f}  MAE: {mae:.2f}  Bias: {bias:+.2f}")
             logger.info(f"Directional Accuracy:      {dir_acc:.1%}")
             logger.info(f"Acceleration Accuracy:     {accel_acc:.1%}")
+            logger.info(
+                f"Variance KPIs: std_ratio={variance_kpis['std_ratio']:.3f}, "
+                f"diff_std_ratio={variance_kpis['diff_std_ratio']:.3f}, "
+                f"corr_diff={variance_kpis['corr_diff']:.3f}, "
+                f"diff_sign_accuracy={variance_kpis['diff_sign_accuracy']:.1%}, "
+                f"tail_mae={variance_kpis['tail_mae']:.2f}, "
+                f"extreme_hit_rate={variance_kpis['extreme_hit_rate']:.1%}"
+            )
             logger.info(f"Coverage: 50%={backtest_rows['in_50_interval'].mean()*100:.1f}%  "
                         f"80%={backtest_rows['in_80_interval'].mean()*100:.1f}%  "
                         f"95%={backtest_rows['in_95_interval'].mean()*100:.1f}%")
+
+            if strategy_counts:
+                logger.info(f"Strategy usage counts: {strategy_counts}")
 
             # ── P1-4: Bias warning ──
             if abs(bias) > 0.2 * mae:
@@ -887,6 +1435,14 @@ def run_expanding_window_backtest(
                 'coverage_95': float(backtest_rows['in_95_interval'].mean()),
                 'trailing_12m_mae': float(trailing_mae),
                 'n_backtest': int(len(backtest_rows)),
+                'std_ratio': float(variance_kpis['std_ratio']),
+                'diff_std_ratio': float(variance_kpis['diff_std_ratio']),
+                'corr_level': float(variance_kpis['corr_level']),
+                'corr_diff': float(variance_kpis['corr_diff']),
+                'diff_sign_accuracy': float(variance_kpis['diff_sign_accuracy']),
+                'tail_mae': float(variance_kpis['tail_mae']),
+                'extreme_hit_rate': float(variance_kpis['extreme_hit_rate']),
+                'strategy_counts': dict(strategy_counts),
             }
 
         if not future_rows.empty:
@@ -945,6 +1501,7 @@ def run_expanding_window_backtest(
                             f"Action='skip_save': production model will NOT be saved"
                         )
                         results_df.attrs['skip_save'] = True
+                        results_df.attrs['keep_rule_failed'] = True
 
                     break  # Enforce against first triggering baseline only
                 else:
@@ -958,6 +1515,59 @@ def run_expanding_window_backtest(
                 f"Keep-rule skipped: only {len(backtest_only)} OOS months "
                 f"(need >= {KEEP_RULE_WINDOW_M})"
             )
+
+    # ── Variance gate enforcement (priority targets) ──
+    if ENABLE_VARIANCE_GATE and not results_df.empty and _is_variance_priority_target(target_type, target_source):
+        backtest_only = results_df[~results_df['error'].isna()].copy()
+        if not backtest_only.empty:
+            vk = compute_variance_kpis(
+                backtest_only['actual'].values.astype(float),
+                backtest_only['predicted'].values.astype(float),
+                tail_quantile=VARIANCE_TAIL_QUANTILE,
+                extreme_quantile=VARIANCE_EXTREME_QUANTILE,
+            )
+            gate_fail_reasons = []
+            if vk['std_ratio'] < VARIANCE_GATE_MIN_STD_RATIO:
+                gate_fail_reasons.append(
+                    f"std_ratio={vk['std_ratio']:.3f} < {VARIANCE_GATE_MIN_STD_RATIO:.3f}"
+                )
+            if vk['diff_std_ratio'] < VARIANCE_GATE_MIN_DIFF_STD_RATIO:
+                gate_fail_reasons.append(
+                    f"diff_std_ratio={vk['diff_std_ratio']:.3f} < {VARIANCE_GATE_MIN_DIFF_STD_RATIO:.3f}"
+                )
+            if vk['corr_diff'] < VARIANCE_GATE_MIN_CORR_DIFF:
+                gate_fail_reasons.append(
+                    f"corr_diff={vk['corr_diff']:.3f} < {VARIANCE_GATE_MIN_CORR_DIFF:.3f}"
+                )
+            if vk['diff_sign_accuracy'] < VARIANCE_GATE_MIN_DIFF_SIGN_ACC:
+                gate_fail_reasons.append(
+                    f"diff_sign_accuracy={vk['diff_sign_accuracy']:.3f} < {VARIANCE_GATE_MIN_DIFF_SIGN_ACC:.3f}"
+                )
+            if vk['extreme_hit_rate'] < VARIANCE_GATE_MIN_EXTREME_HIT_RATE:
+                gate_fail_reasons.append(
+                    f"extreme_hit_rate={vk['extreme_hit_rate']:.3f} < {VARIANCE_GATE_MIN_EXTREME_HIT_RATE:.3f}"
+                )
+
+            if gate_fail_reasons:
+                logger.warning(
+                    "VARIANCE GATE FAILED for %s: %s",
+                    model_id,
+                    "; ".join(gate_fail_reasons),
+                )
+                results_df.attrs['skip_save'] = True
+                results_df.attrs['variance_gate_failed'] = True
+                results_df.attrs['variance_gate_reasons'] = gate_fail_reasons
+            else:
+                logger.info(
+                    "Variance gate passed for %s "
+                    "(std_ratio=%.3f, diff_std_ratio=%.3f, corr_diff=%.3f, diff_sign_accuracy=%.3f, extreme_hit_rate=%.3f)",
+                    model_id,
+                    vk['std_ratio'],
+                    vk['diff_std_ratio'],
+                    vk['corr_diff'],
+                    vk['diff_sign_accuracy'],
+                    vk['extreme_hit_rate'],
+                )
 
     # ── Short-pass stability summary ──
     if step_jaccards:
@@ -1135,17 +1745,25 @@ def train_and_evaluate(
                 "Final union pool had no overlap with snapshot extra candidates; using base snapshot features."
             )
 
+    final_branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
+    final_branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
     if USE_BRANCH_TARGET_FS and branch_target_candidates:
         branch_target_selected = select_branch_target_features_for_step(
             X_train=X_full_valid,
             y_train=y_full_valid,
             target_type=target_type,
             candidate_features=branch_target_candidates,
-            top_k=BRANCH_TARGET_FS_TOPK,
-            method=BRANCH_TARGET_FS_METHOD,
+            top_k=final_branch_fs_top_k,
+            method=final_branch_fs_method,
             corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
             min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
             sample_weights=fs_weights,
+            dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
+            dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
+            dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
+            dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
+            dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
+            dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
         )
     else:
         branch_target_selected = branch_target_candidates
@@ -1158,7 +1776,8 @@ def train_and_evaluate(
     logger.info(
         f"Final feature set: snapshot={len(snapshot_selected)} "
         f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
-        f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)}, "
+        f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)} "
+        f"(method={final_branch_fs_method}, top_k={final_branch_fs_top_k}), "
         f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
         f"final={len(feature_cols)}"
     )
@@ -1175,19 +1794,57 @@ def train_and_evaluate(
     if tune:
         logger.info("Tuning hyperparameters for final production model...")
         feature_only_cols = [c for c in feature_cols if c in X_train.columns and c != 'ds']
+        tuning_mode = _get_tuning_objective_mode(target_type, target_source)
         
         # Pass the DF WITH 'ds' so inner tuning folds can manage their own point-in-time weights
         final_params = tune_hyperparameters(
             X_train[['ds'] + feature_only_cols], y_full_valid, target_month=final_target_month,
             use_huber_loss=use_huber_loss,
+            objective_mode=tuning_mode,
+            lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
+            lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
+            lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
+            lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
+            lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
+            tail_quantile=VARIANCE_TAIL_QUANTILE,
+            tail_weighting=(
+                ENABLE_TAIL_AWARE_WEIGHTING
+                and _is_variance_priority_target(target_type, target_source)
+            ),
+            tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
+            tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+            tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
+            tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
+            tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
         )
         
         final_half_life = final_params.get('half_life_months', 60.0)
         # Reattach the targets and half_life so train_lightgbm_model can recompute internally
         final_params['target_month'] = final_target_month
         final_params['half_life_months'] = final_half_life
+        final_params['tail_weighting'] = (
+            ENABLE_TAIL_AWARE_WEIGHTING
+            and _is_variance_priority_target(target_type, target_source)
+        )
+        final_params['tail_weight_abs_level_quantile'] = TAIL_WEIGHT_ABS_LEVEL_QUANTILE
+        final_params['tail_weight_abs_diff_quantile'] = TAIL_WEIGHT_ABS_DIFF_QUANTILE
+        final_params['tail_weight_level_boost'] = TAIL_WEIGHT_LEVEL_BOOST
+        final_params['tail_weight_diff_boost'] = TAIL_WEIGHT_DIFF_BOOST
+        final_params['tail_weight_max_multiplier'] = TAIL_WEIGHT_MAX_MULTIPLIER
     else:
-        final_params = {'target_month': final_target_month, 'half_life_months': 60.0}
+        final_params = {
+            'target_month': final_target_month,
+            'half_life_months': 60.0,
+            'tail_weighting': (
+                ENABLE_TAIL_AWARE_WEIGHTING
+                and _is_variance_priority_target(target_type, target_source)
+            ),
+            'tail_weight_abs_level_quantile': TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
+            'tail_weight_abs_diff_quantile': TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+            'tail_weight_level_boost': TAIL_WEIGHT_LEVEL_BOOST,
+            'tail_weight_diff_boost': TAIL_WEIGHT_DIFF_BOOST,
+            'tail_weight_max_multiplier': TAIL_WEIGHT_MAX_MULTIPLIER,
+        }
 
     # Train final model
     model, importance, residuals = train_lightgbm_model(
@@ -1203,11 +1860,15 @@ def train_and_evaluate(
 
     # Persist current-run artifacts even if keep-rule failed to avoid stale files.
     # production_eligible communicates deployment readiness.
-    keep_rule_failed = bool(backtest_results.attrs.get('skip_save', False))
-    if keep_rule_failed:
+    keep_rule_failed = bool(backtest_results.attrs.get('keep_rule_failed', False))
+    variance_gate_failed = bool(backtest_results.attrs.get('variance_gate_failed', False))
+    production_eligible = not (keep_rule_failed or variance_gate_failed)
+
+    if keep_rule_failed or variance_gate_failed:
         logger.warning(
-            f"Keep-rule flagged {model_id.upper()} as non-production-eligible; "
-            "saving artifacts with production_eligible=False."
+            f"Model {model_id.upper()} flagged as non-production-eligible; "
+            f"keep_rule_failed={keep_rule_failed}, variance_gate_failed={variance_gate_failed}. "
+            "Saving artifacts with production_eligible=False."
         )
 
     save_model(
@@ -1219,8 +1880,10 @@ def train_and_evaluate(
         release_type=release_type,
         target_source=target_source,
         extra_metadata={
-            'production_eligible': not keep_rule_failed,
+            'production_eligible': production_eligible,
             'keep_rule_failed': keep_rule_failed,
+            'variance_gate_failed': variance_gate_failed,
+            'variance_gate_reasons': backtest_results.attrs.get('variance_gate_reasons', []),
         },
     )
 
@@ -1462,10 +2125,10 @@ def validate_post_train_all_artifacts(
       1) 4 model files + 4 metadata files
       2) 4 per-model metrics JSON files
       3) model_comparison.csv/html
-      4) first_release and revised output bundles under _Output/
+      4) first_release and revised output bundles under OUTPUT_DIR (_output/)
     """
     if output_root is None:
-        output_root = Path(__file__).resolve().parent.parent / "_Output"
+        output_root = OUTPUT_DIR
 
     required: List[Tuple[str, Path]] = []
     optional: List[Tuple[str, Path]] = []
@@ -1697,6 +2360,7 @@ Examples:
                     sa_y_full=sa_r['y_full'],
                     nsa_residuals=nsa_r['residuals'],
                     sa_residuals=sa_r['residuals'],
+                    output_base=OUTPUT_DIR,
                     suffix=output_suffix,
                 )
 
@@ -1736,6 +2400,22 @@ Examples:
                 'feature_cols': feature_cols,
                 'importance': dict(zip(feature_cols, model.feature_importance(importance_type='gain'))),
             }
+            output_suffix = '_revised' if target_source == 'revised' else ''
+
+            # Always refresh single-branch visualization artifacts for direct runs.
+            try:
+                from Train.Output_code.generate_output import generate_single_branch_output
+                generate_single_branch_output(
+                    results_df=backtest_results,
+                    model=model,
+                    metadata=metadata,
+                    X_full=X_full,
+                    target_type=args.target,
+                    target_source=target_source,
+                    output_base=OUTPUT_DIR,
+                )
+            except Exception as e:
+                logger.warning(f"Single-branch output generation failed: {e}")
 
             # If training NSA (default), also train SA and generate combined output
             if args.target == 'nsa':
@@ -1756,7 +2436,6 @@ Examples:
                     }
 
                     from Train.Output_code.generate_output import generate_all_output
-                    output_suffix = '_revised' if target_source == 'revised' else ''
                     generate_all_output(
                         nsa_results=backtest_results,
                         sa_results=sa_backtest,
@@ -1770,6 +2449,7 @@ Examples:
                         sa_y_full=sa_y_full,
                         nsa_residuals=residuals,
                         sa_residuals=sa_residuals,
+                        output_base=OUTPUT_DIR,
                         suffix=output_suffix,
                     )
 

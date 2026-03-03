@@ -57,6 +57,11 @@ UNIFIER_SERIES = {
     "Industrial_Production": "USIPTOT.G",      # Manufacturing activity
 }
 
+# Reuters/LSEG NFP consensus poll (economists' mean forecast)
+CONSENSUS_POLL_NAME = "lseg_us_reuters_polls"
+CONSENSUS_POLL_KEY = "US&NFAREO"
+CONSENSUS_SERIES_NAME = "NFP_Consensus_Mean"
+
 
 def calculate_series_lag(df, series_name):
     """
@@ -232,6 +237,61 @@ def get_effective_release_and_value_vectorized(df, snap_date, median_lag_days, n
 
     return result[['date', 'release_date', 'value']]
 
+@profiled("load_unifier_data._fetch_consensus_series")
+def _fetch_consensus_series():
+    """
+    Fetch NFP consensus poll data (economists' mean forecast) from Unifier.
+
+    Returns a DataFrame with the same schema as other Unifier series:
+        date, release_date, value, series_name, series_code
+
+    Release-date convention: last calendar day of month M for month M's
+    consensus (the poll is always finalised before the NFP release in
+    early month M+1, so this is strictly PIT-correct).
+    """
+    try:
+        df = unifier.get_dataframe(
+            name=CONSENSUS_POLL_NAME, key=CONSENSUS_POLL_KEY, asof_date=None
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch consensus poll: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        logger.warning("Consensus poll returned no data")
+        return pd.DataFrame()
+
+    # Validate required columns
+    if "timestamp" not in df.columns or "first_release_value" not in df.columns:
+        logger.error(
+            f"Consensus poll missing required columns. "
+            f"Available: {list(df.columns)}"
+        )
+        return pd.DataFrame()
+
+    out = df[["timestamp", "first_release_value"]].copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    out["first_release_value"] = pd.to_numeric(out["first_release_value"], errors="coerce")
+    out = out.dropna(subset=["timestamp", "first_release_value"])
+
+    # Normalise to 1st-of-month (timestamp is typically the 15th)
+    out["date"] = out["timestamp"].dt.to_period("M").dt.to_timestamp()
+
+    # Release date = last calendar day of the same month
+    out["release_date"] = out["date"] + pd.offsets.MonthEnd(0)
+
+    out = out.rename(columns={"first_release_value": "value"})
+    out["series_name"] = CONSENSUS_SERIES_NAME
+    out["series_code"] = CONSENSUS_POLL_KEY
+
+    # Keep only the latest row per month (in case of duplicates)
+    out = out.sort_values("timestamp").drop_duplicates(subset=["date"], keep="last")
+
+    out = out[["date", "release_date", "value", "series_name", "series_code"]].copy()
+    logger.info(f"Fetched {len(out)} consensus poll observations")
+    return out
+
+
 @profiled("load_unifier_data.fetch_unifier_snapshots")
 def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
     """
@@ -329,6 +389,9 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
     if not all_series_data:
         raise RuntimeError("No data fetched from Unifier")
 
+    # Fetch consensus poll data (separate endpoint, simpler PIT logic)
+    consensus_df = _fetch_consensus_series()
+
     # Calculate NFP-relative timing offsets for each series (for backfill consistency)
     # Uses imported calculate_median_offset_from_nfp from nfp_relative_timing
     series_nfp_offsets = {}
@@ -400,6 +463,12 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
 
             if not series_df.empty:
                 snap_data_list.append(series_df)
+
+        # Append consensus data for this snapshot (simple PIT filter)
+        if not consensus_df.empty:
+            cons_snap = consensus_df[consensus_df['release_date'] < snap_date].copy()
+            if not cons_snap.empty:
+                snap_data_list.append(cons_snap)
 
         if snap_data_list:
             full_snap = pd.concat(snap_data_list, ignore_index=True)

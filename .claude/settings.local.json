@@ -53,7 +53,9 @@
       "WebFetch(domain:github.com)",
       "Bash(jobs -l)",
       "Bash(NFP_FS_STAGES=\"0,1,4\" python3 -c \":*)",
-      "Bash(jobs)"
+      "Bash(jobs)",
+      "Bash(/opt/anaconda3/envs/nfp/bin/python -c \":*)",
+      "Bash(parquet-tools schema \"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_nsa_revised.parquet\")"
     ]
   }
 }

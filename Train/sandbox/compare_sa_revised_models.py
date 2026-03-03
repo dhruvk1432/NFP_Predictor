@@ -290,6 +290,8 @@ def _discover_model_folders(include_archive: bool, archive_limit: int) -> List[T
             ("catboost_sa_revised", "sandbox", OUTPUT_DIR / "sandbox" / "catboost_sa_revised"),
             ("xgboost_sa_revised", "sandbox", OUTPUT_DIR / "sandbox" / "xgboost_sa_revised"),
             ("sa_blend_walkforward", "sandbox", OUTPUT_DIR / "sandbox" / "sa_blend_walkforward"),
+            ("nsa_predicted_adj", "sandbox", OUTPUT_DIR / "sandbox" / "nsa_predicted_adjustment_revised"),
+            ("blend_predicted_adj", "sandbox", OUTPUT_DIR / "sandbox" / "sa_blend_predicted_adj_walkforward"),
         ]
     )
 

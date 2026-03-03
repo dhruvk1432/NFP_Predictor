@@ -1,6 +1,11 @@
 """
 Sandbox walk-forward blend:
-  SA direct revised model + NSA + perfect seasonal adjustment revised.
+  SA direct revised model + NSA + seasonal adjustment revised.
+
+Uses PIT-safe predicted adjustment by default (--adj-source predicted).
+The "perfect" adjustment option (--adj-source perfect) is retained for
+diagnostic comparison only — it uses lookahead and must NOT be used
+for production or consensus-anchor experiments.
 
 This script does not retrain core models and does not change pipeline artifacts.
 It consumes existing `_output/*_revised/backtest_results.csv` files.
@@ -72,9 +77,12 @@ def _score(actual: np.ndarray, pred: np.ndarray, objective_mode: str) -> float:
     return _objective(actual, pred)
 
 
-def _load_inputs() -> pd.DataFrame:
+def _load_inputs(adj_source: str = "perfect") -> pd.DataFrame:
     sa_path = OUTPUT_DIR / "SA_prediction_revised" / "backtest_results.csv"
-    adj_path = OUTPUT_DIR / "NSA_plus_adjustment_revised" / "backtest_results.csv"
+    if adj_source == "predicted":
+        adj_path = OUTPUT_DIR / "sandbox" / "nsa_predicted_adjustment_revised" / "backtest_results.csv"
+    else:
+        adj_path = OUTPUT_DIR / "NSA_plus_adjustment_revised" / "backtest_results.csv"
     if not sa_path.exists() or not adj_path.exists():
         raise FileNotFoundError(
             "Missing input files. Expected:\n"
@@ -323,9 +331,17 @@ if __name__ == "__main__":
         help="Objective used during Optuna tuning CV.",
     )
     parser.add_argument("--tune-cv-splits", type=int, default=4)
+    parser.add_argument(
+        "--adj-source",
+        type=str,
+        choices=["perfect", "predicted"],
+        default="predicted",
+        help="Source of seasonal adjustment: 'predicted' (PIT-safe, default) or 'perfect' (lookahead, diagnostic only).",
+    )
     args = parser.parse_args()
 
-    data = _load_inputs()
+    data = _load_inputs(adj_source=args.adj_source)
+    logger.info("Adjustment source: %s", args.adj_source)
     tune_opts = BlendTuneOptions(
         enabled=bool(args.tune),
         n_trials=int(args.tune_trials),

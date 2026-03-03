@@ -110,20 +110,30 @@ def _generate_adjustment_folder(
     folder: Path,
 ) -> None:
     """
-    Generate the NSA + perfect seasonal adjustment folder (3 outputs).
+    Generate the NSA + PIT-safe predicted seasonal adjustment folder.
 
-    The perfect adjustment for each month is:
-        adjustment = actual_SA_MoM - actual_NSA_MoM
-        adjusted_pred = nsa_predicted + adjustment
+    Uses an exponentially-weighted average of same-calendar-month historical
+    adjustments (half-life = 3 years) to predict the seasonal adjustment
+    factor, then applies it to the NSA prediction.
 
-    We then compare adjusted_pred to actual SA MoM.
+    This is fully PIT-safe: for each target month, only adjustment data
+    with operational_available_date < target_ds is used.
 
     Args:
         nsa_results: NSA backtest results DataFrame.
         sa_results: SA backtest results DataFrame.
         folder: Destination folder path.
     """
+    from Train.sandbox.experiment_predicted_adjustment import (
+        ExpWeightedMonthlyAvgPredictor,
+        load_adjustment_history,
+    )
+
     folder.mkdir(parents=True, exist_ok=True)
+
+    # Load full historical adjustment series (SA_MoM - NSA_MoM back to 1990)
+    adj_history = load_adjustment_history()
+    predictor = ExpWeightedMonthlyAvgPredictor(half_life_years=3.0)
 
     # Merge NSA and SA results on date
     nsa = nsa_results[nsa_results["actual"].notna()][["ds", "predicted", "actual"]].copy()
@@ -132,12 +142,33 @@ def _generate_adjustment_folder(
     sa = sa_results[sa_results["actual"].notna()][["ds", "actual"]].copy()
     sa = sa.rename(columns={"actual": "sa_actual"})
 
-    merged = pd.merge(nsa, sa, on="ds", how="inner")
+    merged = pd.merge(nsa, sa, on="ds", how="inner").sort_values("ds").reset_index(drop=True)
 
-    # Compute perfect seasonal adjustment
-    merged["adjustment"] = merged["sa_actual"] - merged["nsa_actual"]
-    merged["adjusted_predicted"] = merged["nsa_predicted"] + merged["adjustment"]
+    # For each backtest month, predict adjustment using PIT-safe expanding window
+    predicted_adjustments = []
+    for _, row in merged.iterrows():
+        target_ds = row["ds"]
+
+        # PIT filter: only use adjustments available before target month
+        if "operational_available_date" in adj_history.columns:
+            pit_mask = adj_history["operational_available_date"].notna() & (
+                adj_history["operational_available_date"] < target_ds
+            )
+        else:
+            pit_mask = adj_history["ds"] < target_ds
+        avail_history = adj_history[pit_mask].copy()
+
+        if avail_history.empty:
+            predicted_adjustments.append(0.0)
+        else:
+            predicted_adjustments.append(predictor.fit_predict(avail_history, target_ds))
+
+    merged["predicted_adjustment"] = predicted_adjustments
+    merged["adjusted_predicted"] = merged["nsa_predicted"] + merged["predicted_adjustment"]
     merged["error"] = merged["sa_actual"] - merged["adjusted_predicted"]
+
+    # Also compute perfect adjustment for diagnostic comparison
+    merged["perfect_adjustment"] = merged["sa_actual"] - merged["nsa_actual"]
 
     # Build a results-like DataFrame for the plotting function
     adj_results = pd.DataFrame({
@@ -148,10 +179,10 @@ def _generate_adjustment_folder(
     })
 
     # (a) Predictions plot
-    logger.info("  Generating NSA + adjustment predictions plot...")
+    logger.info("  Generating NSA + predicted adjustment plot...")
     plot_backtest_predictions(
         adj_results,
-        title="NSA Prediction + Perfect Seasonal Adjustment vs Actual SA MoM",
+        title="NSA Prediction + Exp-Weighted Seasonal Adjustment vs Actual SA MoM",
         save_path=folder / "backtest_predictions.png",
     )
 
@@ -164,10 +195,10 @@ def _generate_adjustment_folder(
     save_metrics_csv(metrics, folder / "summary_statistics.csv")
     logger.info(f"  NSA+adj metrics: RMSE={metrics['RMSE']:.2f}, MAE={metrics['MAE']:.2f}, MSE={metrics['MSE']:.2f}")
 
-    # (c) Summary table image
+    # (d) Summary table image
     render_summary_table(metrics, [], 0, folder / "summary_table.png")
 
-    logger.info(f"  NSA + adjustment output complete → {folder}")
+    logger.info(f"  NSA + predicted adjustment output complete → {folder}")
 
 
 def _generate_predictions_folder(
@@ -308,8 +339,8 @@ def generate_all_output(
         sa_results, sa_model, sa_metadata, sa_X_full, sa_folder, f"SA{suffix}",
     )
 
-    # 3) NSA + perfect seasonal adjustment folder
-    logger.info(f"\n[3/5] NSA + Perfect Seasonal Adjustment{suffix}")
+    # 3) NSA + PIT-safe predicted seasonal adjustment folder
+    logger.info(f"\n[3/5] NSA + Predicted Seasonal Adjustment{suffix}")
     adj_folder = output_base / f"NSA_plus_adjustment{suffix}"
     _generate_adjustment_folder(nsa_results, sa_results, adj_folder)
 

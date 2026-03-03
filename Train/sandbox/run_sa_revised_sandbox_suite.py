@@ -61,6 +61,11 @@ def main() -> None:
     parser.add_argument("--tune-objective", type=str, default="composite")
     parser.add_argument("--tune-every-steps", type=str, default="")
     parser.add_argument("--no-tune-huber", action="store_true")
+
+    parser.add_argument("--run-predicted-adj", action="store_true",
+                        help="Run predicted seasonal adjustment experiment.")
+    parser.add_argument("--blend-predicted-adj", action="store_true",
+                        help="Re-run blend using predicted (PIT-safe) adjustment.")
     args = parser.parse_args()
 
     py = sys.executable
@@ -87,6 +92,20 @@ def main() -> None:
         if args.xgb_tune_huber:
             xgb_cmd.append("--tune-huber")
         _run(xgb_cmd)
+
+    if args.run_predicted_adj:
+        _run([py, str(SANDBOX_DIR / "experiment_predicted_adjustment.py")])
+
+    if args.blend_predicted_adj:
+        pred_blend_cmd = [py, str(SANDBOX_DIR / "experiment_sa_blend.py"),
+                          "--adj-source", "predicted"]
+        if args.tune_blend:
+            pred_blend_cmd.append("--tune")
+        if args.blend_tune_trials.strip():
+            pred_blend_cmd.extend(["--tune-trials", args.blend_tune_trials.strip()])
+        if args.blend_tune_timeout.strip():
+            pred_blend_cmd.extend(["--tune-timeout", args.blend_tune_timeout.strip()])
+        _run(pred_blend_cmd)
 
     if not args.skip_blend:
         blend_cmd = [py, str(SANDBOX_DIR / "experiment_sa_blend.py")]

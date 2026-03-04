@@ -55,7 +55,10 @@
       "Bash(NFP_FS_STAGES=\"0,1,4\" python3 -c \":*)",
       "Bash(jobs)",
       "Bash(/opt/anaconda3/envs/nfp/bin/python -c \":*)",
-      "Bash(parquet-tools schema \"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_nsa_revised.parquet\")"
+      "Bash(parquet-tools schema \"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_nsa_revised.parquet\")",
+      "Bash(xargs -I{} sh -c 'python3 -c \"\"import pyarrow.parquet as pq; cols=[c for c in pq.read_schema\\(\\\\\"\"{}\\\\\"\"\\).names if \\\\\"\"consensus\\\\\"\" in c.lower\\(\\)]; print\\(\\\\\"\"{}: \\\\\"\"+str\\(cols\\)\\) if cols else None\"\" 2>/dev/null')",
+      "Bash(xargs -I{} sh -c 'cd \"\"/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor\"\" && python -c \"\"import pyarrow.parquet as pq; cols=[c for c in pq.read_schema\\(\\\\\"\"{}\\\\\"\"\\).names if \\\\\"\"consensus\\\\\"\" in c.lower\\(\\)]; print\\(\\\\\"\"{}: \\\\\"\"+str\\(cols\\)\\) if cols else None\"\" 2>/dev/null')",
+      "Bash(sort -k6,7)"
     ]
   }
 }

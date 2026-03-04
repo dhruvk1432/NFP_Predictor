@@ -5,8 +5,12 @@ Tests 7 mathematical frameworks for integrating economist consensus
 as an anchor into the NFP prediction pipeline.
 
 Key insight: consensus beats our models on MAE/RMSE but our champion
-blend beats consensus on acceleration accuracy (64.7% vs 41.2%).
-Goal: combine both strengths.
+blend (SA+NSA revised walk-forward) beats consensus on acceleration
+accuracy (64.7% vs 41.2%).  Goal: combine both strengths.
+
+Model roles (aligned with model_comparison.py):
+  - champion:   SA+NSA revised walk-forward blend  (sa_blend_champion)
+  - challenger:  best individual LightGBM by MAE    (sa_first_revised)
 
 Data available:
   - 315 months of consensus vs actual (1999-2026)  -> train consensus-bias models

@@ -175,6 +175,7 @@ from Train.config import (
     TAIL_WEIGHT_LEVEL_BOOST, TAIL_WEIGHT_DIFF_BOOST, TAIL_WEIGHT_MAX_MULTIPLIER,
     ENABLE_REGIME_ROUTER, REGIME_HIGHVOL_QUANTILE, REGIME_MIN_CLASS_SAMPLES,
     REGIME_MODEL_NUM_BOOST_ROUND,
+    SA_CALENDAR_FEATURES_KEEP,
 )
 
 from Train.branch_target_selection import (
@@ -1009,8 +1010,14 @@ def run_expanding_window_backtest(
         snapshot_candidates = groups['snapshot_features']
         branch_target_candidates = groups['target_branch_features']
         dropped_cross_target = groups['other_target_features']
+        # For SA targets, drop seasonality-encoding calendar features (month_sin,
+        # is_jan, etc.) because BLS seasonal adjustment already removes that signal.
+        # Keep only structural features (weeks_since_last_survey, is_5_week_month, year).
+        cal_feats = groups['calendar_features']
+        if target_type == 'sa':
+            cal_feats = [f for f in cal_feats if f in SA_CALENDAR_FEATURES_KEEP]
         always_keep = _merge_unique_feature_lists(
-            groups['calendar_features'],
+            cal_feats,
             groups['revision_features'],
         )
 
@@ -1707,8 +1714,11 @@ def train_and_evaluate(
     ]
 
     branch_target_candidates = groups['target_branch_features']
+    cal_feats_final = groups['calendar_features']
+    if target_type == 'sa':
+        cal_feats_final = [f for f in cal_feats_final if f in SA_CALENDAR_FEATURES_KEEP]
     always_keep = _merge_unique_feature_lists(
-        groups['calendar_features'],
+        cal_feats_final,
         groups['revision_features'],
     )
     dropped_cross_target = groups['other_target_features']

@@ -337,6 +337,15 @@ BRANCH_TARGET_FS_WEIGHT_SIGN = 0.10        # Dynamics selector: diff-sign cohere
 BRANCH_TARGET_FS_WEIGHT_TAIL = 0.05        # Dynamics selector: tail-amplitude alignment
 
 
+# Calendar feature filtering for SA targets.
+# SA series have seasonality stripped by BLS, so month/quarter cyclical
+# encodings and seasonal flags are redundant.  Keep only structural features.
+SA_CALENDAR_FEATURES_KEEP = frozenset({
+    'weeks_since_last_survey',
+    'is_5_week_month',
+    'year',
+})
+
 # =============================================================================
 # BASELINE KEEP-RULE
 # =============================================================================

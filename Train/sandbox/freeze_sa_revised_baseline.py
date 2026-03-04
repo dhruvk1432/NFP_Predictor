@@ -1,9 +1,12 @@
 """
 Freeze SA-revised champion/challenger baselines into immutable snapshot folders.
 
-Default mapping for baseline step 1:
-- champion_v1  -> _output/sandbox/sa_blend_walkforward
-- challenger_v1 -> _output/SA_prediction_revised
+Default mapping (v2+):
+- champion   -> _output/sandbox/sa_blend_walkforward   (SA+NSA revised walk-forward blend)
+- challenger -> _output/SA_prediction_revised           (raw SA revised LightGBM)
+
+History:
+- v1: champion was the blend, challenger was raw SA revised LightGBM (same as current).
 """
 
 from __future__ import annotations

@@ -176,6 +176,7 @@ from Train.config import (
     ENABLE_REGIME_ROUTER, REGIME_HIGHVOL_QUANTILE, REGIME_MIN_CLASS_SAMPLES,
     REGIME_MODEL_NUM_BOOST_ROUND,
     SA_CALENDAR_FEATURES_KEEP,
+    ENHANCEMENT_EXEMPT_TARGETS,
 )
 
 from Train.branch_target_selection import (
@@ -569,7 +570,11 @@ def _run_variance_enhancement_sequence(
         'kpis_base': best_kpis,
     }
 
-    use_stack = ENABLE_VARIANCE_ENHANCEMENTS and _is_variance_priority_target(target_type, target_source)
+    use_stack = (
+        ENABLE_VARIANCE_ENHANCEMENTS
+        and _is_variance_priority_target(target_type, target_source)
+        and (target_type, target_source) not in set(ENHANCEMENT_EXEMPT_TARGETS)
+    )
     if not use_stack:
         return best_pred, best_val, best_stage, stage_report
 

@@ -46,10 +46,10 @@ MERGED_CSV = (
     REPO_ROOT
     / "_output"
     / "consensus_comparison"
-    / "consensus_model_merged_first_release_blend.csv"
+    / "consensus_model_merged_first_release_sa_revised.csv"
 )
 TARGET_PARQUET = REPO_ROOT / "data" / "NFP_target" / "y_sa_revised.parquet"
-OUT_DIR = REPO_ROOT / "_output" / "consensus_anchor_experiments_first_release_blend"
+OUT_DIR = REPO_ROOT / "_output" / "consensus_anchor_experiments_first_release_sa_revised"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Minimum expanding-window history before producing a prediction

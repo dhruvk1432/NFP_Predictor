@@ -390,6 +390,14 @@ TUNING_LAMBDA_TAIL_MAE = 0.20
 TUNING_LAMBDA_CORR_DIFF = 20.0
 TUNING_LAMBDA_DIFF_SIGN = 12.0
 
+# Targets exempt from the enhancement stack but still using composite tuning.
+# SA revised is a low-variance target; the enhancement stages (dynamics,
+# acceleration, etc.) introduce noise and hurt MAE without meaningful
+# variance-capture benefit.  Composite tuning + feature selection are retained.
+ENHANCEMENT_EXEMPT_TARGETS = (
+    ('sa', 'revised'),
+)
+
 # Sequential variance-enhancement stack (applied in this order)
 ENABLE_VARIANCE_ENHANCEMENTS = True
 ENHANCEMENT_SEQUENCE = ('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')

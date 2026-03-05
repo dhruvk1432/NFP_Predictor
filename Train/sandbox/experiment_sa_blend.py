@@ -44,7 +44,7 @@ except Exception as _optuna_err:
 
 @dataclass(frozen=True)
 class BlendTuneOptions:
-    enabled: bool = False
+    enabled: bool = True
     n_trials: int = N_OPTUNA_TRIALS
     timeout: int = OPTUNA_TIMEOUT
     objective_mode: str = "composite"
@@ -320,7 +320,19 @@ if __name__ == "__main__":
         default="composite",
         help="Score used for per-step blend-weight search.",
     )
-    parser.add_argument("--tune", action="store_true", help="Enable Optuna tuning for blend hyperparameters.")
+    parser.add_argument(
+        "--tune",
+        dest="tune",
+        action="store_true",
+        default=True,
+        help="Enable Optuna tuning for blend hyperparameters (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-tune",
+        dest="tune",
+        action="store_false",
+        help="Disable Optuna tuning and use the provided blend hyperparameters as-is.",
+    )
     parser.add_argument("--tune-trials", type=int, default=N_OPTUNA_TRIALS)
     parser.add_argument("--tune-timeout", type=int, default=OPTUNA_TIMEOUT)
     parser.add_argument(

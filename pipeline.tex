@@ -1,0 +1,316 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+
+\title{NFP Forecasting Pipeline: From SA/NSA Revised Models to Consensus-Anchor Fusion}
+\author{Pipeline Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose}
+This document describes the end-to-end forecasting pipeline currently used in this repository:
+\begin{enumerate}
+    \item Build direct SA revised and NSA revised prediction streams.
+    \item Build NSA + predicted seasonal adjustment stream.
+    \item Build dynamic SA blend champion.
+    \item Use consensus as an anchor and run fusion models (including A5 and A7).
+\end{enumerate}
+It includes the core mathematics, data construction rules, and metrics-based analysis.
+
+\section{Data, Targets, and Notation}
+\subsection{Notation}
+\begin{align*}
+y_t^{SA} &: \text{true SA revised MoM target at month } t \\
+y_t^{NSA} &: \text{true NSA revised MoM target at month } t \\
+\hat{y}_{t,\text{SA}} &: \text{direct SA revised model prediction} \\
+\hat{y}_{t,\text{NSA}} &: \text{direct NSA revised model prediction} \\
+a_t &: \text{seasonal adjustment term } (y_t^{SA} - y_t^{NSA}) \\
+\hat{a}_t &: \text{predicted seasonal adjustment term} \\
+\hat{y}_{t,\text{adj}} &: \hat{y}_{t,\text{NSA}} + \hat{a}_t \\
+\hat{y}_{t,\text{blend}} &: \text{dynamic blend of } \hat{y}_{t,\text{SA}} \text{ and } \hat{y}_{t,\text{adj}} \\
+c_t &: \text{consensus anchor value} \\
+m_t &: \text{model observation in consensus fusion (here } \hat{y}_{t,\text{blend}} \text{)}.
+\end{align*}
+
+\subsection{Point-in-time safety}
+All model stages use expanding-window logic and strict chronology:
+\begin{itemize}
+    \item Training rows for month $t$ only use information available before or at the configured point-in-time cutoff for $t$.
+    \item For revised targets and adjustment histories, operational availability dates are enforced.
+\end{itemize}
+
+\section{Stage 1: Direct SA Revised and NSA Revised Models}
+\subsection{Targets}
+Two revised target branches are used:
+\begin{itemize}
+    \item SA revised: \texttt{sa\_first\_revised}
+    \item NSA revised: \texttt{nsa\_first\_revised}
+\end{itemize}
+Targets are loaded from pre-built revised parquet caches under \texttt{data/NFP\_target}.
+
+\subsection{Feature construction}
+For each target month, the feature vector includes:
+\begin{itemize}
+    \item Master snapshot features (pre-selected feature sets).
+    \item Branch-target lag/rolling/acceleration features.
+    \item Calendar/timing features (SA branch keeps structural subset only).
+    \item Revision features comparing current and previous snapshot views.
+\end{itemize}
+
+\subsection{Training protocol}
+Backtesting is expanding-window and monthly:
+\begin{itemize}
+    \item Train on all valid historical rows before month $t$.
+    \item Refit model each step.
+    \item Hyperparameters tuned (periodically) with time-series CV.
+    \item Sample weighting uses exponential recency decay:
+\end{itemize}
+\begin{align}
+w_i \propto \exp\left(-\ln(2)\frac{\Delta_i}{h}\right),
+\end{align}
+where $\Delta_i$ is distance in months from sample $i$ to target month and $h$ is half-life.
+
+\subsection{Observed metrics (current run)}
+\begin{table}[h!]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & RMSE & MAE & Bias & DirAcc & AccelAcc & CorrDiff \\
+\midrule
+SA revised & 90.6464 & 66.2620 & 23.2161 & 0.9429 & 0.5000 & 0.1590 \\
+NSA revised & 160.0274 & 120.4492 & -1.2129 & 1.0000 & 0.8824 & 0.9823 \\
+\bottomrule
+\end{tabular}
+\caption{Top-level revised branch metrics from backtest JSON summaries.}
+\end{table}
+
+\section{Stage 2: NSA + Predicted Seasonal Adjustment}
+\subsection{Construction}
+Define adjustment:
+\begin{align}
+a_t = y_t^{SA} - y_t^{NSA}.
+\end{align}
+Then define adjusted SA-space prediction:
+\begin{align}
+\hat{y}_{t,\text{adj}} = \hat{y}_{t,\text{NSA}} + \hat{a}_t.
+\end{align}
+
+\subsection{Adjustment model family}
+Candidate models tested:
+\begin{enumerate}
+    \item SARIMA
+    \item Monthly average
+    \item 12-month complement
+    \item Same-month last year
+    \item Exponentially weighted same-month average
+    \item Linear regression with month dummies and trend
+\end{enumerate}
+
+Current selected model is \texttt{exp\_weighted\_avg} (by SA composite score).
+
+\subsection{Selected adjustment formula}
+For target month $t$, using same-calendar-month historical rows $j$ in PIT-safe history:
+\begin{align}
+u_j &= \exp\left(-\ln(2)\frac{\text{years\_ago}_j}{3.0}\right), \\
+\omega_j &= \frac{u_j}{\sum_k u_k}, \\
+\hat{a}_t &= \sum_j \omega_j a_j.
+\end{align}
+
+\section{Stage 3: SA Blend Champion}
+\subsection{Blend equation}
+\begin{align}
+\hat{y}_{t,\text{blend}} = w_t \hat{y}_{t,\text{SA}} + (1-w_t)\hat{y}_{t,\text{adj}}.
+\end{align}
+
+\subsection{Walk-forward weight selection}
+\begin{itemize}
+    \item If history $<$ \texttt{min\_history} (12), set $w_t=0.5$.
+    \item Else choose $w_t \in \{0,0.05,\dots,1\}$ minimizing objective over trailing window (18 months).
+\end{itemize}
+
+Composite objective:
+\begin{align}
+\mathcal{L} =
+\text{MAE}
+&+ 18\lvert 1-\text{std\_ratio}\rvert
++ 18\lvert 1-\text{diff\_std\_ratio}\rvert \nonumber\\
+&+ 0.20\cdot \text{tail\_mae}
++ 14\cdot(1-\text{corr\_diff})
++ 10\cdot(1-\text{diff\_sign\_accuracy}).
+\end{align}
+
+\subsection{Current blend diagnostics}
+\begin{itemize}
+    \item RMSE: 80.5138
+    \item MAE: 65.3192
+    \item Directional accuracy: 1.0000
+    \item Acceleration accuracy: 0.5882
+    \item Mean SA weight: 0.5057
+    \item Tuning enabled: True (25 trials, composite objective, 4 CV splits)
+\end{itemize}
+
+\section{Stage 4: Consensus Anchor Dataset}
+\subsection{First-release anchor variant}
+Consensus comes from first-release style monthly anchor series and is merged with:
+\begin{itemize}
+    \item champion\_pred $= \hat{y}_{t,\text{blend}}$
+    \item challenger\_pred $= \hat{y}_{t,\text{SA}}$
+    \item actual (SA revised MoM where available)
+\end{itemize}
+This yields 35 realized overlap months for evaluation.
+
+\subsection{Latest-consensus anchor variant}
+An alternative merged file with latest-consensus anchor values is used for sensitivity analysis with the same blend champion stream.
+
+\section{Consensus-Anchor Models of Interest}
+\subsection{A5: Acceleration Override}
+Given last known actual $y_{t-1}$:
+\begin{align}
+\Delta_m &= m_t - y_{t-1}, \\
+\Delta_c &= c_t - y_{t-1}.
+\end{align}
+If $\operatorname{sign}(\Delta_m)=\operatorname{sign}(\Delta_c)$, prediction reverts to consensus:
+\begin{align}
+\hat{y}_t = c_t.
+\end{align}
+If signs disagree:
+\begin{itemize}
+    \item \textbf{consensus mode}: $\hat{y}_t = y_{t-1} + \operatorname{sign}(\Delta_m)|\Delta_c|$
+    \item \textbf{blend mode}: $\hat{y}_t = y_{t-1} + \operatorname{sign}(\Delta_m)\left(\kappa|\Delta_m| + (1-\kappa)|\Delta_c|\right)$
+\end{itemize}
+This document focuses on:
+\begin{itemize}
+    \item \texttt{A5\_AccelOverride\_consensus\_k0.70}
+    \item \texttt{A5\_AccelOverride\_blend\_k0.30}
+\end{itemize}
+
+\subsection{A7: Kalman Fusion}
+State-space specification:
+\begin{align}
+x_t &= x_{t-1} + w_t, \quad w_t \sim \mathcal{N}(0,Q_t), \\
+c_t &= x_t + v_{c,t}, \quad v_{c,t} \sim \mathcal{N}(0,R_{c,t}), \\
+m_t &= x_t + v_{m,t}, \quad v_{m,t} \sim \mathcal{N}(0,R_{m,t}).
+\end{align}
+
+Information-form update:
+\begin{align}
+P_{t|t-1} &= P_{t-1} + Q_t, \\
+I_t &= \frac{1}{P_{t|t-1}} + \frac{1}{R_{c,t}} + \frac{1}{R_{m,t}}, \\
+P_{t|t} &= \frac{1}{I_t}, \\
+\hat{y}_t = x_{t|t} &= P_{t|t}\left(
+\frac{x_{t|t-1}}{P_{t|t-1}} + \frac{c_t}{R_{c,t}} + \frac{m_t}{R_{m,t}}
+\right).
+\end{align}
+
+Initialization (first-release anchor run):
+\begin{align*}
+R_{c,\text{init}} &= 30534.3669, \\
+Q_{\text{init}} &= 41691.3472.
+\end{align*}
+Initialization (latest-consensus anchor run):
+\begin{align*}
+R_{c,\text{init}} &= 29897.4743, \\
+Q_{\text{init}} &= 41691.3472.
+\end{align*}
+
+After each realized month, state is teacher-forced to observed truth:
+\begin{align}
+x_t \leftarrow y_t, \quad P_t \leftarrow 10^{-6}.
+\end{align}
+
+\section{Performance Analysis}
+\subsection{First-release consensus anchor (35 realized months)}
+\begin{table}[h!]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Model & RMSE & MAE & MAE (last 6M) & MAE (last 12M) \\
+\midrule
+A5 consensus k0.70 & 71.8361 & 55.2857 & 65.0000 & 47.7500 \\
+A5 blend k0.30 & 70.9047 & 55.9612 & 73.5050 & 49.9898 \\
+A7 Kalman fusion & 69.4291 & 56.2323 & 53.9080 & 43.5878 \\
+Consensus baseline & -- & -- & 63.6667 & 52.0833 \\
+\bottomrule
+\end{tabular}
+\caption{First-release anchor summary plus trailing-window MAE.}
+\end{table}
+
+Win rate versus first-release consensus baseline over 35 months (strict win if absolute error is smaller):
+\begin{itemize}
+    \item A5 consensus k0.70: 5 wins, 2 losses, 28 ties (14.29\% wins of 35)
+    \item A5 blend k0.30: 5 wins, 3 losses, 27 ties (14.29\% wins of 35)
+    \item A7 Kalman fusion: 21 wins, 14 losses, 0 ties (60.00\% wins of 35)
+\end{itemize}
+
+\subsection{Latest-consensus anchor (same blend champion)}
+\begin{table}[h!]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Model & RMSE & MAE & MAE (last 6M) & MAE (last 12M) \\
+\midrule
+A5 consensus k0.70 & 70.2866 & 55.0571 & 57.1667 & 45.7500 \\
+A5 blend k0.30 & 67.8421 & 54.3490 & 57.1667 & 44.7317 \\
+A7 Kalman fusion & 66.4800 & 54.4150 & 51.4767 & 41.5322 \\
+\bottomrule
+\end{tabular}
+\caption{Latest-consensus anchor results for requested models.}
+\end{table}
+
+For A7 versus latest consensus:
+\begin{itemize}
+    \item Last 6M win rate: 50.00\% (3 wins, 3 losses), average win margin 46.7966, average loss margin 35.4166.
+    \item Last 12M win rate: 58.33\% (7 wins, 5 losses), average win margin 31.1217, average loss margin 29.4477.
+    \item Full 35M win rate: 62.86\% (22 wins, 13 losses), average win margin 23.2955, average loss margin 28.3099.
+\end{itemize}
+
+\section{Feb 2026 Forward Forecast Snapshot}
+Forward month considered: 2026-02.
+
+\subsection{First-release consensus anchor}
+\begin{itemize}
+    \item Consensus anchor: 66.0
+    \item Blend champion input: 127.9134
+    \item A5 consensus k0.70 prediction: 66.0
+    \item A5 blend k0.30 prediction: 66.0
+    \item A7 Kalman fusion prediction: 99.8107
+\end{itemize}
+
+\subsection{Latest-consensus anchor}
+\begin{itemize}
+    \item Consensus anchor: 60.0
+    \item Blend champion input: 127.9134
+    \item A5 consensus k0.70 prediction: 60.0
+    \item A5 blend k0.30 prediction: 60.0
+    \item A7 Kalman fusion prediction: 93.4463
+\end{itemize}
+
+\section{Interpretation}
+\begin{itemize}
+    \item A5 variants often tie consensus exactly by construction (when model and consensus directional signal agrees, A5 outputs consensus directly).
+    \item A7 uses both anchor and blend signals continuously, with adaptive confidence weighting; this tends to produce materially higher strict win rates against consensus.
+    \item Under both anchor definitions, A7 is the strongest of the three on trailing MAE windows.
+\end{itemize}
+
+\section{Reproducibility Commands}
+\begin{verbatim}
+# Build adjustment model and blend champion
+python Train/sandbox/experiment_predicted_adjustment.py --best-by sa_composite
+python Train/sandbox/experiment_sa_blend.py --adj-source predicted
+
+# Build consensus merged variants (first-release anchored files)
+python experiments/build_consensus_anchor_merged_variants.py
+
+# Run full first-release consensus-anchor experiments
+python experiments/consensus_anchor_experiments.py
+\end{verbatim}
+
+\end{document}

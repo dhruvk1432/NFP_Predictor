@@ -15,7 +15,7 @@ Pipeline placement:
 Usage:
     python -m Train.reduce_features
     python -m Train.reduce_features --target-n 60 --corr-threshold 0.90
-    python -m Train.reduce_features --branches nsa_first_release sa_revised
+    python -m Train.reduce_features --branches nsa_revised sa_revised
     python -m Train.reduce_features --dry-run
 """
 
@@ -946,7 +946,7 @@ def reduce_features_for_branch(
 
     Args:
         target_type: 'nsa' or 'sa'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
         target_n: Target number of features after reduction.
         corr_threshold: Correlation clustering threshold.
         boruta_iterations: Number of BorutaSHAP iterations.
@@ -1185,8 +1185,8 @@ def main():
     )
     parser.add_argument(
         '--branches', nargs='+', default=None,
-        help='Specific branches to process (e.g., nsa_first_release sa_revised). '
-             'Default: all 4 branches.',
+        help='Specific branches to process (e.g., nsa_revised sa_revised). '
+             'Default: all branches.',
     )
     parser.add_argument(
         '--dry-run', action='store_true',
@@ -1205,9 +1205,7 @@ def main():
 
     # Determine which branches to process
     all_branches = [
-        ('nsa', 'first_release'),
         ('nsa', 'revised'),
-        ('sa', 'first_release'),
         ('sa', 'revised'),
     ]
 
@@ -1218,7 +1216,7 @@ def main():
             if len(parts) == 2 and parts[0] in ('nsa', 'sa'):
                 branches.append((parts[0], parts[1]))
             else:
-                logger.error(f"Invalid branch format: {b}. Expected nsa_first_release, etc.")
+                logger.error(f"Invalid branch format: {b}. Expected nsa_revised, etc.")
                 sys.exit(1)
     else:
         branches = all_branches

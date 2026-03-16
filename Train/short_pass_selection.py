@@ -127,12 +127,12 @@ def short_pass_weighted_corr(
     top_k: int = 60,
     sample_weights: Optional[np.ndarray] = None,
 ) -> List[str]:
-    """Weighted absolute correlation ranking.
+    """Vectorized weighted absolute correlation ranking.
 
-    For each candidate feature, compute the weighted Pearson correlation
-    with ``y_train``.  Rank by ``|r|`` descending, return top_k.
-
-    Handles NaN by pairwise-complete-case weighting.
+    Computes weighted Pearson correlation between each candidate feature and
+    ``y_train`` in a single vectorized pass.  Handles NaN/inf via
+    pairwise-complete-case masking (NaN positions zeroed before aggregation,
+    with per-column weight renormalization).
 
     Args:
         X_train: Training features (must NOT contain ``ds``).
@@ -151,33 +151,52 @@ def short_pass_weighted_corr(
     valid = ~y_train.isna()
     y = y_train[valid].values.astype(float)
     w = sample_weights[valid.values] if sample_weights is not None else np.ones(len(y))
+    n = len(y)
 
-    correlations = []
-    for col in available:
-        x = X_train.loc[valid, col].values.astype(float)
-        # Pairwise complete cases
-        mask = ~(np.isnan(x) | np.isinf(x))
-        if mask.sum() < 10:
-            correlations.append((col, 0.0))
-            continue
-        xm = x[mask]
-        ym = y[mask]
-        wm = w[mask]
-        wm = wm / wm.sum()
-        # Weighted means
-        mx = np.average(xm, weights=wm)
-        my = np.average(ym, weights=wm)
-        # Weighted correlation
-        cov = np.sum(wm * (xm - mx) * (ym - my))
-        sx = np.sqrt(np.sum(wm * (xm - mx) ** 2))
-        sy = np.sqrt(np.sum(wm * (ym - my) ** 2))
-        if sx < 1e-12 or sy < 1e-12:
-            correlations.append((col, 0.0))
-        else:
-            correlations.append((col, abs(cov / (sx * sy))))
+    # (n, p) matrix — replace inf with NaN for uniform handling
+    X = X_train.loc[valid, available].values.astype(float)
+    X = np.where(np.isinf(X), np.nan, X)
 
-    correlations.sort(key=lambda x: x[1], reverse=True)
-    return [col for col, _ in correlations[:top_k]]
+    # Mask: True where valid (non-NaN), shape (n, p)
+    valid_mask = ~np.isnan(X)
+
+    # Per-column valid count — features with <10 valid obs get corr=0
+    valid_counts = valid_mask.sum(axis=0)  # (p,)
+
+    # Broadcast weights to (n, p), zero out invalid positions
+    W = w[:, None] * valid_mask  # (n, p)
+    W_sum = W.sum(axis=0)        # (p,)
+    # Avoid division by zero for sparse columns
+    W_sum_safe = np.where(W_sum > 0, W_sum, 1.0)
+    W_norm = W / W_sum_safe[None, :]  # normalized weights per column
+
+    # Replace NaN with 0 so they contribute nothing to sums
+    X_clean = np.where(valid_mask, X, 0.0)
+
+    # Weighted means: per-column weighted mean of X and y
+    wmean_x = (W_norm * X_clean).sum(axis=0)        # (p,)
+    # y weighted mean depends on per-column masks (pairwise complete)
+    wmean_y = (W_norm * y[:, None]).sum(axis=0)      # (p,)
+
+    # Centered values (zeroed where invalid)
+    X_c = np.where(valid_mask, X_clean - wmean_x[None, :], 0.0)
+    y_c = np.where(valid_mask, y[:, None] - wmean_y[None, :], 0.0)
+
+    # Weighted covariance, std_x, std_y
+    cov = (W_norm * X_c * y_c).sum(axis=0)                          # (p,)
+    sx = np.sqrt((W_norm * X_c ** 2).sum(axis=0))                   # (p,)
+    sy = np.sqrt((W_norm * y_c ** 2).sum(axis=0))                   # (p,)
+
+    # Correlation (guarded against zero variance)
+    denom = sx * sy + 1e-12
+    corr = np.abs(cov / denom)
+
+    # Zero out features with insufficient valid observations
+    corr = np.where(valid_counts >= 10, corr, 0.0)
+
+    # Select top_k
+    top_idx = np.argsort(corr)[::-1][:top_k]
+    return [available[i] for i in top_idx]
 
 
 @profiled("train.short_pass.select_features_for_step")

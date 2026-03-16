@@ -1,9 +1,0 @@
-[
-    "NOAA_Economic_Damage_Index_chg_3m_lag_18m",
-    "NOAA_Economic_Damage_Index_chg_6m",
-    "NOAA_Economic_Damage_Index_diff_lag_6m",
-    "NOAA_Economic_Damage_Index_pct_chg_rolling_std_6m_lag_12m",
-    "NOAA_Economic_Damage_Index_pct_chg_zscore_12m_lag_6m",
-    "NOAA_Human_Impact_Index_pct_chg_rolling_std_6m_lag_6m",
-    "NOAA_Human_Impact_Index_zscore_3m_lag_3m"
-]

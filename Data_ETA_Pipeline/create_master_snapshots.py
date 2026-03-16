@@ -7,7 +7,7 @@ model. It acts as the grand aggregator, combining independently generated datase
 
 Critical Architecture:
 - Point-in-time accuracy is strictly maintained.
-- It operates in a quad-track mode: {nsa, sa} x {first_release, revised}.
+- It operates in a dual-track mode: {nsa, sa} x {revised}.
 - Prior to concatenation, if a valid JSON cache is not found for the specific combo,
   it spins up parallel workers to run a rigorous 6-stage LightGBM feature selection engine on ALL sources.
 - It strictly filters the final master outputs to ONLY include the surviving features,
@@ -54,6 +54,10 @@ warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
 MASTER_BASE = DATA_PATH / "master_snapshots"
 
+# Floor for historical data rows within each snapshot.
+# Pre-1990 data is extremely sparse and degrades feature selection quality.
+DATA_START_FLOOR = pd.Timestamp("1990-01-01")
+
 # ── Feature selection stage control ──
 # Default: (0,1,2,3,4) — skips Stages 5 (Interaction Rescue) and 6 (SFS),
 # which are redundant with the train-time short-pass.
@@ -97,9 +101,7 @@ SOURCE_EXEC_ORDER = ['FRED_Employment_NSA', 'FRED_Employment_SA', 'FRED_Exogenou
 
 # All 4 combinations of target category and target source
 TARGET_COMBOS = [
-    ('nsa', 'first_release'),
     ('nsa', 'revised'),
-    ('sa', 'first_release'),
     ('sa', 'revised'),
 ]
 DEFAULT_TARGET_COMBOS = tuple(TARGET_COMBOS)
@@ -109,12 +111,8 @@ VALID_FS_TARGET_MODES = {'auto', 'mom', 'delta_mom', 'model_aligned'}
 VALID_FS_STAGE_IDS = set(range(0, 7))
 
 BRANCH_ALIAS_MAP = {
-    'nsa_first': ('nsa', 'first_release'),
-    'nsa_first_release': ('nsa', 'first_release'),
     'nsa_revised': ('nsa', 'revised'),
     'nsa_first_revised': ('nsa', 'revised'),
-    'sa_first': ('sa', 'first_release'),
-    'sa_first_release': ('sa', 'first_release'),
     'sa_revised': ('sa', 'revised'),
     'sa_first_revised': ('sa', 'revised'),
 }
@@ -304,7 +302,6 @@ def _resolve_target_combos(
     Scopes:
     - all: run all branches in TARGET_COMBOS
     - revised: run only revised branches (nsa+sa)
-    - first_release: run only first-release branches (nsa+sa)
     - auto: for short verification windows (<= FAST_VERIFY_MONTH_WINDOW), run
       revised-only for speed. For longer windows, run all branches.
 
@@ -313,10 +310,10 @@ def _resolve_target_combos(
     """
     scope = (target_source_scope or "auto").strip().lower()
 
-    if scope not in {"auto", "all", "revised", "first_release"}:
+    if scope not in {"auto", "all", "revised"}:
         raise ValueError(
             f"Invalid target_source_scope='{target_source_scope}'. "
-            "Expected one of: auto, all, revised, first_release."
+            "Expected one of: auto, all, revised."
         )
 
     # Respect explicit combo overrides in auto mode (used by tests/advanced runs).
@@ -331,9 +328,7 @@ def _resolve_target_combos(
 
     if scope == "all":
         return list(TARGET_COMBOS)
-    if scope == "revised":
-        return [(cat, src) for cat, src in TARGET_COMBOS if src == "revised"]
-    return [(cat, src) for cat, src in TARGET_COMBOS if src == "first_release"]
+    return [(cat, src) for cat, src in TARGET_COMBOS if src == "revised"]
 
 # Source-specific minimum observation thresholds used before expensive selection.
 # Long-history sources can tolerate stricter cutoffs, while shorter-history
@@ -956,6 +951,219 @@ def _normalize_to_wide(df):
     return wide
 
 
+# =============================================================================
+# NO-SELECTION (ALL-FEATURES) MASTER GENERATION
+# =============================================================================
+
+@profiled("create_master_snapshots._batch_load_source_all_features")
+def _batch_load_source_all_features(
+    source_name: str,
+    source_dir: Path,
+    snapshot_months: list[pd.Timestamp],
+) -> dict[str, pd.DataFrame]:
+    """Load ALL features (no filtering) for one source across multiple months.
+
+    Like ``_batch_load_source`` but keeps every column — no ``allowed_features``
+    filter.  Column names are sanitised for LightGBM JSON compatibility.
+
+    Returns dict mapping ``YYYY-MM`` → wide DataFrame (with ``date`` column).
+    """
+    result: dict[str, pd.DataFrame] = {}
+    for obs_month in snapshot_months:
+        path = _snapshot_path(source_dir, obs_month)
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path)
+        except Exception as e:
+            logger.warning(f"[{source_name}] Failed to read {path}: {e}")
+            continue
+        if df.empty:
+            continue
+
+        wide = _normalize_to_wide(df)
+
+        # Drop pre-1990 rows (sparse, low-quality data that hurts selection)
+        if 'date' in wide.columns:
+            wide = wide[pd.to_datetime(wide['date']) >= DATA_START_FLOOR]
+            if wide.empty:
+                continue
+
+        meta_cols = [c for c in ['date', 'snapshot_date'] if c in wide.columns]
+        raw_feature_cols = [c for c in wide.columns if c not in meta_cols]
+        if not raw_feature_cols:
+            continue
+
+        # Sanitise feature names (replace JSON-unsafe chars) — vectorised rename
+        rename_map = {c: sanitize_feature_name(str(c)) for c in raw_feature_cols}
+        wide = wide.rename(columns=rename_map)
+
+        result[obs_month.strftime('%Y-%m')] = wide
+
+    return result
+
+
+@profiled("create_master_snapshots._run_unified_no_selection")
+def _run_unified_no_selection(
+    snapshot_pairs: list[tuple[pd.Timestamp, pd.Timestamp]],
+    skip_existing: bool = False,
+    asof_start: str | None = None,
+    asof_end: str | None = None,
+) -> None:
+    """Generate master snapshots containing ALL source features (no selection).
+
+    Loads all 7 sources (including both NSA *and* SA employment) and merges
+    them into a single wide-format parquet per month.  The identical parquet
+    is then copied to all 4 branch paths so that the training pipeline's
+    ``get_master_snapshot_path()`` contract is satisfied.
+
+    After generation, writes an ``all_features`` marker JSON for each branch.
+    """
+    import gc
+    import shutil
+
+    # Apply optional date bounds
+    pairs = list(snapshot_pairs)
+    if asof_start:
+        asof_start_ts = pd.Timestamp(asof_start)
+        pairs = [(obs, snap) for obs, snap in pairs if obs >= asof_start_ts]
+    if asof_end:
+        asof_end_ts = pd.Timestamp(asof_end) + pd.offsets.MonthEnd(0)
+        pairs = [(obs, snap) for obs, snap in pairs if obs <= asof_end_ts]
+
+    if not pairs:
+        logger.info("No snapshot months to process.")
+        return
+
+    # ── Unified output dir (canonical copy) ──
+    unified_dir = MASTER_BASE / "_unified" / "decades"
+    unified_dir.mkdir(parents=True, exist_ok=True)
+
+    # Progress tracking (reuse existing helpers with a synthetic branch key)
+    progress_key_cat, progress_key_src = "_unified", "all"
+    completed_months = _load_progress(progress_key_cat, progress_key_src)
+
+    # Filter already-completed months
+    pending_pairs: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for obs, snap in pairs:
+        mk = obs.strftime('%Y-%m')
+        if mk in completed_months:
+            continue
+        if skip_existing and _snapshot_path(unified_dir, obs).exists():
+            completed_months.add(mk)
+            continue
+        pending_pairs.append((obs, snap))
+
+    if not pending_pairs:
+        logger.info("[no-selection] All months already completed.")
+    else:
+        logger.info(f"[no-selection] {len(pending_pairs)} months to generate "
+                    f"({pending_pairs[0][0].strftime('%Y-%m')} → "
+                    f"{pending_pairs[-1][0].strftime('%Y-%m')})")
+
+        # Process in batches of 24 months to limit memory
+        BATCH_SIZE = 24
+        for batch_start in range(0, len(pending_pairs), BATCH_SIZE):
+            batch = pending_pairs[batch_start : batch_start + BATCH_SIZE]
+            batch_months = [obs for obs, _ in batch]
+            snap_date_map = {obs.strftime('%Y-%m'): snap for obs, snap in batch}
+
+            # Batch-load ALL sources in parallel (ThreadPool for I/O-bound parquet reads)
+            from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+            source_caches: dict[str, dict[str, pd.DataFrame]] = {}
+            source_items = list(SOURCES.items())
+            logger.info(f"[no-selection] Batch-loading {len(source_items)} sources "
+                        f"({len(batch_months)} months) in parallel...")
+
+            def _load_one_source(name_sdir):
+                name, sdir = name_sdir
+                return name, _batch_load_source_all_features(name, sdir, batch_months)
+
+            with ThreadPoolExecutor(max_workers=len(source_items)) as pool:
+                futures = {pool.submit(_load_one_source, item): item[0]
+                           for item in source_items}
+                for fut in _as_completed(futures):
+                    name, cache = fut.result()
+                    source_caches[name] = cache
+                    logger.info(f"[no-selection] {name}: "
+                                f"{len(cache)}/{len(batch_months)} loaded")
+
+            # Materialise each month in parallel (merge + parquet write are independent)
+            def _materialise_month(obs_snap):
+                obs_month, snap_date = obs_snap
+                month_key = obs_month.strftime('%Y-%m')
+                try:
+                    master = _load_all_sources_from_cache(obs_month, source_caches)
+                    if master.empty:
+                        return month_key, 0, None
+                    master['date'] = pd.to_datetime(master['date'])
+                    master['snapshot_date'] = snap_date
+                    save_path = _snapshot_path(unified_dir, obs_month)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    master.to_parquet(save_path, index=False)
+                    return month_key, master.shape[1], None
+                except Exception as e:
+                    return month_key, 0, e
+
+            with ThreadPoolExecutor(max_workers=len(batch)) as month_pool:
+                month_futures = {
+                    month_pool.submit(_materialise_month, pair): pair[0]
+                    for pair in batch
+                }
+                for fut in _as_completed(month_futures):
+                    month_key, n_cols, err = fut.result()
+                    if err is not None:
+                        logger.error(f"[no-selection] Error {month_key}: {err}")
+                    elif n_cols == 0:
+                        logger.debug(f"[no-selection] Skipped {month_key} (no data)")
+                        completed_months.add(month_key)
+                    else:
+                        completed_months.add(month_key)
+                        logger.info(f"[no-selection] {month_key}: {n_cols} cols")
+
+            _save_progress(progress_key_cat, progress_key_src, completed_months)
+
+            # Free memory between batches
+            del source_caches
+            gc.collect()
+
+    _clear_progress(progress_key_cat, progress_key_src)
+
+    # ── Copy unified parquets to all 4 branch paths ──
+    branch_dirs: dict[str, Path] = {}
+    for target_cat, target_source in TARGET_COMBOS:
+        branch_dir = MASTER_BASE / target_cat / target_source / "decades"
+        branch_dir.mkdir(parents=True, exist_ok=True)
+        branch_dirs[f"{target_cat}/{target_source}"] = branch_dir
+
+    # Walk unified dir and copy each parquet
+    unified_parquets = sorted(unified_dir.rglob("*.parquet"))
+    logger.info(f"[no-selection] Copying {len(unified_parquets)} parquets to 4 branch paths...")
+    for src_path in unified_parquets:
+        rel = src_path.relative_to(unified_dir)
+        for branch_label, branch_dir in branch_dirs.items():
+            dst = branch_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst)
+
+    logger.info(f"[no-selection] Copied to branches: {list(branch_dirs.keys())}")
+
+    # ── Write all_features marker JSON for each branch ──
+    marker = {
+        "mode": "all_features",
+        "generated_at": datetime.now().isoformat(),
+        "note": "Master snapshots contain ALL lean features from all sources. "
+                "Feature selection is deferred to backtest-time dynamic reselection.",
+    }
+    for target_cat, target_source in TARGET_COMBOS:
+        marker_path = MASTER_BASE / f"selected_features_{target_cat}_{target_source}.json"
+        with open(marker_path, 'w') as f:
+            json.dump(marker, f, indent=2)
+        logger.info(f"[no-selection] Wrote marker: {marker_path.name}")
+
+    logger.info("[no-selection] Master snapshot generation complete.")
+
+
 @profiled("create_master_snapshots._batch_load_source")
 def _batch_load_source(source_name: str, source_dir: Path,
                        snapshot_months: list[pd.Timestamp],
@@ -985,6 +1193,13 @@ def _batch_load_source(source_name: str, source_dir: Path,
             continue
 
         wide = _normalize_to_wide(df)
+
+        # Drop pre-1990 rows (sparse, low-quality data that hurts selection)
+        if 'date' in wide.columns:
+            wide = wide[pd.to_datetime(wide['date']) >= DATA_START_FLOOR]
+            if wide.empty:
+                continue
+
         meta_cols = [c for c in ['date', 'snapshot_date'] if c in wide.columns]
         raw_feature_cols = [c for c in wide.columns if c not in meta_cols]
         if not raw_feature_cols:
@@ -1443,10 +1658,10 @@ def create_master_snapshots(
     """
     Args:
         skip_existing: Skip months where master snapshot already exists.
-        target_source_scope: Branch scope ('auto', 'all', 'revised', 'first_release').
+        target_source_scope: Branch scope ('auto', 'all', 'revised').
         target_type_scope: Target family scope ('all', 'nsa', 'sa').
         branches: Optional explicit branch list (e.g. ['sa_revised'] or
-                  ['sa_first_release']). Overrides scope filters.
+                  ['sa_revised']). Overrides scope filters.
         asof_start: Optional YYYY-MM lower bound for as-of months to process (inclusive).
                     Default None = no lower bound.
         asof_end: Optional YYYY-MM upper bound for as-of months to process (inclusive).
@@ -1770,12 +1985,24 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip-existing', action='store_true')
+
+    # ── Selection mode (default: no-selection, all features) ──
+    parser.add_argument(
+        '--with-selection',
+        action='store_true',
+        default=False,
+        help='Run with ETL-time feature selection (legacy mode). '
+             'Default is no-selection: all features are stored and selection '
+             'is deferred to backtest-time dynamic reselection.',
+    )
+
+    # ── Arguments used only with --with-selection ──
     parser.add_argument(
         '--target-source-scope',
-        choices=['auto', 'all', 'revised', 'first_release'],
+        choices=['auto', 'all', 'revised'],
         default=None,
         help=("Branch scope: auto (short windows -> revised-only), all, "
-              "revised, or first_release"),
+              "or revised"),
     )
     parser.add_argument(
         '--target-type-scope',
@@ -1789,7 +2016,7 @@ if __name__ == "__main__":
         nargs='+',
         default=None,
         help=("Explicit branch list (overrides scope filters). "
-              "Examples: sa_revised sa_first_release"),
+              "Examples: sa_revised nsa_revised"),
     )
     parser.add_argument(
         '--asof-start',
@@ -1827,19 +2054,40 @@ if __name__ == "__main__":
               "Faster and less robust than regime-based selection."),
     )
     args = parser.parse_args()
-    fs_stages_override = _parse_fs_stages_arg(args.fs_stages)
 
     start_time = time.time()
-    create_master_snapshots(
-        skip_existing=args.skip_existing,
-        target_source_scope=args.target_source_scope,
-        target_type_scope=args.target_type_scope,
-        branches=args.branches,
-        asof_start=args.asof_start,
-        asof_end=args.asof_end,
-        skip_feature_selection=args.skip_feature_selection,
-        selection_target_mode=args.selection_target_mode,
-        fs_stages_override=fs_stages_override,
-        single_selection_asof=args.single_selection_asof,
-    )
+
+    if not args.with_selection:
+        # ── Default: no-selection mode (all features, unified across sources) ──
+        logger.info("=" * 60)
+        logger.info("NO-SELECTION MODE (default): storing ALL lean features")
+        logger.info("=" * 60)
+        start_dt = pd.to_datetime(START_DATE)
+        end_dt = pd.to_datetime(END_DATE)
+        nfp_map = get_nfp_release_map(start_date=start_dt, end_date=end_dt)
+        snapshot_pairs = sorted(nfp_map.items(), key=lambda x: x[0])
+
+        _run_unified_no_selection(
+            snapshot_pairs=snapshot_pairs,
+            skip_existing=args.skip_existing,
+            asof_start=args.asof_start,
+            asof_end=args.asof_end,
+        )
+    else:
+        # ── Legacy: with-selection mode (ETL-time feature selection) ──
+        logger.info("WITH-SELECTION MODE (legacy): running feature selection")
+        fs_stages_override = _parse_fs_stages_arg(args.fs_stages)
+        create_master_snapshots(
+            skip_existing=args.skip_existing,
+            target_source_scope=args.target_source_scope,
+            target_type_scope=args.target_type_scope,
+            branches=args.branches,
+            asof_start=args.asof_start,
+            asof_end=args.asof_end,
+            skip_feature_selection=args.skip_feature_selection,
+            selection_target_mode=args.selection_target_mode,
+            fs_stages_override=fs_stages_override,
+            single_selection_asof=args.single_selection_asof,
+        )
+
     logger.info(f"Total Master Time: {(time.time() - start_time)/60:.1f} minutes")

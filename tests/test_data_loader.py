@@ -2,9 +2,9 @@
 Tests for Data Loader Module
 
 This module contains comprehensive tests for the NFP Predictor's data loading,
-target generation, and snapshot pivoting functionalities. It ensures that data 
-is correctly ingested, strictly adheres to anti-lookahead point-in-time constraints, 
-and supports the robust calculation of MoM/YoY targets based on 'revised' vs 'first_release' logic.
+target generation, and snapshot pivoting functionalities. It ensures that data
+is correctly ingested, strictly adheres to anti-lookahead point-in-time constraints,
+and supports the robust calculation of MoM/YoY targets based on 'revised' target logic.
 """
 
 import pytest
@@ -141,16 +141,11 @@ class TestLaggedTargetFeatures:
             'nfp_mom_vol_6m',
             'nfp_mom_vol_12m',
             'nfp_accel_vol_6m',
-            'nfp_jerk_lag1',
             'nfp_mom_abs_rolling_6m',
-            'nfp_positive_ratio_12m',
             'nfp_mom_same_month_avg_5y',
             'nfp_mom_vs_trend',
-            'nfp_mom_yoy',
-            'nfp_positive_months_6m',
             'nfp_mom_z_6m',
             'nfp_accel_z_6m',
-            'nfp_mom_vol_ratio_3_12',
             'nfp_turn_flag_lag1',
             'nfp_mom_x_accel_lag1',
         }
@@ -393,30 +388,21 @@ class TestRevisedTargetCache:
         assert 'ds' in result.columns
         assert 'y_mom' in result.columns
 
-    def test_cache_miss_fallback_calls_legacy_build(self, minimal_revised_df, tmp_path):
+    def test_cache_miss_raises_file_not_found(self, tmp_path):
         """
         When the revised-target parquet is absent, load_target_data must
-        fall back to build_revised_target() and return its output unchanged.
+        raise FileNotFoundError (no legacy fallback).
         """
         # tmp_path is empty — no cache file exists
         with (
             patch('Train.data_loader.NFP_TARGET_DIR', tmp_path),
-            patch('Train.data_loader.build_revised_target',
-                  return_value=minimal_revised_df.copy()) as mock_build,
         ):
             from Train.data_loader import _target_cache
             _target_cache.clear()
 
-            result = load_target_data('nsa', release_type='first',
-                                      target_source='revised', use_cache=False)
-
-        # build_revised_target must have been called exactly once (legacy fallback)
-        mock_build.assert_called_once_with('nsa')
-
-        # Result must match what build_revised_target returned
-        assert isinstance(result, pd.DataFrame)
-        assert len(result) == len(minimal_revised_df)
-        assert 'y_mom' in result.columns
+            with pytest.raises(FileNotFoundError, match="Required revised target cache missing"):
+                load_target_data('nsa', release_type='first',
+                                 target_source='revised', use_cache=False)
 
 
 class TestBuildRevisedTarget:

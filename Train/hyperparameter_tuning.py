@@ -34,6 +34,8 @@ from Train.config import (
     TUNING_LAMBDA_TAIL_MAE,
     TUNING_LAMBDA_CORR_DIFF,
     TUNING_LAMBDA_DIFF_SIGN,
+    TUNING_LAMBDA_ACCEL,
+    TUNING_LAMBDA_DIR,
 )
 from Train.variance_metrics import compute_variance_kpis, composite_objective_score
 
@@ -82,15 +84,18 @@ def tune_hyperparameters(
     tail_weight_level_boost: float = 1.35,
     tail_weight_diff_boost: float = 1.35,
     tail_weight_max_multiplier: float = 2.50,
+    warm_start_params: Optional[Dict] = None,
+    lambda_accel: float = TUNING_LAMBDA_ACCEL,
+    lambda_dir: float = TUNING_LAMBDA_DIR,
 ) -> Dict:
     """
-    Tune LightGBM hyperparameters using Optuna to find the optimal model configuration 
+    Tune LightGBM hyperparameters using Optuna to find the optimal model configuration
     for the current expanding window step.
 
-    This function utilizes an inner TimeSeriesSplit cross-validation strategy, which is 
-    strictly forward-looking. This guarantees that hyperparameter search never leaks 
-    future target information into the training phase (a common point of failure in 
-    time-series ML models). 
+    This function utilizes an inner TimeSeriesSplit cross-validation strategy, which is
+    strictly forward-looking. This guarantees that hyperparameter search never leaks
+    future target information into the training phase (a common point of failure in
+    time-series ML models).
 
     Args:
         X: Training features (must include 'ds' column for weight calculation)
@@ -102,6 +107,9 @@ def tune_hyperparameters(
         timeout: Max seconds for the entire tuning run
         num_boost_round: Max boosting rounds per trial
         early_stopping_rounds: Early stopping patience per trial
+        warm_start_params: Optional dict of previous best params to seed
+            Trial 0 with.  Lets Optuna explore *around* a known-good prior
+            rather than starting from scratch after feature reselection.
 
     Returns:
         Best LightGBM parameter dict (ready to pass to lgb.train)
@@ -218,11 +226,26 @@ def tune_hyperparameters(
             )
 
             preds = model.predict(X_val_feats)
-            fold_mae = np.mean(np.abs(y_val.values - preds))
+            y_val_arr = y_val.values.astype(float)
+            pred_arr = np.asarray(preds, dtype=float)
+            fold_mae = float(np.mean(np.abs(y_val_arr - pred_arr)))
+
             if objective_mode == 'composite':
                 kpis = compute_variance_kpis(
-                    y_val.values, preds, tail_quantile=tail_quantile
+                    y_val_arr, pred_arr, tail_quantile=tail_quantile
                 )
+                # Compute acceleration accuracy (need ≥3 samples for diff)
+                accel_acc = 0.0
+                if y_val_arr.size >= 3:
+                    da = np.diff(y_val_arr)
+                    dp = np.diff(pred_arr)
+                    accel_acc = float(np.mean(np.sign(da) == np.sign(dp)))
+
+                # Compute directional accuracy
+                dir_acc = 0.0
+                if y_val_arr.size >= 1:
+                    dir_acc = float(np.mean(np.sign(y_val_arr) == np.sign(pred_arr)))
+
                 fold_score = composite_objective_score(
                     mae=float(fold_mae),
                     std_ratio=float(kpis['std_ratio']),
@@ -235,6 +258,10 @@ def tune_hyperparameters(
                     lambda_tail_mae=lambda_tail_mae,
                     lambda_corr_diff=lambda_corr_diff,
                     lambda_diff_sign=lambda_diff_sign,
+                    accel_accuracy=accel_acc,
+                    lambda_accel=lambda_accel,
+                    dir_accuracy=dir_acc,
+                    lambda_dir=lambda_dir,
                 )
             else:
                 fold_score = float(fold_mae)
@@ -261,6 +288,27 @@ def tune_hyperparameters(
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=20),
     )
+
+    # Warm-start: seed Trial 0 with previous best params so Optuna explores
+    # around a known-good prior instead of starting cold after reselection.
+    if warm_start_params is not None:
+        # Extract only the tunable param keys from the previous best
+        _tunable_keys = {
+            'learning_rate', 'num_leaves', 'max_depth', 'min_data_in_leaf',
+            'feature_fraction', 'bagging_fraction', 'bagging_freq',
+            'lambda_l1', 'lambda_l2', 'half_life_months', 'huber_delta',
+        }
+        # Map 'alpha' back to 'huber_delta' (LightGBM → Optuna naming)
+        seed_params = {}
+        for k, v in warm_start_params.items():
+            if k == 'alpha' and use_huber_loss:
+                seed_params['huber_delta'] = v
+            elif k in _tunable_keys:
+                seed_params[k] = v
+        if seed_params:
+            study.enqueue_trial(seed_params)
+            logger.info(f"Warm-start: seeded Trial 0 with {len(seed_params)} params "
+                        f"from previous best")
 
     study.optimize(_counted_objective, n_trials=n_trials, timeout=timeout)
 

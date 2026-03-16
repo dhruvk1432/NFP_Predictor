@@ -30,15 +30,17 @@ import warnings
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS
+from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS, RESELECT_EVERY_N_MONTHS
 from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump_perf_json, register_atexit_dump
 
 # Import from modular components
 from Train.config import (
     MODEL_SAVE_DIR,
+    MASTER_SNAPSHOTS_BASE,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
     get_model_id,
+    get_master_snapshots_dir,
     get_target_path,
     load_selected_features,
     USE_HUBER_LOSS_DEFAULT,
@@ -46,6 +48,7 @@ from Train.config import (
     TUNE_EVERY_N_MONTHS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
+    SA_ENHANCEMENT_SEQUENCE,
 )
 
 from Train.data_loader import (
@@ -88,7 +91,7 @@ def _process_single_month_task(
         snapshot_date: The date of the data snapshot being used.
         target_type: 'nsa' or 'sa'.
         release_type: 'first' or 'last'.
-        target_source: 'first_release' or 'revised'.
+        target_source: 'revised'.
         target_lags_lookup: Pre-computed dictionary of branch-target lags.
 
     Returns:
@@ -149,6 +152,7 @@ from utils.transforms import winsorize_covid_period
 from Train.hyperparameter_tuning import tune_hyperparameters
 
 from Train.config import (
+    N_OPTUNA_TRIALS, OPTUNA_TIMEOUT,
     USE_UNION_POOL, UNION_POOL_MAX, SHORTPASS_TOPK, SHORTPASS_METHOD,
     SHORTPASS_HALF_LIFE, ENABLE_BASELINE_TRACKING, BASELINE_ROLLING_WINDOW,
     KEEP_RULE_ENABLED, KEEP_RULE_WINDOW_M, KEEP_RULE_TOLERANCE, KEEP_RULE_ACTION,
@@ -177,6 +181,7 @@ from Train.config import (
     REGIME_MODEL_NUM_BOOST_ROUND,
     SA_CALENDAR_FEATURES_KEEP,
     ENHANCEMENT_EXEMPT_TARGETS,
+    RESELECTION_START_DATE,
 )
 
 from Train.branch_target_selection import (
@@ -204,22 +209,43 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 
-def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> List[str]:
+def clean_features(
+    X: pd.DataFrame,
+    y: pd.Series,
+    min_non_nan: int = 100,
+    nan_eval_start: Optional[str] = None,
+    nan_max_rate: Optional[float] = None,
+) -> List[str]:
     """
-    Basic feature cleaning: only drop columns with too few data points.
+    Feature cleaning with optional post-2010 NaN evaluation.
 
-    Data is already cleaned upstream so no other filtering is needed.
-    LightGBM handles NaN natively, so NaN ratio is irrelevant.
+    Two-stage filter:
+    1. Global sparsity: drop columns with fewer than ``min_non_nan`` non-NaN values
+       across the entire history (catches features with almost no data at all).
+    2. Modern-era NaN rate: if ``nan_eval_start`` is set, evaluate NaN rate only
+       from that date onward. Features with NaN rate > ``nan_max_rate`` in the
+       modern window are dropped.  This allows features that start later (ADP from
+       2001, Prosper from 2006) to survive as long as they have good coverage in
+       the evaluation window.
+
+    LightGBM handles NaN natively, so moderate NaN is fine — this filter only
+    removes features that are too sparse to contribute signal.
 
     Args:
-        X: Feature DataFrame
-        y: Target series (unused, kept for API consistency)
-        min_non_nan: Minimum number of non-NaN values required to keep a column.
-            Overridable via NFP_PERF_MIN_NON_NAN env var for profiling-only runs.
+        X: Feature DataFrame (must contain a 'ds' datetime column).
+        y: Target series (unused, kept for API consistency).
+        min_non_nan: Minimum number of non-NaN values required globally.
+        nan_eval_start: If set, evaluate NaN rate from this date onward
+            (e.g. '2010-01-01').  Defaults to ``DYNAMIC_FS_NAN_EVAL_START``
+            from config when called during dynamic reselection.
+        nan_max_rate: Maximum acceptable NaN rate in the eval window.
+            Defaults to ``DYNAMIC_FS_NAN_MAX_RATE`` from config.
 
     Returns:
         List of cleaned feature column names
     """
+    from Train.config import DYNAMIC_FS_NAN_EVAL_START, DYNAMIC_FS_NAN_MAX_RATE
+
     # Profiling-only override: lower threshold when running with sparse data
     _perf_override = os.getenv("NFP_PERF_MIN_NON_NAN", "").strip()
     if _perf_override:
@@ -227,19 +253,361 @@ def clean_features(X: pd.DataFrame, y: pd.Series, min_non_nan: int = 100) -> Lis
             min_non_nan = int(_perf_override)
         except ValueError:
             pass
+
     X_work = X.select_dtypes(include=[np.number]).copy()
     X_work = X_work.drop(columns=['ds'], errors='ignore')
     X_work = X_work.replace([np.inf, -np.inf], np.nan)
 
-    # Drop columns with fewer than min_non_nan non-NaN data points
+    # Stage 1: Global sparsity filter (same as before)
     non_nan_counts = X_work.notna().sum()
     sparse_cols = non_nan_counts[non_nan_counts < min_non_nan].index.tolist()
     X_work = X_work.drop(columns=sparse_cols)
 
-    logger.info(f"Feature cleaning: dropped {len(sparse_cols)} sparse (<{min_non_nan} non-NaN), "
-                f"{len(X_work.columns)} remaining")
+    # Stage 2: Post-2010 NaN rate filter
+    eval_start = nan_eval_start or DYNAMIC_FS_NAN_EVAL_START
+    max_rate = nan_max_rate if nan_max_rate is not None else DYNAMIC_FS_NAN_MAX_RATE
+
+    modern_nan_dropped = []
+    if eval_start and 'ds' in X.columns:
+        eval_ts = pd.Timestamp(eval_start)
+        modern_mask = X['ds'] >= eval_ts
+        n_modern = modern_mask.sum()
+
+        if n_modern > 0:
+            X_modern = X.loc[modern_mask, X_work.columns].replace([np.inf, -np.inf], np.nan)
+            nan_rates = X_modern.isna().sum() / n_modern
+            modern_nan_dropped = nan_rates[nan_rates > max_rate].index.tolist()
+            X_work = X_work.drop(columns=modern_nan_dropped)
+
+    logger.info(
+        f"Feature cleaning: dropped {len(sparse_cols)} sparse (<{min_non_nan} non-NaN), "
+        f"{len(modern_nan_dropped)} high-NaN post-{eval_start}, "
+        f"{len(X_work.columns)} remaining"
+    )
 
     return list(X_work.columns)
+
+
+# =============================================================================
+# DYNAMIC FEATURE RE-SELECTION (two-pass, per-source then global)
+# =============================================================================
+
+# ── Source classification patterns ──
+# After sanitize_feature_name(), column prefixes that identify each data source.
+# NSA employment: "total_*_nsa" (dot→underscore, _nsa suffix).
+# SA employment: "total_*" without _nsa suffix.
+# Exogenous FRED: known macro-series prefixes.
+# Other exogenous: unique first-word prefixes.
+
+_FRED_EXOG_PREFIXES = (
+    'CCNSA_', 'CCSA_', 'Credit_', 'Financial_', 'Oil_', 'SP500_',
+    'VIX_', 'Weekly_', 'Yield_', 'WEI_',
+    # Binary regime features
+    'regime_',
+)
+_UNIFIER_PREFIXES = (
+    'AHE_', 'AWH_', 'CB_', 'Challenger_', 'Empire_', 'Housing_',
+    'ISM_', 'Industrial_', 'NFP_Consensus', 'Retail_', 'UMich_',
+)
+_ADP_PREFIXES = ('ADP_', 'adp_')
+_NOAA_PREFIXES = ('NOAA_', 'noaa_', 'storm_', 'hurricane_')
+_PROSPER_PREFIXES = ('Consumer_Mood', 'Prosper_', 'Consumer_Spending')
+
+
+def _classify_columns_by_source(
+    snapshot_cols: List[str],
+) -> Dict[str, List[str]]:
+    """Partition master-snapshot feature columns into source groups.
+
+    The classifier uses column-name prefixes that are stable after
+    ``sanitize_feature_name()`` is applied during snapshot generation.
+
+    Returns:
+        Dict mapping source name → list of column names. Columns that
+        cannot be matched are placed in an ``'Unknown'`` bucket.
+    """
+    groups: Dict[str, List[str]] = {
+        'FRED_Employment_NSA': [],
+        'FRED_Employment_SA': [],
+        'FRED_Exogenous': [],
+        'Unifier': [],
+        'ADP': [],
+        'NOAA': [],
+        'Prosper': [],
+        'Unknown': [],
+    }
+
+    for col in snapshot_cols:
+        if col.startswith('total_'):
+            # Employment series start with "total_".
+            # NSA columns have "_nsa" in the base name (before transform suffixes).
+            if '_nsa' in col:
+                groups['FRED_Employment_NSA'].append(col)
+            else:
+                groups['FRED_Employment_SA'].append(col)
+        elif col.startswith(_FRED_EXOG_PREFIXES):
+            groups['FRED_Exogenous'].append(col)
+        elif col.startswith(_UNIFIER_PREFIXES):
+            groups['Unifier'].append(col)
+        elif col.startswith(_ADP_PREFIXES):
+            groups['ADP'].append(col)
+        elif col.startswith(_NOAA_PREFIXES):
+            groups['NOAA'].append(col)
+        elif col.startswith(_PROSPER_PREFIXES):
+            groups['Prosper'].append(col)
+        else:
+            groups['Unknown'].append(col)
+
+    return groups
+
+
+def _dynamic_reselection(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    step_date: pd.Timestamp,
+    target_type: str,
+    target_source: str,
+) -> List[str]:
+    """Two-pass recency-weighted dynamic feature re-selection.
+
+    Called every ``RESELECT_EVERY_N_MONTHS`` months during the expanding-window
+    backtest (starting from ``RESELECTION_START_DATE``).  Uses exponential decay
+    sample weights (half-life = ``RESELECTION_HALF_LIFE_MONTHS``) to bias
+    feature importance toward recent observations, adapting to structural changes.
+
+    **Pass 1 (Per-Source):** Partition ``X_train`` columns by data source.
+    Run lightweight feature selection (stages 0, 2, 4, 5) independently per
+    source with recency weights.  FRED Employment runs sequentially;
+    smaller sources run in parallel.
+
+    **Pass 2 (Global Cross-Source):** Combine Pass-1 survivors with
+    target-derived features.  Run global reduction (stages 0, 2, 4) with
+    recency weights to ≤ ``DYNAMIC_FS_PASS2_MAX_FEATURES``.
+
+    Returns:
+        List of selected feature names (≤ DYNAMIC_FS_PASS2_MAX_FEATURES).
+        **Raises RuntimeError** if selection produces zero features.
+    """
+    from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import gc
+
+    from Train.config import (
+        DYNAMIC_FS_PASS2_MAX_FEATURES,
+        DYNAMIC_FS_BORUTA_RUNS,
+        RESELECTION_HALF_LIFE_MONTHS,
+        RESELECTION_STAGES_PASS1,
+        RESELECTION_STAGES_PASS2,
+    )
+    from Data_ETA_Pipeline.feature_selection_engine import (
+        run_full_source_pipeline,
+        _classify_series,
+    )
+
+    # Use recency-weighted stages
+    stages_pass1 = RESELECTION_STAGES_PASS1
+    stages_pass2 = RESELECTION_STAGES_PASS2
+
+    label = f"DynFS/{target_type.upper()}/{target_source}"
+    logger.info(
+        f"[{label}] Dynamic re-selection triggered at {step_date.strftime('%Y-%m')}. "
+        f"Pass-1 stages={stages_pass1}, Pass-2 stages={stages_pass2}, "
+        f"max_features={DYNAMIC_FS_PASS2_MAX_FEATURES}, "
+        f"half_life={RESELECTION_HALF_LIFE_MONTHS}mo"
+    )
+
+    # ── Partition X_train columns by type ──
+    all_cols = [c for c in X_train.columns if c != 'ds']
+    groups = partition_feature_columns(all_cols, target_type=target_type)
+    snapshot_cols = groups['snapshot_features']
+    non_snapshot_cols = (
+        groups['target_branch_features']
+        + groups['calendar_features']
+        + groups['revision_features']
+    )
+
+    # ── Classify snapshot columns by data source ──
+    source_groups = _classify_columns_by_source(snapshot_cols)
+    for src_name, cols in source_groups.items():
+        if cols:
+            logger.info(f"[{label}] Source {src_name}: {len(cols)} features")
+
+    # ── Build date-indexed target for the selection engine ──
+    y_sel = pd.Series(
+        y_train.values,
+        index=pd.to_datetime(X_train['ds'].values),
+        name='y_mom',
+    ).dropna()
+
+    # ── Build date-indexed feature DataFrame from X_train ──
+    X_dated = X_train.set_index(pd.to_datetime(X_train['ds'])).drop(columns=['ds'])
+    X_dated.index.name = 'date'
+
+    # ── Compute recency weights for feature selection ──
+    # Exponential decay: recent months count more for feature importance
+    dates = pd.to_datetime(X_train['ds'])
+    distance_months = np.maximum(0, (step_date - dates).dt.days.values / 30.436875)
+    decay_rate = np.log(2) / RESELECTION_HALF_LIFE_MONTHS
+    reselect_weights = np.exp(-decay_rate * distance_months)
+    reselect_weights = reselect_weights / np.mean(reselect_weights)
+    # Create date-indexed Series for the feature selection engine
+    sw_series = pd.Series(reselect_weights, index=X_dated.index, name='sample_weight')
+
+    # ── Pass 1: Per-source feature selection ──
+    massive_sources = ['FRED_Employment_NSA', 'FRED_Employment_SA']
+    small_sources = ['FRED_Exogenous', 'Unifier', 'ADP', 'NOAA', 'Prosper']
+    pass1_survivors: Dict[str, List[str]] = {}
+
+    def _run_source_pass1(source_name: str, cols: List[str]) -> Tuple[str, List[str]]:
+        """Run Pass-1 selection on one source's columns from X_train."""
+        if not cols:
+            return source_name, []
+
+        snap_wide = X_dated[cols].copy()
+
+        # Drop zero-variance columns
+        zero_var = snap_wide.std() == 0
+        if zero_var.any():
+            snap_wide = snap_wide.loc[:, ~zero_var]
+        if snap_wide.empty:
+            return source_name, []
+
+        # Build series groups (using the FS engine's classifier)
+        series_groups_local = defaultdict(list)
+        for col in snap_wide.columns:
+            grp = _classify_series(col, source_name)
+            series_groups_local[grp].append(col)
+
+        logger.info(
+            f"[{label}] {source_name}: {snap_wide.shape[1]} features, "
+            f"{len(series_groups_local)} groups → Pass-1"
+        )
+
+        try:
+            survivors = run_full_source_pipeline(
+                snap_wide, y_sel, source_name, Path("/dev/null"),
+                series_groups_local, stages=stages_pass1,
+                sample_weight=sw_series,
+            )
+            logger.info(f"[{label}] {source_name}: Pass-1 → {len(survivors)} survivors")
+            return source_name, survivors
+        except Exception as e:
+            logger.error(f"[{label}] {source_name}: Pass-1 failed: {e}")
+            return source_name, []
+
+    # Run massive sources (FRED Employment) sequentially
+    for src_name in massive_sources:
+        cols = source_groups.get(src_name, [])
+        if cols:
+            name, feats = _run_source_pass1(src_name, cols)
+            pass1_survivors[name] = feats
+            gc.collect()
+
+    # Run small sources in parallel
+    small_to_run = [(s, source_groups.get(s, [])) for s in small_sources
+                    if source_groups.get(s)]
+    if small_to_run:
+        max_workers = min(len(small_to_run), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_run_source_pass1, name, cols): name
+                for name, cols in small_to_run
+            }
+            for future in as_completed(futures):
+                src_name, feats = future.result()
+                pass1_survivors[src_name] = feats
+
+    # Include Unknown-source features (pass them through directly)
+    unknown_cols = source_groups.get('Unknown', [])
+    if unknown_cols:
+        pass1_survivors['Unknown'] = unknown_cols
+
+    total_pass1 = sum(len(v) for v in pass1_survivors.values())
+    logger.info(
+        f"[{label}] Pass-1 complete: {total_pass1} total survivors across "
+        f"{len([k for k, v in pass1_survivors.items() if v])} sources"
+    )
+
+    if total_pass1 == 0:
+        raise RuntimeError(
+            f"[{label}] Dynamic re-selection Pass-1 returned zero features. "
+            f"Cannot proceed without features."
+        )
+
+    # ── Pass 2: Global cross-source reduction ──
+    # Combine Pass-1 survivors + target-derived features
+    all_pass1_cols = []
+    for feats in pass1_survivors.values():
+        all_pass1_cols.extend(feats)
+
+    pass2_cols = list(set(all_pass1_cols + non_snapshot_cols))
+    # Only keep columns that exist in X_dated
+    pass2_cols = [c for c in pass2_cols if c in X_dated.columns]
+
+    pass2_wide = X_dated[pass2_cols].copy()
+
+    logger.info(
+        f"[{label}] Pass-2 input: {pass2_wide.shape[1]} features × "
+        f"{pass2_wide.shape[0]} dates"
+    )
+
+    pass2_groups = defaultdict(list)
+    for col in pass2_wide.columns:
+        pass2_groups["Global"].append(col)
+
+    try:
+        pass2_survivors = run_full_source_pipeline(
+            pass2_wide, y_sel, "Global_Pass2", Path("/dev/null"),
+            pass2_groups, stages=stages_pass2,
+            sample_weight=sw_series,
+        )
+    except Exception as e:
+        logger.error(f"[{label}] Pass-2 pipeline failed: {e}")
+        raise RuntimeError(
+            f"[{label}] Dynamic re-selection Pass-2 failed: {e}"
+        )
+
+    # Hard cap: if more than max, take top-N by Boruta importance
+    if len(pass2_survivors) > DYNAMIC_FS_PASS2_MAX_FEATURES:
+        logger.info(
+            f"[{label}] Pass-2 returned {len(pass2_survivors)} features; "
+            f"applying hard cap at {DYNAMIC_FS_PASS2_MAX_FEATURES}"
+        )
+        try:
+            from Data_ETA_Pipeline.feature_selection_engine import get_boruta_importance
+            boruta_hits = get_boruta_importance(
+                pass2_wide[pass2_survivors], y_sel,
+                n_runs=DYNAMIC_FS_BORUTA_RUNS,
+                sample_weight=sw_series,
+            )
+            if len(boruta_hits) >= DYNAMIC_FS_PASS2_MAX_FEATURES:
+                pass2_survivors = boruta_hits[:DYNAMIC_FS_PASS2_MAX_FEATURES]
+            else:
+                remaining = [f for f in pass2_survivors if f not in set(boruta_hits)]
+                pass2_survivors = boruta_hits + remaining[
+                    : DYNAMIC_FS_PASS2_MAX_FEATURES - len(boruta_hits)
+                ]
+        except Exception as e:
+            logger.warning(f"[{label}] Boruta hard-cap failed ({e}); truncating by column order.")
+            pass2_survivors = pass2_survivors[:DYNAMIC_FS_PASS2_MAX_FEATURES]
+
+    # Only return features that exist in X_train
+    available_in_train = set(X_train.columns)
+    final_features = [f for f in pass2_survivors if f in available_in_train]
+
+    if not final_features:
+        raise RuntimeError(
+            f"[{label}] Dynamic re-selection produced zero usable features "
+            f"(Pass-1: {total_pass1}, Pass-2: {len(pass2_survivors)}, "
+            f"available in X_train: 0)."
+        )
+
+    logger.info(
+        f"[{label}] Dynamic re-selection complete: "
+        f"{total_pass1} → {len(pass2_survivors)} → {len(final_features)} features"
+    )
+
+    return final_features
 
 
 def _merge_unique_feature_lists(*groups: List[str]) -> List[str]:
@@ -578,7 +946,10 @@ def _run_variance_enhancement_sequence(
     if not use_stack:
         return best_pred, best_val, best_stage, stage_report
 
-    for stage in ENHANCEMENT_SEQUENCE:
+    # SA uses amplitude-only sequence; NSA uses full stack
+    active_sequence = SA_ENHANCEMENT_SEQUENCE if target_type == 'sa' else ENHANCEMENT_SEQUENCE
+
+    for stage in active_sequence:
         cand_val = None
         cand_pred = None
 
@@ -710,7 +1081,7 @@ def build_training_dataset(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
     show_progress: bool = True,
@@ -729,7 +1100,7 @@ def build_training_dataset(
         target_df: Target DataFrame with y_mom column (the prediction target)
         target_type: 'nsa' or 'sa' - determines which target we're predicting
         release_type: 'first' or 'last' - determines which release to use for lagged features
-        target_source: 'first_release' or 'revised' - determines which master snapshot variant
+        target_source: 'revised' - determines which master snapshot variant
         start_date: Start date for training data
         end_date: End date for training data
         show_progress: Whether to show progress logging
@@ -853,17 +1224,18 @@ def run_expanding_window_backtest(
     target_df: pd.DataFrame,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
     tune: bool = True,
+    nsa_backtest_results: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Run proper expanding window backtest with strictly NO TIME-TRAVEL VIOLATIONS.
 
     This is the core loop evaluating the model's true real-world point-in-time performance.
     Instead of standard K-Fold CV (which randomly shuffles data and predicts the past using the future),
-    this loop marches chronologically forward one month at a time. It uses strictly the available data 
+    this loop marches chronologically forward one month at a time. It uses strictly the available data
     as of that specific historical month to predict it, precisely mirroring a real-time trading environment.
 
     Critical Design Principles:
@@ -877,10 +1249,12 @@ def run_expanding_window_backtest(
         target_df: Target DataFrame with 'ds' and 'y_mom' columns
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
         use_huber_loss: Whether to use Huber loss
         huber_delta: Huber delta parameter
         tune: If True, run Optuna hyperparameter tuning periodically
+        nsa_backtest_results: Optional NSA backtest results DataFrame for
+            injecting NSA acceleration features into SA branch (PIT-safe).
 
     Returns:
         Tuple of (results_df, X_full, y_full) where X_full and y_full are the
@@ -926,24 +1300,40 @@ def run_expanding_window_backtest(
     # Static fallback params (used when tune=False)
     static_params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
 
-    # Load candidate pool for short-pass selection (static set of feature NAMES)
+    # ── Feature selection mode ──
+    # Check if master snapshots are in all-features mode (no ETL-time selection).
+    # When all-features mode, dynamic reselection is mandatory and the only path.
+    master_snapshot_base_features = load_selected_features(
+        target_type=target_type, target_source=target_source
+    )
+    _all_features_mode = master_snapshot_base_features is None
+
+    if _all_features_mode:
+        logger.info(
+            f"[{model_id}] ALL-FEATURES mode: master snapshots contain all lean features. "
+            f"Dynamic reselection is the ONLY feature selection path."
+        )
+    else:
+        logger.info(
+            f"Loaded master snapshot base feature set for {model_id}: "
+            f"{len(master_snapshot_base_features)} features"
+        )
+
+    # Load candidate pool only in legacy (selected-features) mode
     candidate_pool = None
-    if USE_UNION_POOL:
+    if not _all_features_mode and USE_UNION_POOL:
         from Train.candidate_pool import load_or_build_union_pool
         candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
         logger.info(f"Union candidate pool loaded: {len(candidate_pool)} features")
 
-    # Baseline branch snapshot feature set (expected ~50 from master snapshots).
-    # These are kept as the structural base; derived features are additive.
-    master_snapshot_base_features = load_selected_features(
-        target_type=target_type, target_source=target_source
-    )
-    logger.info(
-        f"Loaded master snapshot base feature set for {model_id}: "
-        f"{len(master_snapshot_base_features)} features"
-    )
-
     tuned_params = None  # Cached tuned hyperparameters
+    _warm_start_params = None  # Previous best params for Optuna warm-start after reselection
+
+    # ── Dynamic re-selection state ──
+    dynamic_features: Optional[List[str]] = None   # None = not yet selected
+    last_reselection_date: Optional[pd.Timestamp] = None
+    _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
+    _dynamic_selection_logs: List[Dict] = []  # JSON logs per reselection window
 
     # ── Short-pass stability tracking ──
     step_feature_sets: list[set] = []
@@ -1010,32 +1400,78 @@ def run_expanding_window_backtest(
             cleaned_features = clean_features(X_train_valid, y_train_valid)
             cleaned_features = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
 
-        # Partition features so branch models keep their own target-derived signals
-        groups = partition_feature_columns(cleaned_features, target_type=target_type)
-        snapshot_candidates = groups['snapshot_features']
-        branch_target_candidates = groups['target_branch_features']
-        dropped_cross_target = groups['other_target_features']
-        # For SA targets, drop seasonality-encoding calendar features (month_sin,
-        # is_jan, etc.) because BLS seasonal adjustment already removes that signal.
-        # Keep only structural features (weeks_since_last_survey, is_5_week_month, year).
-        cal_feats = groups['calendar_features']
-        if target_type == 'sa':
-            cal_feats = [f for f in cal_feats if f in SA_CALENDAR_FEATURES_KEEP]
-        always_keep = _merge_unique_feature_lists(
-            cal_feats,
-            groups['revision_features'],
-        )
+        # ── Dynamic re-selection (every N months, starting from 2000) ──
+        # In all-features mode: mandatory, triggered on step 0 and every N months.
+        # Reselection only fires from RESELECTION_START_DATE onward (pre-2000
+        # months reuse the features from the first reselection).
+        # In legacy mode: optional, triggered only when RESELECT_EVERY_N_MONTHS > 0.
+        _reselection_start = pd.Timestamp(RESELECTION_START_DATE)
+        _trigger_reselection = False
+        if _all_features_mode:
+            _trigger_reselection = (
+                dynamic_features is None  # First step — always select
+                or (
+                    target_month >= _reselection_start
+                    and RESELECT_EVERY_N_MONTHS > 0
+                    and last_reselection_date is not None
+                    and (target_month - last_reselection_date).days >= _reselect_interval_days
+                )
+            )
+        elif RESELECT_EVERY_N_MONTHS > 0:
+            _trigger_reselection = (
+                last_reselection_date is None
+                or (
+                    target_month >= _reselection_start
+                    and (target_month - last_reselection_date).days >= _reselect_interval_days
+                )
+            )
 
-        # Keep branch base snapshot features (from selected_features_*.json) even
-        # if sparse in the current window; LightGBM handles NaN natively.
-        snapshot_base_features = [
-            f for f in master_snapshot_base_features if f in X_train_valid.columns and f != 'ds'
-        ]
-        if not snapshot_base_features:
-            # Safety fallback for unexpected cache/schema mismatch.
-            snapshot_base_features = [c for c in snapshot_candidates if c in X_train_valid.columns]
+        if _trigger_reselection:
+            with perf_phase("train.backtest.step.dynamic_reselection", step=i):
+                _dyn_result = _dynamic_reselection(
+                    X_train=X_train_valid,
+                    y_train=y_train_valid,
+                    step_date=target_month,
+                    target_type=target_type,
+                    target_source=target_source,
+                )
+                # _dynamic_reselection raises RuntimeError on failure in all-features mode
+                dynamic_features = _dyn_result
+                last_reselection_date = target_month
+                logger.info(
+                    f"[Step {i}] Dynamic re-selection: {len(dynamic_features)} features "
+                    f"(next re-selection in {RESELECT_EVERY_N_MONTHS} months)"
+                )
 
-        # Compute default sample weights for initial/static use
+                # Write JSON log for this reselection window
+                _sel_log = {
+                    "target_type": target_type,
+                    "target_source": target_source,
+                    "step_date": target_month.strftime('%Y-%m'),
+                    "step_index": i,
+                    "n_features": len(dynamic_features),
+                    "features": dynamic_features,
+                }
+                _dynamic_selection_logs.append(_sel_log)
+                _sel_log_dir = OUTPUT_DIR / "dynamic_selection" / f"{target_type}_{target_source}"
+                _sel_log_dir.mkdir(parents=True, exist_ok=True)
+                _sel_log_path = _sel_log_dir / f"{target_month.strftime('%Y-%m')}.json"
+                try:
+                    import json as _json
+                    with open(_sel_log_path, 'w') as _f:
+                        _json.dump(_sel_log, _f, indent=2)
+                    logger.info(f"[Step {i}] Selection log → {_sel_log_path}")
+                except Exception as _e:
+                    logger.warning(f"[Step {i}] Failed to write selection log: {_e}")
+
+                # Invalidate Optuna params — feature set changed, must re-tune.
+                # Preserve previous best as warm-start seed for faster convergence.
+                _warm_start_params = tuned_params  # may be None on first reselection
+                tuned_params = None
+                logger.info(f"[Step {i}] Optuna params invalidated after reselection"
+                            f"{' (warm-start from prior best)' if _warm_start_params else ''}")
+
+        # Compute sample weights (needed by both dynamic and static paths)
         default_half_life = 60.0
         weights = calculate_sample_weights(X_train_valid, target_month, default_half_life)
         weights = _apply_tail_aware_weighting(
@@ -1045,89 +1481,152 @@ def run_expanding_window_backtest(
             target_source,
         )
 
-        # Shared weights for short-pass rankers (snapshot + branch-target)
-        _current_params = tuned_params if (tune and tuned_params is not None) else static_params
-        sp_half_life = SHORTPASS_HALF_LIFE or _current_params.get('half_life_months', default_half_life)
-        sp_weights = calculate_sample_weights(X_train_valid, target_month, sp_half_life)
+        # ── Feature selection for this step ──
+        if dynamic_features is not None:
+            # Dynamic features are active — use them directly
+            feature_cols = [
+                c for c in dynamic_features
+                if c in X_train_valid.columns and c in cleaned_features
+            ]
+            if not feature_cols:
+                if _all_features_mode:
+                    raise RuntimeError(
+                        f"[Step {i}] Dynamic features have zero overlap with cleaned features. "
+                        f"Dynamic: {len(dynamic_features)}, Cleaned: {len(cleaned_features)}. "
+                        f"Cannot proceed in all-features mode."
+                    )
+                logger.warning(
+                    f"[Step {i}] Dynamic features have no overlap with cleaned features; "
+                    f"falling back to static pipeline."
+                )
+                dynamic_features = None  # Fall through to static pipeline
 
-        # ── Snapshot feature selection (base 50 + optional extra short-pass) ──
-        snapshot_selected = snapshot_base_features
-        snapshot_base_set = set(snapshot_base_features)
-        snapshot_extra_candidates = [
-            c for c in snapshot_candidates if c in X_train_valid.columns and c not in snapshot_base_set
-        ]
+        if dynamic_features is None:
+            if _all_features_mode:
+                # Should never reach here — dynamic reselection is mandatory
+                raise RuntimeError(
+                    f"[Step {i}] All-features mode requires dynamic reselection, "
+                    f"but no features are available. This is a bug."
+                )
 
-        if USE_UNION_POOL and candidate_pool is not None:
-            candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
-            logger.info(
-                f"Snapshot pool (extras): base={len(snapshot_base_features)}, "
-                f"extra_candidates={len(snapshot_extra_candidates)}, pool={len(candidate_pool)}, "
-                f"intersection={len(candidate_in_data)}"
+            # ── Legacy static feature pipeline ──
+            groups = partition_feature_columns(cleaned_features, target_type=target_type)
+            snapshot_candidates = groups['snapshot_features']
+            branch_target_candidates = groups['target_branch_features']
+            dropped_cross_target = groups['other_target_features']
+            cal_feats = groups['calendar_features']
+            if target_type == 'sa':
+                cal_feats = [f for f in cal_feats if f in SA_CALENDAR_FEATURES_KEEP]
+            always_keep = _merge_unique_feature_lists(
+                cal_feats,
+                groups['revision_features'],
             )
 
-            if candidate_in_data:
-                if len(candidate_in_data) > SHORTPASS_TOPK:
-                    with perf_phase("train.backtest.step.short_pass", step=i):
-                        from Train.short_pass_selection import select_features_for_step
-                        snapshot_extra_selected = select_features_for_step(
-                            X_train_valid[candidate_in_data], y_train_valid,
-                            candidate_features=candidate_in_data,
-                            top_k=SHORTPASS_TOPK,
-                            method=SHORTPASS_METHOD,
-                            sample_weights=sp_weights,
-                        )
-                        logger.info(f"Snapshot short-pass selected {len(snapshot_extra_selected)} extra features")
-                else:
-                    snapshot_extra_selected = candidate_in_data
-                    logger.info(f"Snapshot pool intersection ({len(candidate_in_data)}) <= top_k, using all")
-                snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
+            snapshot_base_features = [
+                f for f in master_snapshot_base_features if f in X_train_valid.columns and f != 'ds'
+            ]
+            if not snapshot_base_features:
+                snapshot_base_features = [c for c in snapshot_candidates if c in X_train_valid.columns]
+
+            _current_params = tuned_params if (tune and tuned_params is not None) else static_params
+            sp_half_life = SHORTPASS_HALF_LIFE or _current_params.get('half_life_months', default_half_life)
+            sp_weights = calculate_sample_weights(X_train_valid, target_month, sp_half_life)
+
+            snapshot_selected = snapshot_base_features
+            snapshot_base_set = set(snapshot_base_features)
+            snapshot_extra_candidates = [
+                c for c in snapshot_candidates if c in X_train_valid.columns and c not in snapshot_base_set
+            ]
+
+            if USE_UNION_POOL and candidate_pool is not None:
+                candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
+                if candidate_in_data:
+                    if len(candidate_in_data) > SHORTPASS_TOPK:
+                        with perf_phase("train.backtest.step.short_pass", step=i):
+                            from Train.short_pass_selection import select_features_for_step
+                            snapshot_extra_selected = select_features_for_step(
+                                X_train_valid[candidate_in_data], y_train_valid,
+                                candidate_features=candidate_in_data,
+                                top_k=SHORTPASS_TOPK,
+                                method=SHORTPASS_METHOD,
+                                sample_weights=sp_weights,
+                            )
+                    else:
+                        snapshot_extra_selected = candidate_in_data
+                    snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
+
+            branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
+            branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
+            if USE_BRANCH_TARGET_FS and branch_target_candidates:
+                with perf_phase("train.backtest.step.branch_target_fs", step=i):
+                    branch_target_selected = select_branch_target_features_for_step(
+                        X_train=X_train_valid,
+                        y_train=y_train_valid,
+                        target_type=target_type,
+                        candidate_features=branch_target_candidates,
+                        top_k=branch_fs_top_k,
+                        method=branch_fs_method,
+                        corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
+                        min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
+                        sample_weights=sp_weights,
+                        dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
+                        dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
+                        dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
+                        dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
+                        dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
+                        dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
+                    )
             else:
-                logger.warning(
-                    "Union pool had no overlap with snapshot extra candidates; using base snapshot features."
-                )
+                branch_target_selected = branch_target_candidates
 
-        # ── Branch-target derived feature selection ──
-        branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
-        branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
-        if USE_BRANCH_TARGET_FS and branch_target_candidates:
-            with perf_phase("train.backtest.step.branch_target_fs", step=i):
-                branch_target_selected = select_branch_target_features_for_step(
-                    X_train=X_train_valid,
-                    y_train=y_train_valid,
-                    target_type=target_type,
-                    candidate_features=branch_target_candidates,
-                    top_k=branch_fs_top_k,
-                    method=branch_fs_method,
-                    corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
-                    min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
-                    sample_weights=sp_weights,
-                    dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
-                    dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
-                    dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
-                    dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
-                    dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
-                    dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
-                )
-        else:
-            branch_target_selected = branch_target_candidates
+            feature_cols = _merge_unique_feature_lists(
+                snapshot_selected,
+                branch_target_selected,
+                always_keep,
+            )
 
-        feature_cols = _merge_unique_feature_lists(
-            snapshot_selected,
-            branch_target_selected,
-            always_keep,
-        )
-        logger.info(
-            f"Feature pipeline: snapshot={len(snapshot_selected)} "
-            f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
-            f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)} "
-            f"(method={branch_fs_method}, top_k={branch_fs_top_k}), "
-            f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
-            f"final={len(feature_cols)}"
-        )
+        logger.info(f"[Step {i}] Feature pipeline: {len(feature_cols)} features")
 
         if not feature_cols:
             logger.warning("No features selected for this step; skipping month.")
             continue
+
+        # ── Inject NSA acceleration features for SA branch (PIT-safe) ──
+        _nsa_accel_cols: List[str] = []
+        if target_type == 'sa' and nsa_backtest_results is not None:
+            from Train.nsa_acceleration import (
+                compute_nsa_acceleration_features,
+                build_nsa_features_for_training,
+            )
+            # Compute features for prediction month
+            nsa_feats_pred = compute_nsa_acceleration_features(
+                nsa_backtest_results, target_month
+            )
+            _nsa_accel_cols = list(nsa_feats_pred.keys())
+
+            # Compute features for all training months
+            training_months = pd.to_datetime(X_train_valid['ds'])
+            nsa_train_feats = build_nsa_features_for_training(
+                nsa_backtest_results, training_months
+            )
+            # Inject into training data
+            for col in _nsa_accel_cols:
+                if col in nsa_train_feats.columns:
+                    X_train_valid[col] = nsa_train_feats[col].reindex(
+                        training_months
+                    ).values
+                else:
+                    X_train_valid[col] = np.nan
+
+            # Inject into prediction row
+            for col, val in nsa_feats_pred.items():
+                X_full.at[target_idx, col] = val
+
+            # Add NSA acceleration cols to feature_cols (always included)
+            feature_cols = _merge_unique_feature_lists(feature_cols, _nsa_accel_cols)
+            logger.info(
+                f"[Step {i}] Injected {len(_nsa_accel_cols)} NSA acceleration features"
+            )
 
         # ── Track short-pass stability (Jaccard similarity) ──
         current_set = set(feature_cols)
@@ -1175,7 +1674,9 @@ def run_expanding_window_backtest(
                     tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
                     tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
                     tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
+                    warm_start_params=_warm_start_params,
                 )
+                _warm_start_params = None  # consumed
 
         params = tuned_params if tune and tuned_params is not None else static_params
         
@@ -1616,6 +2117,59 @@ def run_expanding_window_backtest(
             _json.dump(stability_data, _f, indent=2)
         logger.info(f"Saved stability report to {stability_path}")
 
+    # ── Post-backtest: overwrite master snapshots with final selection ──
+    if _all_features_mode and _dynamic_selection_logs:
+        final_log = _dynamic_selection_logs[-1]
+        final_features = final_log["features"]
+        meta_cols = {"date", "snapshot_date"}
+        keep_cols = list(meta_cols) + final_features
+
+        branch_dir = get_master_snapshots_dir(target_type, target_source)
+        if branch_dir.exists():
+            parquet_files = sorted(branch_dir.rglob("*.parquet"))
+            n_overwritten = 0
+            for pq_path in parquet_files:
+                try:
+                    df = pd.read_parquet(pq_path)
+                    available = [c for c in keep_cols if c in df.columns]
+                    if len(available) <= len(meta_cols):
+                        logger.warning(
+                            f"Snapshot {pq_path.name}: no selected features found, skipping overwrite"
+                        )
+                        continue
+                    df_filtered = df[available]
+                    df_filtered.to_parquet(pq_path, index=False)
+                    n_overwritten += 1
+                except Exception as e:
+                    logger.warning(f"Failed to overwrite {pq_path}: {e}")
+
+            logger.info(
+                f"[{model_id}] Post-backtest overwrite: {n_overwritten}/{len(parquet_files)} "
+                f"master snapshots filtered to {len(final_features)} selected features + meta cols"
+            )
+
+            # Update the selected_features JSON marker with final selection
+            import json as _json
+            marker_path = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_{target_source}.json"
+            marker_data = {
+                "mode": "selected",
+                "features": final_features,
+                "n_features": len(final_features),
+                "selected_at": final_log["step_date"],
+                "generated_at": pd.Timestamp.now().isoformat(),
+            }
+            try:
+                with open(marker_path, 'w') as _f:
+                    _json.dump(marker_data, _f, indent=2)
+                logger.info(f"[{model_id}] Updated feature marker: {marker_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write feature marker: {e}")
+        else:
+            logger.warning(
+                f"[{model_id}] Master snapshot dir does not exist: {branch_dir}. "
+                f"Skipping post-backtest overwrite."
+            )
+
     return results_df, X_full, y_full
 
 
@@ -1623,10 +2177,11 @@ def run_expanding_window_backtest(
 def train_and_evaluate(
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     use_huber_loss: bool = USE_HUBER_LOSS_DEFAULT,
     huber_delta: float = HUBER_DELTA,
     tune: bool = True,
+    nsa_backtest_results: Optional[pd.DataFrame] = None,
 ):
     """
     Main training and evaluation function using EXPANDING WINDOW methodology.
@@ -1639,10 +2194,12 @@ def train_and_evaluate(
     Args:
         target_type: 'nsa' for non-seasonally adjusted, 'sa' for seasonally adjusted
         release_type: 'first' for initial release, 'last' for final revised
-        target_source: 'first_release' or 'revised' (from M+1 FRED snapshot)
+        target_source: 'revised' (from M+1 FRED snapshot)
         use_huber_loss: If True, use Huber loss function
         huber_delta: Huber delta parameter
         tune: If True, run Optuna hyperparameter tuning
+        nsa_backtest_results: Optional NSA backtest results for SA branch
+            NSA acceleration feature injection (PIT-safe).
     """
     model_id = get_model_id(target_type, release_type, target_source)
 
@@ -1673,6 +2230,7 @@ def train_and_evaluate(
         use_huber_loss=use_huber_loss,
         huber_delta=huber_delta,
         tune=tune,
+        nsa_backtest_results=nsa_backtest_results,
     )
 
     if backtest_results.empty:
@@ -1697,105 +2255,136 @@ def train_and_evaluate(
     # the max date in the data (most recent NFP print).
     final_target_month = pd.to_datetime(X_full_valid['ds'].max())
 
-    # Final feature selection mirrors backtest policy:
-    # snapshot features (+ optional union short-pass) + selected branch-target derived features
-    cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
-    cleaned_feature_cols = [c for c in cleaned_feature_cols if c in X_full_valid.columns and c != 'ds']
-    groups = partition_feature_columns(cleaned_feature_cols, target_type=target_type)
-
-    snapshot_candidates = groups['snapshot_features']
+    # Final feature selection mirrors backtest policy.
+    # In all-features mode, use the post-backtest selected features (now written to JSON).
+    # In legacy mode, use snapshot base features + union pool + branch target FS.
     master_snapshot_base_features = load_selected_features(
         target_type=target_type, target_source=target_source
     )
-    snapshot_base_features = [
-        f for f in master_snapshot_base_features if f in X_full_valid.columns and f != 'ds'
-    ]
-    if not snapshot_base_features:
-        snapshot_base_features = [c for c in snapshot_candidates if c in X_full_valid.columns]
+    _prod_all_features_mode = master_snapshot_base_features is None
 
-    snapshot_base_set = set(snapshot_base_features)
-    snapshot_extra_candidates = [
-        c for c in snapshot_candidates if c in X_full_valid.columns and c not in snapshot_base_set
-    ]
+    cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
+    cleaned_feature_cols = [c for c in cleaned_feature_cols if c in X_full_valid.columns and c != 'ds']
 
-    branch_target_candidates = groups['target_branch_features']
-    cal_feats_final = groups['calendar_features']
-    if target_type == 'sa':
-        cal_feats_final = [f for f in cal_feats_final if f in SA_CALENDAR_FEATURES_KEEP]
-    always_keep = _merge_unique_feature_lists(
-        cal_feats_final,
-        groups['revision_features'],
-    )
-    dropped_cross_target = groups['other_target_features']
-
-    fs_half_life = SHORTPASS_HALF_LIFE or 60.0
-    fs_weights = calculate_sample_weights(X_full_valid, final_target_month, fs_half_life)
-
-    snapshot_selected = snapshot_base_features
-    if USE_UNION_POOL:
-        from Train.candidate_pool import load_or_build_union_pool
-        from Train.short_pass_selection import select_features_for_step
-
-        candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
-        candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
+    if _prod_all_features_mode:
+        # All-features mode: run dynamic reselection on the full dataset for production
         logger.info(
-            f"Final snapshot pool (extras): base={len(snapshot_base_features)}, "
-            f"extra_candidates={len(snapshot_extra_candidates)}, pool={len(candidate_pool)}, "
-            f"intersection={len(candidate_in_data)}"
+            f"[{model_id}] ALL-FEATURES mode for production model: "
+            f"running dynamic reselection on full dataset"
         )
-        if candidate_in_data:
-            if len(candidate_in_data) > SHORTPASS_TOPK:
-                snapshot_extra_selected = select_features_for_step(
-                    X_full_valid[candidate_in_data], y_full_valid,
-                    candidate_features=candidate_in_data,
-                    top_k=SHORTPASS_TOPK,
-                    method=SHORTPASS_METHOD,
-                    sample_weights=fs_weights,
-                )
-            else:
-                snapshot_extra_selected = candidate_in_data
-            snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
-        else:
-            logger.warning(
-                "Final union pool had no overlap with snapshot extra candidates; using base snapshot features."
-            )
-
-    final_branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
-    final_branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
-    if USE_BRANCH_TARGET_FS and branch_target_candidates:
-        branch_target_selected = select_branch_target_features_for_step(
+        _prod_features = _dynamic_reselection(
             X_train=X_full_valid,
             y_train=y_full_valid,
+            step_date=final_target_month,
             target_type=target_type,
-            candidate_features=branch_target_candidates,
-            top_k=final_branch_fs_top_k,
-            method=final_branch_fs_method,
-            corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
-            min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
-            sample_weights=fs_weights,
-            dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
-            dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
-            dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
-            dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
-            dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
-            dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
+            target_source=target_source,
+        )
+        feature_cols = [
+            c for c in _prod_features
+            if c in X_full_valid.columns and c in cleaned_feature_cols
+        ]
+        if not feature_cols:
+            raise RuntimeError(
+                f"[{model_id}] Production dynamic reselection returned no usable features. "
+                f"Dynamic: {len(_prod_features)}, Cleaned: {len(cleaned_feature_cols)}."
+            )
+        logger.info(
+            f"[{model_id}] Production features: {len(feature_cols)} "
+            f"(from dynamic reselection: {len(_prod_features)})"
         )
     else:
-        branch_target_selected = branch_target_candidates
+        groups = partition_feature_columns(cleaned_feature_cols, target_type=target_type)
 
-    feature_cols = _merge_unique_feature_lists(
-        snapshot_selected,
-        branch_target_selected,
-        always_keep,
-    )
-    logger.info(
-        f"Final feature set: snapshot={len(snapshot_selected)} "
-        f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
-        f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)} "
-        f"(method={final_branch_fs_method}, top_k={final_branch_fs_top_k}), "
-        f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
-        f"final={len(feature_cols)}"
-    )
+        snapshot_candidates = groups['snapshot_features']
+        snapshot_base_features = [
+            f for f in master_snapshot_base_features if f in X_full_valid.columns and f != 'ds'
+        ]
+        if not snapshot_base_features:
+            snapshot_base_features = [c for c in snapshot_candidates if c in X_full_valid.columns]
+
+        snapshot_base_set = set(snapshot_base_features)
+        snapshot_extra_candidates = [
+            c for c in snapshot_candidates if c in X_full_valid.columns and c not in snapshot_base_set
+        ]
+
+        branch_target_candidates = groups['target_branch_features']
+        cal_feats_final = groups['calendar_features']
+        if target_type == 'sa':
+            cal_feats_final = [f for f in cal_feats_final if f in SA_CALENDAR_FEATURES_KEEP]
+        always_keep = _merge_unique_feature_lists(
+            cal_feats_final,
+            groups['revision_features'],
+        )
+        dropped_cross_target = groups['other_target_features']
+
+        fs_half_life = SHORTPASS_HALF_LIFE or 60.0
+        fs_weights = calculate_sample_weights(X_full_valid, final_target_month, fs_half_life)
+
+        snapshot_selected = snapshot_base_features
+        if USE_UNION_POOL:
+            from Train.candidate_pool import load_or_build_union_pool
+            from Train.short_pass_selection import select_features_for_step
+
+            candidate_pool = load_or_build_union_pool(target_type, target_source, UNION_POOL_MAX)
+            candidate_in_data = [f for f in candidate_pool if f in snapshot_extra_candidates]
+            logger.info(
+                f"Final snapshot pool (extras): base={len(snapshot_base_features)}, "
+                f"extra_candidates={len(snapshot_extra_candidates)}, pool={len(candidate_pool)}, "
+                f"intersection={len(candidate_in_data)}"
+            )
+            if candidate_in_data:
+                if len(candidate_in_data) > SHORTPASS_TOPK:
+                    snapshot_extra_selected = select_features_for_step(
+                        X_full_valid[candidate_in_data], y_full_valid,
+                        candidate_features=candidate_in_data,
+                        top_k=SHORTPASS_TOPK,
+                        method=SHORTPASS_METHOD,
+                        sample_weights=fs_weights,
+                    )
+                else:
+                    snapshot_extra_selected = candidate_in_data
+                snapshot_selected = _merge_unique_feature_lists(snapshot_base_features, snapshot_extra_selected)
+            else:
+                logger.warning(
+                    "Final union pool had no overlap with snapshot extra candidates; using base snapshot features."
+                )
+
+        final_branch_fs_top_k = _get_branch_target_fs_top_k(target_type, target_source)
+        final_branch_fs_method = _get_branch_target_fs_method(target_type, target_source)
+        if USE_BRANCH_TARGET_FS and branch_target_candidates:
+            branch_target_selected = select_branch_target_features_for_step(
+                X_train=X_full_valid,
+                y_train=y_full_valid,
+                target_type=target_type,
+                candidate_features=branch_target_candidates,
+                top_k=final_branch_fs_top_k,
+                method=final_branch_fs_method,
+                corr_threshold=BRANCH_TARGET_FS_CORR_THRESHOLD,
+                min_overlap=BRANCH_TARGET_FS_MIN_OVERLAP,
+                sample_weights=fs_weights,
+                dynamics_weight_level=BRANCH_TARGET_FS_WEIGHT_LEVEL,
+                dynamics_weight_diff=BRANCH_TARGET_FS_WEIGHT_DIFF,
+                dynamics_weight_dir=BRANCH_TARGET_FS_WEIGHT_DIR,
+                dynamics_weight_amp=BRANCH_TARGET_FS_WEIGHT_AMP,
+                dynamics_weight_sign=BRANCH_TARGET_FS_WEIGHT_SIGN,
+                dynamics_weight_tail=BRANCH_TARGET_FS_WEIGHT_TAIL,
+            )
+        else:
+            branch_target_selected = branch_target_candidates
+
+        feature_cols = _merge_unique_feature_lists(
+            snapshot_selected,
+            branch_target_selected,
+            always_keep,
+        )
+        logger.info(
+            f"Final feature set: snapshot={len(snapshot_selected)} "
+            f"(base={len(snapshot_base_features)}, extras_from_clean={len(snapshot_extra_candidates)}), "
+            f"branch_target={len(branch_target_selected)}/{len(branch_target_candidates)} "
+            f"(method={final_branch_fs_method}, top_k={final_branch_fs_top_k}), "
+            f"always_keep={len(always_keep)}, dropped_cross_target={len(dropped_cross_target)}, "
+            f"final={len(feature_cols)}"
+        )
 
     if not feature_cols:
         raise ValueError("Final feature selection produced no features.")
@@ -1959,7 +2548,7 @@ def predict_nfp_mom(
     metadata: Optional[Dict] = None,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
 ) -> Dict:
     """
     Make NFP MoM prediction for a specific month.
@@ -1972,7 +2561,7 @@ def predict_nfp_mom(
         metadata: Optional pre-loaded metadata. If None, loads from disk.
         target_type: 'nsa' or 'sa' - determines which model to load
         release_type: 'first' or 'last' - determines which release model to load
-        target_source: 'first_release' or 'revised' - determines which master snapshot variant
+        target_source: 'revised' - determines which master snapshot variant
 
     Returns:
         Dictionary with prediction, intervals, and metadata
@@ -1994,7 +2583,7 @@ def predict_nfp_mom(
                 if pd.notna(op_date) and pd.Timestamp.now() < op_date:
                     raise RuntimeError(
                         f"Revised target for {target_month:%Y-%m} is not yet observable "
-                        f"(available from {op_date:%Y-%m-%d}). Use first_release model instead."
+                        f"(available from {op_date:%Y-%m-%d}). Revised data not yet available."
                     )
         except FileNotFoundError:
             pass  # Revised cache missing — let load_target_data raise below
@@ -2094,7 +2683,7 @@ def convert_mom_to_level(
 def get_latest_prediction(
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
 ) -> Dict:
     """Get prediction for the most recent available month."""
     model_id = get_model_id(target_type, release_type, target_source)
@@ -2117,11 +2706,9 @@ def get_latest_prediction(
     )
 
 
-# All 4 model combos for --train-all
+# All 2 model combos for --train-all
 ALL_COMBOS = [
-    ('nsa', 'first', 'first_release'),
     ('nsa', 'first', 'revised'),
-    ('sa',  'first', 'first_release'),
     ('sa',  'first', 'revised'),
 ]
 
@@ -2137,10 +2724,14 @@ def validate_post_train_all_artifacts(
     Validate that train-all produced complete production artifacts.
 
     Required artifacts:
-      1) 4 model files + 4 metadata files
-      2) 4 per-model metrics JSON files
+      1) 2 model files + 2 metadata files
+      2) 2 per-model metrics JSON files
       3) model_comparison.csv/html
-      4) first_release and revised output bundles under OUTPUT_DIR (_output/)
+      4) revised output bundles under OUTPUT_DIR (_output/)
+
+    Optional artifacts (post-training pipeline):
+      5) sandbox predicted adjustment + SA blend walk-forward
+      6) consensus anchor (Kalman fusion + AccelOverride)
     """
     if output_root is None:
         output_root = OUTPUT_DIR
@@ -2165,45 +2756,38 @@ def validate_post_train_all_artifacts(
     required.append(("comparison::csv", model_save_dir / "model_comparison.csv"))
     required.append(("comparison::html", model_save_dir / "model_comparison.html"))
 
-    for target_source, suffix in [("first_release", ""), ("revised", "_revised")]:
-        required.append((
-            f"output::{target_source}::NSA_prediction",
-            output_root / f"NSA_prediction{suffix}" / "backtest_results.csv",
-        ))
-        required.append((
-            f"output::{target_source}::NSA_metrics",
-            output_root / f"NSA_prediction{suffix}" / "summary_statistics.csv",
-        ))
-        required.append((
-            f"output::{target_source}::NSA_importance",
-            output_root / f"NSA_prediction{suffix}" / "feature_importance.csv",
-        ))
-        required.append((
-            f"output::{target_source}::SA_prediction",
-            output_root / f"SA_prediction{suffix}" / "backtest_results.csv",
-        ))
-        required.append((
-            f"output::{target_source}::SA_metrics",
-            output_root / f"SA_prediction{suffix}" / "summary_statistics.csv",
-        ))
-        required.append((
-            f"output::{target_source}::SA_importance",
-            output_root / f"SA_prediction{suffix}" / "feature_importance.csv",
-        ))
-        required.append((
-            f"output::{target_source}::adjustment_prediction",
-            output_root / f"NSA_plus_adjustment{suffix}" / "backtest_results.csv",
-        ))
-        required.append((
-            f"output::{target_source}::adjustment_metrics",
-            output_root / f"NSA_plus_adjustment{suffix}" / "summary_statistics.csv",
-        ))
+    required.append(("output::revised::NSA_prediction",
+                     output_root / "NSA_prediction" / "backtest_results.csv"))
+    required.append(("output::revised::NSA_metrics",
+                     output_root / "NSA_prediction" / "summary_statistics.csv"))
+    required.append(("output::revised::NSA_importance",
+                     output_root / "NSA_prediction" / "feature_importance.csv"))
+    required.append(("output::revised::SA_prediction",
+                     output_root / "SA_prediction" / "backtest_results.csv"))
+    required.append(("output::revised::SA_metrics",
+                     output_root / "SA_prediction" / "summary_statistics.csv"))
+    required.append(("output::revised::SA_importance",
+                     output_root / "SA_prediction" / "feature_importance.csv"))
+    required.append(("output::revised::adjustment_prediction",
+                     output_root / "NSA_plus_adjustment" / "backtest_results.csv"))
+    required.append(("output::revised::adjustment_metrics",
+                     output_root / "NSA_plus_adjustment" / "summary_statistics.csv"))
 
-        # predictions.csv can be absent when there are no future (NaN) months left.
-        optional.append((
-            f"output::{target_source}::forward_predictions",
-            output_root / f"Predictions{suffix}" / "predictions.csv",
-        ))
+    # predictions.csv can be absent when there are no future (NaN) months left.
+    optional.append(("output::revised::forward_predictions",
+                     output_root / "Predictions" / "predictions.csv"))
+
+    # Post-training sandbox + consensus anchor artifacts (optional)
+    optional.append(("sandbox::predicted_adjustment",
+                     output_root / "sandbox" / "nsa_predicted_adjustment_revised" / "backtest_results.csv"))
+    optional.append(("sandbox::sa_blend_walkforward",
+                     output_root / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"))
+    optional.append(("consensus_anchor::kalman_fusion",
+                     output_root / "consensus_anchor" / "kalman_fusion" / "backtest_results.csv"))
+    optional.append(("consensus_anchor::accel_override",
+                     output_root / "consensus_anchor" / "accel_override" / "backtest_results.csv"))
+    optional.append(("consensus_anchor::comparison_metrics",
+                     output_root / "consensus_anchor" / "comparison_metrics.csv"))
 
     for label, path in required:
         if not path.exists():
@@ -2248,7 +2832,7 @@ Examples:
     )
     parser.add_argument('--train', action='store_true', help='Train model')
     parser.add_argument('--train-all', action='store_true',
-                        help='Train all 4 model variants (NSA/SA × first_release/revised) and generate comparison')
+                        help='Train both model variants (NSA/SA × revised) and generate comparison')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
@@ -2261,15 +2845,12 @@ Examples:
                         help=f'Huber delta parameter (default: {HUBER_DELTA}). Lower = more robust to outliers.')
     parser.add_argument('--no-tune', action='store_true',
                         help='Skip Optuna hyperparameter tuning (use static defaults). Faster for debugging.')
-    parser.add_argument('--revised', action='store_true',
-                        help='Train on revised MoM target (from M+1 FRED snapshot instead of first release)')
-
     args = parser.parse_args()
 
     # Convert --no-* flags to booleans
     use_huber_loss = not args.no_huber_loss
     tune = not args.no_tune
-    target_source = 'revised' if args.revised else 'first_release'
+    target_source = 'revised'
 
     model_id = get_model_id(args.target, args.release, target_source)
 
@@ -2281,20 +2862,25 @@ Examples:
         from Train.Output_code.model_comparison import generate_comparison_scorecard
 
         logger.info("=" * 70)
-        logger.info("TRAINING ALL 4 MODEL VARIANTS (NSA/SA × first_release/revised)")
+        logger.info("TRAINING BOTH MODEL VARIANTS (NSA/SA × revised)")
         logger.info("=" * 70)
 
         all_comparison_results = {}
         all_train_results = {}  # Store full results for output generation
         _train_all_t0 = _time.time()
 
+        # Track NSA backtest results to inject acceleration features into SA
+        _nsa_backtest_for_sa: Optional[pd.DataFrame] = None
+
         for combo_idx, (tt, rt, ts) in enumerate(ALL_COMBOS, 1):
             combo_id = get_model_id(tt, rt, ts)
             logger.info(f"\n{'#' * 70}")
-            logger.info(f"# [{combo_idx}/4] TRAINING: {combo_id.upper()}")
+            logger.info(f"# [{combo_idx}/{len(ALL_COMBOS)}] TRAINING: {combo_id.upper()}")
             logger.info(f"{'#' * 70}")
 
             try:
+                # Pass NSA backtest results to SA branch for acceleration features
+                _nsa_bt = _nsa_backtest_for_sa if tt == 'sa' else None
                 result = train_and_evaluate(
                     target_type=tt,
                     release_type=rt,
@@ -2302,6 +2888,7 @@ Examples:
                     use_huber_loss=use_huber_loss,
                     huber_delta=args.huber_delta,
                     tune=tune,
+                    nsa_backtest_results=_nsa_bt,
                 )
 
                 if result is not None:
@@ -2322,12 +2909,17 @@ Examples:
                         'release_type': rt,
                         'target_source': ts,
                     }
-                    logger.info(f"[{combo_idx}/4] {combo_id.upper()} completed successfully")
+                    # Capture NSA backtest results for SA acceleration feature injection
+                    if tt == 'nsa':
+                        _nsa_backtest_for_sa = backtest_results.copy()
+                        logger.info(f"[{combo_idx}] Captured NSA backtest results "
+                                    f"({len(_nsa_backtest_for_sa)} months) for SA acceleration features")
+                    logger.info(f"[{combo_idx}/{len(ALL_COMBOS)}] {combo_id.upper()} completed successfully")
                 else:
-                    logger.warning(f"[{combo_idx}/4] {combo_id.upper()} returned None")
+                    logger.warning(f"[{combo_idx}/{len(ALL_COMBOS)}] {combo_id.upper()} returned None")
 
             except Exception as e:
-                logger.error(f"[{combo_idx}/4] {combo_id.upper()} FAILED: {e}")
+                logger.error(f"[{combo_idx}/{len(ALL_COMBOS)}] {combo_id.upper()} FAILED: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
 
@@ -2338,31 +2930,29 @@ Examples:
         else:
             logger.error("No models completed successfully")
 
-        # Generate combined output for each target_source pair that has both NSA and SA
+        # Generate combined output for revised (only target_source)
         from Train.Output_code.generate_output import generate_all_output
-        for ts_name in ['first_release', 'revised']:
-            nsa_id = get_model_id('nsa', 'first', ts_name)
-            sa_id = get_model_id('sa', 'first', ts_name)
-            if nsa_id in all_train_results and sa_id in all_train_results:
-                nsa_r = all_train_results[nsa_id]
-                sa_r = all_train_results[sa_id]
-                nsa_metadata = {
-                    'feature_cols': nsa_r['feature_cols'],
-                    'importance': dict(zip(
-                        nsa_r['feature_cols'],
-                        nsa_r['model'].feature_importance(importance_type='gain')
-                    )),
-                }
-                sa_metadata = {
-                    'feature_cols': sa_r['feature_cols'],
-                    'importance': dict(zip(
-                        sa_r['feature_cols'],
-                        sa_r['model'].feature_importance(importance_type='gain')
-                    )),
-                }
-                output_suffix = '_revised' if ts_name == 'revised' else ''
-                logger.info(f"\nGenerating combined output for {ts_name}...")
-                generate_all_output(
+        nsa_id = get_model_id('nsa', 'first', 'revised')
+        sa_id = get_model_id('sa', 'first', 'revised')
+        if nsa_id in all_train_results and sa_id in all_train_results:
+            nsa_r = all_train_results[nsa_id]
+            sa_r = all_train_results[sa_id]
+            nsa_metadata = {
+                'feature_cols': nsa_r['feature_cols'],
+                'importance': dict(zip(
+                    nsa_r['feature_cols'],
+                    nsa_r['model'].feature_importance(importance_type='gain')
+                )),
+            }
+            sa_metadata = {
+                'feature_cols': sa_r['feature_cols'],
+                'importance': dict(zip(
+                    sa_r['feature_cols'],
+                    sa_r['model'].feature_importance(importance_type='gain')
+                )),
+            }
+            logger.info("\nGenerating combined output for revised...")
+            generate_all_output(
                     nsa_results=nsa_r['backtest_results'],
                     sa_results=sa_r['backtest_results'],
                     nsa_model=nsa_r['model'],
@@ -2376,8 +2966,101 @@ Examples:
                     nsa_residuals=nsa_r['residuals'],
                     sa_residuals=sa_r['residuals'],
                     output_base=OUTPUT_DIR,
-                    suffix=output_suffix,
+                    suffix='',
                 )
+
+        # ── Post-output: Predicted adjustment, SA blend, Consensus anchor ──
+        logger.info("\n" + "=" * 70)
+        logger.info("POST-TRAINING: Sandbox experiments + Consensus anchor integration")
+        logger.info("=" * 70)
+
+        # Step 1: NSA predicted seasonal adjustment (PIT-safe walk-forward)
+        try:
+            from Train.sandbox.experiment_predicted_adjustment import (
+                load_adjustment_history,
+                load_backtest_inputs,
+                run_walkforward_backtest,
+                evaluate_models,
+                save_outputs,
+                SARIMAPredictor,
+                MonthlyAveragePredictor,
+                TwelveMonthComplementPredictor,
+                SameMonthLastYearPredictor,
+                ExpWeightedMonthlyAvgPredictor,
+                LinearRegressionPredictor,
+            )
+            logger.info("\n[Post-1] NSA predicted seasonal adjustment...")
+            adj_history = load_adjustment_history()
+            backtest_inputs = load_backtest_inputs()
+            adj_models = [
+                SARIMAPredictor(),
+                MonthlyAveragePredictor(),
+                TwelveMonthComplementPredictor(),
+                SameMonthLastYearPredictor(),
+                ExpWeightedMonthlyAvgPredictor(half_life_years=3.0),
+                LinearRegressionPredictor(),
+            ]
+            model_results = run_walkforward_backtest(adj_history, backtest_inputs, adj_models)
+            comparison = evaluate_models(model_results)
+            best_name = comparison.iloc[0]["model_name"]
+            save_outputs(best_name, model_results, comparison)
+            logger.info("  Predicted adjustment complete (best model: %s)", best_name)
+        except Exception as e:
+            logger.warning("  Predicted adjustment failed (non-fatal): %s", e)
+
+        # Step 2: SA blend walk-forward (Optuna-tuned)
+        try:
+            from Train.sandbox.experiment_sa_blend import (
+                _load_inputs as load_blend_inputs,
+                _tune_blend_params,
+                walkforward_blend,
+                _save_outputs as save_blend_outputs,
+                BlendTuneOptions,
+            )
+            logger.info("\n[Post-2] SA blend walk-forward...")
+            blend_data = load_blend_inputs(adj_source="predicted")
+            blend_tune_opts = BlendTuneOptions(
+                enabled=tune,
+                n_trials=N_OPTUNA_TRIALS,
+                timeout=OPTUNA_TIMEOUT,
+                objective_mode="composite",
+                cv_splits=4,
+            )
+            blend_params = {"window": 18, "min_history": 12, "grid_step": 0.05}
+            if blend_tune_opts.enabled:
+                tuned = _tune_blend_params(blend_data, tune_opts=blend_tune_opts)
+                if tuned is not None:
+                    blend_params.update({
+                        "window": int(tuned["window"]),
+                        "min_history": int(tuned["min_history"]),
+                        "grid_step": float(tuned["grid_step"]),
+                        "best_score": float(tuned["best_score"]),
+                    })
+            blended = walkforward_blend(
+                blend_data,
+                window=int(blend_params["window"]),
+                min_history=int(blend_params["min_history"]),
+                grid_step=float(blend_params["grid_step"]),
+                objective_mode="composite",
+            )
+            save_blend_outputs(blended, tune_opts=blend_tune_opts, blend_params=blend_params)
+            logger.info("  SA blend walk-forward complete")
+        except Exception as e:
+            logger.warning("  SA blend walk-forward failed (non-fatal): %s", e)
+
+        # Step 3: Consensus anchor (Kalman fusion + AccelOverride with Optuna)
+        try:
+            from Train.Output_code.consensus_anchor_runner import run_consensus_anchor_pipeline
+            logger.info("\n[Post-3] Consensus anchor integration...")
+            run_consensus_anchor_pipeline(
+                output_base=OUTPUT_DIR,
+                tune=tune,
+                n_trials=N_OPTUNA_TRIALS,
+                timeout=OPTUNA_TIMEOUT,
+            )
+            logger.info("  Consensus anchor integration complete")
+        except Exception as e:
+            logger.warning("  Consensus anchor failed (non-fatal): %s", e)
 
         _total_elapsed = _time.time() - _train_all_t0
         validation = validate_post_train_all_artifacts(
@@ -2396,7 +3079,7 @@ Examples:
             logger.warning(f"  MISSING OPTIONAL: {missing_opt}")
 
         logger.info(f"\n{'=' * 70}")
-        logger.info(f"ALL 4 MODELS COMPLETE ({_total_elapsed / 60:.1f} minutes total)")
+        logger.info(f"ALL {len(ALL_COMBOS)} MODELS COMPLETE ({_total_elapsed / 60:.1f} minutes total)")
         logger.info(f"{'=' * 70}")
 
     elif args.train:
@@ -2415,8 +3098,6 @@ Examples:
                 'feature_cols': feature_cols,
                 'importance': dict(zip(feature_cols, model.feature_importance(importance_type='gain'))),
             }
-            output_suffix = '_revised' if target_source == 'revised' else ''
-
             # Always refresh single-branch visualization artifacts for direct runs.
             try:
                 from Train.Output_code.generate_output import generate_single_branch_output
@@ -2465,7 +3146,7 @@ Examples:
                         nsa_residuals=residuals,
                         sa_residuals=sa_residuals,
                         output_base=OUTPUT_DIR,
-                        suffix=output_suffix,
+                        suffix='',
                     )
 
     elif args.predict:

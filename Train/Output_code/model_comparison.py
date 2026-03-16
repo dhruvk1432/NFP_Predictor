@@ -2,7 +2,7 @@
 Model Comparison Scorecard
 
 Generates side-by-side comparison tables for all model variants
-(NSA/SA × first_release/revised) plus the SA+NSA revised blend champion
+(NSA/SA revised) plus the SA+NSA revised blend champion
 after `--train-all` completes.
 
 Champion / Challenger labelling:

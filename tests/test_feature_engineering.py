@@ -101,12 +101,15 @@ class TestAddCalendarFeatures:
         assert 'is_5_week_month' in result.columns
 
     def test_adds_seasonal_indicators(self, sample_df):
-        """Test that seasonal indicators are added."""
+        """Test that key seasonal indicators are added (is_summer/is_holiday_season removed)."""
         target_month = pd.Timestamp('2020-07-01')
         result = add_calendar_features(sample_df, target_month)
 
-        assert 'is_summer' in result.columns
-        assert 'is_holiday_season' in result.columns
+        assert 'is_jan' in result.columns
+        assert 'is_july' in result.columns
+        # Dropped in lean feature reduction
+        assert 'is_summer' not in result.columns
+        assert 'is_holiday_season' not in result.columns
 
     def test_january_indicator(self, sample_df):
         """Test that January indicator is correct."""
@@ -144,7 +147,7 @@ class TestGetCalendarFeaturesDict:
             'month_sin', 'month_cos',
             'quarter_sin', 'quarter_cos',
             'weeks_since_last_survey', 'is_5_week_month',
-            'is_jan', 'is_summer'
+            'is_jan', 'is_july', 'year',
         ]
         for key in required_keys:
             assert key in result, f"Missing key: {key}"

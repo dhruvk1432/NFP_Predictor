@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from Train.config import (
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
+    VALID_TARGET_SOURCES,
     ALL_TARGET_CONFIGS,
     VARIANCE_PRIORITY_TARGETS,
     get_target_path,
@@ -39,12 +40,15 @@ class TestTargetConfiguration:
         assert 'last' in VALID_RELEASE_TYPES
         assert len(VALID_RELEASE_TYPES) == 2
 
+    def test_valid_target_sources(self):
+        """Test that valid target sources only includes revised."""
+        assert 'revised' in VALID_TARGET_SOURCES
+        assert len(VALID_TARGET_SOURCES) == 1
+
     def test_all_target_configs(self):
-        """Test that all 4 branch target configurations are defined."""
-        assert len(ALL_TARGET_CONFIGS) == 4
-        assert ('nsa', 'first', 'first_release') in ALL_TARGET_CONFIGS
+        """Test that all 2 branch target configurations are defined (revised only)."""
+        assert len(ALL_TARGET_CONFIGS) == 2
         assert ('nsa', 'first', 'revised') in ALL_TARGET_CONFIGS
-        assert ('sa', 'first', 'first_release') in ALL_TARGET_CONFIGS
         assert ('sa', 'first', 'revised') in ALL_TARGET_CONFIGS
 
 
@@ -83,37 +87,37 @@ class TestGetModelId:
     """Tests for model ID generation."""
 
     def test_nsa_first_id(self):
-        """Test NSA first model ID."""
+        """Test NSA first model ID always includes _revised suffix."""
         model_id = get_model_id('nsa', 'first')
-        assert model_id == 'nsa_first'
+        assert model_id == 'nsa_first_revised'
 
     def test_sa_last_id(self):
-        """Test SA last model ID."""
+        """Test SA last model ID always includes _revised suffix."""
         model_id = get_model_id('sa', 'last')
-        assert model_id == 'sa_last'
+        assert model_id == 'sa_last_revised'
 
     def test_case_normalization(self):
-        """Test that model IDs are lowercase."""
+        """Test that model IDs are lowercase with _revised suffix."""
         model_id = get_model_id('NSA', 'FIRST')
-        assert model_id == 'nsa_first'
+        assert model_id == 'nsa_first_revised'
 
 
 class TestParseModelId:
     """Tests for model ID parsing."""
 
     def test_parse_nsa_first(self):
-        """Test parsing nsa_first model ID."""
+        """Test parsing legacy 2-part nsa_first model ID maps to revised."""
         target_type, release_type, target_source = parse_model_id('nsa_first')
         assert target_type == 'nsa'
         assert release_type == 'first'
-        assert target_source == 'first_release'
+        assert target_source == 'revised'
 
     def test_parse_sa_last(self):
-        """Test parsing sa_last model ID."""
+        """Test parsing legacy 2-part sa_last model ID maps to revised."""
         target_type, release_type, target_source = parse_model_id('sa_last')
         assert target_type == 'sa'
         assert release_type == 'last'
-        assert target_source == 'first_release'
+        assert target_source == 'revised'
 
     def test_parse_nsa_first_revised(self):
         """Test parsing nsa_first_revised model ID."""
@@ -175,10 +179,10 @@ class TestHyperparameters:
 class TestVariancePriorityTargets:
     """Tests for variance-priority branch configuration."""
 
-    def test_sa_branches_are_variance_priority(self):
-        """SA first-release and revised should share variance-focused modeling."""
-        assert ('sa', 'first_release') in VARIANCE_PRIORITY_TARGETS
+    def test_sa_revised_is_variance_priority(self):
+        """SA revised should use variance-focused modeling."""
         assert ('sa', 'revised') in VARIANCE_PRIORITY_TARGETS
+        assert len(VARIANCE_PRIORITY_TARGETS) == 1
 
 
 if __name__ == "__main__":

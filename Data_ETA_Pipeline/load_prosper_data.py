@@ -46,8 +46,6 @@ class RateLimiter:
             self.last_call = time.time()
 
 top_nfp_predictors = [
-    'Regarding the U.S. employment environment, over the next six (6) months, do you think that there will be more, the same or fewer layoffs than at present?',
-    'Which of the following most accurately describes your employment environment? (Check all that apply)',
     'Prosper Consumer Spending Forecast',
     'Consumer Mood Index',
 ]
@@ -394,11 +392,10 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
             )
             snap_data['snapshot_date'] = snap_date
 
-            # Branch-and-Expand: create symlog variants, then compute all features
+            # Lean mode: skip symlog (trees are monotone-invariant), reduced features.
             # NOTE: pct_change skipped entirely — Prosper data is already in percentages,
             # so diff already captures the change in percentage points
-            snap_data = add_symlog_copies(snap_data)
-            snap_data = compute_all_features(snap_data)
+            snap_data = compute_all_features(snap_data, lean=True)
 
             snap_data.to_parquet(save_path, index=False)
             snapshots_written += 1

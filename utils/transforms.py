@@ -214,7 +214,8 @@ def _emit(result_list: list, meta: pd.DataFrame, name: str, values: pd.Series):
 
 def compute_all_features(
     df: pd.DataFrame,
-    skip_series: frozenset = frozenset()
+    skip_series: frozenset = frozenset(),
+    lean: bool = False,
 ) -> pd.DataFrame:
     """
     Compute the full suite of derived features for all series in a long-format DataFrame.
@@ -222,15 +223,21 @@ def compute_all_features(
     Expected input: DataFrame that has already been through add_symlog_copies() and
     add_pct_change_copies(), so it contains raw, _symlog, and _pct_chg variants.
 
-    Feature suite per series type:
+    Feature suite per series type (full mode):
     - Binary (skip_series): level only (1 feature)
     - Pct_Chg (_pct_chg suffix): level + z-scores + rolling + lags (9 features)
     - Raw/Symlog: level + diff + diff z-scores + level z-scores + rolling + lags
       + multi-period changes (15 features)
 
+    When lean=True, drops symlog-derived features, 12m diff z-scores, and level
+    z-scores.  Keeps: level, pct_chg level, diff, diff_zscore_3m, rolling_mean_3m,
+    rolling_std_6m, chg_3m/6m/12m on raw only.  Lags: [1, 3, 6, 12].
+
     Args:
         df: Long-format DataFrame with columns [date, series_name, value, ...].
         skip_series: Set of series_name values that are binary indicators (level only).
+        lean: If True, generate a reduced feature set (no symlog variants,
+              no 12m diff z-scores, no level z-scores).
 
     Returns:
         DataFrame in long format with all derived features.
@@ -244,11 +251,16 @@ def compute_all_features(
     base_cols = [c for c in ['date', 'release_date', 'series_code', 'snapshot_date']
                  if c in df.columns]
     series_list = sorted(df['series_name'].unique())  # Sort for determinism
-    
+
     # Collect all base (un-lagged) features first
     base_features_list = []
 
     for series in series_list:
+        # In lean mode, skip all symlog-derived series — trees are invariant
+        # to monotone transforms so symlog adds features with negligible signal.
+        if lean and ('_symlog' in series):
+            continue
+
         sdf = df[df['series_name'] == series].copy().sort_values('date')
         meta = sdf[base_cols].copy()
         vals = sdf['value']
@@ -268,24 +280,31 @@ def compute_all_features(
             _emit(base_features_list, meta, f"{series}_diff", diff)
             _emit(base_features_list, meta, f"{series}_diff_zscore_3m",
                   _rolling_zscore(diff, 3, 2))
-            _emit(base_features_list, meta, f"{series}_diff_zscore_12m",
-                  _rolling_zscore(diff, 12, 6))
+            if not lean:
+                _emit(base_features_list, meta, f"{series}_diff_zscore_12m",
+                      _rolling_zscore(diff, 12, 6))
 
-        # --- Level z-scores (all non-binary) ---
-        _emit(base_features_list, meta, f"{series}_zscore_3m",
-              _rolling_zscore(vals, 3, 2))
-        _emit(base_features_list, meta, f"{series}_zscore_12m",
-              _rolling_zscore(vals, 12, 6))
+        # --- Level z-scores (all non-binary) — skip in lean mode ---
+        if not lean:
+            _emit(base_features_list, meta, f"{series}_zscore_3m",
+                  _rolling_zscore(vals, 3, 2))
+            _emit(base_features_list, meta, f"{series}_zscore_12m",
+                  _rolling_zscore(vals, 12, 6))
 
-        # --- Rolling stats (all non-binary) ---
-        _emit(base_features_list, meta, f"{series}_rolling_mean_3m",
-              vals.rolling(3, min_periods=2).mean())
-        _emit(base_features_list, meta, f"{series}_rolling_std_6m",
-              vals.rolling(6, min_periods=3).std())
+        # --- Rolling stats ---
+        if lean and is_pct_chg:
+            # In lean mode pct_chg gets rolling stats only
+            _emit(base_features_list, meta, f"{series}_rolling_mean_3m",
+                  vals.rolling(3, min_periods=2).mean())
+            _emit(base_features_list, meta, f"{series}_rolling_std_6m",
+                  vals.rolling(6, min_periods=3).std())
+        else:
+            _emit(base_features_list, meta, f"{series}_rolling_mean_3m",
+                  vals.rolling(3, min_periods=2).mean())
+            _emit(base_features_list, meta, f"{series}_rolling_std_6m",
+                  vals.rolling(6, min_periods=3).std())
 
-        # (Old lag loop removed here - lags are applied globally below)
-
-        # --- Multi-period changes (raw + symlog only) ---
+        # --- Multi-period changes (raw only in lean; raw + symlog in full) ---
         if not is_pct_chg:
             for period in [3, 6, 12]:
                 _emit(base_features_list, meta, f"{series}_chg_{period}m",
@@ -296,25 +315,25 @@ def compute_all_features(
     # Lags: 1, 3, 6, 12 months (18m removed — stale for monthly employment data)
     lags = [1, 3, 6, 12]
     final_output_list = []
-    
+
     for feature_block in base_features_list:
         # Add the un-lagged feature itself
         final_output_list.append(feature_block)
-        
+
         # Add lagged variants
         # Note: feature_block is sorted by date because it comes from sorted sdf
         # and operations preserve order. shift() works correctly on value column.
         for lag in lags:
             lag_block = feature_block.copy()
             lag_block['value'] = lag_block['value'].shift(lag)
-            
+
             # Suffix name and code
             lag_suffix = f"_lag_{lag}m"
             lag_block['series_name'] = lag_block['series_name'] + lag_suffix
-            
+
             if 'series_code' in lag_block.columns:
                  lag_block['series_code'] = lag_block['series_code'].astype(str) + lag_suffix
-            
+
             final_output_list.append(lag_block)
 
     result = pd.concat(final_output_list, ignore_index=True)
@@ -341,6 +360,7 @@ def _rolling_zscore_wide(df: pd.DataFrame, window: int, min_periods: int) -> pd.
 def compute_features_wide(
     long_df: pd.DataFrame,
     apply_mom: bool = True,
+    lean: bool = False,
 ) -> pd.DataFrame:
     """
     Vectorized wide-format feature computation for FRED employment snapshots.
@@ -350,9 +370,15 @@ def compute_features_wide(
 
     All operations are vectorized across columns (no Python loops over series).
 
+    When lean=True, drops symlog variants, 12m diff z-scores, and level z-scores.
+    Keeps: level, pct_chg, diff, diff_zscore_3m, rolling_mean_3m, rolling_std_6m,
+    chg_3m/6m/12m on raw only.  Lags: [1, 3, 6, 12].
+
     Args:
         long_df: Long-format DataFrame with columns [date, value, series_name, ...].
         apply_mom: If True, convert levels to MoM changes first.
+        lean: If True, generate reduced feature set (no symlog, no 12m diff z-scores,
+              no level z-scores).
 
     Returns:
         Wide-format DataFrame with DatetimeIndex (date) and feature columns.
@@ -383,60 +409,101 @@ def compute_features_wide(
 
     base_cols = list(wide.columns)  # original ~160 series (MoM values)
 
-    # 1. Symlog of base
-    symlog_wide = np.sign(wide) * np.log1p(np.abs(wide))
-    symlog_wide.columns = [f"{c}_symlog" for c in base_cols]
-    symlog_cols = list(symlog_wide.columns)
+    if lean:
+        # --- LEAN MODE: raw + pct_chg only (no symlog) ---
 
-    # 2. Pct change of base (symlog_pct_chg removed — redundant with pct_chg for tree models)
-    pct_base = wide.pct_change() * 100
-    pct_base = pct_base.replace([np.inf, -np.inf], np.nan)
-    pct_base.columns = [f"{c}_pct_chg" for c in base_cols]
-    pct_base_cols = list(pct_base.columns)
+        # Pct change of base
+        pct_base = wide.pct_change() * 100
+        pct_base = pct_base.replace([np.inf, -np.inf], np.nan)
+        pct_base.columns = [f"{c}_pct_chg" for c in base_cols]
+        pct_base_cols = list(pct_base.columns)
 
-    # Combine all base series into one wide DataFrame
-    all_wide = pd.concat([wide, symlog_wide, pct_base], axis=1)
+        # Level (raw + pct_chg)
+        feature_frames.append(wide)
+        feature_frames.append(pct_base)
 
-    # Identify column categories for feature generation
-    raw_symlog_cols = base_cols + symlog_cols  # get diff + multi-period
-    pct_chg_cols = pct_base_cols  # no diff, no multi-period
-    all_series_cols = raw_symlog_cols + pct_chg_cols
+        # Diff (raw only)
+        diff_df = wide.diff()
+        diff_df.columns = [f"{c}_diff" for c in base_cols]
+        feature_frames.append(diff_df)
 
-    # --- Generate features (all vectorized) ---
-    # Level (the base values themselves)
-    feature_frames.append(all_wide)
+        # Diff z-scores: 3m only (raw only)
+        dz3 = _rolling_zscore_wide(diff_df, 3, 2)
+        dz3.columns = [f"{c}_diff_zscore_3m" for c in base_cols]
+        feature_frames.append(dz3)
 
-    # Diff (raw + symlog only)
-    diff_df = all_wide[raw_symlog_cols].diff()
-    diff_df.columns = [f"{c}_diff" for c in raw_symlog_cols]
-    feature_frames.append(diff_df)
+        # Rolling stats (raw only)
+        rm3 = wide.rolling(3, min_periods=2).mean()
+        rm3.columns = [f"{c}_rolling_mean_3m" for c in base_cols]
+        feature_frames.append(rm3)
 
-    # Diff z-scores (raw + symlog only)
-    for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
-        dz = _rolling_zscore_wide(diff_df, window, min_p)
-        dz.columns = [f"{c}_diff_zscore_{suffix}" for c in raw_symlog_cols]
-        feature_frames.append(dz)
+        rs6 = wide.rolling(6, min_periods=3).std()
+        rs6.columns = [f"{c}_rolling_std_6m" for c in base_cols]
+        feature_frames.append(rs6)
 
-    # Level z-scores (all non-binary)
-    for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
-        lz = _rolling_zscore_wide(all_wide[all_series_cols], window, min_p)
-        lz.columns = [f"{c}_zscore_{suffix}" for c in all_series_cols]
-        feature_frames.append(lz)
+        # Multi-period changes (raw only)
+        for period in [3, 6, 12]:
+            mc = wide.diff(period)
+            mc.columns = [f"{c}_chg_{period}m" for c in base_cols]
+            feature_frames.append(mc)
 
-    # Rolling stats (all non-binary)
-    rm3 = all_wide[all_series_cols].rolling(3, min_periods=2).mean()
-    rm3.columns = [f"{c}_rolling_mean_3m" for c in all_series_cols]
-    feature_frames.append(rm3)
+    else:
+        # --- FULL MODE: raw + symlog + pct_chg ---
 
-    rs6 = all_wide[all_series_cols].rolling(6, min_periods=3).std()
-    rs6.columns = [f"{c}_rolling_std_6m" for c in all_series_cols]
-    feature_frames.append(rs6)
+        # 1. Symlog of base
+        symlog_wide = np.sign(wide) * np.log1p(np.abs(wide))
+        symlog_wide.columns = [f"{c}_symlog" for c in base_cols]
+        symlog_cols = list(symlog_wide.columns)
 
-    # Multi-period changes (raw + symlog only)
-    for period in [3, 6, 12]:
-        mc = all_wide[raw_symlog_cols].diff(period)
-        mc.columns = [f"{c}_chg_{period}m" for c in raw_symlog_cols]
-        feature_frames.append(mc)
+        # 2. Pct change of base (symlog_pct_chg removed — redundant with pct_chg for tree models)
+        pct_base = wide.pct_change() * 100
+        pct_base = pct_base.replace([np.inf, -np.inf], np.nan)
+        pct_base.columns = [f"{c}_pct_chg" for c in base_cols]
+        pct_base_cols = list(pct_base.columns)
+
+        # Combine all base series into one wide DataFrame
+        all_wide = pd.concat([wide, symlog_wide, pct_base], axis=1)
+
+        # Identify column categories for feature generation
+        raw_symlog_cols = base_cols + symlog_cols  # get diff + multi-period
+        pct_chg_cols = pct_base_cols  # no diff, no multi-period
+        all_series_cols = raw_symlog_cols + pct_chg_cols
+
+        # --- Generate features (all vectorized) ---
+        # Level (the base values themselves)
+        feature_frames.append(all_wide)
+
+        # Diff (raw + symlog only)
+        diff_df = all_wide[raw_symlog_cols].diff()
+        diff_df.columns = [f"{c}_diff" for c in raw_symlog_cols]
+        feature_frames.append(diff_df)
+
+        # Diff z-scores (raw + symlog only)
+        for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
+            dz = _rolling_zscore_wide(diff_df, window, min_p)
+            dz.columns = [f"{c}_diff_zscore_{suffix}" for c in raw_symlog_cols]
+            feature_frames.append(dz)
+
+        # Level z-scores (all non-binary)
+        for window, min_p, suffix in [(3, 2, '3m'), (12, 6, '12m')]:
+            lz = _rolling_zscore_wide(all_wide[all_series_cols], window, min_p)
+            lz.columns = [f"{c}_zscore_{suffix}" for c in all_series_cols]
+            feature_frames.append(lz)
+
+        # Rolling stats (all non-binary)
+        rm3 = all_wide[all_series_cols].rolling(3, min_periods=2).mean()
+        rm3.columns = [f"{c}_rolling_mean_3m" for c in all_series_cols]
+        feature_frames.append(rm3)
+
+        rs6 = all_wide[all_series_cols].rolling(6, min_periods=3).std()
+        rs6.columns = [f"{c}_rolling_std_6m" for c in all_series_cols]
+        feature_frames.append(rs6)
+
+        # Multi-period changes (raw + symlog only)
+        for period in [3, 6, 12]:
+            mc = all_wide[raw_symlog_cols].diff(period)
+            mc.columns = [f"{c}_chg_{period}m" for c in raw_symlog_cols]
+            feature_frames.append(mc)
 
     # --- Combine all base features ---
     all_features = pd.concat(feature_frames, axis=1)

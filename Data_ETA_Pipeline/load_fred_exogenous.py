@@ -588,6 +588,20 @@ def compute_vix_daily_features(df):
     sub_df['vix_5d_ago'] = sub_df['value'].shift(5)
     sub_df['vix_spike_5d'] = sub_df['value'] / sub_df['vix_5d_ago']
 
+    # VIX_monthly = VIX^2 / 12 (annualized variance converted to monthly variance)
+    sub_df['vix_monthly'] = sub_df['value'] ** 2 / 12
+
+    # VIX_monthly daily change (for volatility computation)
+    sub_df['vix_monthly_daily_chg'] = sub_df['vix_monthly'].diff()
+
+    # VIX_monthly 30-day spike detection
+    sub_df['vix_monthly_30d_ago'] = sub_df['vix_monthly'].shift(21)
+    sub_df['vix_monthly_spike_ratio'] = sub_df['vix_monthly'] / sub_df['vix_monthly_30d_ago']
+
+    # VIX_monthly 5-day spike detection
+    sub_df['vix_monthly_5d_ago'] = sub_df['vix_monthly'].shift(5)
+    sub_df['vix_monthly_spike_5d'] = sub_df['vix_monthly'] / sub_df['vix_monthly_5d_ago']
+
     return sub_df
 
 
@@ -606,6 +620,10 @@ def aggregate_vix_to_monthly(daily_df):
         'daily_chg': 'std',
         'vix_spike_ratio': 'max',
         'vix_spike_5d': 'max',
+        'vix_monthly': ['mean', 'max'],
+        'vix_monthly_daily_chg': 'std',
+        'vix_monthly_spike_ratio': 'max',
+        'vix_monthly_spike_5d': 'max',
     })
 
     # Flatten MultiIndex columns
@@ -619,6 +637,11 @@ def aggregate_vix_to_monthly(daily_df):
     temp_df['VIX_max_5d_spike'] = monthly_agg.get('vix_spike_5d_max', np.nan)
     temp_df['VIX_panic_regime'] = (temp_df['VIX_max'] > 50).astype(int)
     temp_df['VIX_high_regime'] = (temp_df['VIX_max'] > 20).astype(int)
+    temp_df['VIX_monthly_mean'] = monthly_agg.get('vix_monthly_mean', np.nan)
+    temp_df['VIX_monthly_max'] = monthly_agg.get('vix_monthly_max', np.nan)
+    temp_df['VIX_monthly_volatility'] = monthly_agg.get('vix_monthly_daily_chg_std', np.nan)
+    temp_df['VIX_monthly_30d_spike'] = monthly_agg.get('vix_monthly_spike_ratio_max', np.nan)
+    temp_df['VIX_monthly_max_5d_spike'] = monthly_agg.get('vix_monthly_spike_5d_max', np.nan)
 
     result = temp_df.reset_index().melt(
         id_vars=['date'],
@@ -1275,10 +1298,10 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
             problematic_features = {s for s in full_snap['series_name'].unique() if 'acceleration' in s or 'weeks_high' in s}
             pct_change_skip = BINARY_REGIME_FEATURES | problematic_features
 
-            # Branch-and-Expand: create 3 base variants, then compute all features
-            full_snap = add_symlog_copies(full_snap, skip_series=BINARY_REGIME_FEATURES)
+            # Lean mode: skip symlog variants (trees are monotone-invariant),
+            # drop 12m diff z-scores and level z-scores to reduce feature count.
             full_snap = add_pct_change_copies(full_snap, skip_series=pct_change_skip)
-            full_snap = compute_all_features(full_snap, skip_series=BINARY_REGIME_FEATURES)
+            full_snap = compute_all_features(full_snap, skip_series=BINARY_REGIME_FEATURES, lean=True)
 
             # CRITICAL: Filter out data not yet released at snapshot time
             # This prevents lookahead bias from including monthly aggregates

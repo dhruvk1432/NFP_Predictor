@@ -102,14 +102,14 @@ class TestPerSourceCache:
 
     def test_cache_miss_returns_none(self, source_cache_dir):
         """No cache file should return None."""
-        result = _check_source_cache('FRED_Exogenous', 'nsa', 'first_release')
+        result = _check_source_cache('FRED_Exogenous', 'nsa', 'revised')
         assert result is None
 
     def test_save_and_load_round_trip(self, source_cache_dir):
         """Saved features should be retrievable."""
         features = ['feat_a', 'feat_b', 'feat_c']
-        _save_source_cache(features, 'ADP', 'nsa', 'first_release')
-        result = _check_source_cache('ADP', 'nsa', 'first_release')
+        _save_source_cache(features, 'ADP', 'nsa', 'revised')
+        result = _check_source_cache('ADP', 'nsa', 'revised')
         assert sorted(result) == sorted(features)
 
     def test_expired_cache_returns_none(self, source_cache_dir):
@@ -130,40 +130,40 @@ class TestPerSourceCache:
 
     def test_different_sources_independent(self, source_cache_dir):
         """Caches for different sources should not interfere."""
-        _save_source_cache(['feat_a'], 'ADP', 'nsa', 'first_release')
-        _save_source_cache(['feat_x', 'feat_y'], 'Unifier', 'nsa', 'first_release')
+        _save_source_cache(['feat_a'], 'ADP', 'nsa', 'revised')
+        _save_source_cache(['feat_x', 'feat_y'], 'Unifier', 'nsa', 'revised')
 
-        adp = _check_source_cache('ADP', 'nsa', 'first_release')
-        unifier = _check_source_cache('Unifier', 'nsa', 'first_release')
+        adp = _check_source_cache('ADP', 'nsa', 'revised')
+        unifier = _check_source_cache('Unifier', 'nsa', 'revised')
 
         assert adp == ['feat_a']
         assert sorted(unifier) == ['feat_x', 'feat_y']
 
     def test_different_branches_independent(self, source_cache_dir):
         """Same source with different target combos should have separate caches."""
-        _save_source_cache(['feat_nsa'], 'ADP', 'nsa', 'first_release')
-        _save_source_cache(['feat_sa'], 'ADP', 'sa', 'first_release')
+        _save_source_cache(['feat_nsa'], 'ADP', 'nsa', 'revised')
+        _save_source_cache(['feat_sa'], 'ADP', 'sa', 'revised')
 
-        nsa = _check_source_cache('ADP', 'nsa', 'first_release')
-        sa = _check_source_cache('ADP', 'sa', 'first_release')
+        nsa = _check_source_cache('ADP', 'nsa', 'revised')
+        sa = _check_source_cache('ADP', 'sa', 'revised')
 
         assert nsa == ['feat_nsa']
         assert sa == ['feat_sa']
 
     def test_corrupted_cache_returns_none(self, source_cache_dir):
         """Corrupted JSON should return None gracefully."""
-        _save_source_cache(['feat_a'], 'ADP', 'nsa', 'first_release')
-        cache_path = _get_source_cache_path('ADP', 'nsa', 'first_release')
+        _save_source_cache(['feat_a'], 'ADP', 'nsa', 'revised')
+        cache_path = _get_source_cache_path('ADP', 'nsa', 'revised')
         with open(cache_path, 'w') as f:
             f.write("NOT VALID JSON{{{")
 
-        result = _check_source_cache('ADP', 'nsa', 'first_release')
+        result = _check_source_cache('ADP', 'nsa', 'revised')
         assert result is None
 
     def test_empty_features_list_cached(self, source_cache_dir):
         """A source that produced 0 features should still cache (avoid re-running)."""
-        _save_source_cache([], 'Prosper', 'nsa', 'first_release')
-        result = _check_source_cache('Prosper', 'nsa', 'first_release')
+        _save_source_cache([], 'Prosper', 'nsa', 'revised')
+        result = _check_source_cache('Prosper', 'nsa', 'revised')
         assert result == []
 
     def test_cache_mode_mismatch_returns_none(self, source_cache_dir):
@@ -402,14 +402,14 @@ class TestProgressTracking:
 
     def test_no_progress_returns_empty(self, source_cache_dir):
         """No progress file should return empty set."""
-        result = _load_progress('nsa', 'first_release')
+        result = _load_progress('nsa', 'revised')
         assert result == set()
 
     def test_save_and_load_round_trip(self, source_cache_dir):
         """Saved progress should be retrievable."""
         months = {'2020-01', '2020-02', '2020-03'}
-        _save_progress('nsa', 'first_release', months)
-        result = _load_progress('nsa', 'first_release')
+        _save_progress('nsa', 'revised', months)
+        result = _load_progress('nsa', 'revised')
         assert result == months
 
     def test_clear_removes_file(self, source_cache_dir):
@@ -427,20 +427,20 @@ class TestProgressTracking:
 
     def test_incremental_progress(self, source_cache_dir):
         """Progress should accumulate across saves."""
-        _save_progress('nsa', 'first_release', {'2020-01'})
-        loaded = _load_progress('nsa', 'first_release')
+        _save_progress('nsa', 'revised', {'2020-01'})
+        loaded = _load_progress('nsa', 'revised')
         loaded.add('2020-02')
-        _save_progress('nsa', 'first_release', loaded)
+        _save_progress('nsa', 'revised', loaded)
 
-        result = _load_progress('nsa', 'first_release')
+        result = _load_progress('nsa', 'revised')
         assert result == {'2020-01', '2020-02'}
 
     def test_different_branches_independent(self, source_cache_dir):
         """Progress for different branches should not interfere."""
-        _save_progress('nsa', 'first_release', {'2020-01'})
+        _save_progress('nsa', 'revised', {'2020-01'})
         _save_progress('sa', 'revised', {'2020-06'})
 
-        nsa = _load_progress('nsa', 'first_release')
+        nsa = _load_progress('nsa', 'revised')
         sa = _load_progress('sa', 'revised')
 
         assert nsa == {'2020-01'}
@@ -448,12 +448,12 @@ class TestProgressTracking:
 
     def test_corrupted_progress_returns_empty(self, source_cache_dir):
         """Corrupted JSON should return empty set (safe restart)."""
-        _save_progress('nsa', 'first_release', {'2020-01'})
-        path = _get_progress_path('nsa', 'first_release')
+        _save_progress('nsa', 'revised', {'2020-01'})
+        path = _get_progress_path('nsa', 'revised')
         with open(path, 'w') as f:
             f.write("CORRUPTED{{{")
 
-        result = _load_progress('nsa', 'first_release')
+        result = _load_progress('nsa', 'revised')
         assert result == set()
 
 
@@ -500,8 +500,8 @@ class TestRegimeSelection:
 
     def test_regime_cache_round_trip(self, source_cache_dir):
         cutoff = pd.Timestamp("2020-01-01")
-        _save_regime_cache(["feat_a", "feat_b"], "nsa", "first_release", cutoff)
-        loaded = _check_regime_cache("nsa", "first_release", cutoff)
+        _save_regime_cache(["feat_a", "feat_b"], "nsa", "revised", cutoff)
+        loaded = _check_regime_cache("nsa", "revised", cutoff)
         assert sorted(loaded) == ["feat_a", "feat_b"]
 
     def test_resolve_regime_cutoff_uses_latest_past_cutoff(self):
@@ -528,7 +528,7 @@ class TestRegimeSelection:
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
-        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "first_release")])
+        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "revised")])
         monkeypatch.setattr(cms, "SOURCES", {"ADP": tmp_path / "mock_sources" / "adp" / "decades"})
         monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
         monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
@@ -573,7 +573,7 @@ class TestRegimeSelection:
 
         cms.create_master_snapshots(skip_existing=False)
 
-        target_dir = master_base / "nsa" / "first_release" / "decades"
+        target_dir = master_base / "nsa" / "revised" / "decades"
         pre_path = cms._snapshot_path(target_dir, pd.Timestamp("2019-12-01"))
         old_path = cms._snapshot_path(target_dir, pd.Timestamp("2020-02-01"))
         new_path = cms._snapshot_path(target_dir, pd.Timestamp("2021-02-01"))
@@ -593,7 +593,7 @@ class TestRegimeSelection:
 
 
 class TestTargetScopeResolution:
-    """Tests for auto/all/revised/first_release branch selection."""
+    """Tests for auto/all/revised branch selection (revised-only)."""
 
     def test_auto_uses_revised_for_short_window(self):
         combos = _resolve_target_combos(
@@ -603,17 +603,14 @@ class TestTargetScopeResolution:
         )
         assert combos == [("nsa", "revised"), ("sa", "revised")]
 
-    def test_auto_uses_all_for_long_window(self):
+    def test_auto_uses_revised_for_long_window(self):
+        """Even with a long window, auto mode returns only revised combos."""
         combos = _resolve_target_combos(
             pd.Timestamp("1990-01-01"),
             pd.Timestamp("2026-02-01"),
             target_source_scope="auto",
         )
-        assert ("nsa", "first_release") in combos
-        assert ("nsa", "revised") in combos
-        assert ("sa", "first_release") in combos
-        assert ("sa", "revised") in combos
-        assert len(combos) == 4
+        assert combos == [("nsa", "revised"), ("sa", "revised")]
 
     def test_explicit_scope_revised(self):
         combos = _resolve_target_combos(
@@ -628,21 +625,17 @@ class TestTargetComboFilters:
     def test_target_type_scope_sa_filters_to_sa_branches(self):
         filtered = _apply_target_combo_filters(
             target_combos=[
-                ("nsa", "first_release"),
                 ("nsa", "revised"),
-                ("sa", "first_release"),
                 ("sa", "revised"),
             ],
             target_type_scope="sa",
         )
-        assert filtered == [("sa", "first_release"), ("sa", "revised")]
+        assert filtered == [("sa", "revised")]
 
     def test_explicit_branches_override_scope(self):
         filtered = _apply_target_combo_filters(
             target_combos=[
-                ("nsa", "first_release"),
                 ("nsa", "revised"),
-                ("sa", "first_release"),
                 ("sa", "revised"),
             ],
             target_type_scope="all",
@@ -656,7 +649,7 @@ class TestSelectionTargetModes:
         assert _resolve_selection_target_mode("sa", "revised", "auto") == "model_aligned"
 
     def test_auto_mode_prefers_mom_for_nsa(self):
-        assert _resolve_selection_target_mode("nsa", "first_release", "auto") == "mom"
+        assert _resolve_selection_target_mode("nsa", "revised", "auto") == "mom"
 
     def test_build_selection_target_model_aligned_shape(self):
         idx = pd.date_range("2020-01-01", periods=24, freq="MS")
@@ -726,7 +719,7 @@ class TestSkipFeatureSelectionFastPath:
         target_snap = pd.Timestamp("2020-01-10")
 
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
-        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "first_release")])
+        monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "revised")])
         monkeypatch.setattr(cms, "SOURCES", {"ADP": source_dir})
         monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
         monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
@@ -739,17 +732,17 @@ class TestSkipFeatureSelectionFastPath:
         monkeypatch.setattr(
             cms,
             "_resolve_target_combos",
-            lambda start_dt, end_dt, scope: [("nsa", "first_release")],
+            lambda start_dt, end_dt, scope: [("nsa", "revised")],
         )
         monkeypatch.setattr(cms, "_run_skip_fs_parallel_fast_path", lambda *args, **kwargs: False)
 
-        cache_path = master_base / "selected_features_nsa_first_release.json"
+        cache_path = master_base / "selected_features_nsa_revised.json"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w") as f:
             json.dump(
                 {
                     "last_run_date": "2026-01-01",
-                    "target_source": "first_release",
+                    "target_source": "revised",
                     "target_cat": "nsa",
                     "features": ["feat_a"],
                 },
@@ -772,7 +765,7 @@ class TestSkipFeatureSelectionFastPath:
         cms.create_master_snapshots(skip_feature_selection=True, skip_existing=False)
 
         out_path = cms._snapshot_path(
-            master_base / "nsa" / "first_release" / "decades",
+            master_base / "nsa" / "revised" / "decades",
             target_obs,
         )
         assert out_path.exists()
@@ -811,7 +804,7 @@ class TestSourceSpecificMinObs:
         monkeypatch.setattr(
             cms,
             "load_target_data",
-            lambda target_type, release_type, use_cache=False: target_df,
+            lambda target_type, release_type, use_cache=False, target_source='revised': target_df,
         )
 
         captured = {}
@@ -826,7 +819,7 @@ class TestSourceSpecificMinObs:
             "ADP",
             source_dir,
             "nsa",
-            "first_release",
+            "revised",
             asof_month=obs_month,
         )
 

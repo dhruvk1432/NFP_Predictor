@@ -602,7 +602,7 @@ class TestBorutaTournament:
         heat_n_runs = []
         original_boruta = _boruta_core
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             heat_n_runs.append(n_runs)
             # Return a few fake survivors to keep tournament going
             return list(X.columns[:3])
@@ -629,7 +629,7 @@ class TestBorutaTournament:
 
         call_count = [0]
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             call_count[0] += 1
             return list(X.columns[:2])
 
@@ -653,7 +653,7 @@ class TestBorutaTournament:
 
         call_count = [0]
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             call_count[0] += 1
             return list(X.columns[:3])
 
@@ -677,7 +677,7 @@ class TestBorutaTournament:
 
         calls = []
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             calls.append((X.shape[1], n_runs, max_shadows))
             # Keep tournament moving
             return list(X.columns[:3])
@@ -706,7 +706,7 @@ class TestBorutaTournament:
 
         seen_runs = []
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             seen_runs.append(n_runs)
             return list(X.columns[:3])
 
@@ -729,7 +729,7 @@ class TestBorutaTournament:
 
         seen_caps = []
 
-        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None):
+        def mock_boruta(X, y, n_runs=100, alpha=0.05, max_shadows=None, sample_weight=None):
             seen_caps.append(max_shadows)
             return list(X.columns[:3])
 

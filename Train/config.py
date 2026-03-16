@@ -8,28 +8,24 @@ target configurations, and file paths used during the data loading and training 
 TARGET TYPES:
     - target_type: 'nsa' (non-seasonally adjusted) or 'sa' (seasonally adjusted)
     - release_type: 'first' (initial release)
-    - target_source: 'first_release' or 'revised'
+    - target_source: 'revised' (once-revised MoM from M+1 FRED snapshot)
 
-This creates 4 model variants:
-    - nsa_first: NSA target trained on first-release features
+This creates 2 model variants:
     - nsa_first_revised: NSA target trained on revised features
-    - sa_first: SA target trained on first-release features
     - sa_first_revised: SA target trained on revised features
 
-The first-release models are the operationally deployable variants (real-time actionable).
-The revised models serve as an upper-bound benchmark for predictability using hindsight-
-corrected data, useful for diagnosing whether model error comes from data noise vs.
-structural model weakness.
+The revised models predict the once-revised MoM change, available ~1 month after the
+initial NFP release (i.e., after the M+1 NFP release).
 """
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import json
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE
+from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE, RESELECT_EVERY_N_MONTHS
 
 
 # =============================================================================
@@ -42,26 +38,23 @@ VALID_TARGET_TYPES = ('nsa', 'sa')
 VALID_RELEASE_TYPES = ('first', 'last')
 """Tuple of valid release types. 'first' is the initial release, 'last' is the final revised release."""
 
-VALID_TARGET_SOURCES = ('first_release', 'revised')
-"""Tuple of valid target sources. 'first_release' uses the initially reported number. 'revised' uses the revised number reported in the subsequent month."""
+VALID_TARGET_SOURCES = ('revised',)
+"""Tuple of valid target sources. 'revised' uses the revised number reported in the subsequent month."""
 
 # FRED series names for revised target construction (raw snapshot levels)
 REVISED_TARGET_SERIES = {'nsa': 'total_nsa', 'sa': 'total'}
 """Dictionary mapping target types to their corresponding raw FRED series names used for target construction."""
 
-# Target combinations — all 4 variants trained and operationally deployable.
-# first_release models: predict the initial BLS print (available on NFP release day).
+# Target combinations — revised-only variants.
 # revised models: predict once-revised MoM (available ~1 month after first_release,
 #   i.e., after the M+1 NFP release). MUST check operational_available_date before use.
 #   predict_nfp_mom() enforces this via RuntimeError if called too early.
 ALL_TARGET_CONFIGS = [
-    ('nsa', 'first', 'first_release'),
     ('nsa', 'first', 'revised'),
-    ('sa',  'first', 'first_release'),
     ('sa',  'first', 'revised'),
 ]
-"""All 4 model variants (NSA/SA × first_release/revised). All are operationally deployable;
-revised models require operational_available_date to have passed (enforced at inference)."""
+"""Both model variants (NSA/SA × revised). Revised models require
+operational_available_date to have passed (enforced at inference)."""
 
 
 # =============================================================================
@@ -69,19 +62,19 @@ revised models require operational_available_date to have passed (enforced at in
 # =============================================================================
 
 MASTER_SNAPSHOTS_BASE = DATA_PATH / "master_snapshots"
-"""Base directory for feature-selected master snapshots ({nsa,sa}/{first_release,revised}/decades/)."""
+"""Base directory for feature-selected master snapshots ({nsa,sa}/revised/decades/)."""
 
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
 """Directory containing raw FRED data snapshots (still needed for build_revised_target)."""
 
 
-def get_master_snapshots_dir(target_type: str, target_source: str = 'first_release') -> Path:
+def get_master_snapshots_dir(target_type: str, target_source: str = 'revised') -> Path:
     """
     Get the decades directory for master snapshots of a specific target configuration.
 
     Args:
         target_type: 'nsa' or 'sa'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
 
     Returns:
         Path to the decades directory containing master snapshots.
@@ -125,20 +118,20 @@ def get_target_path(target_type: str, release_type: str = 'first') -> Path:
 
 
 def get_model_id(target_type: str, release_type: str = 'first',
-                 target_source: str = 'first_release') -> str:
+                 target_source: str = 'revised') -> str:
     """
     Get a unique model identifier string for the target configuration.
 
     Args:
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
 
     Returns:
-        Model identifier string (e.g., 'nsa_first', 'nsa_first_revised')
+        Model identifier string (e.g., 'nsa_first_revised')
     """
     base = f"{target_type.lower()}_{release_type.lower()}"
-    return f"{base}_revised" if target_source == 'revised' else base
+    return f"{base}_revised"
 
 
 def parse_model_id(model_id: str) -> Tuple[str, str, str]:
@@ -146,7 +139,7 @@ def parse_model_id(model_id: str) -> Tuple[str, str, str]:
     Parse a model identifier string into target_type, release_type, and target_source.
 
     Args:
-        model_id: Model identifier (e.g., 'nsa_first' or 'nsa_first_revised')
+        model_id: Model identifier (e.g., 'nsa_first_revised')
 
     Returns:
         Tuple of (target_type, release_type, target_source)
@@ -155,25 +148,23 @@ def parse_model_id(model_id: str) -> Tuple[str, str, str]:
         ValueError: If invalid model_id format
     """
     parts = model_id.lower().split('_')
-    if len(parts) == 2:
-        target_type, release_type = parts
-        target_source = 'first_release'
-    elif len(parts) == 3 and parts[2] == 'revised':
+    if len(parts) == 3 and parts[2] == 'revised':
         target_type, release_type = parts[0], parts[1]
+        target_source = 'revised'
+    elif len(parts) == 2:
+        # Legacy compatibility: treat 'nsa_first' as 'nsa_first_revised'
+        target_type, release_type = parts
         target_source = 'revised'
     else:
         raise ValueError(
             f"Invalid model_id format: {model_id}. "
-            f"Expected 'target_release' (e.g., 'nsa_first') or "
-            f"'target_release_revised' (e.g., 'nsa_first_revised')"
+            f"Expected 'target_release_revised' (e.g., 'nsa_first_revised')"
         )
 
     if target_type not in VALID_TARGET_TYPES:
         raise ValueError(f"Invalid target_type in model_id: {target_type}")
     if release_type not in VALID_RELEASE_TYPES:
         raise ValueError(f"Invalid release_type in model_id: {release_type}")
-    if target_source not in VALID_TARGET_SOURCES:
-        raise ValueError(f"Invalid target_source in model_id: {target_source}")
 
     return target_type, release_type, target_source
 
@@ -187,7 +178,7 @@ TARGET_PATH_SA = get_target_path('sa', 'first')
 # SELECTED FEATURES
 # =============================================================================
 
-def load_selected_features(target_type: str, target_source: str = 'first_release') -> List[str]:
+def load_selected_features(target_type: str, target_source: str = 'revised') -> Optional[List[str]]:
     """
     Load pre-selected feature names from the master snapshots feature selection cache.
 
@@ -195,12 +186,17 @@ def load_selected_features(target_type: str, target_source: str = 'first_release
     a JSON cache of surviving features per {target_type, target_source} combination.
     This function reads that cache directly.
 
+    When the cache contains ``"mode": "all_features"``, it means master snapshots
+    store ALL lean features and selection is deferred to backtest-time dynamic
+    reselection.  In that case this function returns ``None``.
+
     Args:
         target_type: 'nsa' or 'sa'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
 
     Returns:
-        List of feature names selected for this target configuration
+        List of feature names, or ``None`` if master snapshots contain all features
+        (selection deferred to dynamic reselection).
     """
     if target_type not in VALID_TARGET_TYPES:
         raise ValueError(f"Invalid target_type: {target_type}. Must be one of {VALID_TARGET_TYPES}")
@@ -215,6 +211,10 @@ def load_selected_features(target_type: str, target_source: str = 'first_release
 
     with open(cache_path, 'r') as f:
         data = json.load(f)
+
+    # All-features mode: selection deferred to backtest-time dynamic reselection
+    if data.get("mode") == "all_features":
+        return None
 
     return data.get("features", [])
 
@@ -314,7 +314,7 @@ FS_STAGES_FAST_BORUTA = (0, 1, 2, 4)
 # UNION-FIRST CANDIDATE POOL + SHORT-PASS SELECTION
 # =============================================================================
 
-USE_UNION_POOL = True               # Master toggle for union pool + short-pass
+USE_UNION_POOL = False              # Disabled: dynamic reselection is sole feature selection path
 UNION_POOL_MAX = 200                # Max features in the global candidate pool
 SHORTPASS_TOPK = 60                 # Features selected per backtest step (40-80 range)
 SHORTPASS_METHOD = 'lgbm_gain'      # 'lgbm_gain' or 'weighted_corr'
@@ -347,6 +347,41 @@ SA_CALENDAR_FEATURES_KEEP = frozenset({
 })
 
 # =============================================================================
+# DYNAMIC FEATURE RE-SELECTION (during OOS backtest)
+# =============================================================================
+
+# How often (in months) to re-run feature selection during the expanding-window
+# backtest.  Set to 0 to disable.  Loaded from .env via settings.py.
+# RESELECT_EVERY_N_MONTHS is imported from settings at the top of this file.
+
+# Pass 1: per-source selection stages (skip vintage stability — already in a
+# time-aware backtest context).
+DYNAMIC_FS_STAGES_PASS1 = (0, 1, 2, 4, 5, 6)
+
+# Pass 2: global cross-source reduction stages.
+DYNAMIC_FS_STAGES_PASS2 = (0, 1, 2, 4)
+
+# Hard cap on total features after the global pass-2 reduction (exogenous +
+# target-derived + calendar + revision all counted together).
+DYNAMIC_FS_PASS2_MAX_FEATURES = 50
+
+# Boruta iterations for dynamic re-selection (lower than offline for speed).
+DYNAMIC_FS_BORUTA_RUNS = 50
+
+# NaN evaluation window: features are judged on their NaN rate from this date
+# onward.  Earlier NaN (from pre-2010 data gaps) is tolerated.
+DYNAMIC_FS_NAN_EVAL_START = '2010-01-01'
+
+# Maximum acceptable NaN rate in the post-2010 evaluation window.
+DYNAMIC_FS_NAN_MAX_RATE = 0.20
+
+# Recency-weighted reselection (adaptive feature selection during backtest)
+RESELECTION_HALF_LIFE_MONTHS = 36         # More aggressive decay than training (60) for feature scoring
+RESELECTION_START_DATE = '2000-01-01'     # Start adaptive reselection from this date (sufficient data)
+RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluster + Interaction
+RESELECTION_STAGES_PASS2 = (0, 2, 4)     # Global: Pre-funnel + Boruta + Cluster
+
+# =============================================================================
 # BASELINE KEEP-RULE
 # =============================================================================
 
@@ -365,7 +400,6 @@ KEEP_RULE_ACTION = 'skip_save'      # 'fail' | 'fallback_to_baseline' | 'skip_sa
 # Target configs where variance capture is a hard requirement.
 # Each tuple is (target_type, target_source).
 VARIANCE_PRIORITY_TARGETS = (
-    ('sa', 'first_release'),
     ('sa', 'revised'),
 )
 
@@ -390,17 +424,24 @@ TUNING_LAMBDA_TAIL_MAE = 0.20
 TUNING_LAMBDA_CORR_DIFF = 20.0
 TUNING_LAMBDA_DIFF_SIGN = 12.0
 
+# Acceleration and directional accuracy penalties (inner CV composite objective)
+TUNING_LAMBDA_ACCEL = 15.0          # Penalize poor acceleration accuracy
+TUNING_LAMBDA_DIR = 10.0            # Penalize poor directional accuracy
+
+# Kalman fusion composite objective (post-training consensus anchor)
+KALMAN_LAMBDA_ACCEL = 50.0          # Aggressive: prioritize acceleration
+KALMAN_LAMBDA_DIR = 30.0            # Aggressive: prioritize direction
+
 # Targets exempt from the enhancement stack but still using composite tuning.
 # SA revised is a low-variance target; the enhancement stages (dynamics,
 # acceleration, etc.) introduce noise and hurt MAE without meaningful
 # variance-capture benefit.  Composite tuning + feature selection are retained.
-ENHANCEMENT_EXEMPT_TARGETS = (
-    ('sa', 'revised'),
-)
+ENHANCEMENT_EXEMPT_TARGETS = ()     # SA uses amplitude-only; NSA uses full stack
 
 # Sequential variance-enhancement stack (applied in this order)
 ENABLE_VARIANCE_ENHANCEMENTS = True
 ENHANCEMENT_SEQUENCE = ('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')
+SA_ENHANCEMENT_SEQUENCE = ('amplitude',)  # SA: amplitude calibration only (RMSE improvement)
 ENHANCEMENT_MIN_IMPROVEMENT = 0.25  # Minimum composite-score improvement on validation
 
 # Stage A: amplitude calibration  y = a + b*y_hat

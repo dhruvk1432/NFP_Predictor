@@ -2771,7 +2771,7 @@ def _process_one_snapshot(args):
 
         # Process and save NSA
         if not nsa_df.empty:
-            wide_nsa = compute_features_wide(nsa_df, apply_mom=apply_mom)
+            wide_nsa = compute_features_wide(nsa_df, apply_mom=apply_mom, lean=True)
             if not wide_nsa.empty:
                 nsa_dir = Path(str(prepared_dir).replace(
                     'fred_data_prepared', 'fred_data_prepared_nsa'))
@@ -2782,7 +2782,7 @@ def _process_one_snapshot(args):
 
         # Process and save SA
         if not sa_df.empty:
-            wide_sa = compute_features_wide(sa_df, apply_mom=apply_mom)
+            wide_sa = compute_features_wide(sa_df, apply_mom=apply_mom, lean=True)
             if not wide_sa.empty:
                 sa_dir = Path(str(prepared_dir).replace(
                     'fred_data_prepared', 'fred_data_prepared_sa'))

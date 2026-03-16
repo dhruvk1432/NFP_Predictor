@@ -64,7 +64,7 @@ def _format_result(raw_result: Dict, target_source: str) -> Dict:
 def generate_prediction(
     target_type: str = "nsa",
     release_type: str = "first",
-    target_source: str = "first_release",
+    target_source: str = "revised",
     target_month: Optional[str] = None,
     output_path: Optional[str] = None,
 ) -> Dict:
@@ -129,11 +129,6 @@ def main() -> int:
         help="Release type (default: first)",
     )
     parser.add_argument(
-        "--revised",
-        action="store_true",
-        help="Use revised target-source model variant",
-    )
-    parser.add_argument(
         "--month",
         type=str,
         default=None,
@@ -147,13 +142,12 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-    target_source = "revised" if args.revised else "first_release"
 
     try:
         generate_prediction(
             target_type=args.target,
             release_type=args.release,
-            target_source=target_source,
+            target_source="revised",
             target_month=args.month,
             output_path=args.output,
         )

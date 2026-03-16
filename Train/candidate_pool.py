@@ -29,7 +29,7 @@ logger = setup_logger(__file__, TEMP_DIR)
 # Regex for source cache filenames produced by create_master_snapshots.py
 # Pattern: source_{SOURCE_NAME}_{CAT}_{SRC_TYPE}[_asof_{YYYY-MM}].json
 _SOURCE_CACHE_RE = re.compile(
-    r'^source_(.+?)_(nsa|sa)_(first_release|revised)(?:_asof_\d{4}-\d{2})?\.json$'
+    r'^source_(.+?)_(nsa|sa)_(revised)(?:_asof_\d{4}-\d{2})?\.json$'
 )
 
 
@@ -99,7 +99,7 @@ def _read_features_from_json(path: Path) -> List[str]:
 
 def load_all_cached_features(
     target_type: str,
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
 ) -> Dict[str, List[str]]:
     """Load features from all cache JSONs for a target config.
 
@@ -144,7 +144,7 @@ def load_all_cached_features(
 
 def build_union_pool(
     target_type: str,
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     max_candidates: int = UNION_POOL_MAX,
 ) -> List[str]:
     """Build the global union candidate pool with source-balanced ranking.
@@ -250,7 +250,7 @@ def _get_pool_cache_path(target_type: str, target_source: str) -> Path:
 
 def load_or_build_union_pool(
     target_type: str,
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     max_candidates: int = UNION_POOL_MAX,
 ) -> List[str]:
     """Load a cached candidate pool if valid, otherwise rebuild.

@@ -385,7 +385,7 @@ def generate_single_branch_output(
     metadata: Dict,
     X_full: pd.DataFrame,
     target_type: str,
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     output_base: Optional[Path] = None,
     archive: bool = False,
 ) -> Path:
@@ -399,7 +399,7 @@ def generate_single_branch_output(
     if output_base is None:
         output_base = OUTPUT_DIR
 
-    suffix = '_revised' if target_source == 'revised' else ''
+    suffix = ''  # No suffix needed — only revised models exist
     target_norm = str(target_type).strip().lower()
     if target_norm not in {'nsa', 'sa'}:
         raise ValueError(f"target_type must be 'nsa' or 'sa', got: {target_type}")

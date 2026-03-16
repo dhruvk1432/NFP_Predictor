@@ -276,10 +276,9 @@ def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE)
         # Reorder columns
         snapshot_df = snapshot_df[['date', 'series_name', 'value', 'snapshot_date', 'release_date']]
 
-        # Apply feature transforms (symlog -> pct_change -> all derived features)
-        snapshot_df = add_symlog_copies(snapshot_df)
+        # Lean mode: skip symlog (trees are monotone-invariant), reduced features.
         snapshot_df = add_pct_change_copies(snapshot_df)
-        snapshot_df = compute_all_features(snapshot_df)
+        snapshot_df = compute_all_features(snapshot_df, lean=True)
 
         # Determine file path
         year = event_date.year

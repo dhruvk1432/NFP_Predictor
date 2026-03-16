@@ -479,10 +479,10 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             problematic_features = {s for s in full_snap['series_name'].unique()
                                     if any(p in s for p in ZERO_CENTERED_SERIES)}
 
-            # Branch-and-Expand: create 3 base variants, then compute all features
-            full_snap = add_symlog_copies(full_snap)
+            # Lean mode: skip symlog (trees are monotone-invariant), drop 12m
+            # diff z-scores and level z-scores.
             full_snap = add_pct_change_copies(full_snap, skip_series=problematic_features)
-            full_snap = compute_all_features(full_snap)
+            full_snap = compute_all_features(full_snap, lean=True)
 
             full_snap.to_parquet(save_path)
             snapshots_written += 1

@@ -72,8 +72,8 @@ def load_backtest_inputs() -> pd.DataFrame:
 
     Returns DataFrame with columns: [ds, nsa_predicted, sa_actual]
     """
-    nsa_path = OUTPUT_DIR / "NSA_prediction_revised" / "backtest_results.csv"
-    sa_path = OUTPUT_DIR / "SA_prediction_revised" / "backtest_results.csv"
+    nsa_path = OUTPUT_DIR / "NSA_prediction" / "backtest_results.csv"
+    sa_path = OUTPUT_DIR / "SA_prediction" / "backtest_results.csv"
 
     nsa = pd.read_csv(nsa_path, parse_dates=["ds"])[["ds", "predicted"]].rename(
         columns={"predicted": "nsa_predicted"}

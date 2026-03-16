@@ -135,9 +135,14 @@ def composite_objective_score(
     diff_sign_accuracy: float = 0.0,
     lambda_corr_diff: float = 0.0,
     lambda_diff_sign: float = 0.0,
+    accel_accuracy: float = 0.0,
+    lambda_accel: float = 0.0,
+    dir_accuracy: float = 0.0,
+    lambda_dir: float = 0.0,
 ) -> float:
     """
-    Composite score minimizing MAE while penalizing variance collapse.
+    Composite score minimizing MAE while penalizing variance collapse
+    and rewarding acceleration/directional accuracy.
     """
     return float(
         mae
@@ -146,4 +151,6 @@ def composite_objective_score(
         + lambda_tail_mae * tail_mae
         + lambda_corr_diff * (1.0 - max(min(corr_diff, 1.0), -1.0))
         + lambda_diff_sign * (1.0 - max(min(diff_sign_accuracy, 1.0), 0.0))
+        + lambda_accel * (1.0 - max(min(accel_accuracy, 1.0), 0.0))
+        + lambda_dir * (1.0 - max(min(dir_accuracy, 1.0), 0.0))
     )

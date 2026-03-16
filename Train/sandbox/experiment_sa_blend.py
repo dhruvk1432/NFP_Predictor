@@ -78,11 +78,11 @@ def _score(actual: np.ndarray, pred: np.ndarray, objective_mode: str) -> float:
 
 
 def _load_inputs(adj_source: str = "perfect") -> pd.DataFrame:
-    sa_path = OUTPUT_DIR / "SA_prediction_revised" / "backtest_results.csv"
+    sa_path = OUTPUT_DIR / "SA_prediction" / "backtest_results.csv"
     if adj_source == "predicted":
         adj_path = OUTPUT_DIR / "sandbox" / "nsa_predicted_adjustment_revised" / "backtest_results.csv"
     else:
-        adj_path = OUTPUT_DIR / "NSA_plus_adjustment_revised" / "backtest_results.csv"
+        adj_path = OUTPUT_DIR / "NSA_plus_adjustment" / "backtest_results.csv"
     if not sa_path.exists() or not adj_path.exists():
         raise FileNotFoundError(
             "Missing input files. Expected:\n"

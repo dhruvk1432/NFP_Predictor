@@ -99,10 +99,6 @@ def compute_revision_features(
         result[f'{prefix}_max_abs'] = np.nan
         result[f'{prefix}_std'] = np.nan
 
-    # New and dropped series counts
-    result[f'{prefix}_n_new'] = int(len(current_cols - prev_cols))
-    result[f'{prefix}_n_dropped'] = int(len(prev_cols - current_cols))
-
     # Per-series revision diffs (e.g., for FRED employment series)
     if per_series and revisions:
         target_cols = set(per_series_cols) if per_series_cols else set(revisions.keys())
@@ -117,7 +113,7 @@ def get_revision_features_for_month(
     target_month: pd.Timestamp,
     prev_cutoff: Optional[pd.Timestamp] = None,
     target_type: str = 'nsa',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
 ) -> pd.DataFrame:
     """
     Load two consecutive master snapshots and compute revision statistics.
@@ -139,7 +135,7 @@ def get_revision_features_for_month(
         prev_cutoff: Cutoff date for the previous month's data window.
             Typically the M-1 NFP release date. Defaults to prev_month.
         target_type: 'nsa' or 'sa' - determines which master snapshot variant to load.
-        target_source: 'first_release' or 'revised' - determines which master snapshot variant.
+        target_source: 'revised' - determines which master snapshot variant.
 
     Returns:
         pd.DataFrame: A single-row DataFrame containing 8 aggregate revision features.

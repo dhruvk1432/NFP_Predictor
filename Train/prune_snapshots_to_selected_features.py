@@ -30,17 +30,9 @@ import pyarrow.parquet as pq
 
 
 BRANCH_CONFIG = {
-    "nsa_first_release": {
-        "features_json": "selected_features_nsa_first_release.json",
-        "snapshots_dir": "nsa/first_release/decades",
-    },
     "nsa_revised": {
         "features_json": "selected_features_nsa_revised.json",
         "snapshots_dir": "nsa/revised/decades",
-    },
-    "sa_first_release": {
-        "features_json": "selected_features_sa_first_release.json",
-        "snapshots_dir": "sa/first_release/decades",
     },
     "sa_revised": {
         "features_json": "selected_features_sa_revised.json",

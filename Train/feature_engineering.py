@@ -133,16 +133,6 @@ def add_calendar_features(df: pd.DataFrame, target_month: pd.Timestamp) -> pd.Da
     # Year (for capturing secular trends if needed)
     df['year'] = target_month.year
 
-    # --- Additional seasonal indicators ---
-    # Summer slowdown period
-    df['is_summer'] = int(month in [6, 7, 8])
-
-    # Holiday season (Nov-Dec hiring surge)
-    df['is_holiday_season'] = int(month in [11, 12])
-
-    # Beginning/end of year effects
-    df['is_december'] = int(month == 12)
-
     return df
 
 
@@ -177,8 +167,4 @@ def get_calendar_features_dict(target_month: pd.Timestamp) -> Dict[str, float]:
     features['is_jan'] = int(month == 1)
     features['is_july'] = int(month == 7)
     features['year'] = target_month.year
-    features['is_summer'] = int(month in [6, 7, 8])
-    features['is_holiday_season'] = int(month in [11, 12])
-    features['is_december'] = int(month == 12)
-
     return features

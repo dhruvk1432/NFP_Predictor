@@ -10,8 +10,7 @@ It handles:
 5. Model persistence (saving and loading models alongside their feature states).
 
 MULTI-TARGET SUPPORT:
-Model save/load functions support 4 architectural target configurations depending on the 
-chosen macro pipeline: nsa_first, nsa_last, sa_first, sa_last.
+Model save/load functions support 2 target configurations: nsa_first_revised, sa_first_revised.
 """
 
 import pandas as pd
@@ -448,7 +447,7 @@ def save_model(
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
@@ -462,7 +461,7 @@ def save_model(
         save_dir: Base directory for model storage
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
         extra_metadata: Optional additional metadata fields
     """
     model_id = get_model_id(target_type, release_type, target_source)
@@ -497,7 +496,7 @@ def load_model(
     save_dir: Path = MODEL_SAVE_DIR,
     target_type: str = 'nsa',
     release_type: str = 'first',
-    target_source: str = 'first_release',
+    target_source: str = 'revised',
 ) -> Tuple[lgb.Booster, Dict]:
     """
     Load model and associated metadata.
@@ -506,7 +505,7 @@ def load_model(
         save_dir: Base directory for model storage
         target_type: 'nsa' or 'sa'
         release_type: 'first' or 'last'
-        target_source: 'first_release' or 'revised'
+        target_source: 'revised'
 
     Returns:
         Tuple of (model, metadata)
@@ -517,25 +516,8 @@ def load_model(
     model_path = model_dir / f"lightgbm_{model_id}_model.txt"
     metadata_path = model_dir / f"lightgbm_{model_id}_metadata.pkl"
 
-    # Fallback to legacy paths for backward compatibility.
-    # Legacy models have no target_source dimension and therefore map only
-    # to first_release behavior.
     if not model_path.exists():
-        if target_source != 'first_release':
-            raise FileNotFoundError(
-                f"Model not found for {model_id}: {model_path}. "
-                "Train and save the revised model variant explicitly."
-            )
-        # Try legacy path format
-        legacy_model_path = save_dir / f"lightgbm_{target_type}_model.txt"
-        legacy_metadata_path = save_dir / f"lightgbm_{target_type}_metadata.pkl"
-
-        if legacy_model_path.exists():
-            logger.warning(f"Using legacy model path: {legacy_model_path}")
-            model_path = legacy_model_path
-            metadata_path = legacy_metadata_path
-        else:
-            raise FileNotFoundError(f"Model not found: {model_path}")
+        raise FileNotFoundError(f"Model not found: {model_path}")
 
     model = lgb.Booster(model_file=str(model_path))
 

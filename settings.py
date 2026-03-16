@@ -70,6 +70,7 @@ UNIFIER_USER   = _require_env("UNIFIER_USER")
 UNIFIER_TOKEN  = _require_env("UNIFIER_TOKEN")
 MODEL_TYPE = _get_env("MODEL_TYPE")
 TARGET_TYPE = _get_env("TARGET_TYPE")
+RESELECT_EVERY_N_MONTHS = _to_int(_get_env("RESELECT_EVERY_N_MONTHS", "6"))
 
 CACHE_DATA_DIR = DATA_PATH / "cache"
 BACKTEST_DIR   = OUTPUT_DIR / "backtest"

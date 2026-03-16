@@ -151,12 +151,12 @@ def _prepare_lgb_frame(
     return X.set_axis(list(safe_cols), axis=1, copy=False), raw_cols, safe_cols
 
 
-def _safe_lgb_fit(model, X, y):
+def _safe_lgb_fit(model, X, y, sample_weight=None):
     """Safely fit LightGBM with cached column sanitization and no data copy."""
     if X.empty:
         return model
     X_safe, raw_cols, safe_cols = _prepare_lgb_frame(X)
-    model.fit(X_safe, y)
+    model.fit(X_safe, y, sample_weight=sample_weight)
     model._safe_lgb_raw_cols = raw_cols
     model._safe_lgb_safe_cols = safe_cols
     return model
@@ -1140,7 +1140,8 @@ def _adaptive_boruta_runs(
     }
 
 
-def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
+def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None,
+                 sample_weight=None):
     """
     Core Boruta logic: shadow feature comparison with early stopping.
 
@@ -1153,6 +1154,11 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
 
     Shadow array is pre-allocated and reused across runs to avoid
     repeated DataFrame construction overhead.
+
+    Args:
+        sample_weight: Optional recency weights aligned to X_curr rows.
+            When provided, LightGBM fits are weighted so that recent
+            observations have more influence on feature importance.
     """
     n_features = X_curr.shape[1]
     n_rows = len(X_curr)
@@ -1243,7 +1249,8 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
                                               columns=combined_cols)
 
                     model = lgb.LGBMRegressor(**LGB_PARAMS)
-                    _safe_lgb_fit(model, X_combined, y_curr)
+                    _safe_lgb_fit(model, X_combined, y_curr,
+                                 sample_weight=sample_weight)
 
                     importances = pd.Series(
                         model.feature_importances_, index=X_combined.columns
@@ -1313,7 +1320,8 @@ def _boruta_core(X_curr, y_curr, n_runs=100, alpha=0.05, max_shadows=None):
 
 
 def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
-                          tournament_chunk=100, tournament_threshold=150):
+                          tournament_chunk=100, tournament_threshold=150,
+                          sample_weight=None):
     """
     Tournament Boruta: two-round elimination for large feature sets.
 
@@ -1321,10 +1329,25 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
     Round 2 (Final): Pool survivors. Run rigorous Boruta on combined pool.
 
     For small feature sets (<= tournament_threshold), runs standard Boruta.
+
+    Args:
+        sample_weight: Optional recency weights indexed like X.
+            Aligned to the common index automatically.
     """
     common = X.index.intersection(y.index)
     X_curr = X.loc[common]
     y_curr = y.loc[common]
+    # Align sample weights to common index
+    sw_aligned = None
+    if sample_weight is not None:
+        if isinstance(sample_weight, (pd.Series,)):
+            sw_aligned = sample_weight.reindex(common).values
+        elif isinstance(sample_weight, np.ndarray) and len(sample_weight) == len(X):
+            # Positional: reindex via X's iloc mapping
+            idx_map = [X.index.get_loc(c) for c in common]
+            sw_aligned = sample_weight[idx_map]
+        else:
+            sw_aligned = sample_weight
     n_features = X_curr.shape[1]
 
     with perf_phase("fs.boruta.get_importance", n_features=n_features):
@@ -1348,6 +1371,7 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
                     n_runs=n_runs,
                     alpha=alpha,
                     max_shadows=shadow_cap,
+                    sample_weight=sw_aligned,
                 )
 
         # ==========================================
@@ -1384,6 +1408,7 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
                     n_runs=heat_runs,
                     alpha=heat_alpha,
                     max_shadows=chunk_shadow_cap,
+                    sample_weight=sw_aligned,
                 )
             heat_survivors.extend(survivors)
             logger.info(f"   Heat {ci}: {len(survivors)} survived")
@@ -1411,6 +1436,7 @@ def get_boruta_importance(X, y, n_runs=None, block_size=6, alpha=0.05,
                 n_runs=final_runs,
                 alpha=alpha,
                 max_shadows=final_shadow_cap,
+                sample_weight=sw_aligned,
             )
         logger.info(f"   Final survivors: {len(final)}")
         return final
@@ -1585,7 +1611,8 @@ def get_vintage_stability(feature_list, target_series, snapshots_dir,
 
 def cluster_redundancy(X, feature_list, target_series,
                        max_clusters=50, min_overlap=30,
-                       min_corr_to_cluster=0.85):
+                       min_corr_to_cluster=0.85,
+                       sample_weight=None):
     """
     Hierarchical clustering to remove redundant features.
     NaN-aware pairwise Spearman correlations.
@@ -1617,6 +1644,17 @@ def cluster_redundancy(X, feature_list, target_series,
         valid_target = y_curr.notna()
         X_curr = X_curr.loc[valid_target]
         y_curr = y_curr.loc[valid_target]
+
+        # Align sample weights to filtered rows
+        sw_aligned = None
+        if sample_weight is not None:
+            if isinstance(sample_weight, pd.Series):
+                sw_aligned = sample_weight.reindex(X_curr.index).values
+            elif isinstance(sample_weight, np.ndarray) and len(sample_weight) == len(X):
+                common_idx = [X.index.get_loc(c) for c in X_curr.index]
+                sw_aligned = sample_weight[common_idx]
+            else:
+                sw_aligned = sample_weight
 
         with perf_phase("fs.cluster_redundancy.corr_matrix"):
             corr = X_curr.corr(method='spearman')
@@ -1679,7 +1717,7 @@ def cluster_redundancy(X, feature_list, target_series,
         # features with NaN patterns that LightGBM handles natively.
         with perf_phase("fs.cluster_redundancy.representative_model_fit"):
             model = lgb.LGBMRegressor(**LGB_PARAMS)
-            _safe_lgb_fit(model, X_curr, y_curr)
+            _safe_lgb_fit(model, X_curr, y_curr, sample_weight=sw_aligned)
             importance_series = pd.Series(model.feature_importances_, index=feature_list)
 
         selected_redundant = []
@@ -1739,7 +1777,7 @@ def _extract_split_pairs(model, feature_names):
 
 def interaction_rescue(X, y, confirmed_features, rejected_pool,
                        n_splits=8, gap=3, top_k=10, max_phase1_screen=30,
-                       trial_eval_workers=None):
+                       trial_eval_workers=None, sample_weight=None):
     """
     Two-phase interaction rescue:
     Phase 1: Single-feature conditional test
@@ -1752,6 +1790,9 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
     - **dump_model() called once** in _extract_split_pairs (see above).
     - **Cached baseline MAE**: the baseline_with_singles MAE in Phase 2 is
       computed once outside the loop instead of redundantly per iteration.
+
+    Args:
+        sample_weight: Optional recency weights indexed like X.
     """
     with perf_phase(
         "fs.interaction_rescue.total",
@@ -1763,6 +1804,17 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
         common = X.index.intersection(y.index)
         X_curr = X.loc[common]
         y_curr = y.loc[common]
+
+        # Align sample weights to common index
+        sw_aligned = None
+        if sample_weight is not None:
+            if isinstance(sample_weight, pd.Series):
+                sw_aligned = sample_weight.reindex(common).values
+            elif isinstance(sample_weight, np.ndarray) and len(sample_weight) == len(X):
+                idx_map = [X.index.get_loc(c) for c in common]
+                sw_aligned = sample_weight[idx_map]
+            else:
+                sw_aligned = sample_weight
 
         if trial_eval_workers is None:
             trial_eval_workers = min(TRIAL_EVAL_MAX_WORKERS_DEFAULT, os.cpu_count() or 1)
@@ -1784,8 +1836,10 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
                 X_sub = X_curr[feature_set]
                 maes = []
                 for train_idx, test_idx in fold_indices:
+                    sw_fold = sw_aligned[train_idx] if sw_aligned is not None else None
                     model = lgb.LGBMRegressor(**LGB_PARAMS)
-                    _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
+                    _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx],
+                                 sample_weight=sw_fold)
                     preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
                     maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
                 return np.mean(maes)
@@ -1817,7 +1871,8 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
                     all_phase1_feats = confirmed_features + rejected
                     all_phase1_feats = list(dict.fromkeys(all_phase1_feats))
                     screen_model = lgb.LGBMRegressor(**LGB_PARAMS)
-                    _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr)
+                    _safe_lgb_fit(screen_model, X_curr[all_phase1_feats], y_curr,
+                                 sample_weight=sw_aligned)
                     screen_imp = pd.Series(
                         screen_model.feature_importances_, index=all_phase1_feats
                     )
@@ -1862,7 +1917,8 @@ def interaction_rescue(X, y, confirmed_features, rejected_pool,
             model_full = lgb.LGBMRegressor(
                 **{**LGB_PARAMS, 'n_estimators': 200, 'num_leaves': 63, 'max_depth': 6}
             )
-            _safe_lgb_fit(model_full, X_curr[all_feats], y_curr)
+            _safe_lgb_fit(model_full, X_curr[all_feats], y_curr,
+                         sample_weight=sw_aligned)
 
         with perf_phase("fs.interaction_rescue.phase2.extract_pairs"):
             pair_counts = _extract_split_pairs(model_full, all_feats)
@@ -2240,7 +2296,7 @@ def should_keep_change(
 
 @profiled("feature_selection_engine.run_pipeline")
 def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
-                 stages=None):
+                 stages=None, sample_weight=None):
     """Execute feature selection stages for a single target on one source.
 
     Args:
@@ -2248,6 +2304,9 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
             ``None`` (default) runs all stages for backward compatibility.
             Tier 1 minimal set: ``(0, 1, 4)``.
             Skipped stages pass their input through to the next active stage.
+        sample_weight: Optional recency weights indexed like snap_wide.
+            Threaded to Boruta, cluster redundancy, and interaction rescue
+            to bias feature importance toward recent observations.
     """
     active = set(stages) if stages is not None else {0, 1, 2, 3, 4, 5, 6}
 
@@ -2374,7 +2433,8 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
                 logger.info("2. Boruta Feature Selection (shadow features)...")
 
                 stage2_candidates = get_boruta_importance(
-                    X_stage2, y_target
+                    X_stage2, y_target,
+                    sample_weight=sample_weight,
                 )
                 logger.info(f"   > Stage 2 Survivors: {len(stage2_candidates)} features "
                             f"({time.time() - t0:.1f}s)")
@@ -2430,7 +2490,8 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
                 t0 = time.time()
                 logger.info("4. Cluster Redundancy Check (NaN-aware Spearman)...")
                 stage4_candidates = cluster_redundancy(
-                    X_stage2, candidates, y_target
+                    X_stage2, candidates, y_target,
+                    sample_weight=sample_weight,
                 )
                 logger.info(f"   > Stage 4 Survivors: {len(stage4_candidates)} features "
                             f"({time.time() - t0:.1f}s)")
@@ -2450,7 +2511,8 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
                     X_stage2, y_target,
                     confirmed_features=candidates,
                     rejected_pool=stage1_candidates,
-                    top_k=10
+                    top_k=10,
+                    sample_weight=sample_weight,
                 )
                 stage5_candidates = candidates + rescued
                 seen = set()
@@ -2495,12 +2557,14 @@ def run_pipeline(snap_wide, y_target, source_name, snapshots_dir, series_groups,
 @profiled("feature_selection_engine.run_full_source_pipeline")
 def run_full_source_pipeline(snap_wide, target_mom,
                              source_name, snapshots_dir, series_groups,
-                             stages=None):
+                             stages=None, sample_weight=None):
     """
     Run the feature selection pipeline on a single source for the MoM target.
 
     Args:
         stages: Tuple/list of stage numbers (0-6) to execute, or None for all.
+        sample_weight: Optional recency weights indexed like snap_wide.
+            Passed through to run_pipeline for recency-biased feature scoring.
     Returns the selected features.
     """
     y_clean = target_mom.dropna()
@@ -2515,7 +2579,7 @@ def run_full_source_pipeline(snap_wide, target_mom,
 
     final_feats = run_pipeline(
         snap_wide, y_clean, source_name, snapshots_dir, series_groups,
-        stages=stages,
+        stages=stages, sample_weight=sample_weight,
     )
 
     logger.info(f"\n  [{source_name}] Selected: {len(final_feats)} features (MoM only)")

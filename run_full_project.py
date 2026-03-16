@@ -45,7 +45,7 @@ PIPELINE STAGES:
 ----------------
 1. LOAD DATA: Fetch raw data from external sources (FRED, ADP, NOAA, etc.)
 2. PREPARE DATA: Run feature selection engine and build master snapshots (quad-track)
-3. TRAIN: Train all 4 NFP model variants (NSA/SA × first_release/revised),
+3. TRAIN: Train both NFP model variants (NSA/SA × revised),
           generate backtests, scorecards, and comparison output
 
 Author: NFP Predictor Team
@@ -143,7 +143,7 @@ PREPARE_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
     (
         "master_snapshots",
         "Data_ETA_Pipeline/create_master_snapshots.py",
-        "Run feature selection engine and build master snapshots (quad-track: {nsa,sa} × {first_release,revised})",
+        "Run feature selection engine and build master snapshots (dual-track: {nsa,sa} × revised)",
         [],
     ),
 ]
@@ -152,7 +152,7 @@ PREPARE_DATA_STEPS: List[Tuple[str, str, str, List[str]]] = [
 def _build_train_steps(no_tune: bool = False) -> List[Tuple[str, str, str, List[str]]]:
     """Build training step definitions, optionally disabling Optuna tuning.
 
-    Trains all 4 model variants (NSA/SA × first_release/revised) and generates
+    Trains both model variants (NSA/SA × revised) and generates
     a comparative scorecard via --train-all.
     """
     train_args = ["--train-all"]
@@ -162,7 +162,7 @@ def _build_train_steps(no_tune: bool = False) -> List[Tuple[str, str, str, List[
         (
             "train_all_models",
             "Train/train_lightgbm_nfp.py",
-            "Train all 4 model variants (NSA/SA × first_release/revised), backtest, and generate comparison",
+            "Train both model variants (NSA/SA × revised), backtest, and generate comparison",
             train_args,
         ),
     ]
@@ -378,6 +378,8 @@ def _print_summary(
     print(f"  Predictions: {OUTPUT_DIR}/Predictions/")
     print(f"  NSA diag:    {OUTPUT_DIR}/NSA_prediction/")
     print(f"  SA diag:     {OUTPUT_DIR}/SA_prediction/")
+    print(f"  SA blend:    {OUTPUT_DIR}/sandbox/sa_blend_walkforward/")
+    print(f"  Consensus:   {OUTPUT_DIR}/consensus_anchor/")
     print(f"  Scorecard:   {OUTPUT_DIR}/models/lightgbm_nfp/")
     print(f"  Master Data: {DATA_PATH}/master_snapshots/")
     print(f"  Targets:     {DATA_PATH}/NFP_target/")

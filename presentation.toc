@@ -1,0 +1,13 @@
+\beamer@sectionintoc {1}{The Problem}{3}{0}{1}
+\beamer@sectionintoc {2}{System Architecture}{5}{0}{2}
+\beamer@sectionintoc {3}{Point-in-Time Correctness}{6}{0}{3}
+\beamer@sectionintoc {4}{Data Sources}{9}{0}{4}
+\beamer@sectionintoc {5}{Feature Selection Engine}{15}{0}{5}
+\beamer@sectionintoc {6}{Training Pipeline}{20}{0}{6}
+\beamer@sectionintoc {7}{Variance Enhancement Stack}{27}{0}{7}
+\beamer@sectionintoc {8}{Metrics \& Evaluation}{30}{0}{8}
+\beamer@sectionintoc {9}{Model Variants \& Output}{33}{0}{9}
+\beamer@sectionintoc {10}{Operations \& Reproducibility}{34}{0}{10}
+\beamer@sectionintoc {11}{Consensus Anchor Fusion}{36}{0}{11}
+\beamer@sectionintoc {12}{Results}{37}{0}{12}
+\beamer@sectionintoc {13}{Summary}{45}{0}{13}

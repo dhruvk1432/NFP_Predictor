@@ -54,6 +54,15 @@ class BlendTuneOptions:
 def _objective(actual: np.ndarray, pred: np.ndarray) -> float:
     mae = float(np.mean(np.abs(actual - pred)))
     kpis = compute_variance_kpis(actual, pred)
+    # Compute acceleration and directional accuracy for composite scoring
+    accel_acc = 0.0
+    if actual.size >= 3:
+        da = np.diff(actual.astype(float))
+        dp = np.diff(pred.astype(float))
+        accel_acc = float(np.mean(np.sign(da) == np.sign(dp)))
+    dir_acc = 0.0
+    if actual.size >= 1:
+        dir_acc = float(np.mean(np.sign(actual.astype(float)) == np.sign(pred.astype(float))))
     return composite_objective_score(
         mae=mae,
         std_ratio=float(kpis["std_ratio"]),
@@ -66,6 +75,10 @@ def _objective(actual: np.ndarray, pred: np.ndarray) -> float:
         lambda_tail_mae=0.20,
         lambda_corr_diff=14.0,
         lambda_diff_sign=10.0,
+        accel_accuracy=accel_acc,
+        lambda_accel=15.0,
+        dir_accuracy=dir_acc,
+        lambda_dir=10.0,
     )
 
 

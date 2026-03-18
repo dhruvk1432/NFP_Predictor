@@ -48,7 +48,6 @@ from Train.config import (
     TUNE_EVERY_N_MONTHS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
-    SA_ENHANCEMENT_SEQUENCE,
 )
 
 from Train.data_loader import (
@@ -416,8 +415,9 @@ def _dynamic_reselection(
         f"half_life={RESELECTION_HALF_LIFE_MONTHS}mo"
     )
 
-    # ── Partition X_train columns by type ──
-    all_cols = [c for c in X_train.columns if c != 'ds']
+    # ── Partition X_train columns by type (numeric only) ──
+    numeric_cols = X_train.select_dtypes(include=['number']).columns
+    all_cols = [c for c in numeric_cols if c != 'ds']
     groups = partition_feature_columns(all_cols, target_type=target_type)
     snapshot_cols = groups['snapshot_features']
     non_snapshot_cols = (
@@ -439,8 +439,9 @@ def _dynamic_reselection(
         name='y_mom',
     ).dropna()
 
-    # ── Build date-indexed feature DataFrame from X_train ──
-    X_dated = X_train.set_index(pd.to_datetime(X_train['ds'])).drop(columns=['ds'])
+    # ── Build date-indexed feature DataFrame from X_train (numeric only) ──
+    X_dated = X_train[list(all_cols)].copy()
+    X_dated.index = pd.to_datetime(X_train['ds'].values)
     X_dated.index.name = 'date'
 
     # ── Compute recency weights for feature selection ──
@@ -946,10 +947,7 @@ def _run_variance_enhancement_sequence(
     if not use_stack:
         return best_pred, best_val, best_stage, stage_report
 
-    # SA uses amplitude-only sequence; NSA uses full stack
-    active_sequence = SA_ENHANCEMENT_SEQUENCE if target_type == 'sa' else ENHANCEMENT_SEQUENCE
-
-    for stage in active_sequence:
+    for stage in ENHANCEMENT_SEQUENCE:
         cand_val = None
         cand_pred = None
 
@@ -1253,8 +1251,6 @@ def run_expanding_window_backtest(
         use_huber_loss: Whether to use Huber loss
         huber_delta: Huber delta parameter
         tune: If True, run Optuna hyperparameter tuning periodically
-        nsa_backtest_results: Optional NSA backtest results DataFrame for
-            injecting NSA acceleration features into SA branch (PIT-safe).
 
     Returns:
         Tuple of (results_df, X_full, y_full) where X_full and y_full are the
@@ -1592,41 +1588,30 @@ def run_expanding_window_backtest(
             continue
 
         # ── Inject NSA acceleration features for SA branch (PIT-safe) ──
-        _nsa_accel_cols: List[str] = []
         if target_type == 'sa' and nsa_backtest_results is not None:
             from Train.nsa_acceleration import (
                 compute_nsa_acceleration_features,
                 build_nsa_features_for_training,
             )
-            # Compute features for prediction month
             nsa_feats_pred = compute_nsa_acceleration_features(
                 nsa_backtest_results, target_month
             )
             _nsa_accel_cols = list(nsa_feats_pred.keys())
 
-            # Compute features for all training months
             training_months = pd.to_datetime(X_train_valid['ds'])
             nsa_train_feats = build_nsa_features_for_training(
                 nsa_backtest_results, training_months
             )
-            # Inject into training data
             for col in _nsa_accel_cols:
                 if col in nsa_train_feats.columns:
-                    X_train_valid[col] = nsa_train_feats[col].reindex(
-                        training_months
-                    ).values
+                    X_train_valid[col] = nsa_train_feats[col].reindex(training_months).values
                 else:
                     X_train_valid[col] = np.nan
-
-            # Inject into prediction row
             for col, val in nsa_feats_pred.items():
                 X_full.at[target_idx, col] = val
 
-            # Add NSA acceleration cols to feature_cols (always included)
             feature_cols = _merge_unique_feature_lists(feature_cols, _nsa_accel_cols)
-            logger.info(
-                f"[Step {i}] Injected {len(_nsa_accel_cols)} NSA acceleration features"
-            )
+            logger.info(f"[Step {i}] Injected {len(_nsa_accel_cols)} NSA acceleration features")
 
         # ── Track short-pass stability (Jaccard similarity) ──
         current_set = set(feature_cols)
@@ -2117,40 +2102,45 @@ def run_expanding_window_backtest(
             _json.dump(stability_data, _f, indent=2)
         logger.info(f"Saved stability report to {stability_path}")
 
-    # ── Post-backtest: overwrite master snapshots with final selection ──
+    # ── Post-backtest: write pruned snapshots to revised_pruned/ ──
+    # The original revised/ snapshots are preserved with full features for future
+    # dynamic reselection. Pruned copies go to revised_pruned/ for fast loading
+    # in production inference (no dynamic reselection needed).
     if _all_features_mode and _dynamic_selection_logs:
         final_log = _dynamic_selection_logs[-1]
         final_features = final_log["features"]
         meta_cols = {"date", "snapshot_date"}
         keep_cols = list(meta_cols) + final_features
 
-        branch_dir = get_master_snapshots_dir(target_type, target_source)
-        if branch_dir.exists():
-            parquet_files = sorted(branch_dir.rglob("*.parquet"))
-            n_overwritten = 0
+        pruned_dir = MASTER_SNAPSHOTS_BASE / target_type / "revised_pruned" / "decades"
+        source_dir = get_master_snapshots_dir(target_type, target_source)
+
+        if source_dir.exists():
+            parquet_files = sorted(source_dir.rglob("*.parquet"))
+            n_written = 0
             for pq_path in parquet_files:
                 try:
                     df = pd.read_parquet(pq_path)
                     available = [c for c in keep_cols if c in df.columns]
                     if len(available) <= len(meta_cols):
-                        logger.warning(
-                            f"Snapshot {pq_path.name}: no selected features found, skipping overwrite"
-                        )
                         continue
-                    df_filtered = df[available]
-                    df_filtered.to_parquet(pq_path, index=False)
-                    n_overwritten += 1
+                    # Write to revised_pruned with same relative path
+                    rel = pq_path.relative_to(source_dir)
+                    out_path = pruned_dir / rel
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    df[available].to_parquet(out_path, index=False)
+                    n_written += 1
                 except Exception as e:
-                    logger.warning(f"Failed to overwrite {pq_path}: {e}")
+                    logger.warning(f"Failed to write pruned snapshot {pq_path.name}: {e}")
 
             logger.info(
-                f"[{model_id}] Post-backtest overwrite: {n_overwritten}/{len(parquet_files)} "
-                f"master snapshots filtered to {len(final_features)} selected features + meta cols"
+                f"[{model_id}] Wrote pruned snapshots: {n_written}/{len(parquet_files)} files "
+                f"to revised_pruned/ ({len(final_features)} selected features + meta cols)"
             )
 
-            # Update the selected_features JSON marker with final selection
+            # Update pruned feature marker
             import json as _json
-            marker_path = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_{target_source}.json"
+            marker_path = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_revised_pruned.json"
             marker_data = {
                 "mode": "selected",
                 "features": final_features,
@@ -2161,13 +2151,12 @@ def run_expanding_window_backtest(
             try:
                 with open(marker_path, 'w') as _f:
                     _json.dump(marker_data, _f, indent=2)
-                logger.info(f"[{model_id}] Updated feature marker: {marker_path}")
             except Exception as e:
-                logger.warning(f"Failed to write feature marker: {e}")
+                logger.warning(f"Failed to write pruned feature marker: {e}")
         else:
             logger.warning(
-                f"[{model_id}] Master snapshot dir does not exist: {branch_dir}. "
-                f"Skipping post-backtest overwrite."
+                f"[{model_id}] Source dir does not exist: {source_dir}. "
+                f"Skipping pruned snapshot generation."
             )
 
     return results_df, X_full, y_full
@@ -2869,7 +2858,8 @@ Examples:
         all_train_results = {}  # Store full results for output generation
         _train_all_t0 = _time.time()
 
-        # Track NSA backtest results to inject acceleration features into SA
+        # Sequential NSA → SA: NSA runs first, its backtest results provide
+        # acceleration features for the SA model via nsa_acceleration.py.
         _nsa_backtest_for_sa: Optional[pd.DataFrame] = None
 
         for combo_idx, (tt, rt, ts) in enumerate(ALL_COMBOS, 1):

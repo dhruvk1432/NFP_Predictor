@@ -168,6 +168,16 @@ def tune_hyperparameters(
         # Dynamic sample weighting half-life
         half_life_months = trial.suggest_float('half_life_months', HALF_LIFE_MIN_MONTHS, HALF_LIFE_MAX_MONTHS)
 
+        # Tail-aware weight boosts (tuned when tail_weighting is enabled)
+        if tail_weighting:
+            _tw_level_boost = trial.suggest_float('tail_weight_level_boost', 1.0, 3.0)
+            _tw_diff_boost = trial.suggest_float('tail_weight_diff_boost', 1.0, 3.0)
+            _tw_max_mult = trial.suggest_float('tail_weight_max_multiplier', 1.5, 4.0)
+        else:
+            _tw_level_boost = tail_weight_level_boost
+            _tw_diff_boost = tail_weight_diff_boost
+            _tw_max_mult = tail_weight_max_multiplier
+
         # Import locally to avoid circular import since model.py imports config.py
         from Train.model import calculate_sample_weights
 
@@ -176,13 +186,13 @@ def tune_hyperparameters(
         for fold_idx, (train_idx, val_idx) in enumerate(inner_cv.split(X)):
             X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
+
             # Recalculate weights for this specific fold using the fold's own target month
             # (which is effectively the maximum date available in the fold to simulate true point-in-time)
-            # or we could use the outer target_month. But using the true available max date prevents 
+            # or we could use the outer target_month. But using the true available max date prevents
             # the weights from overly decaying for early folds.
             fold_target_month = pd.to_datetime(X.iloc[val_idx]['ds'].max())
-            
+
             w_tr = calculate_sample_weights(X_tr, fold_target_month, half_life_months)
             if tail_weighting and len(y_tr) > 0:
                 y_arr = y_tr.values.astype(float)
@@ -190,13 +200,13 @@ def tune_hyperparameters(
 
                 abs_y = np.abs(y_arr)
                 level_thr = float(np.quantile(abs_y, tail_weight_abs_level_quantile))
-                mult[abs_y >= level_thr] *= tail_weight_level_boost
+                mult[abs_y >= level_thr] *= _tw_level_boost
 
                 abs_dy = np.abs(np.diff(y_arr, prepend=y_arr[0]))
                 diff_thr = float(np.quantile(abs_dy, tail_weight_abs_diff_quantile))
-                mult[abs_dy >= diff_thr] *= tail_weight_diff_boost
+                mult[abs_dy >= diff_thr] *= _tw_diff_boost
 
-                mult = np.clip(mult, 1.0, tail_weight_max_multiplier)
+                mult = np.clip(mult, 1.0, _tw_max_mult)
                 w_tr = w_tr * mult
                 if float(np.mean(w_tr)) > 0:
                     w_tr = w_tr / float(np.mean(w_tr))
@@ -297,6 +307,7 @@ def tune_hyperparameters(
             'learning_rate', 'num_leaves', 'max_depth', 'min_data_in_leaf',
             'feature_fraction', 'bagging_fraction', 'bagging_freq',
             'lambda_l1', 'lambda_l2', 'half_life_months', 'huber_delta',
+            'tail_weight_level_boost', 'tail_weight_diff_boost', 'tail_weight_max_multiplier',
         }
         # Map 'alpha' back to 'huber_delta' (LightGBM → Optuna naming)
         seed_params = {}

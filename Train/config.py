@@ -363,7 +363,7 @@ DYNAMIC_FS_STAGES_PASS2 = (0, 1, 2, 4)
 
 # Hard cap on total features after the global pass-2 reduction (exogenous +
 # target-derived + calendar + revision all counted together).
-DYNAMIC_FS_PASS2_MAX_FEATURES = 50
+DYNAMIC_FS_PASS2_MAX_FEATURES = 80
 
 # Boruta iterations for dynamic re-selection (lower than offline for speed).
 DYNAMIC_FS_BORUTA_RUNS = 50
@@ -375,8 +375,11 @@ DYNAMIC_FS_NAN_EVAL_START = '2010-01-01'
 # Maximum acceptable NaN rate in the post-2010 evaluation window.
 DYNAMIC_FS_NAN_MAX_RATE = 0.20
 
-# Recency-weighted reselection (adaptive feature selection during backtest)
-RESELECTION_HALF_LIFE_MONTHS = 36         # More aggressive decay than training (60) for feature scoring
+# Reselection sample weighting — equal weights (no recency bias).
+# Prior half-life=36 caused massive feature churn (Jaccard=0.23) by
+# over-weighting recent months. Equal weights select features with
+# durable long-term predictive power across the full training window.
+RESELECTION_HALF_LIFE_MONTHS = 9999       # Effectively uniform weights (no decay)
 RESELECTION_START_DATE = '2000-01-01'     # Start adaptive reselection from this date (sufficient data)
 RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluster + Interaction
 RESELECTION_STAGES_PASS2 = (0, 2, 4)     # Global: Pre-funnel + Boruta + Cluster
@@ -416,7 +419,7 @@ VARIANCE_GATE_MIN_DIFF_SIGN_ACC = 0.55
 VARIANCE_GATE_MIN_EXTREME_HIT_RATE = 0.25
 
 # Hyperparameter tuning objective
-TUNING_OBJECTIVE_MODE_DEFAULT = 'mae'       # 'mae' or 'composite'
+TUNING_OBJECTIVE_MODE_DEFAULT = 'composite'  # Both NSA and SA use composite to prevent variance collapse
 TUNING_OBJECTIVE_MODE_VARIANCE = 'composite'
 TUNING_LAMBDA_STD_RATIO = 25.0
 TUNING_LAMBDA_DIFF_STD_RATIO = 25.0
@@ -436,12 +439,15 @@ KALMAN_LAMBDA_DIR = 30.0            # Aggressive: prioritize direction
 # SA revised is a low-variance target; the enhancement stages (dynamics,
 # acceleration, etc.) introduce noise and hurt MAE without meaningful
 # variance-capture benefit.  Composite tuning + feature selection are retained.
-ENHANCEMENT_EXEMPT_TARGETS = ()     # SA uses amplitude-only; NSA uses full stack
+ENHANCEMENT_EXEMPT_TARGETS = (
+    ('sa', 'revised'),
+)
+"""SA exempt: amplitude calibration tested but degrades recent months (MAE 225 vs baseline 97).
+NSA keeps full stack to maximize acceleration capture for downstream fusion."""
 
 # Sequential variance-enhancement stack (applied in this order)
 ENABLE_VARIANCE_ENHANCEMENTS = True
 ENHANCEMENT_SEQUENCE = ('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')
-SA_ENHANCEMENT_SEQUENCE = ('amplitude',)  # SA: amplitude calibration only (RMSE improvement)
 ENHANCEMENT_MIN_IMPROVEMENT = 0.25  # Minimum composite-score improvement on validation
 
 # Stage A: amplitude calibration  y = a + b*y_hat

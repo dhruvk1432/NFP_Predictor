@@ -187,8 +187,20 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
     logger.info("Consensus snapshot: %s", snapshot_path)
     consensus_monthly = _load_consensus(snapshot_path)
 
-    champion_path = output_base / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"
+    # Champion: NSA+Adjustment (best acceleration signal for SA target).
+    # NSA+Adj outperforms SA blend as Kalman model channel because its
+    # acceleration dynamics translate better to the SA target.
+    champion_path = output_base / "NSA_plus_adjustment" / "backtest_results.csv"
+    if not champion_path.exists():
+        champion_path = output_base / "NSA_plus_adjustment_revised" / "backtest_results.csv"
+    if not champion_path.exists():
+        # Fallback to SA blend
+        champion_path = output_base / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"
+        logger.warning("NSA+Adj not found for champion; falling back to SA blend")
+
     challenger_path = output_base / "SA_prediction" / "backtest_results.csv"
+    if not challenger_path.exists():
+        challenger_path = output_base / "SA_prediction_revised" / "backtest_results.csv"
 
     champion_df = _load_model_backtest(champion_path, "champion_pred")
     challenger_df = _load_model_backtest(challenger_path, "challenger_pred")
@@ -203,29 +215,32 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
     merged["actual"] = merged["actual_champion_pred"].combine_first(
         merged["actual_challenger_pred"]
     )
+    logger.info("Champion: %s (%d months)", champion_path.parent.name,
+                merged["champion_pred"].notna().sum())
 
-    # Load NSA+adjustment predictions for acceleration channel.
-    # NSA+adjustment has superior SA acceleration accuracy (~65%) compared to
-    # raw NSA or SA direct (~50%), because the predicted seasonal adjustment
-    # preserves NSA's acceleration dynamics while mapping to SA space.
+    # NSA+Adjustment for the Kalman 3rd channel (same as champion if champion is NSA+adj)
     nsa_adj_path = output_base / "NSA_plus_adjustment" / "backtest_results.csv"
-    # Fallback paths: try revised suffix, then raw NSA
     if not nsa_adj_path.exists():
         nsa_adj_path = output_base / "NSA_plus_adjustment_revised" / "backtest_results.csv"
     if nsa_adj_path.exists():
         nsa_df = _load_model_backtest(nsa_adj_path, "nsa_pred")
         merged = merged.merge(nsa_df[["ds", "nsa_pred"]], on="ds", how="outer")
-        logger.info("Loaded NSA+adjustment predictions: %d months (from %s)",
-                    merged["nsa_pred"].notna().sum(), nsa_adj_path.name)
+        logger.info("Loaded NSA+adjustment: %d months", merged["nsa_pred"].notna().sum())
     else:
-        # Last resort: raw NSA predictions
-        nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
-        if not nsa_raw_path.exists():
-            nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
-        if nsa_raw_path.exists():
-            nsa_df = _load_model_backtest(nsa_raw_path, "nsa_pred")
-            merged = merged.merge(nsa_df[["ds", "nsa_pred"]], on="ds", how="outer")
-            logger.warning("NSA+adjustment not found; using raw NSA predictions (%d months)",
+        merged["nsa_pred"] = np.nan
+        logger.warning("NSA+adjustment not found")
+
+    # NSA Raw predictions for AccelOverride direction voting
+    nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
+    if not nsa_raw_path.exists():
+        nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
+    if nsa_raw_path.exists():
+        nsa_raw_df = _load_model_backtest(nsa_raw_path, "nsa_raw_pred")
+        merged = merged.merge(nsa_raw_df[["ds", "nsa_raw_pred"]], on="ds", how="outer")
+        logger.info("Loaded NSA raw: %d months", merged["nsa_raw_pred"].notna().sum())
+    else:
+        merged["nsa_raw_pred"] = np.nan
+        logger.warning("NSA raw not found; AccelOverride will use fewer signals")
                           merged["nsa_pred"].notna().sum())
         else:
             merged["nsa_pred"] = np.nan
@@ -491,8 +506,11 @@ def accel_override(
     # Keep rows where consensus + model exist; actual can be NaN (OOS)
     keep_cols = ["ds", "actual", "consensus_pred", "champion_pred"]
     has_nsa = "nsa_pred" in overlap_df.columns
+    has_nsa_raw = "nsa_raw_pred" in overlap_df.columns
     if has_nsa:
         keep_cols.append("nsa_pred")
+    if has_nsa_raw:
+        keep_cols.append("nsa_raw_pred")
     df = overlap_df[keep_cols].copy()
     df = df.dropna(subset=["consensus_pred", "champion_pred"])
     df = df.sort_values("ds").reset_index(drop=True)
@@ -508,22 +526,19 @@ def accel_override(
             pred = row["consensus_pred"]
         else:
             last_actual = hist_valid["actual"].iloc[-1]
-            model_delta = row["champion_pred"] - last_actual
             cons_delta = row["consensus_pred"] - last_actual
 
-            # Majority vote: consensus, champion, and optionally NSA
-            dir_cons = np.sign(cons_delta)
-            dir_model = np.sign(model_delta)
-
+            # Majority vote using all available signals
+            dir_votes = [np.sign(cons_delta)]
+            if pd.notna(row.get("champion_pred")):
+                dir_votes.append(np.sign(row["champion_pred"] - last_actual))
             if has_nsa and pd.notna(row.get("nsa_pred")):
-                nsa_delta = float(row["nsa_pred"]) - last_actual
-                dir_nsa = np.sign(nsa_delta)
-                # 3-signal majority vote
-                vote_sum = dir_cons + dir_model + dir_nsa
-                chosen_dir = np.sign(vote_sum) if vote_sum != 0 else dir_cons
-            else:
-                # 2-signal: if disagree, model overrides (original behavior)
-                chosen_dir = dir_model if dir_cons != dir_model else dir_cons
+                dir_votes.append(np.sign(float(row["nsa_pred"]) - last_actual))
+            if has_nsa_raw and pd.notna(row.get("nsa_raw_pred")):
+                dir_votes.append(np.sign(float(row["nsa_raw_pred"]) - last_actual))
+
+            vote_sum = sum(dir_votes)
+            chosen_dir = np.sign(vote_sum) if vote_sum != 0 else np.sign(cons_delta)
 
             agree = (chosen_dir == dir_cons)
 
@@ -759,7 +774,61 @@ def run_consensus_anchor_pipeline(
     with open(accel_dir / "tuned_params.json", "w") as f:
         json.dump(accel_params, f, indent=2)
 
-    # 5) Comparison metrics CSV
+    # 5) Kalman + AccelOverride Post-Filter (hybrid)
+    # Uses Kalman's optimal level estimation, then overrides direction via majority vote
+    logger.info("Running Kalman + AccelOverride Post-Filter...")
+    hybrid_rows = []
+    for _, krow in kalman_df.iterrows():
+        pred = krow["predicted"]
+        ds = krow["ds"]
+        actual = krow["actual"]
+        # Find matching row in overlap for signals
+        ov_match = overlap_with_oos[overlap_with_oos["ds"] == ds]
+        hist_valid = overlap_with_oos[
+            (overlap_with_oos["ds"] < ds) & overlap_with_oos["actual"].notna()
+        ]
+        if not ov_match.empty and len(hist_valid) >= 2:
+            last_actual = float(hist_valid.iloc[-1]["actual"])
+            k_delta = pred - last_actual
+            c_delta = float(ov_match.iloc[0]["consensus_pred"]) - last_actual
+            m_delta = float(ov_match.iloc[0]["champion_pred"]) - last_actual
+            signs = [np.sign(c_delta), np.sign(m_delta)]
+            if has_nsa and pd.notna(ov_match.iloc[0].get("nsa_pred")):
+                signs.append(np.sign(float(ov_match.iloc[0]["nsa_pred"]) - last_actual))
+            if "nsa_raw_pred" in ov_match.columns and pd.notna(ov_match.iloc[0].get("nsa_raw_pred")):
+                signs.append(np.sign(float(ov_match.iloc[0]["nsa_raw_pred"]) - last_actual))
+            vote = sum(signs)
+            majority_dir = np.sign(vote) if vote != 0 else np.sign(c_delta)
+            if majority_dir != np.sign(k_delta) and abs(k_delta) > 1e-6:
+                pred = last_actual + majority_dir * abs(k_delta)
+        hybrid_rows.append({
+            "ds": ds,
+            "actual": actual,
+            "predicted": pred,
+            "consensus_pred": krow["consensus_pred"],
+            "error": actual - pred if pd.notna(actual) else np.nan,
+        })
+    hybrid_df = pd.DataFrame(hybrid_rows)
+    hybrid_metrics = full_metrics(
+        hybrid_df["actual"].values, hybrid_df["predicted"].values,
+        "Kalman_AccelPostFilter",
+    )
+    all_metrics.append(hybrid_metrics)
+    logger.info("  Kalman+AccelPostFilter: MAE=%.1f RMSE=%.1f AccelAcc=%.3f DirAcc=%.3f",
+                hybrid_metrics["MAE"], hybrid_metrics["RMSE"],
+                hybrid_metrics["Acceleration_Accuracy"],
+                hybrid_metrics["Directional_Accuracy"])
+
+    # Save hybrid output bundle
+    hybrid_dir = out_dir / "kalman_accel_postfilter"
+    write_sandbox_output_bundle(
+        results_df=hybrid_df,
+        out_dir=hybrid_dir,
+        model_id="kalman_accel_postfilter",
+        diagnostics_label="Kalman + AccelOverride Post-Filter",
+    )
+
+    # 6) Comparison metrics CSV
     metrics_df = pd.DataFrame(all_metrics).sort_values("MAE").reset_index(drop=True)
     metrics_df.to_csv(out_dir / "comparison_metrics.csv", index=False)
 

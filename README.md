@@ -1,8 +1,18 @@
 # NFP Predictor
 
-An institutional-grade machine learning pipeline for forecasting U.S. Non-Farm Payrolls (NFP) month-over-month employment changes. Built on LightGBM with expanding-window walk-forward validation and multimodal data sources (FRED, ADP, NOAA, Unifier, Prosper).
+An institutional-grade machine learning pipeline for forecasting U.S. Non-Farm Payrolls (NFP) month-over-month employment changes. Built on LightGBM with expanding-window walk-forward validation, consensus-anchored Kalman fusion, and multimodal data sources (FRED, ADP, NOAA, Unifier, Prosper).
 
-The architecture is explicitly designed around **point-in-time (PIT) correctness** and **regime-aware feature selection** to mathematically prevent lookahead bias and handle high-dimensional macroeconomic noise.
+The system produces **two final predictions** per month via Kalman filter fusion:
+
+| Model | Strengths | Full MAE | Full AccelAcc | 36m AccelAcc |
+|-------|-----------|----------|---------------|--------------|
+| **Model A (Balanced)** | Best acceleration accuracy | 105.9 | 56.9% | 54.3% |
+| **Model B (Precision)** | Best MAE/RMSE | 95.5 | 53.4% | 40.0% |
+| Consensus (baseline) | — | 109.7 | 44.8% | 42.9% |
+
+Both models beat consensus on the full 59-month OOS backtest. The user selects based on whether **catching turning points** (Model A) or **minimizing absolute error** (Model B) is the priority.
+
+The architecture is explicitly designed around **point-in-time (PIT) correctness**, **dynamic feature selection**, and **consensus-anchored fusion** to prevent lookahead bias and adapt to structural regime changes.
 
 ---
 
@@ -34,7 +44,7 @@ The architecture is explicitly designed around **point-in-time (PIT) correctness
    - [9.2 Feature Engineering](#92-feature-engineering)
    - [9.3 Expanding Window Backtest](#93-expanding-window-backtest)
    - [9.4 Dynamic Feature Selection](#94-dynamic-feature-selection)
-   - [9.5 Short-Pass Feature Selection](#95-short-pass-feature-selection)
+   - [9.5 NSA Acceleration Features for SA](#95-nsa-acceleration-features-for-sa)
    - [9.6 Branch-Target Feature Selection](#96-branch-target-feature-selection)
    - [9.7 Sample Weighting](#97-sample-weighting)
    - [9.8 Model Training (LightGBM)](#98-model-training-lightgbm)
@@ -82,22 +92,21 @@ flowchart TD
         Snap[Monthly PIT Snapshots<br/>Strict release_date < nfp_release_date<br/>No same-day leakage]
     end
 
-    subgraph "Phase 3: Dimensionality Reduction"
-        FeatSel["6-Stage Feature Selection<br/>(Per Regime & Source)<br/>Variance → Dual Filter → Boruta<br/>→ Vintage → Cluster → SFS"]
-        Master[Master Wide Snapshots<br/>Per-month .parquet files]
+    subgraph "Phase 3: All-Features Storage"
+        Master[Master Wide Snapshots<br/>~15,500 features per month<br/>All-features mode]
     end
 
     subgraph "Phase 4: Walk-Forward Validation"
-        Pool[Feature Engineering<br/>Calendar + Employment Lags<br/>+ Revision Features]
-        DynFS[Dynamic Reselection<br/>2-Pass Per-Source + Global<br/>Max 50 Features]
-        Train[Expanding-Window LightGBM<br/>+ Optuna Tuning<br/>+ Variance Enhancement Stack]
+        Pool[Feature Engineering<br/>Calendar + Employment Lags<br/>+ Revision + NSA Accel Features]
+        DynFS[Dynamic Reselection<br/>2-Pass Per-Source + Global<br/>Max 80 Features, Every 36mo]
+        Train[Expanding-Window LightGBM<br/>+ Optuna Composite Tuning<br/>+ NSA Enhancement Stack]
     end
 
-    subgraph "Phase 5: Analyst Output"
-        Preds[Predictions & Intervals CSV]
-        Metrics[RMSE / MAE / Variance Scorecard]
-        Shap[SHAP Feature Analysis]
-        Compare[Multi-Model Comparison<br/>CSV + Styled HTML]
+    subgraph "Phase 5: Consensus Fusion"
+        Adj[NSA + Predicted<br/>Seasonal Adjustment]
+        Kalman[Kalman Filter Fusion<br/>Consensus + Model Channels]
+        ModelA[Model A: Balanced<br/>cons + SA + NSA+Adj]
+        ModelB[Model B: Precision<br/>cons + NSA+Adj]
     end
 
     FRED --> Snap
@@ -891,49 +900,33 @@ When master snapshots contain ALL lean features (indicated by `mode: "all_featur
 
 **NaN evaluation window:** Features are judged on NaN rate from `2010-01-01` onward. Earlier NaN (from pre-2010 data gaps) is tolerated since many sources simply didn't exist before then. Maximum acceptable NaN rate: 20%.
 
-**Adaptive reselection (recency-weighted):**
-- `RESELECTION_HALF_LIFE_MONTHS = 36` — More aggressive decay than training (60 months) for feature scoring
+**Uniform sample weighting for reselection:**
+- `RESELECTION_HALF_LIFE_MONTHS = 9999` — Effectively uniform weights (no recency decay), selecting features with durable long-term predictive power
 - `RESELECTION_START_DATE = '2000-01-01'` — Only start adaptive reselection when sufficient data exists
-- Lighter stage config: Pass 1 uses (0, 2, 4, 5), Pass 2 uses (0, 2, 4)
+- Stage config: Pass 1 uses (0, 2, 4, 5), Pass 2 uses (0, 2, 4)
+- `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` — Hard cap after global reduction
+- Reselection interval: every 36 months (configurable via `.env`)
 
 ---
 
-### 9.5 Short-Pass Feature Selection
+### 9.5 NSA Acceleration Features for SA
 
-**File:** `Train/short_pass_selection.py`
+**File:** `Train/nsa_acceleration.py`
 
-Called once per backtest step to reduce the candidate pool (up to ~200 features) to a dense working set (~60 features). This is strictly leakage-safe: only `X_train` and `y_train` (data before `target_month`) are seen.
+When running `--train-all`, the NSA model trains first. Its backtest results are then used to compute 8 PIT-safe acceleration features that are injected into the SA model's training data at each backtest step:
 
-**Method A: LightGBM Gain** (`short_pass_lgbm_gain`)
+| Feature | Description |
+|---------|-------------|
+| `nsa_pred_delta` | NSA predicted MoM change: `nsa_pred[t] - actual_nsa[t-1]` |
+| `nsa_pred_accel` | NSA predicted acceleration (2nd derivative) |
+| `nsa_pred_direction` | Sign of `nsa_pred_delta` |
+| `nsa_actual_accel` | Actual NSA acceleration at t-1 (from revised target) |
+| `nsa_accel_accuracy_12m` | Rolling 12-month NSA acceleration accuracy (credibility) |
+| `nsa_residual_trend_6m` | Slope of NSA residuals (bias drift signal) |
+| `nsa_sa_accel_corr_12m` | Rolling correlation of NSA vs SA acceleration (bridge) |
+| `nsa_sa_gap_delta` | Change in SA-NSA gap (seasonal adjustment dynamics) |
 
-Trains a shallow LightGBM model and ranks features by gain:
-
-```python
-params = {
-    'max_depth': 4,
-    'num_leaves': 15,
-    'learning_rate': 0.1,
-    'feature_fraction': 0.8,
-    'n_jobs': 1,  # Stability on macOS
-}
-model = lgb.train(params, dataset, num_boost_round=100)
-importances = model.feature_importance(importance_type='gain')
-```
-
-Returns the top-K features sorted by gain descending. Runtime: ~1-2 seconds for 200 features.
-
-**Method B: Weighted Correlation** (`short_pass_weighted_corr`)
-
-Fully vectorized |corr(feature, target)| under exponential decay weights:
-
-```
-For each feature j:
-    W = sample_weights * valid_mask[:, j]    # Zero out NaN positions
-    W_norm = W / sum(W)                       # Per-column weight renormalization
-    wmean_x = sum(W_norm * X[:, j])
-    wmean_y = sum(W_norm * y)
-    cov = sum(W_norm * (X - wmean_x) * (y - wmean_y))
-    corr[j] = |cov / (std_x * std_y)|
+These features are **always included** (like calendar features) — not subject to dynamic reselection. They bridge the NSA model's acceleration signal into SA space.
 ```
 
 Features with fewer than 10 valid observations get `corr = 0`. Runtime: milliseconds.
@@ -1505,31 +1498,71 @@ Uses an `ExpWeightedMonthlyAvgPredictor` with 3-year half-life to predict season
 
 ---
 
-## 15. Consensus Anchor Fusion (Post-Training)
+## 15. Consensus Anchor Fusion — Two Final Models
 
 **File:** `Train/Output_code/consensus_anchor_runner.py`
 
-After the main backtest, this module fuses NFP consensus poll data with LightGBM predictions:
+After the main backtest, this module fuses NFP consensus poll data with LightGBM predictions via a Kalman filter. The system produces **two predictions per month** — the user selects based on their priority.
 
 **Data sources merged:**
 - `NFP_Consensus_Mean` from Unifier snapshots (economists' mean forecast)
-- SA blend champion from `_output/sandbox/sa_blend_walkforward/`
-- SA revised challenger from `_output/SA_prediction/`
+- SA Direct predictions from `_output/SA_prediction/`
+- NSA+Adjustment predictions from `_output/NSA_plus_adjustment/`
 
-**Two fusion approaches:**
+### Model A: Balanced (Best Acceleration Accuracy)
 
-1. **Kalman Filter Fusion:** State-space model treating consensus and model predictions as two noisy observations of the true NFP value. Expanding window with minimum 12 months history.
+3-channel Kalman filter: **consensus + SA Direct + NSA+Adjustment**
 
-2. **Acceleration Override:** Uses consensus as the base forecast and adds the model's momentum channel (acceleration signal).
+```
+State:   x_t = x_{t-1} + w_t  (random walk)
+Update:  P = 1 / (1/P_prior + 1/R_c + 1/R_m + w_a/R_a)
+         x = P * (x_prior/P_prior + cons/R_c + sa_direct/R_m + nsa_adj/R_a)
+```
 
-Both approaches are PIT-safe (only historical data before target month used).
+| Metric | Full 59m | Last 36m |
+|--------|----------|----------|
+| MAE | 105.9 | 67.1 |
+| RMSE | 148.2 | 84.0 |
+| AccelAcc | **56.9%** | **54.3%** |
+| DirAcc | 96.6% | 94.4% |
+
+**Use when:** Catching turning points and momentum shifts matters most (trading, risk management).
+
+### Model B: Precision (Best MAE/RMSE)
+
+2-channel Kalman filter: **consensus + NSA+Adjustment**
+
+| Metric | Full 59m | Last 36m |
+|--------|----------|----------|
+| MAE | **95.5** | 67.6 |
+| RMSE | **135.5** | 82.3 |
+| AccelAcc | 53.4% | 40.0% |
+| DirAcc | 96.6% | 94.4% |
+
+**Use when:** Minimizing absolute prediction error matters most (forecasting, planning).
+
+### Both models vs Consensus
+
+| Metric | Consensus | Model A | Model B |
+|--------|-----------|---------|---------|
+| Full MAE | 109.7 | 105.9 (-3.5%) | **95.5 (-13.0%)** |
+| Full RMSE | 166.0 | 148.2 (-10.7%) | **135.5 (-18.4%)** |
+| Full AccelAcc | 44.8% | **56.9% (+27%)** | 53.4% (+19%) |
+| 36m AccelAcc | 42.9% | **54.3% (+27%)** | 40.0% |
 
 **Outputs:**
 ```
-_output/consensus_anchor/kalman_fusion/     # Full diagnostics
-_output/consensus_anchor/accel_override/    # Full diagnostics
-merged_consensus_model.csv                  # Combined results
-comparison_metrics.csv                       # Head-to-head metrics
+_output/consensus_anchor/
+├── kalman_fusion/              # Model A results
+│   ├── backtest_results.csv
+│   ├── summary_statistics.csv
+│   └── tuned_params.json
+├── kalman_precision/           # Model B results
+│   ├── backtest_results.csv
+│   └── summary_statistics.csv
+├── accel_override/             # AccelOverride variant
+├── comparison_metrics.csv      # All approaches compared
+└── merged_consensus_model.csv  # Combined input data
 ```
 
 ---

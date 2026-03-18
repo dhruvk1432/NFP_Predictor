@@ -1,0 +1,47 @@
+\frametitle{Running the Pipeline}
+\begin{columns}[T]
+\begin{column}{0.48\textwidth}
+\begin{block}{Full Pipeline}
+\begin{lstlisting}[style=pseudo, morekeywords={python,bash}]
+# End-to-end
+python run_full_project.py
+
+# Fresh re-download
+python run_full_project.py --fresh
+
+# Individual stages
+python run_full_project.py --stage data
+python run_full_project.py --stage train
+python run_full_project.py --stage train --no-tune
+
+# Skip sources
+python run_full_project.py --skip noaa,prosper
+\end{lstlisting}
+\end{block}
+\end{column}
+\begin{column}{0.48\textwidth}
+\begin{block}{Direct Training}
+\begin{lstlisting}[style=pseudo, morekeywords={python}]
+# All variants + scorecard
+python Train/train_lightgbm_nfp.py --train-all
+
+# Single variant
+python Train/train_lightgbm_nfp.py --train \
+  --target sa --release first
+
+# Production inference
+python scripts/predict_next_nfp.py --target nsa
+\end{lstlisting}
+\end{block}
+
+\begin{block}{Environment Overrides}
+\begin{lstlisting}[style=pseudo]
+# Fast feature selection
+NFP_FS_STAGES="0,1,4" python run_full_project.py
+
+# Enable performance profiling
+NFP_PERF=1 python run_full_project.py
+\end{lstlisting}
+\end{block}
+\end{column}
+\end{columns}

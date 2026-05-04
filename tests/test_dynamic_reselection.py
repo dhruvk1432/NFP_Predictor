@@ -703,7 +703,7 @@ class TestBacktestAllFeaturesMode:
         dynamic_features = None  # Not yet selected (step 0)
         last_reselection_date = None
 
-        RESELECT_EVERY_N_MONTHS = 6
+        RESELECT_EVERY_N_MONTHS = 36
         _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
 
         _trigger_reselection = (
@@ -724,7 +724,7 @@ class TestBacktestAllFeaturesMode:
         last_reselection_date = pd.Timestamp('2020-01-01')
         target_month = pd.Timestamp('2020-07-15')
 
-        RESELECT_EVERY_N_MONTHS = 6
+        RESELECT_EVERY_N_MONTHS = 36
         _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
 
         _trigger_reselection = (
@@ -744,7 +744,7 @@ class TestBacktestAllFeaturesMode:
         last_reselection_date = pd.Timestamp('2020-01-01')
         target_month = pd.Timestamp('2020-03-01')  # Only 2 months later
 
-        RESELECT_EVERY_N_MONTHS = 6
+        RESELECT_EVERY_N_MONTHS = 36
         _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
 
         _trigger_reselection = (

@@ -7,7 +7,14 @@ Generates output artifacts after training:
   ├── SA_prediction/           (single-branch or combined)
   ├── NSA_plus_adjustment/     (combined only)
   ├── Predictions/             (combined only)
+  ├── consensus_anchor/        (4-way scorecard: baseline_consensus,
+  │                             kalman_fusion, accel_override,
+  │                             kalman_accel_postfilter)
   └── Archive/YYYY-MM-DD_HHMMSS/
+
+Archiving is performed by `archive_outputs()` (defined below), which is
+also called at the end of `--train-all` so the archive captures the full
+final state including the post-training consensus-anchor outputs.
 """
 
 import shutil
@@ -37,6 +44,76 @@ def _get_top_features(importance: Dict[str, float], n: int = 5) -> list:
     """Return top-n (feature_name, score) tuples sorted by importance descending."""
     sorted_items = sorted(importance.items(), key=lambda x: x[1], reverse=True)
     return sorted_items[:n]
+
+
+# Default folder list archived by `archive_outputs` when called at the end
+# of `--train-all`. Paths are relative to `output_base`. Missing folders are
+# skipped silently (e.g. sandbox outputs are optional).
+DEFAULT_ARCHIVE_FOLDERS: List[str] = [
+    "NSA_prediction",
+    "SA_prediction",
+    "NSA_plus_adjustment",
+    "Predictions",
+    # Post-training: consensus anchor (4-way scorecard + comparison artifacts)
+    "consensus_anchor",
+    # Post-training: sandbox experiments (optional)
+    "sandbox/sa_blend_walkforward",
+    "sandbox/nsa_predicted_adjustment_revised",
+]
+
+
+def archive_outputs(
+    output_base: Path,
+    folders: Optional[List[str]] = None,
+    timestamp: Optional[str] = None,
+) -> Path:
+    """
+    Snapshot a set of output folders into `_output/Archive/<timestamp>/`.
+
+    Each folder in `folders` is copied (recursively) under the archive
+    directory, preserving its relative path. Missing folders are skipped
+    with a warning so this is safe to call even when some optional
+    post-training stages were disabled.
+
+    Args:
+        output_base: Base output dir (typically `settings.OUTPUT_DIR`).
+        folders: List of folder paths relative to `output_base`. Defaults
+            to `DEFAULT_ARCHIVE_FOLDERS`, which includes the four model
+            bundles plus the consensus anchor 4-way scorecard.
+        timestamp: Override the archive timestamp (mainly for tests).
+
+    Returns:
+        The archive directory path.
+    """
+    if folders is None:
+        folders = DEFAULT_ARCHIVE_FOLDERS
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+    archive_root = output_base / "Archive" / timestamp
+    archive_root.mkdir(parents=True, exist_ok=True)
+
+    archived: List[str] = []
+    skipped: List[str] = []
+    for rel in folders:
+        src = output_base / rel
+        if not src.exists():
+            skipped.append(rel)
+            continue
+        dst = archive_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        archived.append(rel)
+
+    logger.info(f"Archived {len(archived)} folder(s) to {archive_root}")
+    for name in archived:
+        logger.info(f"  + {name}")
+    for name in skipped:
+        logger.warning(f"  (skipped, not found) {name}")
+
+    return archive_root
 
 
 def _generate_prediction_folder(
@@ -135,14 +212,17 @@ def _generate_adjustment_folder(
     adj_history = load_adjustment_history()
     predictor = ExpWeightedMonthlyAvgPredictor(half_life_years=3.0)
 
-    # Merge NSA and SA results on date
-    nsa = nsa_results[nsa_results["actual"].notna()][["ds", "predicted", "actual"]].copy()
+    # Merge NSA and SA results on date. Keep ALL NSA rows that have a
+    # prediction (including OOS future months where actual is NaN); join on
+    # SA actual when present so the consensus-anchor stage can pick up OOS
+    # NSA+adjustment predictions as champion_pred.
+    nsa = nsa_results[nsa_results["predicted"].notna()][["ds", "predicted", "actual"]].copy()
     nsa = nsa.rename(columns={"predicted": "nsa_predicted", "actual": "nsa_actual"})
 
-    sa = sa_results[sa_results["actual"].notna()][["ds", "actual"]].copy()
+    sa = sa_results[["ds", "actual"]].copy()
     sa = sa.rename(columns={"actual": "sa_actual"})
 
-    merged = pd.merge(nsa, sa, on="ds", how="inner").sort_values("ds").reset_index(drop=True)
+    merged = pd.merge(nsa, sa, on="ds", how="left").sort_values("ds").reset_index(drop=True)
 
     # For each backtest month, predict adjustment using PIT-safe expanding window
     predicted_adjustments = []
@@ -165,10 +245,18 @@ def _generate_adjustment_folder(
 
     merged["predicted_adjustment"] = predicted_adjustments
     merged["adjusted_predicted"] = merged["nsa_predicted"] + merged["predicted_adjustment"]
-    merged["error"] = merged["sa_actual"] - merged["adjusted_predicted"]
+    merged["error"] = np.where(
+        merged["sa_actual"].notna(),
+        merged["sa_actual"] - merged["adjusted_predicted"],
+        np.nan,
+    )
 
-    # Also compute perfect adjustment for diagnostic comparison
-    merged["perfect_adjustment"] = merged["sa_actual"] - merged["nsa_actual"]
+    # Also compute perfect adjustment for diagnostic comparison (NaN for OOS)
+    merged["perfect_adjustment"] = np.where(
+        merged["sa_actual"].notna() & merged["nsa_actual"].notna(),
+        merged["sa_actual"] - merged["nsa_actual"],
+        np.nan,
+    )
 
     # Build a results-like DataFrame for the plotting function
     adj_results = pd.DataFrame({
@@ -213,17 +301,28 @@ def _generate_predictions_folder(
     nsa_residuals: List,
     sa_residuals: List,
     folder: Path,
+    output_base: Optional[Path] = None,
 ) -> None:
     """
-    Generate forward predictions using the production models for months
-    where the target is NaN (unreleased data).
+    Generate the forecast for the *next* unreleased NFP month using the
+    production models.
+
+    Predicts only the earliest future month (the next-to-release NFP), one
+    row per model. We intentionally do not emit predictions for further-out
+    OOS months because: (a) the analyst consensus survey doesn't exist yet
+    for them, so the consensus-anchor variants can't be computed; (b) those
+    forecasts would mix here with the next-release prediction and confuse
+    downstream readers of `predictions.csv`.
 
     Outputs:
-        predictions.csv — one row per future month with point prediction + CIs
+        predictions.csv — one row per model for the next unreleased month
+        (NSA, SA, NSA_plus_adjustment, plus Consensus + consensus_anchor_*
+        rows added later by the consensus-anchor stage).
     """
     folder.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    nsa_oos: Dict[pd.Timestamp, float] = {}
     for label, model, metadata, X_full, y_full, residuals in [
         ("NSA", nsa_model, nsa_metadata, nsa_X_full, nsa_y_full, nsa_residuals),
         ("SA", sa_model, sa_metadata, sa_X_full, sa_y_full, sa_residuals),
@@ -234,10 +333,15 @@ def _generate_predictions_folder(
             logger.info(f"  No future months to predict for {label}")
             continue
 
-        X_future = X_full[future_mask].copy()
+        # Only predict the next unreleased month.
+        X_future_all = X_full[future_mask].copy().sort_values('ds')
+        X_future = X_future_all.iloc[[0]]
         future_dates = X_future['ds'].tolist()
         X_pred = X_future[[c for c in feature_cols if c in X_future.columns]]
         preds = model.predict(X_pred)
+
+        if label == "NSA":
+            nsa_oos = {pd.Timestamp(ds): float(p) for ds, p in zip(future_dates, preds)}
 
         # Confidence intervals from OOS residuals
         if len(residuals) > 2:
@@ -271,6 +375,68 @@ def _generate_predictions_folder(
                         f"Pred={r['predicted']:.0f} "
                         f"[80% CI: {r['lower_80']:.0f}, {r['upper_80']:.0f}]")
 
+    # NSA + predicted seasonal adjustment for each OOS month.
+    # PIT-safe: only uses adjustment history available before target_ds.
+    if nsa_oos:
+        try:
+            from Train.sandbox.experiment_predicted_adjustment import (
+                ExpWeightedMonthlyAvgPredictor,
+                load_adjustment_history,
+            )
+
+            adj_history = load_adjustment_history()
+            predictor = ExpWeightedMonthlyAvgPredictor(half_life_years=3.0)
+
+            # Residuals from the NSA_plus_adjustment backtest (written earlier
+            # in the same generate_all_output run) drive CIs.
+            adj_res: np.ndarray = np.array([])
+            if output_base is not None:
+                adj_path = output_base / "NSA_plus_adjustment" / "backtest_results.csv"
+                if not adj_path.exists():
+                    adj_path = output_base / "NSA_plus_adjustment_revised" / "backtest_results.csv"
+                if adj_path.exists():
+                    adj_bt = pd.read_csv(adj_path)
+                    if "error" in adj_bt.columns:
+                        adj_res = adj_bt["error"].dropna().to_numpy()[-36:]
+
+            for ds, nsa_pred in nsa_oos.items():
+                if "operational_available_date" in adj_history.columns:
+                    pit_mask = adj_history["operational_available_date"].notna() & (
+                        adj_history["operational_available_date"] < ds
+                    )
+                else:
+                    pit_mask = adj_history["ds"] < ds
+                avail = adj_history[pit_mask]
+                adj_value = predictor.fit_predict(avail, ds) if not avail.empty else 0.0
+                pred = nsa_pred + adj_value
+                if adj_res.size > 2:
+                    rows.append({
+                        "model": "NSA_plus_adjustment",
+                        "ds": ds,
+                        "predicted": pred,
+                        "lower_50": pred + np.percentile(adj_res, 25),
+                        "upper_50": pred + np.percentile(adj_res, 75),
+                        "lower_80": pred + np.percentile(adj_res, 10),
+                        "upper_80": pred + np.percentile(adj_res, 90),
+                        "lower_95": pred + np.percentile(adj_res, 2.5),
+                        "upper_95": pred + np.percentile(adj_res, 97.5),
+                    })
+                else:
+                    rows.append({
+                        "model": "NSA_plus_adjustment",
+                        "ds": ds,
+                        "predicted": pred,
+                        "lower_50": np.nan, "upper_50": np.nan,
+                        "lower_80": np.nan, "upper_80": np.nan,
+                        "lower_95": np.nan, "upper_95": np.nan,
+                    })
+                logger.info(
+                    f"  NSA_plus_adjustment {pd.Timestamp(ds).strftime('%Y-%m')}: "
+                    f"NSA={nsa_pred:.0f} + adj={adj_value:.0f} -> Pred={pred:.0f}"
+                )
+        except Exception as e:
+            logger.warning(f"  Skipped NSA_plus_adjustment OOS prediction: {e}")
+
     if rows:
         pred_df = pd.DataFrame(rows)
         pred_df.to_csv(folder / "predictions.csv", index=False)
@@ -294,6 +460,7 @@ def generate_all_output(
     sa_residuals: List = None,
     output_base: Optional[Path] = None,
     suffix: str = '',
+    archive: bool = True,
 ) -> Path:
     """
     Generate the complete output folder structure.
@@ -355,23 +522,29 @@ def generate_all_output(
             nsa_y_full, sa_y_full,
             nsa_residuals or [], sa_residuals or [],
             pred_folder,
+            output_base=output_base,
         )
     else:
         logger.warning("  Skipping predictions folder — y_full not provided")
 
-    # 5) Archive: copy all folders with timestamp
-    logger.info("\n[5/5] Archiving output")
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    archive_folder = output_base / "Archive" / timestamp
+    # 5) Archive: copy folders into a timestamped snapshot.
+    # Skipped when called from `--train-all`, which defers archiving until
+    # after the post-training consensus anchor step so the archive captures
+    # the full final state including the 4-way scorecard.
+    if archive:
+        logger.info("\n[5/5] Archiving output")
+        archive_outputs(
+            output_base,
+            folders=[
+                f"NSA_prediction{suffix}",
+                f"SA_prediction{suffix}",
+                f"NSA_plus_adjustment{suffix}",
+                f"Predictions{suffix}",
+            ],
+        )
+    else:
+        logger.info("\n[5/5] Archiving deferred to end of pipeline")
 
-    for src_name in [f"NSA_prediction{suffix}", f"SA_prediction{suffix}",
-                     f"NSA_plus_adjustment{suffix}", f"Predictions{suffix}"]:
-        src = output_base / src_name
-        if src.exists():
-            dst = archive_folder / src_name
-            shutil.copytree(src, dst)
-
-    logger.info(f"  Archived to {archive_folder}")
     logger.info("\n" + "=" * 60)
     logger.info("OUTPUT GENERATION COMPLETE")
     logger.info("=" * 60)

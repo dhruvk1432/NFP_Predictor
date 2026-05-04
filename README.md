@@ -2,15 +2,19 @@
 
 An institutional-grade machine learning pipeline for forecasting U.S. Non-Farm Payrolls (NFP) month-over-month employment changes. Built on LightGBM with expanding-window walk-forward validation, consensus-anchored Kalman fusion, and multimodal data sources (FRED, ADP, NOAA, Unifier, Prosper).
 
-The system produces **two final predictions** per month via Kalman filter fusion:
+The production output is a **Kalman-filter fusion** of three independent signals — economists' consensus poll, the SA-blend champion, and the NSA-derived acceleration channel — Optuna-tuned on a composite objective that weights MAE, acceleration accuracy, and directional accuracy.
 
-| Model | Strengths | Full MAE | Full AccelAcc | 36m AccelAcc |
-|-------|-----------|----------|---------------|--------------|
-| **Model A (Balanced)** | Best acceleration accuracy | 105.9 | 56.9% | 54.3% |
-| **Model B (Precision)** | Best MAE/RMSE | 95.5 | 53.4% | 40.0% |
-| Consensus (baseline) | — | 109.7 | 44.8% | 42.9% |
+**Headline OOS results (59-month walk-forward, SA revised target):**
 
-Both models beat consensus on the full 59-month OOS backtest. The user selects based on whether **catching turning points** (Model A) or **minimizing absolute error** (Model B) is the priority.
+| Forecast | MAE | RMSE | DirAcc | AccelAcc | Notes |
+|---|---|---|---|---|---|
+| **Kalman Fusion (NSA)** | **108.8** | **155.2** | **98.3%** | **58.6%** | Production model |
+| Baseline Consensus | 109.7 | 166.0 | 96.6% | 44.8% | Economists' mean poll |
+| AccelOverride (k=0.50) | 111.4 | 167.3 | 96.6% | 48.3% | Direction-vote variant |
+| Kalman + AccelOverride post-filter | 119.2 | 172.0 | 96.6% | 51.7% | Hybrid variant |
+| Baseline Champion (NSA+Adj) | 164.6 | 206.3 | 88.1% | 62.1% | Standalone model channel |
+
+Kalman Fusion edges consensus on every error metric **and** lifts acceleration accuracy by ~14 percentage points — the gain that matters most for catching turning points. The pipeline ships all four forecasts side-by-side under [`_output/consensus_anchor/`](_output/consensus_anchor/) so the operator can audit the full ensemble each release.
 
 The architecture is explicitly designed around **point-in-time (PIT) correctness**, **dynamic feature selection**, and **consensus-anchored fusion** to prevent lookahead bias and adapt to structural regime changes.
 
@@ -81,7 +85,7 @@ Forecasting NFP is notoriously difficult for quantitative models due to four str
 ```mermaid
 flowchart TD
     subgraph "Phase 1: Raw Ingestion"
-        FRED[FRED APIs<br/>159 Employment Series<br/>+ 10 Exogenous Indicators]
+        FRED[FRED APIs<br/>~295 Employment Series<br/>+ 10 Exogenous Indicators]
         ADP[ADP Payrolls<br/>investing.com API]
         NOAA[NOAA Weather<br/>Storm Events + CPI Deflation]
         Unifier[Unifier / LSEG<br/>ISM, Housing, Retail, UMich<br/>+ NFP Consensus Poll]
@@ -98,15 +102,16 @@ flowchart TD
 
     subgraph "Phase 4: Walk-Forward Validation"
         Pool[Feature Engineering<br/>Calendar + Employment Lags<br/>+ Revision + NSA Accel Features]
-        DynFS[Dynamic Reselection<br/>2-Pass Per-Source + Global<br/>Max 80 Features, Every 36mo]
+        DynFS[Dynamic Reselection<br/>2-Pass Per-Source + Global<br/>Max 80 Features, Every 6mo]
         Train[Expanding-Window LightGBM<br/>+ Optuna Composite Tuning<br/>+ NSA Enhancement Stack]
     end
 
-    subgraph "Phase 5: Consensus Fusion"
+    subgraph "Phase 5: Consensus Anchor Fusion"
         Adj[NSA + Predicted<br/>Seasonal Adjustment]
-        Kalman[Kalman Filter Fusion<br/>Consensus + Model Channels]
-        ModelA[Model A: Balanced<br/>cons + SA + NSA+Adj]
-        ModelB[Model B: Precision<br/>cons + NSA+Adj]
+        Kalman[Kalman Fusion - production<br/>cons + champion + NSA accel]
+        AccelOv[AccelOverride<br/>cons base + direction vote]
+        Hybrid[Kalman + AccelOverride<br/>post-filter hybrid]
+        Cons[Baseline Consensus<br/>untouched poll]
     end
 
     FRED --> Snap
@@ -115,15 +120,17 @@ flowchart TD
     Unifier --> Snap
     Prosper --> Snap
 
-    Snap --> FeatSel
-    FeatSel --> Master
+    Snap --> Master
     Master --> Pool
     Pool --> DynFS
     DynFS --> Train
-    Train --> Preds
-    Train --> Metrics
-    Train --> Shap
-    Train --> Compare
+    Train --> Adj
+    Train --> Kalman
+    Unifier --> Cons
+    Cons --> Kalman
+    Cons --> AccelOv
+    Kalman --> Hybrid
+    AccelOv --> Hybrid
 ```
 
 ---
@@ -137,16 +144,20 @@ flowchart TD
 
 ### Install
 
+The project is packaged via [`pyproject.toml`](pyproject.toml). Core runtime dependencies (pandas, numpy, scikit-learn, LightGBM, fredapi, requests, etc.) are installed alongside the package itself:
+
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
-For development tools (linting, pre-commit):
+For Optuna-driven hyperparameter tuning and development tooling (ruff, pytest, pre-commit):
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,hyperopt]"
 pre-commit install
 ```
+
+> **Note:** A standalone `requirements.txt` is no longer maintained — `pyproject.toml` is the single source of truth.
 
 ### Configure environment
 
@@ -196,7 +207,7 @@ NFP_Predictor/
 │   ├── noaa_pipeline.py                 # NOAA weather data (75-day lag modelling + CPI deflation)
 │   ├── load_unifier_data.py             # Unifier survey data (vendor timestamp repair)
 │   ├── load_prosper_data.py             # Prosper consumer sentiment surveys
-│   ├── feature_selection_engine.py      # 6-stage regime-aware feature selection
+│   ├── feature_selection_engine.py      # 7-stage regime-aware feature selection (stages 0–6)
 │   ├── create_master_snapshots.py       # Aggregates all sources → master parquets
 │   ├── nfp_release_calendar.py          # BLS NFP release date calendar (first Friday rule)
 │   ├── perf_stats.py                    # Performance profiling decorators + JSON dumps
@@ -204,6 +215,9 @@ NFP_Predictor/
 │   ├── utils.py                         # ETL utilities (snapshot paths, MultiIndex helpers)
 │   ├── test_feature_selection.py        # Feature selection tests
 │   └── analyze_noaa_weights_vintage.py  # NOAA weighting analysis
+│
+├── Prepare_Data/                        # Target-construction utilities
+│   └── build_revised_targets.py         # Build once-revised NFP targets from FRED vintages
 │
 ├── Train/                               # Phase 4–5: Model training and output
 │   ├── train_lightgbm_nfp.py            # Main entrypoint: expanding-window backtest
@@ -217,22 +231,29 @@ NFP_Predictor/
 │   ├── short_pass_selection.py          # Per-step top-K feature filter (walk-forward)
 │   ├── branch_target_selection.py       # Branch-target derived feature selection
 │   ├── revision_features.py             # Revision-specific feature construction
+│   ├── nsa_acceleration.py              # PIT-safe NSA acceleration features for SA model
+│   ├── reduce_features.py               # Post-selection feature reduction utilities
+│   ├── prune_snapshots_to_selected_features.py  # Trim master snapshots to selected columns
 │   ├── variance_metrics.py              # Variance KPIs and composite objective
-│   ├── selected_features/               # Per-source, per-track selected feature JSONs
+│   ├── sandbox/                         # Standalone experiments (CatBoost, XGBoost, SA blend, etc.)
 │   └── Output_code/                     # Output generation modules
 │       ├── model_comparison.py          # Multi-variant scorecard (CSV + styled HTML)
 │       ├── generate_output.py           # Orchestrates all output artefacts
 │       ├── metrics.py                   # RMSE, MAE, coverage calculations
 │       ├── plots.py                     # Backtest, SHAP, and diagnostic plots
 │       ├── feature_importance.py        # Gain-based importance analysis
-│       └── consensus_anchor_runner.py   # Post-training Kalman/consensus fusion
+│       └── consensus_anchor_runner.py   # Post-training Kalman / AccelOverride fusion
 │
 ├── scripts/                             # Utility / diagnostic scripts
 │   ├── predict_next_nfp.py              # Production inference: next-month prediction + intervals
 │   ├── check_data_freshness.py          # Verify data is up-to-date before release day
 │   ├── benchmark_keep_rule.py           # Run keep-rule benchmark reports
 │   ├── directional_accuracy.py          # Directional hit-rate analysis
-│   └── revision_analysis.py             # NFP revision autocorrelation analysis
+│   ├── revision_analysis.py             # NFP revision autocorrelation analysis
+│   ├── ab_feature_selection.py          # A/B harness for feature-selection variants
+│   ├── test_stage0_prescreen.py         # Smoke test for Stage-0 Spearman pre-screen
+│   ├── trim_pre1990_rows.py             # Trim pre-1990 rows from cached snapshots
+│   └── generate_presentation_assets.py  # Produce charts/tables for the LaTeX deck
 │
 ├── utils/                               # Shared utilities
 │   ├── transforms.py                    # SymLog, COVID winsorization, Z-score helpers
@@ -240,8 +261,7 @@ NFP_Predictor/
 │   └── benchmark_harness.py             # A/B timing harness for algorithm comparisons
 │
 ├── tests/                               # pytest test suite
-├── notebooks/                           # Per-source feature analysis notebooks (NSA track)
-├── revised_notebooks/                   # Per-source feature analysis notebooks (SA/revised track)
+├── experiments/                         # Ad-hoc experiment scripts and notes
 │
 ├── data/                                # Data root (not committed; set via DATA_PATH)
 │   ├── fred_data/decades/               # Raw FRED vintage snapshots
@@ -251,10 +271,18 @@ NFP_Predictor/
 │   └── NFP_target/                      # Target parquets (total_nsa_first_release.parquet, etc.)
 │
 ├── _output/                             # Pipeline output artefacts
+│   ├── NSA_prediction/, SA_prediction/  # Per-track backtest results, plots, SHAP
+│   ├── NSA_plus_adjustment/             # NSA + PIT-safe seasonal adjustment
+│   ├── consensus_anchor/                # 4-way consensus-anchored ensemble
+│   ├── dynamic_selection/               # Cached dynamic feature-selection artefacts
+│   ├── sandbox/                         # Sandbox experiment outputs
+│   ├── backtest/, models/, Predictions/ # Standard training artefacts
+│   └── Archive/                         # Timestamped snapshots of previous runs
 ├── _temp/                               # Logs and performance profiling JSON files
 │
-├── requirements.txt
-├── pyproject.toml                       # Build config, ruff lint rules, pytest settings
+├── presentation.tex / presentation.pdf  # Beamer presentation deck
+├── pyproject.toml                       # Build config, runtime + dev deps, ruff, pytest
+├── .pre-commit-config.yaml
 └── .github/workflows/test.yml           # CI: pytest × Python 3.10–3.12, ruff, mypy
 ```
 
@@ -301,7 +329,7 @@ For historical FRED data where `realtime_start` is unavailable (pre-2009), two i
 
 **File:** `Data_ETA_Pipeline/fred_employment_pipeline.py`
 
-**Purpose:** The core employment target variable (NFP itself) and 159 disaggregated employment series organized in a 7-level hierarchy.
+**Purpose:** The core employment target variable (NFP itself) and the full disaggregated FRED employment hierarchy — ~295 series total (NSA + SA pairs across ~150 entities), organized in a 7-level hierarchy.
 
 **Hierarchy:**
 
@@ -315,7 +343,7 @@ Level 4+: Sub-industry breakdowns (e.g., Durable Goods, Food Services, Health Ca
 
 **Key mechanics:**
 
-- **159 FRED series** are defined in the `FRED_EMPLOYMENT_CODES` dictionary, mapping hierarchical names to FRED series IDs.
+- All series are defined in the `FRED_EMPLOYMENT_CODES` dictionary, which maps hierarchical names (e.g. `total.private.goods.manufacturing_nsa`) to FRED series IDs (`CEU3000000001`).
 - **ALFRED vintage downloads:** `_fetch_one_all_asof()` fetches each series with full revision history via the Federal Reserve's ALFRED API, preserving `realtime_start` metadata.
 - **BLS schedule scraping:** `scrape_bls_employment_situation_schedule()` scrapes the BLS website for the official NFP release schedule. Falls back to `HARDCODED_RELEASE_DATES` for known-but-not-yet-published dates.
 - **NFP timing utilities (cached):** `get_nfp_release_for_month()` and `get_nfp_release_map()` return the exact release date for each target month. `calculate_median_offset_from_nfp()` computes the typical lag between a series' release and the NFP release.
@@ -337,7 +365,7 @@ For each of the 159 employment series, the pipeline computes:
 | `_rolling_3m` | `mean(MoM[t], MoM[t-1], MoM[t-2])` | 3-month rolling mean of MoM |
 | `_volatility` | `std(MoM[t:t-3])` | 3-month rolling standard deviation |
 
-This yields approximately **159 × 9 = 1,431 employment features** per snapshot.
+This yields several thousand FRED employment features per snapshot before feature selection.
 
 **Target files produced:**
 
@@ -894,18 +922,17 @@ When master snapshots contain ALL lean features (indicated by `mode: "all_featur
 - NOAA
 - Prosper
 
-**Pass 2 (global):** Combine all Pass-1 survivors plus target-derived features, then reduce to a hard cap of `DYNAMIC_FS_PASS2_MAX_FEATURES = 50` using stages (0, 1, 2, 4).
+**Pass 2 (global):** Combine all Pass-1 survivors plus target-derived features, then reduce to a hard cap of `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` using stages (0, 1, 2, 4).
 
 **Reselection frequency:** Controlled by `RESELECT_EVERY_N_MONTHS` (default: 6), loaded from `.env` via `settings.py`.
 
-**NaN evaluation window:** Features are judged on NaN rate from `2010-01-01` onward. Earlier NaN (from pre-2010 data gaps) is tolerated since many sources simply didn't exist before then. Maximum acceptable NaN rate: 20%.
+**NaN evaluation window:** Features are judged on NaN rate from `2010-01-01` onward. Earlier NaN (from pre-2010 data gaps) is tolerated since many sources simply didn't exist before then. Maximum acceptable NaN rate: 20% (`DYNAMIC_FS_NAN_MAX_RATE`).
 
 **Uniform sample weighting for reselection:**
 - `RESELECTION_HALF_LIFE_MONTHS = 9999` — Effectively uniform weights (no recency decay), selecting features with durable long-term predictive power
 - `RESELECTION_START_DATE = '2000-01-01'` — Only start adaptive reselection when sufficient data exists
-- Stage config: Pass 1 uses (0, 2, 4, 5), Pass 2 uses (0, 2, 4)
+- Stage config: Pass 1 uses `RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)`, Pass 2 uses `RESELECTION_STAGES_PASS2 = (0, 2, 4)`
 - `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` — Hard cap after global reduction
-- Reselection interval: every 36 months (configurable via `.env`)
 
 ---
 
@@ -927,14 +954,13 @@ When running `--train-all`, the NSA model trains first. Its backtest results are
 | `nsa_sa_gap_delta` | Change in SA-NSA gap (seasonal adjustment dynamics) |
 
 These features are **always included** (like calendar features) — not subject to dynamic reselection. They bridge the NSA model's acceleration signal into SA space.
-```
 
-Features with fewer than 10 valid observations get `corr = 0`. Runtime: milliseconds.
-
-**Configuration:**
-- `SHORTPASS_TOPK = 60` — Features selected per step (configurable in 40-80 range)
-- `SHORTPASS_METHOD = 'lgbm_gain'` — Default method
+**Short-pass selection configuration** (`Train/short_pass_selection.py`):
+- `SHORTPASS_TOPK = 60` — Features selected per step (configurable in 40–80 range)
+- `SHORTPASS_METHOD = 'lgbm_gain'` — Default method (alternative: `'weighted_corr'`)
 - `SHORTPASS_HALF_LIFE = None` — Reuses the backtest step's half-life
+
+Features with fewer than 10 valid observations get `corr = 0` to prevent spurious selection from sparse coverage.
 
 ---
 
@@ -1406,7 +1432,9 @@ NFP_PERF=1 python run_full_project.py
 | `TUNE_EVERY_N_MONTHS` | 12 | Re-tune frequency |
 | `CONFIDENCE_LEVELS` | [0.50, 0.80, 0.95] | Prediction interval levels |
 | `SHORTPASS_TOPK` | 60 | Features per backtest step |
-| `DYNAMIC_FS_PASS2_MAX_FEATURES` | 50 | Hard cap after global reduction |
+| `DYNAMIC_FS_PASS2_MAX_FEATURES` | 80 | Hard cap after global reduction |
+| `KALMAN_LAMBDA_ACCEL` | 50.0 | Composite-objective weight on acceleration accuracy (consensus tuning) |
+| `KALMAN_LAMBDA_DIR` | 30.0 | Composite-objective weight on directional accuracy (consensus tuning) |
 
 **Variance enhancement configuration:**
 
@@ -1454,6 +1482,17 @@ _output/
 │   ├── summary_statistics.csv
 │   └── summary_table.png
 │
+├── consensus_anchor/                # Post-training Kalman / AccelOverride fusion (see §15)
+│   ├── kalman_fusion/               # Production model
+│   ├── baseline_consensus/
+│   ├── accel_override/
+│   ├── kalman_accel_postfilter/
+│   ├── comparison_metrics.csv
+│   ├── comparison_overlay.png
+│   ├── comparison_metrics.png
+│   ├── comparison_scorecard.html
+│   └── merged_consensus_model.csv
+│
 ├── Predictions/
 │   └── predictions.csv              # Forward predictions with 50/80/95% CIs
 │
@@ -1463,11 +1502,10 @@ _output/
 │   ├── model_comparison.csv         # Multi-variant scorecard
 │   └── model_comparison.html        # Styled HTML with conditional formatting
 │
-├── benchmark_reports/               # Keep-rule JSON reports
-├── revision_analysis/               # Revision ACF/PACF and trend plots
-├── Archive/YYYY-MM-DD_HHMMSS/      # Timestamped snapshots of previous runs
-├── directional_accuracy.jpg
-└── revised_vs_predicted_mom.jpg
+├── backtest/                        # Raw backtest artefacts
+├── dynamic_selection/               # Cached per-cutoff dynamic FS survivors
+├── sandbox/                         # Sandbox experiment outputs (CatBoost, XGBoost, blends)
+└── Archive/YYYY-MM-DD_HHMMSS/       # Timestamped snapshots of previous runs
 ```
 
 ### Model Comparison Scorecard
@@ -1498,71 +1536,89 @@ Uses an `ExpWeightedMonthlyAvgPredictor` with 3-year half-life to predict season
 
 ---
 
-## 15. Consensus Anchor Fusion — Two Final Models
+## 15. Consensus Anchor Fusion (Post-Training)
 
-**File:** `Train/Output_code/consensus_anchor_runner.py`
+**File:** [`Train/Output_code/consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py)
 
-After the main backtest, this module fuses NFP consensus poll data with LightGBM predictions via a Kalman filter. The system produces **two predictions per month** — the user selects based on their priority.
+After the main backtest, this module merges the LSEG/Reuters NFP consensus poll with the model's own predictions and produces **four side-by-side forecasts** so the operator can see the full ensemble. The production output is **Kalman Fusion (NSA)**; the other three are reported as comparators.
 
-**Data sources merged:**
-- `NFP_Consensus_Mean` from Unifier snapshots (economists' mean forecast)
-- SA Direct predictions from `_output/SA_prediction/`
-- NSA+Adjustment predictions from `_output/NSA_plus_adjustment/`
+### Inputs
 
-### Model A: Balanced (Best Acceleration Accuracy)
+The runner builds its merged dataset on-the-fly from:
 
-3-channel Kalman filter: **consensus + SA Direct + NSA+Adjustment**
+| Channel | Source | Role |
+|---|---|---|
+| `consensus_pred` | Latest Unifier snapshot — `NFP_Consensus_Mean` | Anchor / always-on observation |
+| `champion_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (fallback: SA blend sandbox) | Primary model channel |
+| `nsa_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` | NSA acceleration channel for Kalman |
+| `nsa_raw_pred` | `_output/NSA_prediction/backtest_results.csv` | Direction-vote tiebreaker for AccelOverride |
+| `actual` | `data/NFP_target/y_sa_revised.parquet` | Ground truth (SA revised MoM) |
+
+### The four forecasts
+
+**1. Kalman Fusion (NSA)** — production model. Information-filter form, three observation channels (consensus, SA-blend champion, NSA-implied delta lifted to a level via the prior actual). Adaptive trailing-window noise estimation per step (`R_c`, `R_m`, `R_a`, `Q`).
 
 ```
 State:   x_t = x_{t-1} + w_t  (random walk)
-Update:  P = 1 / (1/P_prior + 1/R_c + 1/R_m + w_a/R_a)
-         x = P * (x_prior/P_prior + cons/R_c + sa_direct/R_m + nsa_adj/R_a)
+Update:  P_post = 1 / (1/P_prior + 1/R_c + 1/R_m + w_a/R_a)
+         x_post = P_post · (x_prior/P_prior + cons/R_c + champ/R_m + nsa_level/R_a)
 ```
 
-| Metric | Full 59m | Last 36m |
-|--------|----------|----------|
-| MAE | 105.9 | 67.1 |
-| RMSE | 148.2 | 84.0 |
-| AccelAcc | **56.9%** | **54.3%** |
-| DirAcc | 96.6% | 94.4% |
+**2. Baseline Consensus** — Reuters/LSEG mean poll, untouched. The honest benchmark to beat.
 
-**Use when:** Catching turning points and momentum shifts matters most (trading, risk management).
+**3. AccelOverride** — keeps consensus as the level anchor; flips the directional component only when ≥ 2 of 3 signals (consensus, champion, NSA raw) vote against it. `magnitude_mode ∈ {'consensus','blend','model'}` controls how much model magnitude is mixed in.
 
-### Model B: Precision (Best MAE/RMSE)
+**4. Kalman + AccelOverride post-filter** — hybrid: take the Kalman level, then apply AccelOverride direction logic on top of it.
 
-2-channel Kalman filter: **consensus + NSA+Adjustment**
+### Optuna tuning (composite objective)
 
-| Metric | Full 59m | Last 36m |
-|--------|----------|----------|
-| MAE | **95.5** | 67.6 |
-| RMSE | **135.5** | 82.3 |
-| AccelAcc | 53.4% | 40.0% |
-| DirAcc | 96.6% | 94.4% |
+Both Kalman and AccelOverride are tuned with TPE, optimising:
 
-**Use when:** Minimizing absolute prediction error matters most (forecasting, planning).
+```
+score = MAE − KALMAN_LAMBDA_ACCEL · accel_acc − KALMAN_LAMBDA_DIR · dir_acc
+```
 
-### Both models vs Consensus
+with `KALMAN_LAMBDA_ACCEL = 50.0` and `KALMAN_LAMBDA_DIR = 30.0` (set in [`Train/config.py`](Train/config.py)). Search spaces:
 
-| Metric | Consensus | Model A | Model B |
-|--------|-----------|---------|---------|
-| Full MAE | 109.7 | 105.9 (-3.5%) | **95.5 (-13.0%)** |
-| Full RMSE | 166.0 | 148.2 (-10.7%) | **135.5 (-18.4%)** |
-| Full AccelAcc | 44.8% | **56.9% (+27%)** | 53.4% (+19%) |
-| 36m AccelAcc | 42.9% | **54.3% (+27%)** | 40.0% |
+| Variant | Tuned parameters |
+|---|---|
+| Kalman Fusion | `trailing_window ∈ [6, 36]`, `nsa_weight_scale ∈ [0.1, 3.0]` |
+| AccelOverride | `kappa ∈ [0.1, 0.9]`, `magnitude_mode ∈ {consensus, blend, model}` |
 
-**Outputs:**
+Trial budget = `N_OPTUNA_TRIALS = 25`, timeout = `OPTUNA_TIMEOUT = 300 s`. Both fall back to defaults if Optuna isn't installed (`trailing_window=18`, `kappa=0.5`, `magnitude_mode='consensus'`).
+
+### Backtest results (59 OOS months, SA revised target)
+
+| Forecast | MAE | RMSE | DirAcc | AccelAcc | STD Ratio | Diff STD Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| **Kalman Fusion (NSA)** | **108.8** | **155.2** | **98.3%** | **58.6%** | 0.87 | 0.72 |
+| Baseline Consensus | 109.7 | 166.0 | 96.6% | 44.8% | 0.96 | 0.46 |
+| AccelOverride (k=0.50, consensus) | 111.4 | 167.3 | 96.6% | 48.3% | 0.96 | 0.55 |
+| Kalman + AccelOverride post-filter | 119.2 | 172.0 | 96.6% | 51.7% | 0.87 | 0.74 |
+| Baseline Champion (NSA+Adj) | 164.6 | 206.3 | 88.1% | 62.1% | 1.03 | 1.45 |
+
+Kalman Fusion is the only forecast that beats consensus on **every** error metric while also lifting acceleration accuracy by ~14 percentage points. The standalone champion has the highest raw acceleration accuracy but pays for it with much higher level error and over-amplified variance — it is most useful as a *channel* in the Kalman update, not as the final forecast.
+
+### Outputs
+
 ```
 _output/consensus_anchor/
-├── kalman_fusion/              # Model A results
+├── merged_consensus_model.csv          # Merged input dataset (consensus + all model channels)
+├── comparison_metrics.csv              # All four forecasts + champion, full metric suite
+├── comparison_metrics.png              # Side-by-side bar charts (MAE/RMSE + DirAcc/AccelAcc)
+├── comparison_overlay.png              # Overlay: actual vs each forecast
+├── comparison_scorecard.html           # Sortable HTML scorecard with embedded plots
+├── kalman_fusion/                      # Production model
 │   ├── backtest_results.csv
 │   ├── summary_statistics.csv
-│   └── tuned_params.json
-├── kalman_precision/           # Model B results
-│   ├── backtest_results.csv
-│   └── summary_statistics.csv
-├── accel_override/             # AccelOverride variant
-├── comparison_metrics.csv      # All approaches compared
-└── merged_consensus_model.csv  # Combined input data
+│   ├── summary_metrics.json
+│   ├── tuned_params.json               # {trailing_window, nsa_weight_scale}
+│   ├── backtest_predictions.png
+│   ├── summary_table.png
+│   └── acf_*.csv / pacf_*.csv / acf_pacf_diagnostics.png
+├── baseline_consensus/                 # Untouched consensus poll
+├── accel_override/                     # tuned_params.json: {kappa, magnitude_mode}
+└── kalman_accel_postfilter/            # Hybrid Kalman + direction override
 ```
 
 ---

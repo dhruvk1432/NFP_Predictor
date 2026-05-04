@@ -1,84 +1,90 @@
-# Sandbox Experiments (No Core Pipeline Changes)
+# Sandbox Experiments
 
-These scripts are intentionally isolated from the production training pipeline.
-They do not modify model artifacts under `Train/train_lightgbm_nfp.py`.
+Standalone experiments that **do not** modify the production training pipeline ([`Train/train_lightgbm_nfp.py`](../train_lightgbm_nfp.py)) or any artefacts under [`_output/`](../../_output/) outside of [`_output/sandbox/`](../../_output/sandbox/).
 
-## 1) CatBoost SA Revised Backtest
+These scripts exist to test alternative models, blends, and consensus-anchor formulations against the SA revised target without risking the main backtest. The best ideas from this folder graduate into the production [`Train/Output_code/consensus_anchor_runner.py`](../Output_code/consensus_anchor_runner.py).
 
-Runs a standalone walk-forward backtest for `sa_first_revised` using CatBoost.
+> **Multiprocessing note:** sandbox feature-building defaults to `JOBLIB_MULTIPROCESSING=0` for stability on macOS. If your terminal is stable with multiprocessing, override per run, e.g.:
+> ```bash
+> JOBLIB_MULTIPROCESSING=1 python Train/sandbox/experiment_lgbm_sa_revised_variants.py --variants all
+> ```
+
+---
+
+## Inventory
+
+| Script | Purpose |
+|---|---|
+| [`experiment_catboost_sa_revised.py`](experiment_catboost_sa_revised.py) | CatBoost walk-forward backtest for `sa_first_revised` |
+| [`experiment_xgboost_sa_revised.py`](experiment_xgboost_sa_revised.py) | XGBoost walk-forward backtest, optional Optuna tuning |
+| [`experiment_lgbm_sa_revised_variants.py`](experiment_lgbm_sa_revised_variants.py) | Four LightGBM variants (`v1`–`v4`) on the SA-revised feature set |
+| [`experiment_sa_blend.py`](experiment_sa_blend.py) | Walk-forward dynamic blend of SA Direct + NSA+Adjustment |
+| [`experiment_predicted_adjustment.py`](experiment_predicted_adjustment.py) | Predict `SA_MoM − NSA_MoM` (seasonal adjustment factor) via SARIMA, monthly avg, exp-weighted, etc. |
+| [`explore_anchor_plus_direction.py`](explore_anchor_plus_direction.py) | Use SA prediction as anchor, NSA-derived direction as nudge — research only |
+| [`explore_consensus_anchor.py`](explore_consensus_anchor.py) | Replace SA anchor with the LSEG consensus poll — research only |
+| [`compare_sa_revised_models.py`](compare_sa_revised_models.py) | Unified ranking table across main + sandbox + archive runs |
+| [`run_sa_revised_sandbox_suite.py`](run_sa_revised_sandbox_suite.py) | One-command runner: all sandbox experiments, then comparison |
+| [`freeze_sa_revised_baseline.py`](freeze_sa_revised_baseline.py) | Champion / challenger baseline freezer |
+| [`output_utils.py`](output_utils.py) | Shared sandbox diagnostics writer (`write_sandbox_output_bundle`) — used by other scripts |
+
+Each experiment writes a full diagnostic bundle (backtest CSV, summary stats, ACF/PACF, prediction plot, summary table) under `_output/sandbox/<experiment_id>/`.
+
+---
+
+## 1. CatBoost / XGBoost SA Revised Backtest
 
 ```bash
 python Train/sandbox/experiment_catboost_sa_revised.py
-```
-
-Outputs:
-
-- `_output/sandbox/catboost_sa_revised/backtest_results.csv`
-- `_output/sandbox/catboost_sa_revised/summary_statistics.csv`
-- `_output/sandbox/catboost_sa_revised/summary_metrics.json`
-- `_output/sandbox/catboost_sa_revised/backtest_predictions.png`
-- `_output/sandbox/catboost_sa_revised/summary_table.png`
-- `_output/sandbox/catboost_sa_revised/acf_sa_revised.csv`
-- `_output/sandbox/catboost_sa_revised/pacf_sa_revised.csv`
-- `_output/sandbox/catboost_sa_revised/acf_error_sa_revised.csv`
-- `_output/sandbox/catboost_sa_revised/pacf_error_sa_revised.csv`
-- `_output/sandbox/catboost_sa_revised/acf_pacf_diagnostics.png`
-
-If CatBoost is not installed, run XGBoost sandbox instead:
-
-```bash
+# or
 python Train/sandbox/experiment_xgboost_sa_revised.py
 ```
 
-Enable Optuna tuning for XGBoost walk-forward:
+Enable Optuna tuning for XGBoost (composite objective):
 
 ```bash
-python Train/sandbox/experiment_xgboost_sa_revised.py --tune --tune-objective composite --tune-trials 25 --tune-every-steps 1
+python Train/sandbox/experiment_xgboost_sa_revised.py \
+  --tune --tune-objective composite --tune-trials 25 --tune-every-steps 1
 ```
 
-Outputs:
+If CatBoost is not installed, the XGBoost script is the recommended fallback.
 
-- `_output/sandbox/xgboost_sa_revised/backtest_results.csv`
-- `_output/sandbox/xgboost_sa_revised/summary_statistics.csv`
-- `_output/sandbox/xgboost_sa_revised/summary_metrics.json`
-- `_output/sandbox/xgboost_sa_revised/backtest_predictions.png`
-- `_output/sandbox/xgboost_sa_revised/summary_table.png`
-- `_output/sandbox/xgboost_sa_revised/acf_sa_revised.csv`
-- `_output/sandbox/xgboost_sa_revised/pacf_sa_revised.csv`
-- `_output/sandbox/xgboost_sa_revised/acf_error_sa_revised.csv`
-- `_output/sandbox/xgboost_sa_revised/pacf_error_sa_revised.csv`
-- `_output/sandbox/xgboost_sa_revised/acf_pacf_diagnostics.png`
+**Outputs (per experiment, e.g. `xgboost_sa_revised`):**
+```
+_output/sandbox/<experiment_id>/
+├── backtest_results.csv
+├── summary_statistics.csv
+├── summary_metrics.json
+├── backtest_predictions.png
+├── summary_table.png
+├── acf_sa_revised.csv         pacf_sa_revised.csv
+├── acf_error_sa_revised.csv   pacf_error_sa_revised.csv
+└── acf_pacf_diagnostics.png
+```
 
-## 2) SA Blend Walk-Forward (SA Direct + NSA+Perfect Adjustment)
+---
 
-Builds a walk-forward dynamic blend using existing output CSVs.
+## 2. SA Blend Walk-Forward (SA Direct + NSA+Adjustment)
+
+Builds a walk-forward dynamic blend from existing main-pipeline backtest CSVs — no retraining.
 
 ```bash
 python Train/sandbox/experiment_sa_blend.py
 ```
 
-Enable Optuna tuning for blend hyperparameters (`window`, `min_history`, `grid_step`):
+Tune blend hyperparameters (`window`, `min_history`, `grid_step`):
 
 ```bash
-python Train/sandbox/experiment_sa_blend.py --tune --tune-objective composite --tune-trials 25 --tune-cv-splits 4
+python Train/sandbox/experiment_sa_blend.py \
+  --tune --tune-objective composite --tune-trials 25 --tune-cv-splits 4
 ```
 
-Outputs:
+Output: `_output/sandbox/sa_blend_walkforward/` (same diagnostics bundle as above). This blend used to be a Kalman-fusion channel and is still kept as the fallback champion in [`consensus_anchor_runner.py`](../Output_code/consensus_anchor_runner.py).
 
-- `_output/sandbox/sa_blend_walkforward/backtest_results.csv`
-- `_output/sandbox/sa_blend_walkforward/summary_statistics.csv`
-- `_output/sandbox/sa_blend_walkforward/summary_metrics.json`
-- `_output/sandbox/sa_blend_walkforward/backtest_predictions.png`
-- `_output/sandbox/sa_blend_walkforward/summary_table.png`
-- `_output/sandbox/sa_blend_walkforward/acf_sa_revised.csv`
-- `_output/sandbox/sa_blend_walkforward/pacf_sa_revised.csv`
-- `_output/sandbox/sa_blend_walkforward/acf_error_sa_revised.csv`
-- `_output/sandbox/sa_blend_walkforward/pacf_error_sa_revised.csv`
-- `_output/sandbox/sa_blend_walkforward/acf_pacf_diagnostics.png`
+---
 
-## 3) LightGBM SA Revised Version Suite (Past-Style -> Current-Style)
+## 3. LightGBM SA Revised Variant Suite
 
-Runs sandbox-only SA revised variants on the current feature dataset:
+Four sandbox-only LightGBM variants on the current SA-revised feature set:
 
 - `v1_legacy_level_only`
 - `v2_snapshot_plus_branch`
@@ -86,85 +92,124 @@ Runs sandbox-only SA revised variants on the current feature dataset:
 - `v4_delta_amp_stack`
 
 ```bash
+# Run all four with default hyperparameters
 python Train/sandbox/experiment_lgbm_sa_revised_variants.py --variants all
+
+# Full Optuna tuning per walk-forward step, per variant
+python Train/sandbox/experiment_lgbm_sa_revised_variants.py \
+  --variants all --tune --tune-objective composite \
+  --tune-trials 25 --tune-every-steps 1
 ```
 
-To enable full Optuna tuning for each walk-forward step of each variant:
+**Outputs:**
+```
+_output/sandbox/sa_revised_variants/
+├── <variant_id>/...           # Per-variant diagnostics bundle
+├── suite_summary.csv
+└── suite_summary.json
+```
+
+---
+
+## 4. Predicted Seasonal Adjustment
+
+Backtests several models for the seasonal adjustment factor (`SA_MoM − NSA_MoM`) without lookahead, then combines NSA predictions with the predicted adjustment to produce SA-space forecasts. Models tested: SARIMA, monthly average, 12-month complement, same-month last year, exponentially-weighted monthly average, linear regression with month dummies.
 
 ```bash
-python Train/sandbox/experiment_lgbm_sa_revised_variants.py --variants all --tune --tune-objective composite --tune-trials 25 --tune-every-steps 1
+python Train/sandbox/experiment_predicted_adjustment.py
 ```
 
-Outputs:
+Output: `_output/sandbox/nsa_predicted_adjustment_revised/`.
 
-- `_output/sandbox/sa_revised_variants/<variant_id>/...` (same diagnostics bundle)
-- `_output/sandbox/sa_revised_variants/suite_summary.csv`
-- `_output/sandbox/sa_revised_variants/suite_summary.json`
+---
 
-Note:
+## 5. Consensus / Anchor Explorations
 
-- Sandbox feature-building defaults to `JOBLIB_MULTIPROCESSING=0` for stability.
-- If your terminal is stable with multiprocessing, override per run:
-  `JOBLIB_MULTIPROCESSING=1 python Train/sandbox/experiment_lgbm_sa_revised_variants.py --variants all`
-
-## 4) Unified SA Revised Comparison (Main + Sandbox + Archive)
-
-Builds one ranking table and comparison plots for all discovered SA revised runs.
+Research-only scripts that informed the production [`consensus_anchor_runner.py`](../Output_code/consensus_anchor_runner.py). They reuse existing backtest CSVs and the latest Unifier consensus snapshot — no retraining.
 
 ```bash
-python Train/sandbox/compare_sa_revised_models.py --include-archive --archive-limit 8 --min-backtest-rows 12
+python Train/sandbox/explore_anchor_plus_direction.py   # SA anchor + NSA direction
+python Train/sandbox/explore_consensus_anchor.py        # Consensus poll as anchor
 ```
 
-Outputs:
+Both print metrics to stdout; neither writes to `_output/` (they are intentionally side-effect-free explorations).
 
-- `_output/sandbox/sa_revised_comparison/model_metrics_raw.csv`
-- `_output/sandbox/sa_revised_comparison/model_metrics_ranked.csv`
-- `_output/sandbox/sa_revised_comparison/comparison_summary.txt`
-- `_output/sandbox/sa_revised_comparison/compare_error_metrics.png`
-- `_output/sandbox/sa_revised_comparison/compare_variance_metrics.png`
-- `_output/sandbox/sa_revised_comparison/compare_scores.png`
-- `_output/sandbox/sa_revised_comparison/compare_predictions_overlay.png`
+---
 
-## 5) One-Command Suite Runner
+## 6. Unified SA Revised Comparison
 
-Runs all sandbox experiments, then comparison:
+Builds one ranking table and overlay plots across main, sandbox, and archived SA-revised runs:
+
+```bash
+python Train/sandbox/compare_sa_revised_models.py \
+  --include-archive --archive-limit 8 --min-backtest-rows 12
+```
+
+**Outputs:**
+```
+_output/sandbox/sa_revised_comparison/
+├── model_metrics_raw.csv
+├── model_metrics_ranked.csv
+├── comparison_summary.txt
+├── compare_error_metrics.png
+├── compare_variance_metrics.png
+├── compare_scores.png
+└── compare_predictions_overlay.png
+```
+
+---
+
+## 7. One-Command Suite Runner
+
+Run all sandbox experiments, then the comparison table:
 
 ```bash
 python Train/sandbox/run_sa_revised_sandbox_suite.py
 ```
 
-Suite runner with tuned LightGBM variants:
+With tuned LightGBM variants:
 
 ```bash
-python Train/sandbox/run_sa_revised_sandbox_suite.py --tune-variants --tune-objective composite --tune-trials 25 --tune-every-steps 1
+python Train/sandbox/run_sa_revised_sandbox_suite.py \
+  --tune-variants --tune-objective composite \
+  --tune-trials 25 --tune-every-steps 1
 ```
 
-Suite runner with tuning on XGBoost + blend + LightGBM variants:
+Full tuning across XGBoost + blend + LightGBM variants:
 
 ```bash
-python Train/sandbox/run_sa_revised_sandbox_suite.py --tune-xgboost --xgb-tune-objective composite --xgb-tune-trials 25 --xgb-tune-every-steps 1 --tune-blend --blend-tune-objective composite --blend-tune-trials 25 --tune-variants --tune-objective composite --tune-trials 25 --tune-every-steps 1
+python Train/sandbox/run_sa_revised_sandbox_suite.py \
+  --tune-xgboost --xgb-tune-objective composite \
+  --xgb-tune-trials 25 --xgb-tune-every-steps 1 \
+  --tune-blend --blend-tune-objective composite --blend-tune-trials 25 \
+  --tune-variants --tune-objective composite \
+  --tune-trials 25 --tune-every-steps 1
 ```
 
-## 6) Freeze Baseline Step 1 (Champion/Challenger)
+Run the full suite, then freeze the SA-revised baseline pair:
 
-Freeze the current SA revised baseline pair:
+```bash
+python Train/sandbox/run_sa_revised_sandbox_suite.py \
+  --freeze-baseline --freeze-version v1
+```
 
-- `champion_v1`: sandbox SA blend (`_output/sandbox/sa_blend_walkforward`)
-- `challenger_v1`: main SA revised (`_output/SA_prediction_revised`)
+---
+
+## 8. Freeze Baseline (Champion / Challenger)
+
+Freezes the current SA-revised baseline pair:
+
+- `champion_v1` — sandbox SA blend (`_output/sandbox/sa_blend_walkforward`)
+- `challenger_v1` — main SA-revised (`_output/SA_prediction`, falling back to `_output/SA_prediction_revised`)
 
 ```bash
 python Train/sandbox/freeze_sa_revised_baseline.py --version v1
 ```
 
-Outputs:
-
-- `_output/frozen_baselines/sa_revised/champion_v1/`
-- `_output/frozen_baselines/sa_revised/challenger_v1/`
-- `_output/model_registry/sa_revised/sa_revised_baseline_v1.json`
-- `_output/model_registry/sa_revised/sa_revised_baseline_latest.json`
-
-To run full suite then freeze in one command:
-
-```bash
-python Train/sandbox/run_sa_revised_sandbox_suite.py --freeze-baseline --freeze-version v1
+**Outputs:**
+```
+_output/frozen_baselines/sa_revised/champion_v1/
+_output/frozen_baselines/sa_revised/challenger_v1/
+_output/model_registry/sa_revised/sa_revised_baseline_v1.json
+_output/model_registry/sa_revised/sa_revised_baseline_latest.json
 ```

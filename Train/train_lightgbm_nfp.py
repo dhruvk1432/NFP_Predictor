@@ -36,11 +36,9 @@ from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump
 # Import from modular components
 from Train.config import (
     MODEL_SAVE_DIR,
-    MASTER_SNAPSHOTS_BASE,
     VALID_TARGET_TYPES,
     VALID_RELEASE_TYPES,
     get_model_id,
-    get_master_snapshots_dir,
     get_target_path,
     load_selected_features,
     USE_HUBER_LOSS_DEFAULT,
@@ -2102,63 +2100,6 @@ def run_expanding_window_backtest(
             _json.dump(stability_data, _f, indent=2)
         logger.info(f"Saved stability report to {stability_path}")
 
-    # ── Post-backtest: write pruned snapshots to revised_pruned/ ──
-    # The original revised/ snapshots are preserved with full features for future
-    # dynamic reselection. Pruned copies go to revised_pruned/ for fast loading
-    # in production inference (no dynamic reselection needed).
-    if _all_features_mode and _dynamic_selection_logs:
-        final_log = _dynamic_selection_logs[-1]
-        final_features = final_log["features"]
-        meta_cols = {"date", "snapshot_date"}
-        keep_cols = list(meta_cols) + final_features
-
-        pruned_dir = MASTER_SNAPSHOTS_BASE / target_type / "revised_pruned" / "decades"
-        source_dir = get_master_snapshots_dir(target_type, target_source)
-
-        if source_dir.exists():
-            parquet_files = sorted(source_dir.rglob("*.parquet"))
-            n_written = 0
-            for pq_path in parquet_files:
-                try:
-                    df = pd.read_parquet(pq_path)
-                    available = [c for c in keep_cols if c in df.columns]
-                    if len(available) <= len(meta_cols):
-                        continue
-                    # Write to revised_pruned with same relative path
-                    rel = pq_path.relative_to(source_dir)
-                    out_path = pruned_dir / rel
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    df[available].to_parquet(out_path, index=False)
-                    n_written += 1
-                except Exception as e:
-                    logger.warning(f"Failed to write pruned snapshot {pq_path.name}: {e}")
-
-            logger.info(
-                f"[{model_id}] Wrote pruned snapshots: {n_written}/{len(parquet_files)} files "
-                f"to revised_pruned/ ({len(final_features)} selected features + meta cols)"
-            )
-
-            # Update pruned feature marker
-            import json as _json
-            marker_path = MASTER_SNAPSHOTS_BASE / f"selected_features_{target_type}_revised_pruned.json"
-            marker_data = {
-                "mode": "selected",
-                "features": final_features,
-                "n_features": len(final_features),
-                "selected_at": final_log["step_date"],
-                "generated_at": pd.Timestamp.now().isoformat(),
-            }
-            try:
-                with open(marker_path, 'w') as _f:
-                    _json.dump(marker_data, _f, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to write pruned feature marker: {e}")
-        else:
-            logger.warning(
-                f"[{model_id}] Source dir does not exist: {source_dir}. "
-                f"Skipping pruned snapshot generation."
-            )
-
     return results_df, X_full, y_full
 
 
@@ -2766,17 +2707,30 @@ def validate_post_train_all_artifacts(
     optional.append(("output::revised::forward_predictions",
                      output_root / "Predictions" / "predictions.csv"))
 
-    # Post-training sandbox + consensus anchor artifacts (optional)
+    # Post-training sandbox artifacts (optional)
     optional.append(("sandbox::predicted_adjustment",
                      output_root / "sandbox" / "nsa_predicted_adjustment_revised" / "backtest_results.csv"))
     optional.append(("sandbox::sa_blend_walkforward",
                      output_root / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"))
-    optional.append(("consensus_anchor::kalman_fusion",
-                     output_root / "consensus_anchor" / "kalman_fusion" / "backtest_results.csv"))
-    optional.append(("consensus_anchor::accel_override",
-                     output_root / "consensus_anchor" / "accel_override" / "backtest_results.csv"))
-    optional.append(("consensus_anchor::comparison_metrics",
-                     output_root / "consensus_anchor" / "comparison_metrics.csv"))
+
+    # Consensus anchor: full 4-way scorecard is part of the production artifact set
+    consensus_dir = output_root / "consensus_anchor"
+    required.append(("consensus_anchor::baseline_consensus",
+                     consensus_dir / "baseline_consensus" / "backtest_results.csv"))
+    required.append(("consensus_anchor::kalman_fusion",
+                     consensus_dir / "kalman_fusion" / "backtest_results.csv"))
+    required.append(("consensus_anchor::accel_override",
+                     consensus_dir / "accel_override" / "backtest_results.csv"))
+    required.append(("consensus_anchor::kalman_accel_postfilter",
+                     consensus_dir / "kalman_accel_postfilter" / "backtest_results.csv"))
+    required.append(("consensus_anchor::comparison_metrics",
+                     consensus_dir / "comparison_metrics.csv"))
+    required.append(("consensus_anchor::comparison_overlay",
+                     consensus_dir / "comparison_overlay.png"))
+    required.append(("consensus_anchor::comparison_metrics_png",
+                     consensus_dir / "comparison_metrics.png"))
+    required.append(("consensus_anchor::comparison_scorecard",
+                     consensus_dir / "comparison_scorecard.html"))
 
     for label, path in required:
         if not path.exists():
@@ -2957,6 +2911,9 @@ Examples:
                     sa_residuals=sa_r['residuals'],
                     output_base=OUTPUT_DIR,
                     suffix='',
+                    # Archive happens at the very end of --train-all so the
+                    # snapshot includes the consensus-anchor outputs.
+                    archive=False,
                 )
 
         # ── Post-output: Predicted adjustment, SA blend, Consensus anchor ──
@@ -3039,18 +2996,24 @@ Examples:
             logger.warning("  SA blend walk-forward failed (non-fatal): %s", e)
 
         # Step 3: Consensus anchor (Kalman fusion + AccelOverride with Optuna)
-        try:
-            from Train.Output_code.consensus_anchor_runner import run_consensus_anchor_pipeline
-            logger.info("\n[Post-3] Consensus anchor integration...")
-            run_consensus_anchor_pipeline(
-                output_base=OUTPUT_DIR,
-                tune=tune,
-                n_trials=N_OPTUNA_TRIALS,
-                timeout=OPTUNA_TIMEOUT,
-            )
-            logger.info("  Consensus anchor integration complete")
-        except Exception as e:
-            logger.warning("  Consensus anchor failed (non-fatal): %s", e)
+        # Required artifact: failing this step fails the whole pipeline, since the
+        # 4-way scorecard (baseline_consensus, kalman_fusion, accel_override,
+        # kalman_accel_postfilter) is part of the production output set.
+        from Train.Output_code.consensus_anchor_runner import run_consensus_anchor_pipeline
+        logger.info("\n[Post-3] Consensus anchor integration...")
+        run_consensus_anchor_pipeline(
+            output_base=OUTPUT_DIR,
+            tune=tune,
+            n_trials=N_OPTUNA_TRIALS,
+            timeout=OPTUNA_TIMEOUT,
+        )
+        logger.info("  Consensus anchor integration complete")
+
+        # Step 4: Archive the full final state (deferred from generate_all_output
+        # so the snapshot includes the consensus anchor 4-way scorecard).
+        from Train.Output_code.generate_output import archive_outputs
+        logger.info("\n[Post-4] Archiving final outputs...")
+        archive_outputs(OUTPUT_DIR)
 
         _total_elapsed = _time.time() - _train_all_t0
         validation = validate_post_train_all_artifacts(

@@ -241,10 +241,6 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
     else:
         merged["nsa_raw_pred"] = np.nan
         logger.warning("NSA raw not found; AccelOverride will use fewer signals")
-                          merged["nsa_pred"].notna().sum())
-        else:
-            merged["nsa_pred"] = np.nan
-            logger.warning("No NSA predictions found; Kalman NSA channel disabled")
 
     # Backfill actuals from target parquet for full consensus history
     if TARGET_PARQUET.exists():
@@ -527,18 +523,24 @@ def accel_override(
         else:
             last_actual = hist_valid["actual"].iloc[-1]
             cons_delta = row["consensus_pred"] - last_actual
+            dir_cons = np.sign(cons_delta)
+            model_delta = (
+                float(row["champion_pred"]) - last_actual
+                if pd.notna(row.get("champion_pred"))
+                else cons_delta
+            )
 
             # Majority vote using all available signals
-            dir_votes = [np.sign(cons_delta)]
+            dir_votes = [dir_cons]
             if pd.notna(row.get("champion_pred")):
-                dir_votes.append(np.sign(row["champion_pred"] - last_actual))
+                dir_votes.append(np.sign(model_delta))
             if has_nsa and pd.notna(row.get("nsa_pred")):
                 dir_votes.append(np.sign(float(row["nsa_pred"]) - last_actual))
             if has_nsa_raw and pd.notna(row.get("nsa_raw_pred")):
                 dir_votes.append(np.sign(float(row["nsa_raw_pred"]) - last_actual))
 
             vote_sum = sum(dir_votes)
-            chosen_dir = np.sign(vote_sum) if vote_sum != 0 else np.sign(cons_delta)
+            chosen_dir = np.sign(vote_sum) if vote_sum != 0 else dir_cons
 
             agree = (chosen_dir == dir_cons)
 
@@ -617,6 +619,355 @@ def _tune_accel_override(
 
 
 # ---------------------------------------------------------------------------
+# Comparison Visualization
+# ---------------------------------------------------------------------------
+
+# Stable colors per forecast across the overlay + bar chart.
+_FORECAST_COLORS = {
+    "Baseline_Consensus": "#DC2626",        # red
+    "Kalman_Fusion_NSA": "#2563EB",         # blue
+    "Kalman_Fusion": "#2563EB",
+    "Kalman_AccelPostFilter": "#7C3AED",    # purple
+    "AccelOverride": "#16A34A",             # green
+    "Baseline_Champion": "#9CA3AF",         # gray
+}
+
+
+def _color_for(label: str) -> str:
+    if label in _FORECAST_COLORS:
+        return _FORECAST_COLORS[label]
+    if label.startswith("AccelOverride"):
+        return _FORECAST_COLORS["AccelOverride"]
+    if label.startswith("Kalman_Fusion"):
+        return _FORECAST_COLORS["Kalman_Fusion"]
+    return "#374151"
+
+
+def write_comparison_visualization(
+    out_dir: Path,
+    forecast_dfs: Dict[str, pd.DataFrame],
+    metrics_df: pd.DataFrame,
+) -> None:
+    """
+    Produce a unified comparison view across all 4 consensus-anchor forecasts:
+      - comparison_overlay.png  (actual vs each forecast, full backtest)
+      - comparison_metrics.png  (MAE / RMSE / DirAcc / AccelAcc bar chart)
+      - comparison_scorecard.html  (sortable metrics table + image grid)
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Overlay plot
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Plot actuals once from whichever forecast has them
+    actual_series = None
+    for df in forecast_dfs.values():
+        if "actual" in df.columns and df["actual"].notna().any():
+            actual_series = df[["ds", "actual"]].dropna(subset=["actual"]).sort_values("ds")
+            break
+    if actual_series is not None:
+        ax.plot(actual_series["ds"], actual_series["actual"],
+                color="black", linewidth=1.8, marker="o", markersize=3, label="Actual",
+                zorder=10)
+
+    for label, df in forecast_dfs.items():
+        plot_df = df[["ds", "predicted"]].dropna().sort_values("ds")
+        if plot_df.empty:
+            continue
+        ax.plot(plot_df["ds"], plot_df["predicted"],
+                color=_color_for(label), linewidth=1.4, marker="s", markersize=2.5,
+                alpha=0.9, label=label)
+
+    ax.set_title("Consensus Anchor: 4-Way Forecast Comparison (SA Revised MoM)",
+                 fontweight="bold")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("NFP MoM Change (thousands)")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    ax.legend(loc="upper left", frameon=True, fancybox=True, shadow=True, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "comparison_overlay.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # 2) Metrics bar chart — split into two panels because MAE/RMSE (~100s)
+    # and accuracies (~0.5) live on incompatible scales.
+    error_metrics = [("MAE", "MAE"), ("RMSE", "RMSE")]
+    accuracy_metrics = [
+        ("Acceleration_Accuracy", "AccelAcc"),
+        ("Directional_Accuracy", "DirAcc"),
+    ]
+    bar_df = metrics_df[metrics_df["Forecast"].isin(forecast_dfs.keys())].copy()
+    if not bar_df.empty:
+        ordered = [f for f in forecast_dfs.keys() if f in set(bar_df["Forecast"])]
+        bar_df = bar_df.set_index("Forecast").loc[ordered]
+
+        n_models = len(bar_df)
+        width = 0.8 / max(n_models, 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        for ax, panel in zip(axes, [error_metrics, accuracy_metrics]):
+            cols, names = zip(*panel)
+            x = np.arange(len(names))
+            for i, (label, row) in enumerate(bar_df.iterrows()):
+                vals = [float(row[c]) for c in cols]
+                offset = (i - (n_models - 1) / 2) * width
+                bars = ax.bar(
+                    x + offset, vals, width,
+                    label=label, color=_color_for(label), alpha=0.88,
+                )
+                for bar in bars:
+                    h = bar.get_height()
+                    fmt = f"{h:.1f}" if abs(h) > 2 else f"{h:.3f}"
+                    ax.annotate(
+                        fmt, xy=(bar.get_x() + bar.get_width() / 2, h),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=8,
+                    )
+            ax.set_xticks(x)
+            ax.set_xticklabels(names)
+            ax.grid(True, axis="y", alpha=0.3)
+
+        axes[0].set_title("Error metrics (lower is better)", fontweight="bold")
+        axes[0].set_ylabel("Thousands of jobs")
+        axes[1].set_title("Accuracy metrics (higher is better)", fontweight="bold")
+        axes[1].set_ylim(0, 1.05)
+        axes[1].legend(loc="lower right", frameon=True, fancybox=True, shadow=True)
+
+        fig.suptitle("Consensus Anchor: Backtest Metrics by Forecast", fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(out_dir / "comparison_metrics.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+    # 3) HTML scorecard
+    table_html = (
+        metrics_df.round(3)
+        .to_html(index=False, classes="metrics", border=0)
+    )
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Consensus Anchor Scorecard</title>
+<style>
+ body {{ font-family: -apple-system, system-ui, Helvetica, Arial, sans-serif;
+        margin: 24px; color: #111; }}
+ h1 {{ font-size: 22px; margin-bottom: 8px; }}
+ h2 {{ font-size: 16px; margin-top: 28px; }}
+ table.metrics {{ border-collapse: collapse; font-size: 13px; }}
+ table.metrics th, table.metrics td {{ padding: 6px 10px; border-bottom: 1px solid #eee; text-align: right; }}
+ table.metrics th:first-child, table.metrics td:first-child {{ text-align: left; }}
+ table.metrics tr:hover td {{ background: #f6f8fa; }}
+ img {{ max-width: 100%; border: 1px solid #eee; margin-top: 8px; }}
+ .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+</style></head>
+<body>
+ <h1>Consensus Anchor — 4-Way Forecast Scorecard</h1>
+ <p>Sorted by MAE. Backtest period: {len(actual_series) if actual_series is not None else "?"} months.</p>
+ {table_html}
+ <h2>Forecast overlay</h2>
+ <img src="comparison_overlay.png" alt="overlay" />
+ <h2>Metrics comparison</h2>
+ <img src="comparison_metrics.png" alt="metrics" />
+ <h2>Per-forecast diagnostics</h2>
+ <div class="grid">
+  <div><h3>Baseline Consensus</h3><img src="baseline_consensus/backtest_predictions.png"/></div>
+  <div><h3>Kalman Fusion (NSA)</h3><img src="kalman_fusion/backtest_predictions.png"/></div>
+  <div><h3>AccelOverride</h3><img src="accel_override/backtest_predictions.png"/></div>
+  <div><h3>Kalman + AccelOverride Post-Filter</h3><img src="kalman_accel_postfilter/backtest_predictions.png"/></div>
+ </div>
+</body></html>
+"""
+    (out_dir / "comparison_scorecard.html").write_text(html, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# predictions.csv augmentation
+# ---------------------------------------------------------------------------
+
+# Map predictions.csv `model` column → relative path of the model's
+# summary_statistics.csv under output_base. Used to attach a backtest RMSE
+# to each row so the file can be sorted best-to-worst.
+_MODEL_RMSE_PATHS: Dict[str, str] = {
+    "NSA":                                       "NSA_prediction/summary_statistics.csv",
+    "SA":                                        "SA_prediction/summary_statistics.csv",
+    "NSA_plus_adjustment":                       "NSA_plus_adjustment/summary_statistics.csv",
+    "Consensus":                                 "consensus_anchor/baseline_consensus/summary_statistics.csv",
+    "consensus_anchor_kalman_fusion":            "consensus_anchor/kalman_fusion/summary_statistics.csv",
+    "consensus_anchor_accel_override":           "consensus_anchor/accel_override/summary_statistics.csv",
+    "consensus_anchor_kalman_accel_postfilter":  "consensus_anchor/kalman_accel_postfilter/summary_statistics.csv",
+}
+
+
+def _load_model_rmses(output_base: Path) -> Dict[str, float]:
+    """Read backtest RMSE from each model's summary_statistics.csv.
+
+    Missing files are skipped (the row will get NaN RMSE and sort last).
+    """
+    out: Dict[str, float] = {}
+    for model, rel in _MODEL_RMSE_PATHS.items():
+        path = output_base / rel
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+            if "RMSE" in df.columns and len(df) > 0:
+                out[model] = float(df["RMSE"].iloc[0])
+        except Exception as exc:
+            logger.warning("Could not read RMSE from %s: %s", path, exc)
+    return out
+
+
+def _quantile_ci_row(model_label: str, ds, pred: float, residuals: np.ndarray) -> Dict:
+    """Build a predictions.csv row with quantile-based CIs from residuals."""
+    if residuals.size > 2:
+        return {
+            "model": model_label,
+            "ds": ds,
+            "predicted": pred,
+            "lower_50": pred + np.percentile(residuals, 25),
+            "upper_50": pred + np.percentile(residuals, 75),
+            "lower_80": pred + np.percentile(residuals, 10),
+            "upper_80": pred + np.percentile(residuals, 90),
+            "lower_95": pred + np.percentile(residuals, 2.5),
+            "upper_95": pred + np.percentile(residuals, 97.5),
+        }
+    return {
+        "model": model_label,
+        "ds": ds,
+        "predicted": pred,
+        "lower_50": np.nan, "upper_50": np.nan,
+        "lower_80": np.nan, "upper_80": np.nan,
+        "lower_95": np.nan, "upper_95": np.nan,
+    }
+
+
+def _augment_predictions_csv(
+    output_base: Path,
+    cons_results: pd.DataFrame,
+    kalman_df: pd.DataFrame,
+    accel_df: pd.DataFrame,
+    hybrid_df: pd.DataFrame,
+) -> None:
+    """
+    Append Consensus + consensus_anchor rows to _output/Predictions/predictions.csv.
+
+    For each OOS month (actual is NaN) in the consensus-anchor result frames,
+    add four rows:
+      - Consensus  (the analyst median we are anchoring to)
+      - consensus_anchor_kalman_fusion
+      - consensus_anchor_accel_override
+      - consensus_anchor_kalman_accel_postfilter
+
+    CIs are derived from each forecast's historical residuals (last 36).
+    """
+    pred_path = output_base / "Predictions" / "predictions.csv"
+    if not pred_path.exists():
+        logger.warning("predictions.csv not found at %s; skipping augmentation", pred_path)
+        return
+
+    base_df = pd.read_csv(pred_path, parse_dates=["ds"])
+    # Drop any consensus-anchor / Consensus rows from prior runs to keep the
+    # file idempotent.
+    keep_models = {"NSA", "SA", "NSA_plus_adjustment"}
+    base_df = base_df[base_df["model"].isin(keep_models)].copy()
+
+    new_rows: List[Dict] = []
+
+    def _residuals(df: pd.DataFrame) -> np.ndarray:
+        if "error" not in df.columns:
+            return np.array([])
+        return df["error"].dropna().to_numpy()[-36:]
+
+    variant_specs = [
+        ("consensus_anchor_kalman_fusion", kalman_df),
+        ("consensus_anchor_accel_override", accel_df),
+        ("consensus_anchor_kalman_accel_postfilter", hybrid_df),
+    ]
+
+    # Restrict to the next-to-release month only. predictions.csv is the
+    # next-NFP forecast bundle, not a multi-month forward strip — the base
+    # NSA/SA/NSA_plus_adjustment rows already contain only that month, and
+    # consensus_anchor rows must match.
+    target_ds: Optional[pd.Timestamp] = None
+    if not base_df.empty:
+        target_ds = pd.Timestamp(base_df["ds"].min())
+
+    def _is_target(row_ds) -> bool:
+        if target_ds is None:
+            return True
+        return pd.Timestamp(row_ds) == target_ds
+
+    # Consensus row (the analyst median anchor). No CI — it's a single number.
+    cons_oos = cons_results[cons_results["actual"].isna()].copy().sort_values("ds")
+    if target_ds is None and not cons_oos.empty:
+        target_ds = pd.Timestamp(cons_oos.iloc[0]["ds"])
+    for _, row in cons_oos.iterrows():
+        if not _is_target(row["ds"]):
+            continue
+        new_rows.append({
+            "model": "Consensus",
+            "ds": row["ds"],
+            "predicted": float(row["predicted"]),
+            "lower_50": np.nan, "upper_50": np.nan,
+            "lower_80": np.nan, "upper_80": np.nan,
+            "lower_95": np.nan, "upper_95": np.nan,
+        })
+        logger.info(
+            "  Consensus %s -> %.0f (analyst median anchor)",
+            pd.Timestamp(row["ds"]).strftime("%Y-%m"), float(row["predicted"]),
+        )
+
+    # consensus_anchor variants
+    for label, df in variant_specs:
+        if df is None or df.empty:
+            continue
+        res = _residuals(df)
+        oos = df[df["actual"].isna()].copy().sort_values("ds")
+        for _, row in oos.iterrows():
+            if not _is_target(row["ds"]):
+                continue
+            new_rows.append(_quantile_ci_row(
+                label, row["ds"], float(row["predicted"]), res,
+            ))
+            logger.info(
+                "  %s %s -> %.0f",
+                label, pd.Timestamp(row["ds"]).strftime("%Y-%m"), float(row["predicted"]),
+            )
+
+    if not new_rows:
+        logger.info("No OOS consensus-anchor rows to add to predictions.csv")
+        return
+
+    augmented = pd.concat([base_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    # Attach backtest RMSE per model and sort best→worst so a reader of
+    # predictions.csv immediately sees which forecasts to trust most.
+    rmse_map = _load_model_rmses(output_base)
+    augmented["rmse"] = augmented["model"].map(rmse_map)
+    # Stable order: by RMSE ascending (NaN last), tie-break on model name.
+    augmented = augmented.sort_values(
+        ["rmse", "model"], na_position="last"
+    ).reset_index(drop=True)
+
+    # Reorder columns so `rmse` sits next to `predicted` for readability.
+    cols = list(augmented.columns)
+    if "rmse" in cols and "predicted" in cols:
+        cols.remove("rmse")
+        insert_at = cols.index("predicted") + 1
+        cols = cols[:insert_at] + ["rmse"] + cols[insert_at:]
+        augmented = augmented[cols]
+
+    augmented.to_csv(pred_path, index=False)
+    logger.info(
+        "Augmented %s with %d Consensus / consensus_anchor rows",
+        pred_path, len(new_rows),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -683,6 +1034,24 @@ def run_consensus_anchor_pipeline(
     all_metrics.append(cons_base)
     logger.info("  Consensus: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
                 cons_base["MAE"], cons_base["RMSE"], cons_base["Acceleration_Accuracy"])
+
+    # Write a full diagnostics bundle for the consensus baseline so it has the
+    # same plot/CSV/ACF artifacts as the three model approaches.
+    cons_results = overlap_with_oos[["ds", "actual", "consensus_pred"]].copy()
+    cons_results = cons_results.dropna(subset=["consensus_pred"]).sort_values("ds").reset_index(drop=True)
+    cons_results = cons_results.rename(columns={"consensus_pred": "predicted"})
+    cons_results["consensus_pred"] = cons_results["predicted"]
+    cons_results["error"] = np.where(
+        cons_results["actual"].notna(),
+        cons_results["actual"] - cons_results["predicted"],
+        np.nan,
+    )
+    write_sandbox_output_bundle(
+        results_df=cons_results,
+        out_dir=out_dir / "baseline_consensus",
+        model_id="baseline_consensus",
+        diagnostics_label="Baseline Consensus (Bloomberg/Reuters median)",
+    )
 
     champ_ov = overlap_df[["actual", "champion_pred"]].dropna()
     champ_base = full_metrics(
@@ -837,6 +1206,33 @@ def run_consensus_anchor_pipeline(
         logger.info("  %-25s MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
                      row["Forecast"], row["MAE"], row["RMSE"],
                      row["Acceleration_Accuracy"])
+
+    # 7) Unified comparison visualization across the 4 forecasts
+    forecast_dfs = {
+        cons_base["Forecast"]: cons_results,
+        kalman_metrics["Forecast"]: kalman_df,
+        accel_metrics["Forecast"]: accel_df,
+        hybrid_metrics["Forecast"]: hybrid_df,
+    }
+    try:
+        write_comparison_visualization(out_dir, forecast_dfs, metrics_df)
+        logger.info("Wrote unified 4-way comparison visualization (overlay + bar + HTML)")
+    except Exception as exc:
+        logger.warning("Comparison visualization failed: %s", exc)
+
+    # 8) Augment _output/Predictions/predictions.csv with the consensus anchor
+    # OOS rows + the analyst Consensus we are anchoring to. The base file is
+    # written by generate_all_output (NSA, SA, NSA_plus_adjustment rows).
+    try:
+        _augment_predictions_csv(
+            output_base=output_base,
+            cons_results=cons_results,
+            kalman_df=kalman_df,
+            accel_df=accel_df,
+            hybrid_df=hybrid_df,
+        )
+    except Exception as exc:
+        logger.warning("Augmenting predictions.csv failed: %s", exc)
 
     logger.info("Consensus anchor outputs saved to %s", out_dir)
     logger.info("=" * 60)

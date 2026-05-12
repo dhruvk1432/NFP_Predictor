@@ -52,3 +52,6 @@ dist/
 _output/
 *.ckpt
 *.pkl
+
+# Archive bundles — never commit large zips
+*.zip

@@ -1555,9 +1555,11 @@ def run_expanding_window_backtest(
     # ── Per-window features replay mode ──
     # When enabled, replay a prior dynamic-reselection run by loading saved
     # per-window JSONs and applying them at the matching backtest step.
-    # Overrides frozen-features mode when both are configured.
+    # Overrides frozen-features AND all-features modes when JSONs are present —
+    # an explicit replay schedule is treated as a deliberate user choice that
+    # takes precedence over automatic feature selection.
     _per_window_features_sets: List[Tuple[pd.Timestamp, List[str]]] = []
-    _per_window_mode = USE_PER_WINDOW_FEATURES and not _all_features_mode
+    _per_window_mode = USE_PER_WINDOW_FEATURES
     if _per_window_mode:
         _per_window_features_sets = _load_per_window_feature_sets(target_type, target_source)
         if not _per_window_features_sets:
@@ -1575,6 +1577,7 @@ def run_expanding_window_backtest(
                 f"[{model_id}] PER-WINDOW mode: loaded {len(_per_window_features_sets)} "
                 f"feature sets at step_dates [{_step_dates_str}]. Backtest will replay "
                 f"these sets at the matching steps; no fresh reselection."
+                + (" (overriding ALL-FEATURES mode)" if _all_features_mode else "")
             )
 
     # ── Short-pass stability tracking ──
@@ -1671,9 +1674,13 @@ def run_expanding_window_backtest(
         # Reselection only fires from RESELECTION_START_DATE onward (pre-2000
         # months reuse the features from the first reselection).
         # In legacy mode: optional, triggered only when RESELECT_EVERY_N_MONTHS > 0.
+        # Per-window replay mode short-circuits this entirely — the user-curated
+        # schedule from disk is authoritative.
         _reselection_start = pd.Timestamp(RESELECTION_START_DATE)
         _trigger_reselection = False
-        if _all_features_mode:
+        if _per_window_mode:
+            _trigger_reselection = False
+        elif _all_features_mode:
             _trigger_reselection = (
                 dynamic_features is None  # First step — always select
                 or (
@@ -2484,9 +2491,10 @@ def train_and_evaluate(
     # Per-window mode for production: use the LATEST per-window feature set
     # (most recent step_date in the cohort). Mirrors the backtest's final-step
     # behavior so the production model stays consistent with the last step's
-    # OOS predictions.
+    # OOS predictions. Takes precedence over all-features mode — an explicit
+    # replay schedule is a deliberate user choice.
     _prod_per_window_sets: List[Tuple[pd.Timestamp, List[str]]] = []
-    _prod_per_window_mode = USE_PER_WINDOW_FEATURES and not _prod_all_features_mode
+    _prod_per_window_mode = USE_PER_WINDOW_FEATURES
     if _prod_per_window_mode:
         _prod_per_window_sets = _load_per_window_feature_sets(target_type, target_source)
         if not _prod_per_window_sets:
@@ -2498,7 +2506,24 @@ def train_and_evaluate(
         else:
             _prod_frozen_features_mode = False
 
-    if _prod_all_features_mode:
+    if _prod_per_window_mode:
+        latest_step_date, latest_features = _prod_per_window_sets[-1]
+        feature_cols = [
+            c for c in latest_features
+            if c in X_full_valid.columns and c in cleaned_feature_cols
+        ]
+        if not feature_cols:
+            raise RuntimeError(
+                f"[{model_id}] PER-WINDOW production features have zero overlap "
+                f"with X_full_valid / cleaned_feature_cols. Latest set "
+                f"({latest_step_date.strftime('%Y-%m')}): {len(latest_features)} features."
+            )
+        logger.info(
+            f"[{model_id}] PER-WINDOW production features: {len(feature_cols)} "
+            f"(from latest set {latest_step_date.strftime('%Y-%m')})"
+            + (" (overriding ALL-FEATURES mode)" if _prod_all_features_mode else "")
+        )
+    elif _prod_all_features_mode:
         # All-features mode: run dynamic reselection on the full dataset for production
         logger.info(
             f"[{model_id}] ALL-FEATURES mode for production model: "
@@ -2523,22 +2548,6 @@ def train_and_evaluate(
         logger.info(
             f"[{model_id}] Production features: {len(feature_cols)} "
             f"(from dynamic reselection: {len(_prod_features)})"
-        )
-    elif _prod_per_window_mode:
-        latest_step_date, latest_features = _prod_per_window_sets[-1]
-        feature_cols = [
-            c for c in latest_features
-            if c in X_full_valid.columns and c in cleaned_feature_cols
-        ]
-        if not feature_cols:
-            raise RuntimeError(
-                f"[{model_id}] PER-WINDOW production features have zero overlap "
-                f"with X_full_valid / cleaned_feature_cols. Latest set "
-                f"({latest_step_date.strftime('%Y-%m')}): {len(latest_features)} features."
-            )
-        logger.info(
-            f"[{model_id}] PER-WINDOW production features: {len(feature_cols)} "
-            f"(from latest set {latest_step_date.strftime('%Y-%m')})"
         )
     elif _prod_frozen_features_mode:
         # Frozen mode: production model uses the same pre-selected features as the backtest.

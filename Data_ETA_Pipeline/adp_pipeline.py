@@ -339,10 +339,10 @@ def validate_snapshots():
         if 'snapshot_date' in df.columns and 'release_date' in df.columns:
             snap_date = df['snapshot_date'].iloc[0]
             max_release = df['release_date'].max()
-            if max_release <= snap_date:
-                logger.info(f"  Point-in-time: OK (all releases <= snapshot)")
+            if max_release < snap_date:
+                logger.info(f"  Point-in-time: OK (all releases < snapshot)")
             else:
-                logger.error(f"  Point-in-time VIOLATION: {max_release} > {snap_date}")
+                logger.error(f"  Point-in-time VIOLATION: {max_release} >= {snap_date}")
 
         if df.duplicated(subset=['date', 'series_name']).sum() > 0:
             logger.warning(f"  Contains duplicates!")

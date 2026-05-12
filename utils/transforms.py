@@ -640,10 +640,34 @@ def winsorize(
     return series.clip(lower=lower, upper=upper)
 
 
+# Centralized COVID-shock window. The Mar-May 2020 lockdown produced 5+σ outliers
+# in NFP MoM (raw NSA April 2020 = -19,733K; raw SA = -20,471K) that distort
+# regression / variance estimates if not handled. Every winsorize call and every
+# COVID-aware filter in the codebase should reference these constants rather than
+# re-hardcoding the dates.
+COVID_START_DEFAULT = '2020-03-01'
+COVID_END_DEFAULT = '2020-05-01'
+COVID_EXCLUDE_MONTHS = pd.to_datetime([
+    '2020-03-01', '2020-04-01', '2020-05-01',
+])
+
+
+def is_covid_month(ds) -> "pd.Series | np.ndarray":
+    """Return a boolean mask: True where ds is in the COVID exclusion window.
+
+    Accepts a Series, DatetimeIndex, list, or single Timestamp. Returns a
+    pandas Series for Series input, a numpy array otherwise.
+    """
+    ds_dt = pd.to_datetime(ds)
+    if isinstance(ds, pd.Series):
+        return ds_dt.isin(COVID_EXCLUDE_MONTHS)
+    return ds_dt.isin(COVID_EXCLUDE_MONTHS)
+
+
 def winsorize_covid_period(
     data: pd.DataFrame | pd.Series,
-    covid_start: str = '2020-03-01',
-    covid_end: str = '2020-05-01',
+    covid_start: str = COVID_START_DEFAULT,
+    covid_end: str = COVID_END_DEFAULT,
     lower_percentile: float = 0.01,
     upper_percentile: float = 0.99,
 ) -> pd.DataFrame | pd.Series:

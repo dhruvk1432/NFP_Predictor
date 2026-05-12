@@ -64,13 +64,17 @@ def _resolve_fs_lgbm_njobs() -> int:
     """Resolve the LightGBM ``n_jobs`` used inside Boruta / feature selection.
 
     Default is platform-aware:
-      * macOS (Darwin) → 1 (the original deadlock fix: LightGBM + ProcessPoolExecutor
-        + ``n_jobs=-1`` would OOM-deadlock on macOS via the fork-then-exec path).
+      * macOS (Darwin) → 5 (empirically determined sweet spot via
+        ``Train/sandbox/probe_fs_lgbm_njobs.py``: 2.12× speedup vs n_jobs=1
+        on this hardware; n_jobs=6+ regresses due to thread contention.
+        Confirmed not to deadlock — the original ``n_jobs=-1`` issue was
+        specifically about LightGBM running inside ProcessPoolExecutor, not
+        Boruta-internal threading).
       * Everything else → -1 (use all cores).
 
     The env var ``NFP_FS_LGBM_NJOBS`` overrides this at process start so the
-    Phase-2 sandbox probe can sweep small candidate values empirically without
-    code edits. Accepts any int (negative values pass through to LightGBM).
+    sandbox probe can sweep candidate values empirically without code edits.
+    Accepts any int (negative values pass through to LightGBM).
     """
     raw = os.getenv("NFP_FS_LGBM_NJOBS", "").strip()
     if raw:
@@ -79,8 +83,7 @@ def _resolve_fs_lgbm_njobs() -> int:
         except ValueError:
             pass
     # Platform default
-    return 1 if platform.system() == "Darwin" else -1
-
+    return 5 if platform.system() == "Darwin" else -1
 
 FS_LGBM_NJOBS = _resolve_fs_lgbm_njobs()
 
@@ -92,9 +95,9 @@ LGB_PARAMS = {
     'learning_rate': 0.05,
     'num_leaves': 31,
     'verbose': -1,
-    # Platform-aware (see _resolve_fs_lgbm_njobs above). macOS keeps n_jobs=1
-    # to avoid the LightGBM + ProcessPoolExecutor OOM-deadlock; other OSes
-    # use all cores. Override via NFP_FS_LGBM_NJOBS env var for sandbox probes.
+    # Platform-aware (see _resolve_fs_lgbm_njobs above). macOS defaults to 5
+    # (the empirical sweet spot from the sandbox probe); other OSes use all
+    # cores. Override via NFP_FS_LGBM_NJOBS env var.
     'n_jobs': FS_LGBM_NJOBS,
     'random_state': SEED,
 }

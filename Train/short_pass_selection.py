@@ -96,6 +96,14 @@ def short_pass_lgbm_gain(
         'verbose': -1,
         'n_jobs': 1,
         'random_state': seed,
+        'seed': seed,
+        'bagging_seed': seed,
+        'feature_fraction_seed': seed,
+        'data_random_seed': seed,
+        'extra_seed': seed,
+        'objective_seed': seed,
+        'deterministic': True,
+        'force_col_wise': True,
     }
 
     ds = lgb.Dataset(X, label=y, weight=w, free_raw_data=False)

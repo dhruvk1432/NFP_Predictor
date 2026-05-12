@@ -202,7 +202,7 @@ def _generate_adjustment_folder(
         folder: Destination folder path.
     """
     from Train.sandbox.experiment_predicted_adjustment import (
-        ExpWeightedMonthlyAvgPredictor,
+        ExpWeightedMedianCovidExcludedPredictor,
         load_adjustment_history,
     )
 
@@ -210,7 +210,7 @@ def _generate_adjustment_folder(
 
     # Load full historical adjustment series (SA_MoM - NSA_MoM back to 1990)
     adj_history = load_adjustment_history()
-    predictor = ExpWeightedMonthlyAvgPredictor(half_life_years=3.0)
+    predictor = ExpWeightedMedianCovidExcludedPredictor(half_life_years=3.0)
 
     # Merge NSA and SA results on date. Keep ALL NSA rows that have a
     # prediction (including OOS future months where actual is NaN); join on
@@ -380,12 +380,12 @@ def _generate_predictions_folder(
     if nsa_oos:
         try:
             from Train.sandbox.experiment_predicted_adjustment import (
-                ExpWeightedMonthlyAvgPredictor,
+                ExpWeightedMedianCovidExcludedPredictor,
                 load_adjustment_history,
             )
 
             adj_history = load_adjustment_history()
-            predictor = ExpWeightedMonthlyAvgPredictor(half_life_years=3.0)
+            predictor = ExpWeightedMedianCovidExcludedPredictor(half_life_years=3.0)
 
             # Residuals from the NSA_plus_adjustment backtest (written earlier
             # in the same generate_all_output run) drive CIs.

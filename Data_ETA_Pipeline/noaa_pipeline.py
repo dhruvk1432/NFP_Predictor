@@ -1,9 +1,9 @@
 """
 NOAA Storm Events Pipeline
 ===========================
-Downloads NOAA storm events data, aggregates to state-monthly features with
-inflation-adjusted damages, combines into a master file, and creates
-NFP-weighted national aggregate snapshots.
+Downloads NOAA storm events data, aggregates to state-monthly features in
+nominal USD, combines into a master file, and creates NFP-weighted national
+aggregate snapshots.
 
 Merges: Load_Data/load_noaa_data.py + Prepare_Data/create_noaa_master.py + Prepare_Data/create_noaa_weighted.py
 
@@ -266,54 +266,6 @@ def download_and_filter_year(
     return df
 
 # ---------------------------------------------------------------------
-# Helpers (CPI / inflation)
-# ---------------------------------------------------------------------
-
-def load_cpi_series(start_date: str) -> pd.DataFrame:
-    """
-    Load CPIAUCSL series from FRED API starting at given date.
-
-    Uses env var FRED_API_KEY or script-level FRED_API_KEY.
-    Returns DataFrame with columns:
-        date (Timestamp)
-        cpi  (float index level)
-        month (Timestamp, month start)
-    """
-    api_key = os.getenv("FRED_API_KEY") or FRED_API_KEY
-    if not api_key:
-        raise RuntimeError("No FRED API key found in environment or script variable.")
-
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": "CPIAUCSL",
-        "api_key": api_key,
-        "file_type": "json",
-        "observation_start": start_date,
-    }
-    resp = requests.get(url, params=params, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-
-    obs = data.get("observations", [])
-    if not obs:
-        raise RuntimeError("No CPI observations returned from FRED API.")
-
-    rows = []
-    for o in obs:
-        date_str = o["date"]  # 'YYYY-MM-DD'
-        value_str = o["value"]
-        try:
-            val = float(value_str)
-        except ValueError:
-            continue
-        rows.append({"date": pd.to_datetime(date_str), "cpi": val})
-
-    cpi_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-    # Month timestamp for matching
-    cpi_df["month"] = cpi_df["date"].dt.to_period("M").dt.to_timestamp()
-    return cpi_df
-
-# ---------------------------------------------------------------------
 # Helpers (aggregation)
 # ---------------------------------------------------------------------
 
@@ -445,9 +397,9 @@ def aggregate_to_state_monthly(
     end_dt: datetime | None = None,
 ) -> pd.DataFrame:
     """
-    Aggregate event-level NOAA data to monthly state-level features,
-    inflation-adjust damages to today's CPI, and then expand to a full
-    STATE x month grid from start_dt to end_dt, filling zeros where no events.
+    Aggregate event-level NOAA data to monthly state-level features (nominal
+    USD) and expand to a full STATE x month grid from start_dt to end_dt,
+    filling zeros where no events occurred.
     """
     if "begin_datetime" not in df.columns:
         df = add_begin_datetime_column(df)
@@ -539,41 +491,33 @@ def aggregate_to_state_monthly(
         full[col] = full[col].fillna(0)
 
     # -----------------------------------------------------------------
-    # Inflation adjustment to "today's" dollars using CPIAUCSL
+    # Release dates per event month (NOAA NCEI ~75-day publication lag)
     # -----------------------------------------------------------------
-    # Load CPI from earliest month in our grid
-    cpi_df = load_cpi_series(start_date=start_month.strftime("%Y-%m-%d"))
-
-    # Restrict CPI to our month_range
-    cpi_df = cpi_df[cpi_df["month"].between(start_month, end_month)]
-    if cpi_df.empty:
-        raise RuntimeError("CPI data is empty or does not cover the requested date range.")
-
-    cpi_today = cpi_df["cpi"].max()  # latest CPI in sample (approx "today")
-    cpi_df["inflation_factor"] = cpi_today / cpi_df["cpi"]
-    # NOAA-specific: Use documented 75-day lag from month-end
-    # Per NOAA NCEI: Data available ~75 days after month end (e.g., Jan data -> Apr 15)
-    cpi_df["release_date"] = cpi_df["month"].apply(
+    # Damage values are kept in nominal USD. Inflation adjustment was removed:
+    # using a single "today's CPI" deflator across all historical rows would
+    # embed future CPI knowledge into every snapshot (PIT violation). Tree
+    # models split on absolute thresholds and do not require real-dollar
+    # normalization; the downstream log1p in create_weighted_national_aggregates
+    # also compresses long-run scale drift.
+    release_by_month = pd.DataFrame({"month": month_range})
+    release_by_month["release_date"] = release_by_month["month"].apply(
         lambda m: calculate_noaa_release_date(m, lag_days=75)
     )
 
-    # Merge CPI info by month into the full grid
     full = full.merge(
-        cpi_df[["month", "cpi", "inflation_factor", "release_date"]],
+        release_by_month,
         left_on="event_month",
         right_on="month",
         how="left",
     ).drop(columns=["month"])
-
-    # In case of any gaps, fill cpi and inflation_factor forward/backward
-    full["cpi"] = full["cpi"].ffill().bfill()
-    full["inflation_factor"] = full["inflation_factor"].ffill().bfill()
     full["release_date"] = full["release_date"].ffill().bfill()
 
-    # Real (today's dollars) damage
-    full["total_property_damage_real"] = full["total_property_damage"] * full["inflation_factor"]
-    full["total_crop_damage_real"] = full["total_crop_damage"] * full["inflation_factor"]
-    full["total_damage_real"] = full["total_damage"] * full["inflation_factor"]
+    # `_real` columns retained for backwards compatibility with downstream
+    # consumers (load_and_parse_noaa_master, NOAA_*_INDEX columns).
+    # They now hold nominal values — no CPI deflation.
+    full["total_property_damage_real"] = full["total_property_damage"]
+    full["total_crop_damage_real"] = full["total_crop_damage"]
+    full["total_damage_real"] = full["total_damage"]
 
     # Final column ordering
     cols = [
@@ -592,7 +536,6 @@ def aggregate_to_state_monthly(
         "injuries_direct",
         "injuries_indirect",
         "total_injuries",
-        "inflation_factor",
         "release_date",
     ]
 
@@ -647,7 +590,7 @@ def load_noaa_data():
     full_df = full_df.sort_values("begin_datetime").reset_index(drop=True)
 
     # -----------------------------------------------------------------
-    # Aggregate to monthly state-level features (real USD) on full grid
+    # Aggregate to monthly state-level features (nominal USD) on full grid
     # -----------------------------------------------------------------
     state_monthly = aggregate_to_state_monthly(
         full_df,
@@ -687,7 +630,6 @@ def load_noaa_data():
             injuries_direct=("injuries_direct", "sum"),
             injuries_indirect=("injuries_indirect", "sum"),
             total_injuries=("total_injuries", "sum"),
-            inflation_factor=("inflation_factor", "first"),
             release_date=("release_date", "first"),
         )
     )
@@ -725,7 +667,7 @@ def create_noaa_master():
 
     # Convert to long format with series names like "storm_count_US"
     # UPDATED: Use release_date instead of known_by_month_end
-    value_cols = [col for col in df_us.columns if col not in ['date', 'inflation_factor', 'release_date']]
+    value_cols = [col for col in df_us.columns if col not in ['date', 'release_date']]
 
     us_long = df_us.melt(
         id_vars=['date', 'release_date'],
@@ -819,36 +761,60 @@ def download_state_employment_vintages(fred: Fred, end_date: str = END_DATE) -> 
 
     all_vintages = []
 
+    # FRED periodically returns transient 5xx errors; the previous no-retry path
+    # silently dropped affected states from the cache, producing N<51 weighted
+    # aggregates downstream. Retry transient failures with exponential backoff
+    # before giving up.
+    MAX_ATTEMPTS = 4
+    BACKOFF_BASE = 5  # seconds; attempts wait 5, 10, 20, 40s
+
     for i, (state, code) in enumerate(fred_codes.items(), 1):
-        try:
-            # Get ALL vintages as of end_date
-            vintage_df = fred.get_series_as_of_date(code, as_of_date=as_of_str)
+        vintage_df = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                vintage_df = fred.get_series_as_of_date(code, as_of_date=as_of_str)
+                break
+            except Exception as e:
+                if attempt == MAX_ATTEMPTS:
+                    logger.error(f"[{i}/51] Error fetching {state} employment after {MAX_ATTEMPTS} attempts: {e}")
+                else:
+                    wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning(f"[{i}/51] {state} attempt {attempt}/{MAX_ATTEMPTS} failed ({e}); retrying in {wait}s")
+                    time.sleep(wait)
 
-            if vintage_df.empty:
-                logger.warning(f"[{i}/51] No data for {state} ({code})")
-                continue
-
-            # Transform to our format
-            vintage_df['state_code'] = state
-            vintage_df['date'] = pd.to_datetime(vintage_df['date'])
-            vintage_df['realtime_start'] = pd.to_datetime(vintage_df['realtime_start'])
-            vintage_df['value'] = pd.to_numeric(vintage_df['value'], errors='coerce')
-
-            all_vintages.append(vintage_df[['state_code', 'date', 'value', 'realtime_start']])
-
-            logger.info(f"[{i}/51] Downloaded {state} ({code}): {len(vintage_df)} vintages")
-
-            # Rate limiting: sleep every 10 series
-            if i % 10 == 0 and i < len(fred_codes):
-                logger.info(f"Rate limiting: sleeping 5 seconds...")
-                time.sleep(5)
-
-        except Exception as e:
-            logger.error(f"[{i}/51] Error fetching {state} employment: {e}")
+        if vintage_df is None:
             continue
+
+        if vintage_df.empty:
+            logger.warning(f"[{i}/51] No data for {state} ({code})")
+            continue
+
+        vintage_df['state_code'] = state
+        vintage_df['date'] = pd.to_datetime(vintage_df['date'])
+        vintage_df['realtime_start'] = pd.to_datetime(vintage_df['realtime_start'])
+        vintage_df['value'] = pd.to_numeric(vintage_df['value'], errors='coerce')
+
+        all_vintages.append(vintage_df[['state_code', 'date', 'value', 'realtime_start']])
+
+        logger.info(f"[{i}/51] Downloaded {state} ({code}): {len(vintage_df)} vintages")
+
+        if i % 10 == 0 and i < len(fred_codes):
+            logger.info(f"Rate limiting: sleeping 5 seconds...")
+            time.sleep(5)
 
     if not all_vintages:
         raise ValueError("No state employment data retrieved")
+
+    # Hard guarantee: every requested state must be in the final cache.
+    # Otherwise downstream weighted aggregates silently exclude missing states.
+    got_states = {df['state_code'].iloc[0] for df in all_vintages}
+    missing = set(fred_codes.keys()) - got_states
+    if missing:
+        raise ValueError(
+            f"FRED state employment download incomplete after retries: "
+            f"{len(missing)}/51 states missing ({sorted(missing)}). "
+            f"Cache will not be saved; re-run the pipeline."
+        )
 
     combined = pd.concat(all_vintages, ignore_index=True)
     logger.info(f"Downloaded {len(combined)} total vintage records for {combined['state_code'].nunique()} states")
@@ -863,28 +829,66 @@ def download_state_employment_vintages(fred: Fred, end_date: str = END_DATE) -> 
 
 def get_state_employment_weights(vintages_df: pd.DataFrame, snap_date: pd.Timestamp) -> pd.DataFrame:
     """
-    Calculate state-by-state employment share weights strictly from data known on `snap_date`.
+    Calculate state-by-state employment share weights using the best PIT-respecting
+    data available on `snap_date`.
 
-    This function prevents lookahead bias in the weighting process. If we used modern, 
-    fully-revised employment shares to weight historical storm damage, we would be implicitly 
-    feeding the model future economic information. By querying `vintages_df` (which contains 
-    ALFRED real-time publication dates) with a strict `< snap_date` filter, we construct 
-    employment shares exactly as they would have been perceived by a trader on that day.
+    Two paths (see leakage.md Issue 5):
 
-    If snap_date is before the earliest ALFRED vintage (e.g. pre-2005), falls back to 
-    the earliest available vintage as a best-effort proxy.
+    1. STRICT-PIT path. For every state, take vintages with `realtime_start < snap_date`
+       and use the latest such vintage. This is the correct path for any snap_date after
+       full vintage coverage begins (≈2007-07-01).
+
+    2. PRE-COVERAGE PROXY path. ALFRED's earliest stored vintage for state employment is
+       2005-06-17 (for 7 Mississippi-basin states: AR/IL/IN/KY/MO/MS/TN) and 2007-06-19
+       (for the remaining 44, including CA/TX/NY/FL). For snap_dates before that — or
+       in the 2005-06 → 2007-06 transition window where only the 7 early states have
+       stored vintages — strict-PIT data does not exist on FRED's side (verified
+       2026-05-11 against ALFRED `vintagedates`; SA variant `CANA` and unemployment
+       `CAUR` have the same hard floor). For any state without a strict-PIT vintage we
+       use that state's earliest available vintage's value of the appropriate
+       observation month as a proxy.
+
+       Empirical bias on this proxy is tiny on the quantity we actually use (relative
+       employment shares): comparing the 2007-06-19 vintage of pre-2007 observations
+       vs the latest revised values for those same observations (a lower bound on the
+       true revision magnitude), share drift is median 0.003 pp, p95 0.025 pp, max
+       0.18 pp (CA, 2005-06 obs). For a state with a ~12% share, that's a ~0.3%
+       relative weight error — well below the noise floor of the log-transformed
+       weighted storm-damage features that consume these weights. The trade-off is
+       analogous to Issue 4 Population A's acceptance of latest-revised as a
+       first-release proxy. The alternative (skipping ~209 of 437 production
+       snapshots) loses 17 years of NOAA storm-damage signal — net negative.
+
+       The previous fallback (`realtime_start == earliest_vintage` with the GLOBAL min
+       earliest vintage) was wrong because it silently dropped the 44 states whose
+       earliest vintage is later than the global min, producing a "national" aggregate
+       that was actually a 7-state regional average. Per-state earliest fixes that.
     """
-    # Check if we have any vintage by snap_date
-    earliest_vintage = vintages_df['realtime_start'].min()
+    expected_states = set(vintages_df['state_code'].unique())
 
-    if snap_date < earliest_vintage:
-        # Fallback: Use earliest vintage
-        logger.warning(f"Snapshot {snap_date.date()} predates earliest vintage ({earliest_vintage.date()}). Using earliest vintage as proxy.")
-        known_df = vintages_df[vintages_df['realtime_start'] == earliest_vintage].copy()
+    strict_pit = vintages_df[vintages_df['realtime_start'] < snap_date]
+    pit_states = set(strict_pit['state_code'].unique())
+    missing_states = expected_states - pit_states
+
+    if not missing_states:
+        known_df = strict_pit.copy()
     else:
-        # Normal case: Filter to vintages known BEFORE snap_date (strict <)
-        # Changed from <= to strict < to prevent same-day data leakage
-        known_df = vintages_df[vintages_df['realtime_start'] < snap_date].copy()
+        # Pre-coverage proxy: for each missing state, use that state's earliest
+        # stored vintage (2005-06-17 for the 7 early states, 2007-06-19 for the
+        # rest). See block comment above for the empirical bias bound.
+        earliest_per_state = vintages_df.groupby('state_code')['realtime_start'].min()
+        proxy_mask = (
+            vintages_df['state_code'].isin(missing_states)
+            & (vintages_df['realtime_start']
+               == vintages_df['state_code'].map(earliest_per_state))
+        )
+        proxy_rows = vintages_df[proxy_mask]
+        known_df = pd.concat([strict_pit, proxy_rows], ignore_index=True)
+        logger.info(
+            f"Snapshot {snap_date.date()}: strict PIT covers "
+            f"{len(pit_states)}/{len(expected_states)} states; using earliest-vintage "
+            f"proxy for {len(missing_states)} states (see leakage.md Issue 5)."
+        )
 
     if known_df.empty:
         raise ValueError(f"No state employment data available as of {snap_date}")
@@ -1151,12 +1155,15 @@ def create_noaa_weighted_snapshots(
         event_date = row['ds']
         snap_date = row['release_date']  # NFP release date
 
-        # Create directory using utility
-        save_path = get_snapshot_path(NOAA_SNAPSHOTS_DIR, snap_date)
+        # File is keyed by the OBSERVATION MONTH (matches every other source's
+        # convention and the master loader at create_master_snapshots._snapshot_path).
+        # snap_date is still used below as the strict PIT cutoff for which NOAA
+        # rows are included; only the filename changes.
+        save_path = get_snapshot_path(NOAA_SNAPSHOTS_DIR, event_date)
 
         # Skip if exists
         if save_path.exists():
-            logger.info(f"[{i}/{len(nfp_releases)}] Snapshot exists for {snap_date.strftime('%Y-%m')}, skipping")
+            logger.info(f"[{i}/{len(nfp_releases)}] Snapshot exists for {event_date.strftime('%Y-%m')}, skipping")
             continue
 
         try:
@@ -1164,9 +1171,13 @@ def create_noaa_weighted_snapshots(
             try:
                 weights = get_state_employment_weights(employment_vintages, snap_date)
             except ValueError:
-                # If no weights available (e.g. pre-1990), treat as missing
-                if i % 12 == 0:  # Reduce log noise
-                    logger.info(f"[{i}/{len(nfp_releases)}] No weights for {snap_date.strftime('%Y-%m')} (pre-1990), skipping")
+                # The function uses a per-state earliest-vintage proxy when strict-PIT
+                # coverage is incomplete (see comment on get_state_employment_weights
+                # and leakage.md Issue 5), so this only fires for snap_dates so old
+                # that no state has any vintage observation in range — effectively
+                # never with START_DATE >= 1990.
+                if i % 12 == 0:
+                    logger.info(f"[{i}/{len(nfp_releases)}] No weights for {snap_date.strftime('%Y-%m')}, skipping")
                 continue
 
             # Create weighted aggregates (with point-in-time filtering using snap_date)

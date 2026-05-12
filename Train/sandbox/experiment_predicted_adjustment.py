@@ -92,11 +92,34 @@ def load_backtest_inputs() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 class AdjustmentPredictor(ABC):
-    """Base class for seasonal adjustment prediction models."""
+    """Base class for seasonal adjustment prediction models.
+
+    By default the base class strips Mar-May 2020 COVID rows from the
+    history before delegating to the subclass's `_fit_predict_impl`.
+    Pass `exclude_covid=False` to opt out (e.g., to reproduce the legacy
+    leaky behavior for an A/B comparison). Without this filter the
+    `adjustment = sa_winsor - nsa_winsor` series for COVID months is an
+    artifact of the pre-winsorization bounds (Apr 2020 = +2,433 vs the
+    real raw +50), and predictors that fit it absorb that artifact as if
+    it were a true seasonal pattern.
+    """
+
+    def __init__(self, exclude_covid: bool = True):
+        self._exclude_covid = bool(exclude_covid)
+
+    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+        """Public entry point. Strips COVID rows when configured, then
+        delegates to the subclass implementation.
+        """
+        if self._exclude_covid and not history.empty and "ds" in history.columns:
+            history = history[~is_covid_month(history["ds"])].copy()
+        return self._fit_predict_impl(history, target_ds)
 
     @abstractmethod
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
-        """Predict adjustment for target_ds using only PIT-filtered history."""
+    def _fit_predict_impl(
+        self, history: pd.DataFrame, target_ds: pd.Timestamp,
+    ) -> float:
+        """Subclass-specific prediction on a (possibly COVID-filtered) history."""
         ...
 
     @property
@@ -108,7 +131,9 @@ class AdjustmentPredictor(ABC):
 class SARIMAPredictor(AdjustmentPredictor):
     """SARIMA(1,0,1)x(1,1,1,12) on the adjustment series."""
 
-    def __init__(self, order=(1, 0, 1), seasonal_order=(1, 1, 1, 12)):
+    def __init__(self, order=(1, 0, 1), seasonal_order=(1, 1, 1, 12),
+                 exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
         self._order = order
         self._seasonal_order = seasonal_order
 
@@ -116,7 +141,7 @@ class SARIMAPredictor(AdjustmentPredictor):
     def name(self) -> str:
         return "sarima"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         if len(history) < 36:
             return _monthly_avg_fallback(history, target_ds)
         try:
@@ -143,25 +168,29 @@ class SARIMAPredictor(AdjustmentPredictor):
 class MonthlyAveragePredictor(AdjustmentPredictor):
     """Mean adjustment for the target calendar month from all prior years."""
 
+    def __init__(self, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
+
     @property
     def name(self) -> str:
         return "monthly_avg"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         return _monthly_avg_fallback(history, target_ds)
 
 
 class TwelveMonthComplementPredictor(AdjustmentPredictor):
     """Sum last 11 months of adjustments, predict the negative."""
 
-    def __init__(self, constant: float = 0.0):
+    def __init__(self, constant: float = 0.0, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
         self._constant = constant
 
     @property
     def name(self) -> str:
         return "12m_complement"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         if len(history) < 11:
             return _monthly_avg_fallback(history, target_ds)
         last_11 = history.tail(11)["adjustment"].values
@@ -171,11 +200,14 @@ class TwelveMonthComplementPredictor(AdjustmentPredictor):
 class SameMonthLastYearPredictor(AdjustmentPredictor):
     """Use the adjustment from the same calendar month one year ago."""
 
+    def __init__(self, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
+
     @property
     def name(self) -> str:
         return "same_month_ly"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         month = target_ds.month
         same_month = history[history["ds"].dt.month == month]
         if same_month.empty:
@@ -186,14 +218,15 @@ class SameMonthLastYearPredictor(AdjustmentPredictor):
 class ExpWeightedMonthlyAvgPredictor(AdjustmentPredictor):
     """Exponentially-weighted average of same-calendar-month adjustments."""
 
-    def __init__(self, half_life_years: float = 3.0):
+    def __init__(self, half_life_years: float = 3.0, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
         self._half_life = half_life_years
 
     @property
     def name(self) -> str:
         return "exp_weighted_avg"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         month = target_ds.month
         same_month = history[history["ds"].dt.month == month].copy()
         if same_month.empty:
@@ -204,14 +237,192 @@ class ExpWeightedMonthlyAvgPredictor(AdjustmentPredictor):
         return float((same_month["adjustment"].values * weights.values).sum())
 
 
+# ── Sandbox A: COVID-excluded + weighted median ──
+# Mar–May 2020 are 3-5 sigma outliers driven by a one-off regime shift (lockdown
+# layoffs / re-hiring). Re-export the centralized constant from utils.transforms
+# so all predictors below — and any external consumer — share a single source of
+# truth for the COVID window.
+from utils.transforms import COVID_EXCLUDE_MONTHS, is_covid_month  # noqa: E402,F401
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    order = np.argsort(values)
+    v_sorted = values[order]
+    w_sorted = weights[order]
+    cum = np.cumsum(w_sorted)
+    cutoff = 0.5 * cum[-1]
+    idx = int(np.searchsorted(cum, cutoff))
+    idx = min(idx, len(v_sorted) - 1)
+    return float(v_sorted[idx])
+
+
+class ExpWeightedMedianCovidExcludedPredictor(AdjustmentPredictor):
+    """Exp-weighted MEDIAN of same-calendar-month adjustments.
+
+    With Fix 6, COVID exclusion is enforced by the base class. The "covid_excl"
+    suffix on the class name is preserved for backward compatibility with the
+    `comparison_metrics.csv` Forecast column. The double-filter on COVID rows
+    inside the impl is now defensive (no-op when exclude_covid=True).
+    """
+
+    def __init__(self, half_life_years: float = 3.0, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
+        self._half_life = half_life_years
+
+    @property
+    def name(self) -> str:
+        return "exp_weighted_median_covid_excl"
+
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+        month = target_ds.month
+        same_month = history[history["ds"].dt.month == month].copy()
+        # Defensive: also strip COVID rows by ds (no-op when base class
+        # already filtered, but keeps single-call API safe if a caller
+        # ever passes raw history with exclude_covid=False).
+        same_month = same_month[~same_month["ds"].isin(COVID_EXCLUDE_MONTHS)]
+        if same_month.empty:
+            return _monthly_avg_fallback(history, target_ds)
+        years_ago = (target_ds - same_month["ds"]).dt.days / 365.25
+        decay = np.exp(-np.log(2) * years_ago / self._half_life)
+        return _weighted_median(same_month["adjustment"].values, decay.values)
+
+
+# ── Sandbox B: LightGBM regressor with structural features ──
+# Train per step on PIT-filtered history with month dummies, lagged same-month
+# adjustments, NSA level (proxy for economy size), and a linear trend. Lets the
+# model learn level-scaling and interaction effects the linear baselines miss,
+# while LightGBM's native NaN handling + tree splits absorb COVID without
+# explicit winsorization.
+class LightGBMAdjustmentPredictor(AdjustmentPredictor):
+    """LightGBM regression on adjustment ~ month dummies + same-month lags + level + trend.
+
+    `exclude_covid` (default True) drops Mar-May 2020 rows from the history
+    before fitting, via the base class. `winsorize_covid` (default True)
+    additionally clips y_train to [1, 99] percentile of non-COVID y values
+    inside the impl — this is a defensive second pass that is harmless when
+    COVID rows have already been removed.
+    """
+
+    def __init__(
+        self,
+        num_boost_round: int = 200,
+        learning_rate: float = 0.05,
+        max_depth: int = 4,
+        num_leaves: int = 15,
+        winsorize_covid: bool = True,
+        exclude_covid: bool = True,
+    ):
+        super().__init__(exclude_covid=exclude_covid)
+        self._num_boost_round = num_boost_round
+        self._learning_rate = learning_rate
+        self._max_depth = max_depth
+        self._num_leaves = num_leaves
+        self._winsorize_covid = winsorize_covid
+
+    @property
+    def name(self) -> str:
+        return "lightgbm_adjustment"
+
+    def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.sort_values("ds").reset_index(drop=True).copy()
+        for m in range(1, 13):
+            df[f"m{m}"] = (df["ds"].dt.month == m).astype(float)
+        # Linear trend (months from history start)
+        df["trend"] = (df["ds"] - df["ds"].iloc[0]).dt.days / 30.436875
+        # NSA level proxies
+        df["nsa_lvl_12m_mean"] = df["nsa_mom"].rolling(12, min_periods=3).mean()
+        df["nsa_lag_1"] = df["nsa_mom"].shift(1)
+        # Same-month lagged adjustments (last 1, 2, 3 same-calendar-month obs)
+        for k in [1, 2, 3]:
+            df[f"same_month_adj_lag_{k}"] = df.groupby(df["ds"].dt.month)["adjustment"].shift(k)
+        # Linear lags
+        df["adj_lag_1"] = df["adjustment"].shift(1)
+        df["adj_lag_12"] = df["adjustment"].shift(12)
+        return df
+
+    def _feature_cols(self) -> List[str]:
+        return (
+            [f"m{m}" for m in range(1, 13)]
+            + ["trend", "nsa_lvl_12m_mean", "nsa_lag_1",
+               "same_month_adj_lag_1", "same_month_adj_lag_2", "same_month_adj_lag_3",
+               "adj_lag_1", "adj_lag_12"]
+        )
+
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+        if len(history) < 36:
+            return _monthly_avg_fallback(history, target_ds)
+        try:
+            import lightgbm as lgb
+            full = pd.concat(
+                [history, pd.DataFrame([{"ds": target_ds, "nsa_mom": np.nan,
+                                         "sa_mom": np.nan, "adjustment": np.nan}])],
+                ignore_index=True,
+            )
+            feat = self._build_features(full)
+            cols = self._feature_cols()
+
+            train = feat[feat["ds"] < target_ds].dropna(subset=cols + ["adjustment"])
+            if len(train) < 24:
+                return _monthly_avg_fallback(history, target_ds)
+
+            y_train = train["adjustment"].astype(float).values
+            if self._winsorize_covid:
+                covid_mask = train["ds"].isin(COVID_EXCLUDE_MONTHS).values
+                if covid_mask.any():
+                    non_covid = y_train[~covid_mask]
+                    lo, hi = np.percentile(non_covid, [1, 99])
+                    y_train = np.clip(y_train, lo, hi)
+
+            X_train = train[cols].astype(float).values
+            target_row = feat[feat["ds"] == target_ds]
+            if target_row.empty:
+                return _monthly_avg_fallback(history, target_ds)
+            X_target = target_row[cols].astype(float).values
+            if not np.isfinite(X_target).all():
+                # Fall back if lag features can't be computed (early history)
+                return _monthly_avg_fallback(history, target_ds)
+
+            params = {
+                "objective": "regression",
+                "metric": "mae",
+                "learning_rate": self._learning_rate,
+                "max_depth": self._max_depth,
+                "num_leaves": self._num_leaves,
+                "feature_fraction": 0.9,
+                "bagging_fraction": 0.9,
+                "bagging_freq": 1,
+                "min_data_in_leaf": 5,
+                "verbose": -1,
+                "n_jobs": 1,
+                "random_state": 42,
+                "seed": 42,
+                "bagging_seed": 42,
+                "feature_fraction_seed": 42,
+                "data_random_seed": 42,
+                "extra_seed": 42,
+                "objective_seed": 42,
+                "deterministic": True,
+                "force_col_wise": True,
+            }
+            ds = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+            model = lgb.train(params, ds, num_boost_round=self._num_boost_round)
+            return float(model.predict(X_target)[0])
+        except Exception as e:
+            logger.debug("LightGBM adjustment failed for %s: %s — fallback", target_ds.date(), e)
+            return _monthly_avg_fallback(history, target_ds)
+
+
 class LinearRegressionPredictor(AdjustmentPredictor):
     """OLS: adjustment ~ month_dummies + linear_trend."""
+
+    def __init__(self, exclude_covid: bool = True):
+        super().__init__(exclude_covid=exclude_covid)
 
     @property
     def name(self) -> str:
         return "linreg_month_trend"
 
-    def fit_predict(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
+    def _fit_predict_impl(self, history: pd.DataFrame, target_ds: pd.Timestamp) -> float:
         from sklearn.linear_model import LinearRegression
 
         df = history.copy()
@@ -462,6 +673,10 @@ def main() -> None:
         SameMonthLastYearPredictor(),
         ExpWeightedMonthlyAvgPredictor(half_life_years=args.exp_half_life),
         LinearRegressionPredictor(),
+        # Sandbox A: COVID-excluded + weighted median
+        ExpWeightedMedianCovidExcludedPredictor(half_life_years=args.exp_half_life),
+        # Sandbox B: LightGBM regressor with structural features
+        LightGBMAdjustmentPredictor(),
     ]
 
     logger.info("Running walk-forward backtest with %d models over %d months",

@@ -1,33 +1,33 @@
 """
 Post-training consensus-anchor integration.
 
-Runs after the main train-all pipeline to produce consensus-anchored
-predictions using two proven approaches:
-  1) Kalman Filter Fusion  (consensus + model signals fused via state-space)
-  2) AccelOverride          (consensus base + model acceleration direction)
+Runs after the main train-all pipeline to produce a consensus-anchored
+forecast via Kalman Filter Fusion (consensus + model signals fused via a
+state-space random walk with adaptive trailing-window noise estimation).
 
-Both approaches use Optuna for hyperparameter tuning with expanding-window
-cross-validation to maintain strict PIT safety.
+Optuna with nested expanding-window CV tunes `trailing_window` and
+`nsa_weight_scale` to maintain strict PIT safety.
 
 The merged consensus+model dataset is built on-the-fly from:
-  - Latest Unifier snapshot  (NFP_Consensus_Mean, ~315 months)
+  - Master snapshots         (NFP_Consensus_Mean, PIT-correct per target month)
   - SA blend champion        (_output/sandbox/sa_blend_walkforward/backtest_results.csv)
   - SA revised challenger    (_output/SA_prediction/backtest_results.csv)
+  - NSA + adjustment         (_output/NSA_plus_adjustment/backtest_results.csv)
 
 Outputs:
   _output/consensus_anchor/
   ├── merged_consensus_model.csv
+  ├── baseline_consensus/        (raw analyst median, for benchmarking)
   ├── kalman_fusion/
   │   ├── backtest_results.csv
   │   ├── summary_statistics.csv
   │   ├── backtest_predictions.png
   │   └── summary_table.png
-  ├── accel_override/
-  │   ├── backtest_results.csv
-  │   ├── summary_statistics.csv
-  │   ├── backtest_predictions.png
-  │   └── summary_table.png
   └── comparison_metrics.csv
+
+Note: AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11)
+because both consistently underperformed the Consensus baseline on the
+60-month backtest window.
 """
 
 from __future__ import annotations
@@ -43,9 +43,14 @@ import pandas as pd
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from settings import OUTPUT_DIR, TEMP_DIR, DATA_PATH, setup_logger
-from Train.config import N_OPTUNA_TRIALS, OPTUNA_TIMEOUT
+from Train.config import N_OPTUNA_TRIALS, OPTUNA_TIMEOUT, get_master_snapshots_dir
 from Train.variance_metrics import compute_variance_kpis
 from Train.sandbox.output_utils import write_sandbox_output_bundle
+from utils.transforms import (
+    winsorize_covid_period,
+    is_covid_month,
+    COVID_EXCLUDE_MONTHS,
+)
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -57,8 +62,8 @@ try:
 except Exception:
     OPTUNA_AVAILABLE = False
 
-SNAPSHOT_ROOT = DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades"
 TARGET_PARQUET = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
+CONSENSUS_FEATURE_COL = "NFP_Consensus_Mean"
 
 # Minimum expanding-window history before producing a prediction
 MIN_HISTORY = 12
@@ -68,15 +73,22 @@ MIN_HISTORY = 12
 # Metrics
 # ---------------------------------------------------------------------------
 
-def full_metrics(actual: np.ndarray, pred: np.ndarray, label: str) -> Dict:
-    """Compute the full metric suite for consensus anchor experiments."""
-    a = np.asarray(actual, dtype=float)
-    p = np.asarray(pred, dtype=float)
-    mask = np.isfinite(a) & np.isfinite(p)
-    a, p = a[mask], p[mask]
+def _full_metric_block(
+    a: np.ndarray, p: np.ndarray, prefix: str = "",
+) -> Dict[str, float]:
+    """Compute the consensus_anchor metric suite over an arbitrary stratum.
 
+    Returns NaN-filled entries when the stratum is empty so the comparison
+    CSV's column set is stable across forecasts.
+    """
+    keys = (
+        "RMSE", "MAE", "MSE", "ME_Bias", "MedAE", "SMAPE_pct",
+        "Directional_Accuracy", "Acceleration_Accuracy",
+        "STD_Ratio", "Diff_STD_Ratio", "Corr_Level", "Corr_Diff",
+        "Diff_Sign_Accuracy", "Tail_MAE", "Extreme_Hit_Rate",
+    )
     if a.size == 0:
-        return {"Forecast": label, "N": 0}
+        return {f"{prefix}{k}": float("nan") for k in keys}
 
     e = a - p
     mae = float(np.mean(np.abs(e)))
@@ -89,72 +101,172 @@ def full_metrics(actual: np.ndarray, pred: np.ndarray, label: str) -> Dict:
     if a.size >= 2:
         accel_acc = float(np.mean(np.sign(np.diff(a)) == np.sign(np.diff(p))))
     else:
-        accel_acc = np.nan
+        accel_acc = float("nan")
 
-    # SMAPE
     denom = (np.abs(a) + np.abs(p))
     smape = float(np.mean(2 * np.abs(e) / np.where(denom == 0, 1, denom)) * 100)
 
     vk = compute_variance_kpis(a, p)
 
     return {
-        "Forecast": label,
-        "N": int(a.size),
-        "RMSE": rmse,
-        "MAE": mae,
-        "MSE": mse,
-        "ME_Bias": me,
-        "MedAE": medae,
-        "SMAPE_pct": smape,
-        "Directional_Accuracy": dir_acc,
-        "Acceleration_Accuracy": accel_acc,
-        "STD_Ratio": float(vk["std_ratio"]),
-        "Diff_STD_Ratio": float(vk["diff_std_ratio"]),
-        "Corr_Level": float(vk["corr_level"]),
-        "Corr_Diff": float(vk["corr_diff"]),
-        "Diff_Sign_Accuracy": float(vk["diff_sign_accuracy"]),
-        "Tail_MAE": float(vk["tail_mae"]),
-        "Extreme_Hit_Rate": float(vk["extreme_hit_rate"]),
+        f"{prefix}RMSE": rmse,
+        f"{prefix}MAE": mae,
+        f"{prefix}MSE": mse,
+        f"{prefix}ME_Bias": me,
+        f"{prefix}MedAE": medae,
+        f"{prefix}SMAPE_pct": smape,
+        f"{prefix}Directional_Accuracy": dir_acc,
+        f"{prefix}Acceleration_Accuracy": accel_acc,
+        f"{prefix}STD_Ratio": float(vk["std_ratio"]),
+        f"{prefix}Diff_STD_Ratio": float(vk["diff_std_ratio"]),
+        f"{prefix}Corr_Level": float(vk["corr_level"]),
+        f"{prefix}Corr_Diff": float(vk["corr_diff"]),
+        f"{prefix}Diff_Sign_Accuracy": float(vk["diff_sign_accuracy"]),
+        f"{prefix}Tail_MAE": float(vk["tail_mae"]),
+        f"{prefix}Extreme_Hit_Rate": float(vk["extreme_hit_rate"]),
     }
+
+
+def full_metrics(
+    actual: np.ndarray,
+    pred: np.ndarray,
+    label: str,
+    ds: "pd.Series | pd.DatetimeIndex | None" = None,
+) -> Dict:
+    """Compute the full metric suite for consensus anchor experiments,
+    stratified by all / non-COVID / COVID-only when ``ds`` is provided.
+
+    Args:
+        actual: Actual values (NaN entries are filtered out together with the
+            corresponding pred and ds entries).
+        pred: Predicted values.
+        label: Forecast name written into the 'Forecast' column.
+        ds: Optional aligned datestamps. When provided, the output gains
+            NonCovid_* and CovidOnly_* prefixed metric blocks plus
+            N_NonCovid / N_Covid counts. When None, only the unprefixed
+            metrics are returned (preserves legacy schema for any caller
+            that does not pass ds).
+    """
+    a = np.asarray(actual, dtype=float)
+    p = np.asarray(pred, dtype=float)
+
+    if ds is not None:
+        ds_arr = pd.to_datetime(pd.Series(ds).reset_index(drop=True))
+    else:
+        ds_arr = None
+
+    finite_mask = np.isfinite(a) & np.isfinite(p)
+    a = a[finite_mask]
+    p = p[finite_mask]
+    if ds_arr is not None:
+        ds_arr = ds_arr[finite_mask].reset_index(drop=True)
+
+    out: Dict[str, "float | int | str"] = {"Forecast": label, "N": int(a.size)}
+    if a.size == 0:
+        return out
+
+    out.update(_full_metric_block(a, p, prefix=""))
+
+    if ds_arr is not None:
+        covid_mask = is_covid_month(ds_arr).to_numpy()
+        non_covid_mask = ~covid_mask
+        out.update(_full_metric_block(a[non_covid_mask], p[non_covid_mask],
+                                      prefix="NonCovid_"))
+        out.update(_full_metric_block(a[covid_mask], p[covid_mask],
+                                      prefix="CovidOnly_"))
+        out["N_NonCovid"] = int(non_covid_mask.sum())
+        out["N_Covid"] = int(covid_mask.sum())
+
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Data Loading (reuses logic from build_consensus_anchor_merged_variants.py)
 # ---------------------------------------------------------------------------
 
-def _latest_snapshot_path() -> Path:
-    candidates = list(SNAPSHOT_ROOT.rglob("*.parquet"))
-    if not candidates:
-        raise FileNotFoundError(f"No snapshot parquet files found under {SNAPSHOT_ROOT}")
+def _load_consensus_pit(
+    target_type: str = "sa",
+    target_source: str = "revised",
+) -> pd.DataFrame:
+    """Load NFP_Consensus_Mean per ds via the master-snapshot infrastructure.
 
-    def snapshot_key(path: Path) -> pd.Timestamp:
-        return pd.to_datetime(path.stem + "-01", errors="coerce")
+    For each target month M, the master snapshot at M was built at ETL time with the
+    strict filter ``release_date < M's NFP release date``, so any column value at row
+    ``ds=M`` is PIT-correct by construction. We extract ``NFP_Consensus_Mean`` at
+    that row.
 
-    dated = [(p, snapshot_key(p)) for p in candidates]
-    dated = [(p, d) for p, d in dated if pd.notna(d)]
-    if not dated:
-        raise RuntimeError("Could not parse dates from snapshot parquet filenames")
-    latest_path, _ = max(dated, key=lambda x: x[1])
-    return latest_path
+    Replaces the prior "read latest Unifier snapshot + groupby('value','last')"
+    approach, which carried no PIT enforcement and was vulnerable to silent leak if
+    the upstream survey ever published post-NFP-release updates.
+    """
+    base_dir = get_master_snapshots_dir(target_type, target_source)
+    if not base_dir.exists():
+        raise FileNotFoundError(
+            f"Master snapshots directory not found: {base_dir}. "
+            "Run the ETL pipeline first."
+        )
 
+    snapshot_files = sorted(base_dir.glob("**/*.parquet"))
+    if not snapshot_files:
+        raise FileNotFoundError(f"No master snapshot parquet files under {base_dir}")
 
-def _load_consensus(snapshot_path: Path) -> pd.DataFrame:
-    snap = pd.read_parquet(snapshot_path, columns=["date", "series_name", "value"])
-    cons = snap[snap["series_name"] == "NFP_Consensus_Mean"].copy()
-    if cons.empty:
-        raise RuntimeError(f"NFP_Consensus_Mean not found in snapshot: {snapshot_path}")
+    rows: List[Dict] = []
+    skipped_no_column = 0
+    for snap_path in snapshot_files:
+        try:
+            obs_month = pd.to_datetime(snap_path.stem + "-01")
+        except (ValueError, TypeError):
+            continue
 
-    cons["ds"] = pd.to_datetime(cons["date"]).dt.to_period("M").dt.to_timestamp()
-    cons["value"] = pd.to_numeric(cons["value"], errors="coerce")
-    cons = cons.dropna(subset=["ds", "value"]).sort_values("ds")
+        try:
+            snap = pd.read_parquet(snap_path, columns=["date", CONSENSUS_FEATURE_COL])
+        except (KeyError, ValueError):
+            # NFP_Consensus_Mean was not selected into this snapshot.
+            skipped_no_column += 1
+            continue
+        except Exception as exc:
+            logger.warning("Failed to read consensus from %s: %s", snap_path, exc)
+            continue
 
-    monthly = (
-        cons.groupby("ds", as_index=False)
-        .agg(consensus_pred=("value", "last"))
-        .sort_values("ds")
-        .reset_index(drop=True)
-    )
-    return monthly
+        snap["date"] = pd.to_datetime(snap["date"], errors="coerce")
+        match = snap[snap["date"] == obs_month]
+        if match.empty:
+            continue
+
+        val = match[CONSENSUS_FEATURE_COL].iloc[0]
+        if pd.isna(val):
+            continue
+
+        rows.append({"ds": obs_month, "consensus_pred": float(val)})
+
+    if not rows:
+        raise RuntimeError(
+            f"No consensus values found via master snapshots under {base_dir} "
+            f"({skipped_no_column} snapshots lacked the {CONSENSUS_FEATURE_COL} column)."
+        )
+
+    if skipped_no_column:
+        logger.info(
+            "Consensus PIT load: %d snapshots lacked %s and were skipped",
+            skipped_no_column, CONSENSUS_FEATURE_COL,
+        )
+
+    out = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
+
+    # Apply COVID winsorization so the consensus_anchor stage sees consensus
+    # on the same scale as the LightGBM training pipeline (which winsorizes
+    # X_full upfront) and the SA actuals (which are pre-winsorized at parquet
+    # write time). Without this, raw consensus -14,448 for Apr 2020 produces
+    # an artificial +13,911 error vs the winsorized SA actual -537, inflating
+    # the Consensus baseline's MAE in comparison_metrics.csv and leaking into
+    # Kalman R_c estimation as a regime-shift bias.
+    out_indexed = out.set_index("ds")
+    out_indexed["consensus_pred"] = winsorize_covid_period(
+        out_indexed[["consensus_pred"]]
+    )["consensus_pred"]
+    out = out_indexed.reset_index()
+
+    return out
 
 
 def _load_model_backtest(path: Path, pred_name: str) -> pd.DataFrame:
@@ -183,9 +295,13 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
     if output_base is None:
         output_base = OUTPUT_DIR
 
-    snapshot_path = _latest_snapshot_path()
-    logger.info("Consensus snapshot: %s", snapshot_path)
-    consensus_monthly = _load_consensus(snapshot_path)
+    consensus_monthly = _load_consensus_pit(target_type="sa", target_source="revised")
+    logger.info(
+        "Consensus loaded PIT-correctly via master snapshots: %d months (%s to %s)",
+        len(consensus_monthly),
+        consensus_monthly["ds"].min().strftime("%Y-%m"),
+        consensus_monthly["ds"].max().strftime("%Y-%m"),
+    )
 
     # Champion: NSA+Adjustment (best acceleration signal for SA target).
     # NSA+Adj outperforms SA blend as Kalman model channel because its
@@ -319,16 +435,31 @@ def kalman_fusion(
 
     has_nsa = "nsa_pred" in df.columns and use_nsa_accel
 
-    # Initialize noise parameters from full consensus history
-    cons_hist = consensus_df[
-        consensus_df["consensus_pred"].notna() & consensus_df["actual"].notna()
+    # Initialize noise parameters from consensus history strictly BEFORE the first
+    # backtest month so the noise prior cannot peek into months that will later be
+    # evaluated. Once `len(hist_valid) >= 6` inside the loop the per-step path takes
+    # over and these inits no longer matter.
+    first_backtest_ds = df.iloc[0]["ds"] if not df.empty else pd.Timestamp.max
+    prior_cons = consensus_df[
+        consensus_df["consensus_pred"].notna()
+        & consensus_df["actual"].notna()
+        & (consensus_df["ds"] < first_backtest_ds)
     ]
-    cons_err = (cons_hist["actual"] - cons_hist["consensus_pred"]).values
-    R_c_init = float(np.var(cons_err[-60:], ddof=1))
-    Q_init = float(np.var(np.diff(cons_hist["actual"].dropna().values[-60:]), ddof=1))
+    prior_cons_err = (prior_cons["actual"] - prior_cons["consensus_pred"]).values
+    R_c_init = float(np.var(prior_cons_err[-60:], ddof=1)) if len(prior_cons_err) >= 2 else 1.0
+    prior_actuals = prior_cons["actual"].dropna().values[-60:]
+    Q_init = float(np.var(np.diff(prior_actuals), ddof=1)) if len(prior_actuals) >= 2 else 1.0
 
     x_hat = float(df.iloc[0]["consensus_pred"])
     P = Q_init
+
+    # Most-recent variance estimates — re-used across the loop when a step's
+    # COVID-clean trailing window is too small to re-estimate. Initialized to
+    # the prior-history defaults computed above.
+    R_c = R_c_init
+    R_m = R_c_init * 1.5 if use_model else 1e12
+    Q = Q_init
+    R_a = R_c_init * 2.0  # NSA channel default
 
     results = []
     for i in range(len(df)):
@@ -337,20 +468,31 @@ def kalman_fusion(
         hist = df.iloc[:i]
         hist_valid = hist[hist["actual"].notna()]
 
+        # COVID-clean view for variance computation: Mar/Apr/May 2020 are
+        # winsorized (Fix 3) so values are flat and constant — including them
+        # in var(...) collapses the trailing-window noise estimate. Excluding
+        # them gives an honest estimate of the post-winsor noise floor for
+        # non-COVID months.
         if len(hist_valid) >= 6:
-            recent_cons_err = (hist_valid["actual"] - hist_valid["consensus_pred"]).values[-trailing_window:]
-            R_c = float(np.var(recent_cons_err, ddof=1)) + 1e-6
-            if use_model:
-                recent_model_err = (hist_valid["actual"] - hist_valid["champion_pred"]).values[-trailing_window:]
-                R_m = float(np.var(recent_model_err, ddof=1)) + 1e-6
-            else:
-                R_m = 1e12
-            recent_actual_diff = np.diff(hist_valid["actual"].values[-trailing_window:])
-            Q = float(np.var(recent_actual_diff, ddof=1)) + 1e-6
-        else:
-            R_c = R_c_init
-            R_m = R_c_init * 1.5 if use_model else 1e12
-            Q = Q_init
+            hist_clean = hist_valid[~is_covid_month(hist_valid["ds"])]
+            if len(hist_clean) >= 4:
+                recent_cons_err = (
+                    hist_clean["actual"] - hist_clean["consensus_pred"]
+                ).values[-trailing_window:]
+                R_c = float(np.var(recent_cons_err, ddof=1)) + 1e-6
+                if use_model:
+                    recent_model_err = (
+                        hist_clean["actual"] - hist_clean["champion_pred"]
+                    ).values[-trailing_window:]
+                    R_m = float(np.var(recent_model_err, ddof=1)) + 1e-6
+                else:
+                    R_m = 1e12
+                recent_actual_diff = np.diff(
+                    hist_clean["actual"].values[-trailing_window:]
+                )
+                Q = float(np.var(recent_actual_diff, ddof=1)) + 1e-6
+            # else: keep R_c, R_m, Q at the most recent estimates (or inits)
+        # else: keep R_c, R_m, Q at the most recent estimates (or inits)
 
         # Prediction step
         x_prior = x_hat
@@ -369,21 +511,29 @@ def kalman_fusion(
             nsa_delta = float(row["nsa_pred"]) - prev_actual
             nsa_level_implied = prev_actual + nsa_delta
 
-            # Estimate NSA delta noise from trailing window
+            # Estimate NSA delta noise from trailing window — also COVID-clean.
             if has_nsa and len(hist_valid) >= 6:
-                nsa_hist = hist_valid[hist_valid["nsa_pred"].notna()] if "nsa_pred" in hist_valid.columns else pd.DataFrame()
-                if len(nsa_hist) >= 4:
+                nsa_hist = (
+                    hist_valid[hist_valid["nsa_pred"].notna()]
+                    if "nsa_pred" in hist_valid.columns
+                    else pd.DataFrame()
+                )
+                nsa_hist_clean = (
+                    nsa_hist[~is_covid_month(nsa_hist["ds"])]
+                    if not nsa_hist.empty else nsa_hist
+                )
+                if len(nsa_hist_clean) >= 4:
                     # NSA delta error: (actual[t] - actual[t-1]) - (nsa_pred[t] - actual[t-1])
                     # = actual[t] - nsa_pred[t]
-                    recent_nsa_err = (nsa_hist["actual"] - nsa_hist["nsa_pred"]).values[-trailing_window:]
+                    recent_nsa_err = (
+                        nsa_hist_clean["actual"] - nsa_hist_clean["nsa_pred"]
+                    ).values[-trailing_window:]
                     R_a = float(np.var(recent_nsa_err, ddof=1)) + 1e-6
                     info_a = nsa_weight_scale / R_a
                 else:
-                    # Insufficient NSA history — use conservative noise
-                    R_a = R_c_init * 2.0
+                    # Insufficient COVID-clean NSA history — keep most-recent R_a
                     info_a = nsa_weight_scale / R_a
             else:
-                R_a = R_c_init * 2.0
                 info_a = nsa_weight_scale / R_a
 
         P_post = 1.0 / (info_prior + info_c + info_m + info_a)
@@ -415,8 +565,119 @@ def kalman_fusion(
     label = "Kalman_Fusion" if use_model else "Kalman_Consensus_Only"
     if has_nsa:
         label += "_NSA"
-    metrics = full_metrics(res_df["actual"].values, res_df["predicted"].values, label)
+    metrics = full_metrics(
+        res_df["actual"].values, res_df["predicted"].values, label,
+        ds=res_df["ds"],
+    )
     return res_df, metrics
+
+
+def _kalman_fold_runner(
+    full_overlap: pd.DataFrame,
+    consensus_df: pd.DataFrame,
+    fn_kwargs: Dict,
+    eval_end: int,
+) -> pd.DataFrame:
+    """Run kalman_fusion on overlap_df.iloc[:eval_end] and return its full res_df.
+
+    `kalman_fusion` is per-step PIT-correct (uses df.iloc[:i] for noise estimation),
+    so passing a chronological prefix preserves PIT for every row of the prefix.
+    """
+    res_df, _ = kalman_fusion(
+        full_overlap.iloc[:eval_end],
+        consensus_df,
+        **fn_kwargs,
+    )
+    return res_df
+
+
+def _walkforward_cv_score(
+    overlap_df: pd.DataFrame,
+    fold_runner,
+    composite_objective_fn,
+    n_splits: int = 5,
+    min_train: int = 60,
+) -> float:
+    """Nested expanding-window CV score for a tuner trial.
+
+    Splits ``overlap_df`` into ``n_splits`` chronological folds at the tail. For
+    each fold, runs ``fold_runner(overlap_df, eval_end)``  on a prefix that
+    includes that fold's eval window. Scores only on the fold's eval rows
+    (which are strictly future relative to all earlier folds). Returns the mean
+    composite score across folds.
+
+    This breaks the Optuna meta-leak (Issue 9): hyperparameters are chosen by
+    averaging composite scores over windows that each function has not "trained
+    on" via earlier-fold actuals — every score is OOS w.r.t. the params being
+    tuned.
+
+    Args:
+        overlap_df: Sorted DataFrame with [ds, actual, ...] (consensus + model).
+        fold_runner: Callable(overlap_df, eval_end) -> res_df, where res_df has
+            columns [ds, actual, predicted] and len(res_df) == eval_end.
+        composite_objective_fn: Callable(actual, pred) -> float (lower is better).
+        n_splits: Number of chronological folds at the tail.
+        min_train: Minimum training prefix size (months) before the first fold.
+            Set to ensure each fold's per-step noise estimation has enough
+            history to switch off the init fallbacks.
+
+    Returns:
+        Mean composite score over folds. If overlap_df is too small for nested
+        CV, falls back to a single full-fit score (the legacy behaviour).
+    """
+    overlap_df = overlap_df.sort_values("ds").reset_index(drop=True)
+    n = len(overlap_df)
+
+    # Need at least min_train + n_splits eval rows to run nested CV.
+    if n < min_train + n_splits * 3:
+        res_df = fold_runner(overlap_df, eval_end=n)
+        actual = res_df["actual"].values.astype(float)
+        pred = res_df["predicted"].values.astype(float)
+        mask = np.isfinite(actual) & np.isfinite(pred)
+        if mask.sum() == 0:
+            return float("inf")
+        return float(composite_objective_fn(actual[mask], pred[mask]))
+
+    eval_size = (n - min_train) // n_splits
+    fold_scores: List[float] = []
+    for k in range(n_splits):
+        eval_start = min_train + k * eval_size
+        eval_end = n if k == n_splits - 1 else min_train + (k + 1) * eval_size
+        res_df = fold_runner(overlap_df, eval_end=eval_end)
+        # Score ONLY on this fold's eval window (strictly future w.r.t. all
+        # earlier folds; never overlaps with future folds either).
+        eval_rows = res_df.iloc[eval_start:eval_end]
+        actual = eval_rows["actual"].values.astype(float)
+        pred = eval_rows["predicted"].values.astype(float)
+        mask = np.isfinite(actual) & np.isfinite(pred)
+        if mask.sum() == 0:
+            continue
+        fold_scores.append(float(composite_objective_fn(actual[mask], pred[mask])))
+
+    if not fold_scores:
+        return float("inf")
+    return float(np.mean(fold_scores))
+
+
+def _composite_kalman_accel_objective(
+    actual: np.ndarray, pred: np.ndarray,
+) -> float:
+    """MAE - λ_accel * accel_acc - λ_dir * dir_acc — the composite objective
+    used by `_tune_kalman` for nested expanding-window CV scoring."""
+    from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
+    a, p = np.asarray(actual, dtype=float), np.asarray(pred, dtype=float)
+    if a.size == 0:
+        return float("inf")
+    mae = float(np.mean(np.abs(a - p)))
+    if not np.isfinite(mae):
+        return float("inf")
+    dir_acc = float(np.mean(np.sign(a) == np.sign(p))) if a.size >= 1 else 0.0
+    if a.size >= 2:
+        da, dp = np.diff(a), np.diff(p)
+        accel_acc = float(np.mean(np.sign(da) == np.sign(dp)))
+    else:
+        accel_acc = 0.0
+    return float(mae - KALMAN_LAMBDA_ACCEL * accel_acc - KALMAN_LAMBDA_DIR * dir_acc)
 
 
 def _tune_kalman(
@@ -424,11 +685,15 @@ def _tune_kalman(
     consensus_df: pd.DataFrame,
     n_trials: int = N_OPTUNA_TRIALS,
     timeout: int = OPTUNA_TIMEOUT,
+    n_splits: int = 5,
 ) -> Dict:
     """Optuna-tune trailing_window and nsa_weight_scale for Kalman fusion.
 
-    Uses composite objective: MAE - λ_accel * accel_acc - λ_dir * dir_acc
-    to prioritize acceleration and directional accuracy alongside MAE.
+    Uses nested expanding-window CV (n_splits chronological folds) so each
+    trial's score is averaged over windows that the trial's params did not
+    "train on" — closes Issue 9's meta-leak.
+
+    Composite objective: MAE - λ_accel * accel_acc - λ_dir * dir_acc.
     """
     from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
 
@@ -439,28 +704,30 @@ def _tune_kalman(
     has_nsa = "nsa_pred" in overlap_df.columns and overlap_df["nsa_pred"].notna().any()
 
     logger.info("Optuna tuning Kalman fusion: trials=%d timeout=%ds nsa=%s "
-                "λ_accel=%.1f λ_dir=%.1f",
-                n_trials, timeout, has_nsa, KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR)
+                "λ_accel=%.1f λ_dir=%.1f n_splits=%d (nested walkforward CV)",
+                n_trials, timeout, has_nsa, KALMAN_LAMBDA_ACCEL,
+                KALMAN_LAMBDA_DIR, n_splits)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def objective(trial: "optuna.Trial") -> float:
         tw = trial.suggest_int("trailing_window", 6, 36)
         nsa_ws = trial.suggest_float("nsa_weight_scale", 0.1, 3.0) if has_nsa else 1.0
-        _, metrics = kalman_fusion(
-            overlap_df, consensus_df,
-            trailing_window=tw,
-            use_nsa_accel=has_nsa,
-            nsa_weight_scale=nsa_ws,
+        fn_kwargs = {
+            "trailing_window": tw,
+            "use_nsa_accel": has_nsa,
+            "nsa_weight_scale": nsa_ws,
+        }
+
+        def _runner(full_overlap, eval_end):
+            return _kalman_fold_runner(full_overlap, consensus_df, fn_kwargs, eval_end)
+
+        score = _walkforward_cv_score(
+            overlap_df=overlap_df,
+            fold_runner=_runner,
+            composite_objective_fn=_composite_kalman_accel_objective,
+            n_splits=n_splits,
         )
-        mae = metrics.get("MAE", float("inf"))
-        accel_acc = metrics.get("Acceleration_Accuracy", 0.0)
-        dir_acc = metrics.get("Directional_Accuracy", 0.0)
-
-        if not np.isfinite(mae):
-            return float("inf")
-
-        # Composite: minimize MAE while maximizing acceleration and direction
-        return float(mae - KALMAN_LAMBDA_ACCEL * accel_acc - KALMAN_LAMBDA_DIR * dir_acc)
+        return score
 
     study = optuna.create_study(
         direction="minimize",
@@ -480,145 +747,6 @@ def _tune_kalman(
 
 
 # ---------------------------------------------------------------------------
-# Approach: Acceleration Direction Override
-# ---------------------------------------------------------------------------
-
-def accel_override(
-    overlap_df: pd.DataFrame,
-    kappa: float = 0.5,
-    magnitude_mode: str = "consensus",
-) -> Tuple[pd.DataFrame, Dict]:
-    """
-    Use consensus as base, override acceleration direction via majority vote.
-
-    When consensus and champion disagree on direction, NSA acts as tiebreaker.
-    If 2 of 3 signals (consensus, champion, NSA) agree, that direction wins.
-
-    magnitude_mode:
-      - 'consensus': keep consensus magnitude, only flip direction
-      - 'blend': blend consensus and model magnitudes
-      - 'model': partial adjustment from consensus toward model
-    """
-    # Keep rows where consensus + model exist; actual can be NaN (OOS)
-    keep_cols = ["ds", "actual", "consensus_pred", "champion_pred"]
-    has_nsa = "nsa_pred" in overlap_df.columns
-    has_nsa_raw = "nsa_raw_pred" in overlap_df.columns
-    if has_nsa:
-        keep_cols.append("nsa_pred")
-    if has_nsa_raw:
-        keep_cols.append("nsa_raw_pred")
-    df = overlap_df[keep_cols].copy()
-    df = df.dropna(subset=["consensus_pred", "champion_pred"])
-    df = df.sort_values("ds").reset_index(drop=True)
-    results = []
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-        # Use only historical rows with known actuals for acceleration
-        hist_valid = df.iloc[:i]
-        hist_valid = hist_valid[hist_valid["actual"].notna()]
-
-        if len(hist_valid) < 2:
-            pred = row["consensus_pred"]
-        else:
-            last_actual = hist_valid["actual"].iloc[-1]
-            cons_delta = row["consensus_pred"] - last_actual
-            dir_cons = np.sign(cons_delta)
-            model_delta = (
-                float(row["champion_pred"]) - last_actual
-                if pd.notna(row.get("champion_pred"))
-                else cons_delta
-            )
-
-            # Majority vote using all available signals
-            dir_votes = [dir_cons]
-            if pd.notna(row.get("champion_pred")):
-                dir_votes.append(np.sign(model_delta))
-            if has_nsa and pd.notna(row.get("nsa_pred")):
-                dir_votes.append(np.sign(float(row["nsa_pred"]) - last_actual))
-            if has_nsa_raw and pd.notna(row.get("nsa_raw_pred")):
-                dir_votes.append(np.sign(float(row["nsa_raw_pred"]) - last_actual))
-
-            vote_sum = sum(dir_votes)
-            chosen_dir = np.sign(vote_sum) if vote_sum != 0 else dir_cons
-
-            agree = (chosen_dir == dir_cons)
-
-            if agree:
-                pred = row["consensus_pred"]
-            else:
-                if magnitude_mode == "consensus":
-                    pred = last_actual + chosen_dir * abs(cons_delta)
-                elif magnitude_mode == "blend":
-                    blended_mag = kappa * abs(model_delta) + (1 - kappa) * abs(cons_delta)
-                    pred = last_actual + chosen_dir * blended_mag
-                elif magnitude_mode == "model":
-                    correction = kappa * (model_delta - cons_delta)
-                    pred = row["consensus_pred"] + correction
-                else:
-                    raise ValueError(magnitude_mode)
-
-        results.append({
-            "ds": row["ds"],
-            "actual": row["actual"],
-            "predicted": pred,
-            "consensus_pred": row["consensus_pred"],
-            "error": row["actual"] - pred if pd.notna(row["actual"]) else np.nan,
-        })
-
-    res_df = pd.DataFrame(results)
-    label = f"AccelOverride_{magnitude_mode}_k{kappa:.2f}"
-    metrics = full_metrics(res_df["actual"].values, res_df["predicted"].values, label)
-    return res_df, metrics
-
-
-def _tune_accel_override(
-    overlap_df: pd.DataFrame,
-    n_trials: int = N_OPTUNA_TRIALS,
-    timeout: int = OPTUNA_TIMEOUT,
-) -> Dict:
-    """Optuna-tune kappa and magnitude_mode for AccelOverride.
-
-    Uses composite objective: MAE - λ_accel * accel_acc - λ_dir * dir_acc.
-    """
-    from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
-
-    if not OPTUNA_AVAILABLE:
-        logger.warning("Optuna not available; using default AccelOverride params")
-        return {"kappa": 0.5, "magnitude_mode": "consensus"}
-
-    logger.info("Optuna tuning AccelOverride: trials=%d timeout=%ds λ_accel=%.1f λ_dir=%.1f",
-                n_trials, timeout, KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR)
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    def objective(trial: "optuna.Trial") -> float:
-        kappa = trial.suggest_float("kappa", 0.1, 0.9)
-        mode = trial.suggest_categorical("magnitude_mode", ["consensus", "blend", "model"])
-        _, metrics = accel_override(overlap_df, kappa=kappa, magnitude_mode=mode)
-        mae = metrics.get("MAE", float("inf"))
-        accel_acc = metrics.get("Acceleration_Accuracy", 0.0)
-        dir_acc = metrics.get("Directional_Accuracy", 0.0)
-
-        if not np.isfinite(mae):
-            return float("inf")
-
-        return float(mae - KALMAN_LAMBDA_ACCEL * accel_acc - KALMAN_LAMBDA_DIR * dir_acc)
-
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-    )
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
-    best = study.best_trial
-    logger.info("AccelOverride Optuna: best_obj=%.1f kappa=%.3f mode=%s",
-                best.value, best.params["kappa"], best.params["magnitude_mode"])
-    return {
-        "kappa": float(best.params["kappa"]),
-        "magnitude_mode": str(best.params["magnitude_mode"]),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Comparison Visualization
 # ---------------------------------------------------------------------------
 
@@ -627,8 +755,6 @@ _FORECAST_COLORS = {
     "Baseline_Consensus": "#DC2626",        # red
     "Kalman_Fusion_NSA": "#2563EB",         # blue
     "Kalman_Fusion": "#2563EB",
-    "Kalman_AccelPostFilter": "#7C3AED",    # purple
-    "AccelOverride": "#16A34A",             # green
     "Baseline_Champion": "#9CA3AF",         # gray
 }
 
@@ -636,8 +762,6 @@ _FORECAST_COLORS = {
 def _color_for(label: str) -> str:
     if label in _FORECAST_COLORS:
         return _FORECAST_COLORS[label]
-    if label.startswith("AccelOverride"):
-        return _FORECAST_COLORS["AccelOverride"]
     if label.startswith("Kalman_Fusion"):
         return _FORECAST_COLORS["Kalman_Fusion"]
     return "#374151"
@@ -775,8 +899,6 @@ def write_comparison_visualization(
  <div class="grid">
   <div><h3>Baseline Consensus</h3><img src="baseline_consensus/backtest_predictions.png"/></div>
   <div><h3>Kalman Fusion (NSA)</h3><img src="kalman_fusion/backtest_predictions.png"/></div>
-  <div><h3>AccelOverride</h3><img src="accel_override/backtest_predictions.png"/></div>
-  <div><h3>Kalman + AccelOverride Post-Filter</h3><img src="kalman_accel_postfilter/backtest_predictions.png"/></div>
  </div>
 </body></html>
 """
@@ -796,8 +918,6 @@ _MODEL_RMSE_PATHS: Dict[str, str] = {
     "NSA_plus_adjustment":                       "NSA_plus_adjustment/summary_statistics.csv",
     "Consensus":                                 "consensus_anchor/baseline_consensus/summary_statistics.csv",
     "consensus_anchor_kalman_fusion":            "consensus_anchor/kalman_fusion/summary_statistics.csv",
-    "consensus_anchor_accel_override":           "consensus_anchor/accel_override/summary_statistics.csv",
-    "consensus_anchor_kalman_accel_postfilter":  "consensus_anchor/kalman_accel_postfilter/summary_statistics.csv",
 }
 
 
@@ -848,18 +968,17 @@ def _augment_predictions_csv(
     output_base: Path,
     cons_results: pd.DataFrame,
     kalman_df: pd.DataFrame,
-    accel_df: pd.DataFrame,
-    hybrid_df: pd.DataFrame,
 ) -> None:
     """
-    Append Consensus + consensus_anchor rows to _output/Predictions/predictions.csv.
+    Append Consensus + Kalman_Fusion rows to _output/Predictions/predictions.csv.
 
     For each OOS month (actual is NaN) in the consensus-anchor result frames,
-    add four rows:
+    add two rows:
       - Consensus  (the analyst median we are anchoring to)
       - consensus_anchor_kalman_fusion
-      - consensus_anchor_accel_override
-      - consensus_anchor_kalman_accel_postfilter
+
+    AccelOverride and Kalman+AccelPostFilter were dropped (2026-05-11) because
+    both consistently underperformed the Consensus baseline.
 
     CIs are derived from each forecast's historical residuals (last 36).
     """
@@ -870,7 +989,8 @@ def _augment_predictions_csv(
 
     base_df = pd.read_csv(pred_path, parse_dates=["ds"])
     # Drop any consensus-anchor / Consensus rows from prior runs to keep the
-    # file idempotent.
+    # file idempotent. Also strip the deprecated AccelOverride and
+    # Kalman+AccelPostFilter rows in case they linger from earlier runs.
     keep_models = {"NSA", "SA", "NSA_plus_adjustment"}
     base_df = base_df[base_df["model"].isin(keep_models)].copy()
 
@@ -883,8 +1003,6 @@ def _augment_predictions_csv(
 
     variant_specs = [
         ("consensus_anchor_kalman_fusion", kalman_df),
-        ("consensus_anchor_accel_override", accel_df),
-        ("consensus_anchor_kalman_accel_postfilter", hybrid_df),
     ]
 
     # Restrict to the next-to-release month only. predictions.csv is the
@@ -1030,6 +1148,7 @@ def run_consensus_anchor_pipeline(
         overlap_df["actual"].values,
         overlap_df["consensus_pred"].values,
         "Baseline_Consensus",
+        ds=overlap_df["ds"],
     )
     all_metrics.append(cons_base)
     logger.info("  Consensus: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
@@ -1053,11 +1172,12 @@ def run_consensus_anchor_pipeline(
         diagnostics_label="Baseline Consensus (Bloomberg/Reuters median)",
     )
 
-    champ_ov = overlap_df[["actual", "champion_pred"]].dropna()
+    champ_ov = overlap_df[["ds", "actual", "champion_pred"]].dropna()
     champ_base = full_metrics(
         champ_ov["actual"].values,
         champ_ov["champion_pred"].values,
         "Baseline_Champion",
+        ds=champ_ov["ds"],
     )
     all_metrics.append(champ_base)
     logger.info("  Champion:  MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
@@ -1104,100 +1224,12 @@ def run_consensus_anchor_pipeline(
     with open(kalman_dir / "tuned_params.json", "w") as f:
         json.dump(kalman_params, f, indent=2)
 
-    # 4) AccelOverride
-    logger.info("Running Acceleration Override...")
-    if tune:
-        # Tune on historical-only overlap (no OOS rows)
-        accel_params = _tune_accel_override(overlap_df,
-                                             n_trials=n_trials, timeout=timeout)
-    else:
-        accel_params = {"kappa": 0.5, "magnitude_mode": "consensus"}
+    # AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11) because
+    # both consistently underperformed the analyst Consensus baseline on the
+    # 60-month backtest window. The Kalman_Fusion variant is the sole anchored
+    # forecast we now emit alongside the raw Consensus baseline.
 
-    # Final run includes OOS future rows
-    accel_df, accel_metrics = accel_override(
-        overlap_with_oos,
-        kappa=accel_params["kappa"],
-        magnitude_mode=accel_params["magnitude_mode"],
-    )
-    all_metrics.append(accel_metrics)
-    logger.info("  AccelOverride: MAE=%.1f RMSE=%.1f AccelAcc=%.3f (kappa=%.3f mode=%s)",
-                accel_metrics["MAE"], accel_metrics["RMSE"],
-                accel_metrics["Acceleration_Accuracy"],
-                accel_params["kappa"], accel_params["magnitude_mode"])
-
-    # Log OOS predictions
-    accel_oos = accel_df[accel_df["actual"].isna()]
-    if not accel_oos.empty:
-        for _, r in accel_oos.iterrows():
-            logger.info("  [OOS] AccelOverride %s -> predicted=%.1f",
-                        r["ds"].strftime("%Y-%m"), r["predicted"])
-
-    # Save AccelOverride output bundle
-    accel_dir = out_dir / "accel_override"
-    write_sandbox_output_bundle(
-        results_df=accel_df,
-        out_dir=accel_dir,
-        model_id="accel_override",
-        diagnostics_label="Acceleration Override (Consensus + Model Direction)",
-    )
-    with open(accel_dir / "tuned_params.json", "w") as f:
-        json.dump(accel_params, f, indent=2)
-
-    # 5) Kalman + AccelOverride Post-Filter (hybrid)
-    # Uses Kalman's optimal level estimation, then overrides direction via majority vote
-    logger.info("Running Kalman + AccelOverride Post-Filter...")
-    hybrid_rows = []
-    for _, krow in kalman_df.iterrows():
-        pred = krow["predicted"]
-        ds = krow["ds"]
-        actual = krow["actual"]
-        # Find matching row in overlap for signals
-        ov_match = overlap_with_oos[overlap_with_oos["ds"] == ds]
-        hist_valid = overlap_with_oos[
-            (overlap_with_oos["ds"] < ds) & overlap_with_oos["actual"].notna()
-        ]
-        if not ov_match.empty and len(hist_valid) >= 2:
-            last_actual = float(hist_valid.iloc[-1]["actual"])
-            k_delta = pred - last_actual
-            c_delta = float(ov_match.iloc[0]["consensus_pred"]) - last_actual
-            m_delta = float(ov_match.iloc[0]["champion_pred"]) - last_actual
-            signs = [np.sign(c_delta), np.sign(m_delta)]
-            if has_nsa and pd.notna(ov_match.iloc[0].get("nsa_pred")):
-                signs.append(np.sign(float(ov_match.iloc[0]["nsa_pred"]) - last_actual))
-            if "nsa_raw_pred" in ov_match.columns and pd.notna(ov_match.iloc[0].get("nsa_raw_pred")):
-                signs.append(np.sign(float(ov_match.iloc[0]["nsa_raw_pred"]) - last_actual))
-            vote = sum(signs)
-            majority_dir = np.sign(vote) if vote != 0 else np.sign(c_delta)
-            if majority_dir != np.sign(k_delta) and abs(k_delta) > 1e-6:
-                pred = last_actual + majority_dir * abs(k_delta)
-        hybrid_rows.append({
-            "ds": ds,
-            "actual": actual,
-            "predicted": pred,
-            "consensus_pred": krow["consensus_pred"],
-            "error": actual - pred if pd.notna(actual) else np.nan,
-        })
-    hybrid_df = pd.DataFrame(hybrid_rows)
-    hybrid_metrics = full_metrics(
-        hybrid_df["actual"].values, hybrid_df["predicted"].values,
-        "Kalman_AccelPostFilter",
-    )
-    all_metrics.append(hybrid_metrics)
-    logger.info("  Kalman+AccelPostFilter: MAE=%.1f RMSE=%.1f AccelAcc=%.3f DirAcc=%.3f",
-                hybrid_metrics["MAE"], hybrid_metrics["RMSE"],
-                hybrid_metrics["Acceleration_Accuracy"],
-                hybrid_metrics["Directional_Accuracy"])
-
-    # Save hybrid output bundle
-    hybrid_dir = out_dir / "kalman_accel_postfilter"
-    write_sandbox_output_bundle(
-        results_df=hybrid_df,
-        out_dir=hybrid_dir,
-        model_id="kalman_accel_postfilter",
-        diagnostics_label="Kalman + AccelOverride Post-Filter",
-    )
-
-    # 6) Comparison metrics CSV
+    # 4) Comparison metrics CSV
     metrics_df = pd.DataFrame(all_metrics).sort_values("MAE").reset_index(drop=True)
     metrics_df.to_csv(out_dir / "comparison_metrics.csv", index=False)
 
@@ -1207,20 +1239,18 @@ def run_consensus_anchor_pipeline(
                      row["Forecast"], row["MAE"], row["RMSE"],
                      row["Acceleration_Accuracy"])
 
-    # 7) Unified comparison visualization across the 4 forecasts
+    # 5) Unified comparison visualization across the surviving forecasts
     forecast_dfs = {
         cons_base["Forecast"]: cons_results,
         kalman_metrics["Forecast"]: kalman_df,
-        accel_metrics["Forecast"]: accel_df,
-        hybrid_metrics["Forecast"]: hybrid_df,
     }
     try:
         write_comparison_visualization(out_dir, forecast_dfs, metrics_df)
-        logger.info("Wrote unified 4-way comparison visualization (overlay + bar + HTML)")
+        logger.info("Wrote unified comparison visualization (overlay + bar + HTML)")
     except Exception as exc:
         logger.warning("Comparison visualization failed: %s", exc)
 
-    # 8) Augment _output/Predictions/predictions.csv with the consensus anchor
+    # 6) Augment _output/Predictions/predictions.csv with the consensus anchor
     # OOS rows + the analyst Consensus we are anchoring to. The base file is
     # written by generate_all_output (NSA, SA, NSA_plus_adjustment rows).
     try:
@@ -1228,8 +1258,6 @@ def run_consensus_anchor_pipeline(
             output_base=output_base,
             cons_results=cons_results,
             kalman_df=kalman_df,
-            accel_df=accel_df,
-            hybrid_df=hybrid_df,
         )
     except Exception as exc:
         logger.warning("Augmenting predictions.csv failed: %s", exc)
@@ -1239,7 +1267,6 @@ def run_consensus_anchor_pipeline(
 
     return {
         "kalman_fusion": kalman_metrics,
-        "accel_override": accel_metrics,
         "baselines": {"consensus": cons_base, "champion": champ_base},
     }
 

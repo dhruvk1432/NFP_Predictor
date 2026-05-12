@@ -64,6 +64,9 @@ DEFAULT_STAGE3_REDUNDANCY_OTHER = 0.90
 DEFAULT_STAGE3_MIN_OVERLAP = 24
 
 # LightGBM params for quick Boruta models (shallow, fast)
+# NOTE: `random_state` and `seed` here are placeholders; callers override
+# them per-iteration (e.g. `seed + iteration`) for shadow-feature shuffles
+# while keeping the rest of the determinism block fixed.
 BORUTA_LGB_PARAMS = {
     'objective': 'regression',
     'metric': 'mae',
@@ -73,6 +76,13 @@ BORUTA_LGB_PARAMS = {
     'feature_fraction': 0.8,
     'verbose': -1,
     'n_jobs': -1,
+    'deterministic': True,
+    'force_col_wise': True,
+    'bagging_seed': 42,
+    'feature_fraction_seed': 42,
+    'data_random_seed': 42,
+    'extra_seed': 42,
+    'objective_seed': 42,
 }
 
 BORUTA_NUM_ROUNDS = 100

@@ -935,12 +935,22 @@ def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, c
 
             earliest_vintage = vintage_df.groupby('date')['realtime_start'].min()
 
-            # For weekly claims, initial release should be very close to the observation date.
-            # We still use a generous buffer to detect "truly late" starts only.
-            late_start_dates = earliest_vintage[
-                earliest_vintage > (earliest_vintage.index + pd.Timedelta(days=30))
-            ].index
-            late_start_set = set(late_start_dates)
+            # Distinguish two reasons a vintage timestamp may be "late":
+            #   (a) ALFRED catalog gap — the date is from before FRED started
+            #       tracking vintages (catalog_start ≈ 2009-09-10 for CCSA/CCNSA),
+            #       so the only stored vintage sits at the catalog start regardless
+            #       of the actual DOL release. These benefit from synthesizing
+            #       obs+7 (DOL's true ~7-day publication cadence).
+            #   (b) Real publication delay — vintage well after catalog start
+            #       (e.g., 2025 government-shutdown weeks where the actual
+            #       first vintage lagged 33-61 days). These must keep their
+            #       true late timestamps; replacing them with obs+7 was a
+            #       forward-looking leak (see leakage.md Issue 4 / Population B).
+            catalog_start = vintage_df['realtime_start'].min()
+            catalog_gap = earliest_vintage - earliest_vintage.index
+            in_catalog_window = earliest_vintage <= (catalog_start + pd.Timedelta(days=14))
+            gap_is_large = catalog_gap > pd.Timedelta(days=30)
+            late_start_set = set(earliest_vintage.index[in_catalog_window & gap_is_large])
 
             # Remove retroactive vintages from vintage_df
             # We'll replace them with synthetic first releases
@@ -957,8 +967,22 @@ def _fetch_single_series(fred, name, code, start_date, end_date, daily_series, c
             )
 
             if missing_dates:
+                # Population A trade-off (see leakage.md Issue 4): for pre-2009
+                # weeks where ALFRED has no real first-release record, the value
+                # used here is `current_series` — i.e. the LATEST REVISED value,
+                # not the actual first-release value the model would have seen
+                # in real time. Empirical revision magnitude on the post-2009
+                # universe (where both vintages are observable) is small — median
+                # 0.0%, p99 ~7% for CCSA, ~1.4% for CCNSA — so the value-side
+                # bias is below typical model noise. The alternative is dropping
+                # 42 years (1967-2009) of weekly claims history, which would
+                # remove a major training signal. If a true first-release
+                # archive becomes available (e.g. directly from DOL), revisit
+                # by replacing this current_df fallback with the archived value.
+                # The synthetic release_date (obs+7) is correct: DOL has
+                # historically published continued claims ~7 days after the
+                # observation week.
                 missing_df = current_df[current_df['date'].isin(missing_dates)].copy()
-                # LESS PESSIMISTIC: approximate weekly claims lag as 7 days
                 missing_df['realtime_start'] = missing_df['date'] + pd.Timedelta(days=7)
                 df = pd.concat([df, missing_df], ignore_index=True)
 

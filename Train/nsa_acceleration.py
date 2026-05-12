@@ -29,7 +29,13 @@ import pandas as pd
 
 
 def _load_nsa_revised_target() -> pd.DataFrame:
-    """Load NSA revised target with y_mom and acceleration columns."""
+    """Load NSA revised target with y_mom, acceleration, and operational_available_date.
+
+    `operational_available_date` is the M+1 NFP release date (the moment the
+    revised value of M becomes operationally observable). Used downstream by
+    the SA branch to filter revised actuals strictly by release timing rather
+    than by observation month.
+    """
     import sys
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from settings import DATA_PATH
@@ -37,13 +43,21 @@ def _load_nsa_revised_target() -> pd.DataFrame:
     path = DATA_PATH / "NFP_target" / "y_nsa_revised.parquet"
     if not path.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(path, columns=["ds", "y_mom", "acceleration"])
+    df = pd.read_parquet(
+        path, columns=["ds", "y_mom", "acceleration", "operational_available_date"]
+    )
     df["ds"] = pd.to_datetime(df["ds"])
+    df["operational_available_date"] = pd.to_datetime(
+        df["operational_available_date"], errors="coerce"
+    )
     return df.dropna(subset=["ds"]).sort_values("ds").reset_index(drop=True)
 
 
 def _load_sa_revised_target() -> pd.DataFrame:
-    """Load SA revised target with y_mom and acceleration columns."""
+    """Load SA revised target with y_mom, acceleration, and operational_available_date.
+
+    See `_load_nsa_revised_target` for the role of operational_available_date.
+    """
     import sys
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from settings import DATA_PATH
@@ -51,8 +65,13 @@ def _load_sa_revised_target() -> pd.DataFrame:
     path = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
     if not path.exists():
         return pd.DataFrame()
-    df = pd.read_parquet(path, columns=["ds", "y_mom", "acceleration"])
+    df = pd.read_parquet(
+        path, columns=["ds", "y_mom", "acceleration", "operational_available_date"]
+    )
     df["ds"] = pd.to_datetime(df["ds"])
+    df["operational_available_date"] = pd.to_datetime(
+        df["operational_available_date"], errors="coerce"
+    )
     return df.dropna(subset=["ds"]).sort_values("ds").reset_index(drop=True)
 
 
@@ -75,12 +94,16 @@ _NAN_FEATURES = {
 def compute_nsa_acceleration_features(
     nsa_backtest_df: pd.DataFrame,
     target_month: pd.Timestamp,
+    cutoff_date: Optional[pd.Timestamp] = None,
 ) -> Dict[str, float]:
     """
     Compute NSA acceleration features for a single SA backtest step.
 
-    Uses NSA backtest predictions + NSA/SA revised target actuals,
-    all strictly before ``target_month`` (PIT-safe).
+    Uses NSA backtest predictions + NSA/SA revised target actuals — all
+    strictly available before the SA target's first NFP release date
+    (`cutoff_date`). The revised target's release timing is enforced via the
+    ``operational_available_date`` column on each parquet (the M+1 NFP release
+    for ds=M).
 
     Features produced:
         nsa_pred_delta:         NSA model's predicted MoM change (pred[t] - actual_nsa[t-1])
@@ -94,7 +117,19 @@ def compute_nsa_acceleration_features(
 
     Args:
         nsa_backtest_df: NSA backtest results with 'ds', 'actual', 'predicted'.
+            (Predictions are themselves OOS from the NSA backtest, made strictly
+            before each `ds`, so `ds < target_month` is correct for them.)
         target_month: The month being predicted by the SA model.
+        cutoff_date: Strict release-date barrier for revised actuals. Should be
+            the SA model's cutoff for `target_month` (= release_date of
+            target_month's first NFP release). When provided, filters
+            ``nsa_target`` and ``sa_target`` by
+            ``operational_available_date < cutoff_date`` — closes Issue 10's
+            same-day leak by excluding revised values whose
+            ``operational_available_date`` equals the cutoff. When None,
+            falls back to the legacy ``ds < target_month`` filter
+            (preserves backward-compat for callers that pre-date this
+            change).
 
     Returns:
         Dict of feature_name -> value. NaN when insufficient history.
@@ -112,7 +147,9 @@ def compute_nsa_acceleration_features(
     nsa_target = _NSA_TARGET_CACHE
     sa_target = _SA_TARGET_CACHE
 
-    # Filter backtest to rows before target_month
+    # Filter NSA backtest predictions: ds < target_month is correct because each
+    # backtest prediction at ds was made strictly before ds, so any prediction at
+    # ds < target_month was knowable before target_month.
     df = nsa_backtest_df.copy()
     df["ds"] = pd.to_datetime(df["ds"])
     hist = df[df["ds"] < target_month].sort_values("ds").reset_index(drop=True)
@@ -126,12 +163,26 @@ def compute_nsa_acceleration_features(
 
     nsa_pred_now = float(current.iloc[0]["predicted"])
 
-    # NSA revised actuals available before target_month (PIT-safe)
-    nsa_hist = nsa_target[nsa_target["ds"] < target_month].sort_values("ds")
+    # Revised actuals: prefer operational_available_date filter (PIT-strict),
+    # fall back to ds-based filter for legacy callers without a cutoff.
+    if (
+        cutoff_date is not None
+        and "operational_available_date" in nsa_target.columns
+        and "operational_available_date" in sa_target.columns
+    ):
+        cutoff_ts = pd.Timestamp(cutoff_date)
+        nsa_hist = nsa_target[
+            nsa_target["operational_available_date"].notna()
+            & (nsa_target["operational_available_date"] < cutoff_ts)
+        ].sort_values("ds")
+        sa_hist = sa_target[
+            sa_target["operational_available_date"].notna()
+            & (sa_target["operational_available_date"] < cutoff_ts)
+        ].sort_values("ds")
+    else:
+        nsa_hist = nsa_target[nsa_target["ds"] < target_month].sort_values("ds")
+        sa_hist = sa_target[sa_target["ds"] < target_month].sort_values("ds")
     nsa_hist = nsa_hist[nsa_hist["y_mom"].notna()]
-
-    # SA revised actuals available before target_month (PIT-safe)
-    sa_hist = sa_target[sa_target["ds"] < target_month].sort_values("ds")
     sa_hist = sa_hist[sa_hist["y_mom"].notna()]
 
     if nsa_hist.empty:
@@ -250,6 +301,7 @@ def compute_nsa_acceleration_features(
 def build_nsa_features_for_training(
     nsa_backtest_df: pd.DataFrame,
     training_months: pd.DatetimeIndex,
+    cutoff_dates: Optional[Dict[pd.Timestamp, pd.Timestamp]] = None,
 ) -> pd.DataFrame:
     """
     Build NSA acceleration features for all training months.
@@ -260,13 +312,23 @@ def build_nsa_features_for_training(
     Args:
         nsa_backtest_df: Full NSA backtest results.
         training_months: DatetimeIndex of months in the SA training set.
+        cutoff_dates: Optional ds -> cutoff_date map. When provided, each
+            month's revised-actual filter uses
+            ``operational_available_date < cutoff_dates[month]`` rather than
+            the legacy ``ds < month`` filter. The expected cutoff for SA
+            target ``month`` is ``release_date_of_SA_first_release(month)``.
+            See `compute_nsa_acceleration_features` for details on Issue 10
+            (the same-day-leak this filter closes).
 
     Returns:
         DataFrame indexed by month with NSA acceleration feature columns.
     """
     rows = []
     for month in training_months:
-        feats = compute_nsa_acceleration_features(nsa_backtest_df, month)
+        cutoff = (cutoff_dates or {}).get(month)
+        feats = compute_nsa_acceleration_features(
+            nsa_backtest_df, month, cutoff_date=cutoff,
+        )
         feats["ds"] = month
         rows.append(feats)
 

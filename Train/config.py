@@ -223,6 +223,23 @@ def load_selected_features(target_type: str, target_source: str = 'revised') -> 
 # LIGHTGBM HYPERPARAMETERS
 # =============================================================================
 
+# Determinism block — pin every random source LightGBM uses so the same
+# data + same hyperparameters yield bit-identical predictions across runs.
+# Setting `deterministic=True` together with `force_col_wise=True` also
+# stabilises the multi-threaded floating-point summation order, so this
+# stays bit-identical regardless of n_jobs.
+LGBM_DETERMINISM = {
+    'random_state': 42,
+    'seed': 42,
+    'bagging_seed': 42,
+    'feature_fraction_seed': 42,
+    'data_random_seed': 42,
+    'extra_seed': 42,
+    'objective_seed': 42,
+    'deterministic': True,
+    'force_col_wise': True,
+}
+
 DEFAULT_LGBM_PARAMS = {
     'objective': 'regression',
     'metric': 'mae',
@@ -235,8 +252,8 @@ DEFAULT_LGBM_PARAMS = {
     'bagging_fraction': 0.8,
     'bagging_freq': 5,
     'verbose': -1,
-    'random_state': 42,
     'n_jobs': -1,
+    **LGBM_DETERMINISM,
 }
 
 # Huber loss parameters - ENABLED BY DEFAULT for outlier robustness
@@ -383,6 +400,40 @@ RESELECTION_HALF_LIFE_MONTHS = 9999       # Effectively uniform weights (no deca
 RESELECTION_START_DATE = '2000-01-01'     # Start adaptive reselection from this date (sufficient data)
 RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluster + Interaction
 RESELECTION_STAGES_PASS2 = (0, 2, 4)     # Global: Pre-funnel + Boruta + Cluster
+
+# =============================================================================
+# TIER-A UNIVERSE DISTILLATION (Hierarchical reselection — see faster.md)
+# =============================================================================
+# Pass-1 of the reselection is the wall-clock-dominant work: it Boruta-screens
+# the full ~17k-column FRED universe per source every time it runs. Under the
+# hierarchical scheme, Pass-1 is refreshed on a slower cadence than Pass-2,
+# and its survivors are persisted to disk so each Pass-2 step reuses them.
+#
+# PIT invariant: a universe cache file with asof T may only be consumed by
+# backtest steps whose step_date >= T. Enforced in Train/universe_cache.py.
+#
+# Gated by USE_UNIVERSE_CACHE — defaults to False until the Phase-2 sandbox
+# (Train/sandbox/validate_tiered_reselection.py) confirms parity vs baseline.
+
+USE_UNIVERSE_CACHE = False
+"""Master switch for Tier-A universe distillation. Keep False until the
+Phase-2 sandbox validates the hierarchical scheme on a real backtest window.
+Once enabled, _dynamic_reselection reuses cached Pass-1 survivors when fresh."""
+
+UNIVERSE_REFRESH_MONTHS = 24
+"""How often Pass-1 (universe distillation) is re-run. A cache with
+``universe_asof = T`` is reused at any step_date in
+``[T, T + UNIVERSE_REFRESH_MONTHS)``; outside that window, Pass-1 is
+recomputed and persisted afresh."""
+
+UNIVERSE_STAGES = DYNAMIC_FS_STAGES_PASS1
+"""Stages Pass-1 runs at when populating the universe cache. Heavier than
+the legacy ``RESELECTION_STAGES_PASS1`` because we amortize the cost over
+~24 months of backtest steps."""
+
+UNIVERSE_CACHE_DIR = OUTPUT_DIR / "cache" / "universe"
+"""Where universe-distillation caches live. Filenames embed (target_type,
+target_source, universe_asof) so the PIT filter can compare by name."""
 
 # =============================================================================
 # BASELINE KEEP-RULE

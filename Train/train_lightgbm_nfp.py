@@ -26,11 +26,25 @@ from typing import Dict, List, Tuple, Optional, Any
 import sys
 import os
 import json
+import random
 import warnings
+
+# ── Global determinism ──
+# Pin every global RNG before anything else imports numpy/random under us.
+# LightGBM's own seeds are set per-param-dict (see Train.config.LGBM_DETERMINISM);
+# this block covers numpy, the stdlib `random` module, and the Python hash seed
+# (which only takes effect for child processes — informative for joblib workers).
+_GLOBAL_RNG_SEED = 42
+os.environ.setdefault("PYTHONHASHSEED", str(_GLOBAL_RNG_SEED))
+random.seed(_GLOBAL_RNG_SEED)
+np.random.seed(_GLOBAL_RNG_SEED)
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS, RESELECT_EVERY_N_MONTHS
+from settings import (
+    DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS,
+    RESELECT_EVERY_N_MONTHS, USE_PER_WINDOW_FEATURES,
+)
 from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump_perf_json, register_atexit_dump
 
 # Import from modular components
@@ -46,6 +60,7 @@ from Train.config import (
     TUNE_EVERY_N_MONTHS,
     NUM_BOOST_ROUND,
     EARLY_STOPPING_ROUNDS,
+    LGBM_DETERMINISM,
 )
 
 from Train.data_loader import (
@@ -358,6 +373,81 @@ def _classify_columns_by_source(
     return groups
 
 
+def _load_per_window_feature_sets(
+    target_type: str,
+    target_source: str,
+) -> List[Tuple[pd.Timestamp, List[str]]]:
+    """Load saved per-window feature JSONs for replay mode.
+
+    Reads ``_output/dynamic_selection/{target_type}_{target_source}/*.json``
+    and filters to the most recent run cohort (JSONs whose mtime is within
+    6 hours of the latest). Returns a list of ``(step_date, features)``
+    tuples sorted ascending by step_date.
+
+    Used by USE_PER_WINDOW_FEATURES mode to reproduce the predictions of a
+    prior dynamic-reselection backtest run without re-running the slow
+    feature-selection stage.
+    """
+    sel_dir = OUTPUT_DIR / "dynamic_selection" / f"{target_type}_{target_source}"
+    if not sel_dir.exists():
+        return []
+
+    json_paths = list(sel_dir.glob("*.json"))
+    if not json_paths:
+        return []
+
+    mtimes = [(p, p.stat().st_mtime) for p in json_paths]
+    latest_mtime = max(m for _, m in mtimes)
+    cohort_window_seconds = 6 * 3600
+    cohort = [p for p, m in mtimes if (latest_mtime - m) <= cohort_window_seconds]
+
+    sets: List[Tuple[pd.Timestamp, List[str]]] = []
+    for p in sorted(cohort):
+        try:
+            with open(p, 'r') as f:
+                data = json.load(f)
+            sets.append((pd.Timestamp(data["step_date"]), list(data["features"])))
+        except Exception as e:
+            logger.warning(f"_load_per_window_feature_sets: failed to load {p}: {e}")
+
+    sets.sort(key=lambda x: x[0])
+
+    # Stale-cohort warning. When users flip RESELECT_EVERY_N_MONTHS back on
+    # without removing old JSONs, the 6-hour cohort filter above silently
+    # snaps to the most-recent ad-hoc run, which can be months old. Surface
+    # this explicitly so we don't quietly replay 2021-vintage features.
+    import time as _time
+    age_days = (_time.time() - latest_mtime) / 86400.0
+    if age_days > 30:
+        logger.warning(
+            f"_load_per_window_feature_sets: latest cohort under {sel_dir} is "
+            f"{age_days:.0f} days old. If you intended fresh reselection, "
+            f"clear or back up this directory and set RESELECT_EVERY_N_MONTHS>0."
+        )
+    if len(sets) == 1:
+        logger.warning(
+            f"_load_per_window_feature_sets: per-window replay is using a "
+            f"single feature set at step_date={sets[0][0].strftime('%Y-%m')} "
+            f"for ALL backtest steps. Verify this is intentional."
+        )
+
+    return sets
+
+
+def _get_features_for_step(
+    per_window_sets: List[Tuple[pd.Timestamp, List[str]]],
+    target_month: pd.Timestamp,
+) -> Optional[List[str]]:
+    """Return the feature list with the most recent step_date <= target_month."""
+    chosen: Optional[List[str]] = None
+    for step_date, features in per_window_sets:
+        if step_date <= target_month:
+            chosen = features
+        else:
+            break
+    return chosen
+
+
 def _dynamic_reselection(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -453,9 +543,46 @@ def _dynamic_reselection(
     sw_series = pd.Series(reselect_weights, index=X_dated.index, name='sample_weight')
 
     # ── Pass 1: Per-source feature selection ──
+    # Tier-A universe-distillation cache: when USE_UNIVERSE_CACHE is enabled,
+    # try to load a recent enough Pass-1 result from disk and skip the heavy
+    # per-source Boruta loop entirely. PIT invariant (enforced inside
+    # load_latest_universe): the cache's asof must be ≤ step_date.
     massive_sources = ['FRED_Employment_NSA', 'FRED_Employment_SA']
     small_sources = ['FRED_Exogenous', 'Unifier', 'ADP', 'NOAA', 'Prosper']
     pass1_survivors: Dict[str, List[str]] = {}
+
+    from Train.config import USE_UNIVERSE_CACHE, UNIVERSE_REFRESH_MONTHS
+
+    _universe_cache_hit = False
+    if USE_UNIVERSE_CACHE:
+        from Train.universe_cache import (
+            is_cache_fresh,
+            load_latest_universe,
+            save_universe,
+        )
+        _cached_universe = load_latest_universe(
+            target_type=target_type,
+            target_source=target_source,
+            step_date=step_date,
+        )
+        if _cached_universe is not None and is_cache_fresh(
+            _cached_universe["asof"], step_date, UNIVERSE_REFRESH_MONTHS,
+        ):
+            # Restrict cached survivors to columns that exist in this slice
+            # (the universe might have been built when extra cols existed).
+            _x_cols = set(X_dated.columns)
+            pass1_survivors = {
+                src: [c for c in feats if c in _x_cols]
+                for src, feats in _cached_universe["survivors"].items()
+            }
+            _universe_cache_hit = True
+            logger.info(
+                f"[{label}] Tier-A HIT: universe_asof="
+                f"{_cached_universe['asof'].strftime('%Y-%m')} step_date="
+                f"{step_date.strftime('%Y-%m')} → "
+                f"{sum(len(v) for v in pass1_survivors.values())} survivors "
+                f"across {len(pass1_survivors)} sources. Skipping Pass-1."
+            )
 
     def _run_source_pass1(source_name: str, cols: List[str]) -> Tuple[str, List[str]]:
         """Run Pass-1 selection on one source's columns from X_train."""
@@ -494,38 +621,55 @@ def _dynamic_reselection(
             logger.error(f"[{label}] {source_name}: Pass-1 failed: {e}")
             return source_name, []
 
-    # Run massive sources (FRED Employment) sequentially
-    for src_name in massive_sources:
-        cols = source_groups.get(src_name, [])
-        if cols:
-            name, feats = _run_source_pass1(src_name, cols)
-            pass1_survivors[name] = feats
-            gc.collect()
+    if not _universe_cache_hit:
+        # Run massive sources (FRED Employment) sequentially
+        for src_name in massive_sources:
+            cols = source_groups.get(src_name, [])
+            if cols:
+                name, feats = _run_source_pass1(src_name, cols)
+                pass1_survivors[name] = feats
+                gc.collect()
 
-    # Run small sources in parallel
-    small_to_run = [(s, source_groups.get(s, [])) for s in small_sources
-                    if source_groups.get(s)]
-    if small_to_run:
-        max_workers = min(len(small_to_run), 4)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_run_source_pass1, name, cols): name
-                for name, cols in small_to_run
-            }
-            for future in as_completed(futures):
-                src_name, feats = future.result()
-                pass1_survivors[src_name] = feats
+        # Run small sources in parallel
+        small_to_run = [(s, source_groups.get(s, [])) for s in small_sources
+                        if source_groups.get(s)]
+        if small_to_run:
+            max_workers = min(len(small_to_run), 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_run_source_pass1, name, cols): name
+                    for name, cols in small_to_run
+                }
+                for future in as_completed(futures):
+                    src_name, feats = future.result()
+                    pass1_survivors[src_name] = feats
 
-    # Include Unknown-source features (pass them through directly)
-    unknown_cols = source_groups.get('Unknown', [])
-    if unknown_cols:
-        pass1_survivors['Unknown'] = unknown_cols
+        # Include Unknown-source features (pass them through directly)
+        unknown_cols = source_groups.get('Unknown', [])
+        if unknown_cols:
+            pass1_survivors['Unknown'] = unknown_cols
 
     total_pass1 = sum(len(v) for v in pass1_survivors.values())
     logger.info(
         f"[{label}] Pass-1 complete: {total_pass1} total survivors across "
         f"{len([k for k, v in pass1_survivors.items() if v])} sources"
+        f"{' (from cache)' if _universe_cache_hit else ''}"
     )
+
+    # Persist a freshly-computed Pass-1 result so future step_dates inside
+    # the UNIVERSE_REFRESH_MONTHS window can reuse it. We only save when we
+    # actually recomputed (cache miss); cache hits don't re-save the same data.
+    if USE_UNIVERSE_CACHE and not _universe_cache_hit and total_pass1 > 0:
+        try:
+            save_universe(
+                survivors=pass1_survivors,
+                target_type=target_type,
+                target_source=target_source,
+                asof=step_date,
+                stages=tuple(stages_pass1),
+            )
+        except Exception as _e:
+            logger.warning(f"[{label}] universe_cache save failed: {_e}")
 
     if total_pass1 == 0:
         raise RuntimeError(
@@ -763,8 +907,8 @@ def _train_simple_regressor(
         'bagging_freq': 1,
         'min_data_in_leaf': 5,
         'verbosity': -1,
-        'random_state': 42,
         'n_jobs': 1,
+        **LGBM_DETERMINISM,
     }
     w = None if train_weights is None else np.asarray(train_weights, dtype=float)
     if objective == 'binary':
@@ -1269,17 +1413,69 @@ def run_expanding_window_backtest(
     # Warm branch-target cache used in lagged feature engineering
     load_target_data(target_type, release_type=release_type, target_source=target_source)
 
-    # Build FULL feature dataset once
-    logger.info("Building full feature dataset...")
-    X_full, y_full = build_training_dataset(
-        target_df, target_type=target_type, release_type=release_type,
-        target_source=target_source,
-        show_progress=False
+    # Build a ds -> release_date map from the current target. Used by the SA
+    # branch's NSA-acceleration injection block to filter revised actuals by
+    # operational_available_date < cutoff_date (Issue 10 fix). For the NSA
+    # branch this map is built but not consumed.
+    target_release_date_map: Dict[pd.Timestamp, pd.Timestamp] = {}
+    if 'release_date' in target_df.columns:
+        valid_rd = target_df['release_date'].notna()
+        target_release_date_map = dict(zip(
+            pd.to_datetime(target_df.loc[valid_rd, 'ds']),
+            pd.to_datetime(target_df.loc[valid_rd, 'release_date']),
+        ))
+
+    # Build FULL feature dataset once.
+    # First check the persistent content-hashed parquet cache — build_training_dataset
+    # is a deterministic function of the master snapshots + target parquet, so when
+    # neither has changed since the last run, we skip the parallel build entirely.
+    from Train.training_dataset_cache import (
+        load_cached_dataset,
+        save_cached_dataset,
     )
+    _cached = load_cached_dataset(
+        target_df, target_type, release_type, target_source,
+        start_date=None, end_date=None,
+    )
+    if _cached is not None:
+        X_full, y_full = _cached
+    else:
+        logger.info("Building full feature dataset...")
+        X_full, y_full = build_training_dataset(
+            target_df, target_type=target_type, release_type=release_type,
+            target_source=target_source,
+            show_progress=False
+        )
+        if not X_full.empty:
+            save_cached_dataset(
+                X_full, y_full, target_df,
+                target_type, release_type, target_source,
+                start_date=None, end_date=None,
+            )
 
     if X_full.empty:
         logger.error("Failed to build training dataset")
         return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+
+    # COVID-winsorize X_full and y_full ONCE upfront so training, prediction
+    # (X_pred = X_full.iloc[[target_idx]]), AND the production model fit (which
+    # also reuses X_full via train_and_evaluate) all see consistent winsorized
+    # values for Mar-May 2020. This closes the asymmetry where the prior
+    # per-step winsorize on X_train_valid only touched the training slice and
+    # left X_pred at COVID target months exposed to raw out-of-distribution
+    # feature values (e.g., NFP_Consensus_Mean = -14,448 at Apr 2020). The
+    # clipping bounds use full-history non-COVID quantiles, which are
+    # empirically stable across decades for NFP-related features.
+    logger.info("Applying COVID winsorization to X_full and y_full upfront...")
+    _x_indexed = X_full.set_index('ds')
+    _numeric = _x_indexed.select_dtypes(include=[np.number]).columns
+    _x_indexed[_numeric] = winsorize_covid_period(_x_indexed[_numeric])
+    X_full = _x_indexed.reset_index(names='ds')
+
+    _y_indexed = pd.Series(
+        y_full.values, index=pd.to_datetime(X_full['ds']), name='y_mom',
+    )
+    y_full = winsorize_covid_period(_y_indexed).reset_index(drop=True)
 
     # Pre-compute indices for faster lookup
     date_to_idx = {d: i for i, d in enumerate(X_full['ds'])}
@@ -1326,8 +1522,60 @@ def run_expanding_window_backtest(
     # ── Dynamic re-selection state ──
     dynamic_features: Optional[List[str]] = None   # None = not yet selected
     last_reselection_date: Optional[pd.Timestamp] = None
-    _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
     _dynamic_selection_logs: List[Dict] = []  # JSON logs per reselection window
+
+    def _months_since(later: pd.Timestamp, earlier: pd.Timestamp) -> int:
+        """Whole calendar-month count from ``earlier`` to ``later`` (signed).
+
+        Used as the reselection cadence metric so that ``RESELECT_EVERY_N_MONTHS``
+        means clean calendar months rather than 30-day approximations
+        (the old ``days * 30`` heuristic drifted ~5 days per year, producing
+        the off-by-one spacing visible in older ``_output/dynamic_selection``).
+        """
+        return (later.year - earlier.year) * 12 + (later.month - earlier.month)
+
+    # ── Frozen-features mode ──
+    # When master_snapshot_base_features is loaded (mode="selected") AND
+    # reselection is disabled (RESELECT_EVERY_N_MONTHS == 0), use the saved
+    # feature list verbatim. Skips both dynamic reselection and the legacy
+    # static short-pass / branch-target FS extras — every backtest step uses
+    # exactly the same pre-selected feature set.
+    _frozen_features_mode = (
+        not _all_features_mode
+        and master_snapshot_base_features
+        and RESELECT_EVERY_N_MONTHS == 0
+    )
+    if _frozen_features_mode:
+        dynamic_features = list(master_snapshot_base_features)
+        logger.info(
+            f"[{model_id}] FROZEN-FEATURES mode: using {len(dynamic_features)} "
+            f"pre-selected features verbatim. No reselection, no extras."
+        )
+
+    # ── Per-window features replay mode ──
+    # When enabled, replay a prior dynamic-reselection run by loading saved
+    # per-window JSONs and applying them at the matching backtest step.
+    # Overrides frozen-features mode when both are configured.
+    _per_window_features_sets: List[Tuple[pd.Timestamp, List[str]]] = []
+    _per_window_mode = USE_PER_WINDOW_FEATURES and not _all_features_mode
+    if _per_window_mode:
+        _per_window_features_sets = _load_per_window_feature_sets(target_type, target_source)
+        if not _per_window_features_sets:
+            logger.warning(
+                f"[{model_id}] PER-WINDOW mode requested but no JSONs found at "
+                f"{OUTPUT_DIR / 'dynamic_selection' / f'{target_type}_{target_source}'}. "
+                f"Falling back to frozen-features mode."
+            )
+            _per_window_mode = False
+        else:
+            _frozen_features_mode = False
+            dynamic_features = None  # set per step inside loop
+            _step_dates_str = ", ".join(d.strftime("%Y-%m") for d, _ in _per_window_features_sets)
+            logger.info(
+                f"[{model_id}] PER-WINDOW mode: loaded {len(_per_window_features_sets)} "
+                f"feature sets at step_dates [{_step_dates_str}]. Backtest will replay "
+                f"these sets at the matching steps; no fresh reselection."
+            )
 
     # ── Short-pass stability tracking ──
     step_feature_sets: list[set] = []
@@ -1374,14 +1622,13 @@ def run_expanding_window_backtest(
             X_train_valid = X_train_valid.iloc[sort_order].reset_index(drop=True)
             y_train_valid = y_train_valid.iloc[sort_order].reset_index(drop=True)
 
-        with perf_phase("train.backtest.step.covid_winsorize", step=i):
-            # COVID winsorization on training data only (no future leakage)
-            X_indexed = X_train_valid.set_index('ds')
-            numeric_cols = X_indexed.select_dtypes(include=[np.number]).columns
-            X_indexed[numeric_cols] = winsorize_covid_period(X_indexed[numeric_cols])
-            y_indexed = pd.Series(y_train_valid.values, index=X_indexed.index, name='y_mom')
-            y_train_valid = winsorize_covid_period(y_indexed).reset_index(drop=True)
-            X_train_valid = X_indexed.reset_index(names='ds')
+        # NOTE: COVID winsorization is now applied ONCE upfront on X_full / y_full
+        # (just after build_training_dataset) so X_train_valid is already winsorized
+        # by virtue of being a slice of X_full. The prior per-step winsorize block
+        # was removed because (a) it duplicated work on every step and (b) it left
+        # X_pred (taken directly from X_full) unwinsorized, creating an
+        # asymmetry between training inputs and prediction inputs at COVID
+        # target months.
 
         # Compute baseline predictions using only training data
         baseline_preds = {}
@@ -1393,6 +1640,31 @@ def run_expanding_window_backtest(
             # Recompute clean_features every step (feature availability changes as window expands)
             cleaned_features = clean_features(X_train_valid, y_train_valid)
             cleaned_features = [c for c in cleaned_features if c in X_train_valid.columns and c != 'ds']
+
+        # ── Per-window feature swap (replay) ──
+        # In per-window mode, pick the saved feature set whose step_date is the
+        # most recent <= the current target_month. When the set changes vs the
+        # previous step, invalidate Optuna params (preserve previous best as
+        # warm-start seed) — mirrors what fresh reselection does.
+        if _per_window_mode:
+            new_features = _get_features_for_step(_per_window_features_sets, target_month)
+            if new_features is None:
+                raise RuntimeError(
+                    f"[Step {i}] PER-WINDOW mode: no feature set found with "
+                    f"step_date <= {target_month.strftime('%Y-%m')}. Earliest "
+                    f"available: {_per_window_features_sets[0][0].strftime('%Y-%m')}"
+                )
+            if dynamic_features != new_features:
+                if dynamic_features is not None:
+                    logger.info(
+                        f"[Step {i}] PER-WINDOW switch at "
+                        f"{target_month.strftime('%Y-%m')}: feature set changed "
+                        f"(now {len(new_features)} features). Invalidating Optuna "
+                        f"params (warm-start preserved)."
+                    )
+                    _warm_start_params = tuned_params
+                    tuned_params = None
+                dynamic_features = list(new_features)
 
         # ── Dynamic re-selection (every N months, starting from 2000) ──
         # In all-features mode: mandatory, triggered on step 0 and every N months.
@@ -1408,7 +1680,7 @@ def run_expanding_window_backtest(
                     target_month >= _reselection_start
                     and RESELECT_EVERY_N_MONTHS > 0
                     and last_reselection_date is not None
-                    and (target_month - last_reselection_date).days >= _reselect_interval_days
+                    and _months_since(target_month, last_reselection_date) >= RESELECT_EVERY_N_MONTHS
                 )
             )
         elif RESELECT_EVERY_N_MONTHS > 0:
@@ -1416,7 +1688,7 @@ def run_expanding_window_backtest(
                 last_reselection_date is None
                 or (
                     target_month >= _reselection_start
-                    and (target_month - last_reselection_date).days >= _reselect_interval_days
+                    and _months_since(target_month, last_reselection_date) >= RESELECT_EVERY_N_MONTHS
                 )
             )
 
@@ -1591,14 +1863,20 @@ def run_expanding_window_backtest(
                 compute_nsa_acceleration_features,
                 build_nsa_features_for_training,
             )
+            # Cutoff = SA's first NFP release date for this target_month, matching
+            # the strict-< cutoff that build_training_dataset already uses for all
+            # other features. Closes Issue 10's same-day leak by filtering revised
+            # actuals via operational_available_date < cutoff_date.
+            cutoff_for_target = target_release_date_map.get(target_month, target_month)
             nsa_feats_pred = compute_nsa_acceleration_features(
-                nsa_backtest_results, target_month
+                nsa_backtest_results, target_month, cutoff_date=cutoff_for_target,
             )
             _nsa_accel_cols = list(nsa_feats_pred.keys())
 
             training_months = pd.to_datetime(X_train_valid['ds'])
             nsa_train_feats = build_nsa_features_for_training(
-                nsa_backtest_results, training_months
+                nsa_backtest_results, training_months,
+                cutoff_dates=target_release_date_map,
             )
             for col in _nsa_accel_cols:
                 if col in nsa_train_feats.columns:
@@ -2196,6 +2474,30 @@ def train_and_evaluate(
     cleaned_feature_cols = clean_features(X_full_valid, y_full_valid)
     cleaned_feature_cols = [c for c in cleaned_feature_cols if c in X_full_valid.columns and c != 'ds']
 
+    # Frozen-features mode for production: same gate as backtest.
+    _prod_frozen_features_mode = (
+        not _prod_all_features_mode
+        and master_snapshot_base_features
+        and RESELECT_EVERY_N_MONTHS == 0
+    )
+
+    # Per-window mode for production: use the LATEST per-window feature set
+    # (most recent step_date in the cohort). Mirrors the backtest's final-step
+    # behavior so the production model stays consistent with the last step's
+    # OOS predictions.
+    _prod_per_window_sets: List[Tuple[pd.Timestamp, List[str]]] = []
+    _prod_per_window_mode = USE_PER_WINDOW_FEATURES and not _prod_all_features_mode
+    if _prod_per_window_mode:
+        _prod_per_window_sets = _load_per_window_feature_sets(target_type, target_source)
+        if not _prod_per_window_sets:
+            logger.warning(
+                f"[{model_id}] PER-WINDOW mode requested for production but no "
+                f"JSONs found. Falling back to frozen-features mode."
+            )
+            _prod_per_window_mode = False
+        else:
+            _prod_frozen_features_mode = False
+
     if _prod_all_features_mode:
         # All-features mode: run dynamic reselection on the full dataset for production
         logger.info(
@@ -2221,6 +2523,37 @@ def train_and_evaluate(
         logger.info(
             f"[{model_id}] Production features: {len(feature_cols)} "
             f"(from dynamic reselection: {len(_prod_features)})"
+        )
+    elif _prod_per_window_mode:
+        latest_step_date, latest_features = _prod_per_window_sets[-1]
+        feature_cols = [
+            c for c in latest_features
+            if c in X_full_valid.columns and c in cleaned_feature_cols
+        ]
+        if not feature_cols:
+            raise RuntimeError(
+                f"[{model_id}] PER-WINDOW production features have zero overlap "
+                f"with X_full_valid / cleaned_feature_cols. Latest set "
+                f"({latest_step_date.strftime('%Y-%m')}): {len(latest_features)} features."
+            )
+        logger.info(
+            f"[{model_id}] PER-WINDOW production features: {len(feature_cols)} "
+            f"(from latest set {latest_step_date.strftime('%Y-%m')})"
+        )
+    elif _prod_frozen_features_mode:
+        # Frozen mode: production model uses the same pre-selected features as the backtest.
+        feature_cols = [
+            c for c in master_snapshot_base_features
+            if c in X_full_valid.columns and c in cleaned_feature_cols
+        ]
+        if not feature_cols:
+            raise RuntimeError(
+                f"[{model_id}] Frozen production features have zero overlap with "
+                f"X_full_valid / cleaned_feature_cols. Selected={len(master_snapshot_base_features)}."
+            )
+        logger.info(
+            f"[{model_id}] FROZEN production features: {len(feature_cols)} "
+            f"(from selected_features_{target_type}_{target_source}.json)"
         )
     else:
         groups = partition_feature_columns(cleaned_feature_cols, target_type=target_type)
@@ -2661,7 +2994,7 @@ def validate_post_train_all_artifacts(
 
     Optional artifacts (post-training pipeline):
       5) sandbox predicted adjustment + SA blend walk-forward
-      6) consensus anchor (Kalman fusion + AccelOverride)
+      6) consensus anchor (baseline consensus + Kalman fusion)
     """
     if output_root is None:
         output_root = OUTPUT_DIR
@@ -2713,16 +3046,14 @@ def validate_post_train_all_artifacts(
     optional.append(("sandbox::sa_blend_walkforward",
                      output_root / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"))
 
-    # Consensus anchor: full 4-way scorecard is part of the production artifact set
+    # Consensus anchor: Baseline_Consensus + Kalman_Fusion are the production
+    # artifact set. AccelOverride and Kalman+AccelPostFilter were dropped
+    # 2026-05-11 (both underperformed Consensus on the backtest window).
     consensus_dir = output_root / "consensus_anchor"
     required.append(("consensus_anchor::baseline_consensus",
                      consensus_dir / "baseline_consensus" / "backtest_results.csv"))
     required.append(("consensus_anchor::kalman_fusion",
                      consensus_dir / "kalman_fusion" / "backtest_results.csv"))
-    required.append(("consensus_anchor::accel_override",
-                     consensus_dir / "accel_override" / "backtest_results.csv"))
-    required.append(("consensus_anchor::kalman_accel_postfilter",
-                     consensus_dir / "kalman_accel_postfilter" / "backtest_results.csv"))
     required.append(("consensus_anchor::comparison_metrics",
                      consensus_dir / "comparison_metrics.csv"))
     required.append(("consensus_anchor::comparison_overlay",

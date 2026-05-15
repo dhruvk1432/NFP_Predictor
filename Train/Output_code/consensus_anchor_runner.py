@@ -98,10 +98,10 @@ def _full_metric_block(
     medae = float(np.median(np.abs(e)))
 
     dir_acc = float(np.mean(np.sign(a) == np.sign(p)))
-    if a.size >= 2:
-        accel_acc = float(np.mean(np.sign(np.diff(a)) == np.sign(np.diff(p))))
-    else:
-        accel_acc = float("nan")
+    # Acceleration accuracy uses the operational "vs last actual" formula:
+    # sign(p[m] - a[m-1]) vs sign(a[m] - a[m-1]).
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(a, p))
 
     denom = (np.abs(a) + np.abs(p))
     smape = float(np.mean(2 * np.abs(e) / np.where(denom == 0, 1, denom)) * 100)
@@ -314,23 +314,37 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
         champion_path = output_base / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"
         logger.warning("NSA+Adj not found for champion; falling back to SA blend")
 
+    # SA LightGBM "challenger" is only a diagnostic overlay — Kalman fusion
+    # itself does not consume it. With the SA branch retired the file may not
+    # exist; fall back to the champion's actuals.
     challenger_path = output_base / "SA_prediction" / "backtest_results.csv"
     if not challenger_path.exists():
         challenger_path = output_base / "SA_prediction_revised" / "backtest_results.csv"
 
     champion_df = _load_model_backtest(champion_path, "champion_pred")
-    challenger_df = _load_model_backtest(challenger_path, "challenger_pred")
-
-    merged = (
-        consensus_monthly
-        .merge(champion_df, on="ds", how="outer")
-        .merge(challenger_df, on="ds", how="outer")
-        .sort_values("ds")
-        .reset_index(drop=True)
-    )
-    merged["actual"] = merged["actual_champion_pred"].combine_first(
-        merged["actual_challenger_pred"]
-    )
+    if challenger_path.exists():
+        challenger_df = _load_model_backtest(challenger_path, "challenger_pred")
+        merged = (
+            consensus_monthly
+            .merge(champion_df, on="ds", how="outer")
+            .merge(challenger_df, on="ds", how="outer")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        merged["actual"] = merged["actual_champion_pred"].combine_first(
+            merged["actual_challenger_pred"]
+        )
+    else:
+        logger.info("SA LightGBM challenger backtest not present — fusion will run without it")
+        merged = (
+            consensus_monthly
+            .merge(champion_df, on="ds", how="outer")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        merged["challenger_pred"] = np.nan
+        merged["actual_challenger_pred"] = np.nan
+        merged["actual"] = merged["actual_champion_pred"]
     logger.info("Champion: %s (%d months)", champion_path.parent.name,
                 merged["champion_pred"].notna().sum())
 
@@ -672,12 +686,61 @@ def _composite_kalman_accel_objective(
     if not np.isfinite(mae):
         return float("inf")
     dir_acc = float(np.mean(np.sign(a) == np.sign(p))) if a.size >= 1 else 0.0
-    if a.size >= 2:
-        da, dp = np.diff(a), np.diff(p)
-        accel_acc = float(np.mean(np.sign(da) == np.sign(dp)))
-    else:
-        accel_acc = 0.0
+    # Operational "vs last actual" accel formula.
+    from Train.variance_metrics import acceleration_accuracy
+    _acc = float(acceleration_accuracy(a, p))
+    accel_acc = 0.0 if not np.isfinite(_acc) else _acc
     return float(mae - KALMAN_LAMBDA_ACCEL * accel_acc - KALMAN_LAMBDA_DIR * dir_acc)
+
+
+def _build_pit_adjustment_cache(
+    target_dates: pd.Series,
+    adj_history: pd.DataFrame,
+) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """Pre-compute PIT-filtered adjustment history for each target date.
+
+    Done once outside the Optuna inner loop so per-trial cost is just the
+    weight computation in ``ExpWeightedMedianCovidExcludedPredictor.fit_predict``
+    (a function of ``half_life_years``), not the full filter sweep.
+    """
+    cache: Dict[pd.Timestamp, pd.DataFrame] = {}
+    if "operational_available_date" in adj_history.columns:
+        op_col = "operational_available_date"
+    else:
+        op_col = "ds"
+    for ds in target_dates:
+        target_ds = pd.Timestamp(ds)
+        if op_col == "operational_available_date":
+            mask = (
+                adj_history["operational_available_date"].notna()
+                & (adj_history["operational_available_date"] < target_ds)
+            )
+        else:
+            mask = adj_history["ds"] < target_ds
+        cache[target_ds] = adj_history[mask].reset_index(drop=True)
+    return cache
+
+
+def _compute_adjustment_series(
+    target_dates: pd.Series,
+    pit_cache: Dict[pd.Timestamp, pd.DataFrame],
+    half_life_years: float,
+) -> np.ndarray:
+    """Compute the per-date predicted adjustment using ExpWeightedMedian with
+    the given ``half_life_years``. Uses the pre-built PIT cache."""
+    from Train.sandbox.experiment_predicted_adjustment import (
+        ExpWeightedMedianCovidExcludedPredictor,
+    )
+    predictor = ExpWeightedMedianCovidExcludedPredictor(half_life_years=half_life_years)
+    out = np.zeros(len(target_dates), dtype=float)
+    for i, ds in enumerate(target_dates):
+        target_ds = pd.Timestamp(ds)
+        avail = pit_cache.get(target_ds)
+        if avail is None or avail.empty:
+            out[i] = 0.0
+        else:
+            out[i] = float(predictor.fit_predict(avail, target_ds))
+    return out
 
 
 def _tune_kalman(
@@ -686,32 +749,69 @@ def _tune_kalman(
     n_trials: int = N_OPTUNA_TRIALS,
     timeout: int = OPTUNA_TIMEOUT,
     n_splits: int = 5,
+    *,
+    adj_history: Optional[pd.DataFrame] = None,
+    nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]] = None,
+    tune_adjustment: bool = False,
 ) -> Dict:
-    """Optuna-tune trailing_window and nsa_weight_scale for Kalman fusion.
+    """Optuna-tune Kalman fusion params (and optionally the adjustment
+    half-life) against the fusion-level composite objective.
 
     Uses nested expanding-window CV (n_splits chronological folds) so each
     trial's score is averaged over windows that the trial's params did not
     "train on" — closes Issue 9's meta-leak.
 
     Composite objective: MAE - λ_accel * accel_acc - λ_dir * dir_acc.
+
+    When ``tune_adjustment=True`` and the raw NSA predictions + adjustment
+    history are provided, ``half_life_years`` is sampled jointly with the
+    Kalman params and the champion / nsa_pred columns of ``overlap_df`` are
+    rebuilt in-memory for each trial. This drives the adjustment toward the
+    same fusion objective rather than leaving it at a hard-coded 3-year
+    half-life.
     """
     from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
 
     if not OPTUNA_AVAILABLE:
         logger.warning("Optuna not available; using default Kalman params")
-        return {"trailing_window": 18, "nsa_weight_scale": 1.0}
+        return {"trailing_window": 18, "nsa_weight_scale": 1.0, "half_life_years": 3.0}
 
     has_nsa = "nsa_pred" in overlap_df.columns and overlap_df["nsa_pred"].notna().any()
 
+    _adj_enabled = (
+        tune_adjustment
+        and adj_history is not None
+        and nsa_raw_by_ds is not None
+        and not overlap_df.empty
+    )
+    pit_cache: Optional[Dict[pd.Timestamp, pd.DataFrame]] = None
+    if _adj_enabled:
+        pit_cache = _build_pit_adjustment_cache(overlap_df["ds"], adj_history)
+
     logger.info("Optuna tuning Kalman fusion: trials=%d timeout=%ds nsa=%s "
-                "λ_accel=%.1f λ_dir=%.1f n_splits=%d (nested walkforward CV)",
-                n_trials, timeout, has_nsa, KALMAN_LAMBDA_ACCEL,
+                "tune_adj=%s λ_accel=%.1f λ_dir=%.1f n_splits=%d (nested walkforward CV)",
+                n_trials, timeout, has_nsa, _adj_enabled, KALMAN_LAMBDA_ACCEL,
                 KALMAN_LAMBDA_DIR, n_splits)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def objective(trial: "optuna.Trial") -> float:
         tw = trial.suggest_int("trailing_window", 6, 36)
         nsa_ws = trial.suggest_float("nsa_weight_scale", 0.1, 3.0) if has_nsa else 1.0
+
+        if _adj_enabled:
+            hl = trial.suggest_float("half_life_years", 0.5, 8.0)
+            adj_vals = _compute_adjustment_series(overlap_df["ds"], pit_cache, hl)
+            nsa_raw_vals = np.array([
+                nsa_raw_by_ds.get(pd.Timestamp(d), np.nan) for d in overlap_df["ds"]
+            ], dtype=float)
+            champion_new = nsa_raw_vals + adj_vals
+            modified_overlap = overlap_df.copy()
+            modified_overlap["champion_pred"] = champion_new
+            if "nsa_pred" in modified_overlap.columns:
+                modified_overlap["nsa_pred"] = champion_new
+        else:
+            modified_overlap = overlap_df
+
         fn_kwargs = {
             "trailing_window": tw,
             "use_nsa_accel": has_nsa,
@@ -722,7 +822,7 @@ def _tune_kalman(
             return _kalman_fold_runner(full_overlap, consensus_df, fn_kwargs, eval_end)
 
         score = _walkforward_cv_score(
-            overlap_df=overlap_df,
+            overlap_df=modified_overlap,
             fold_runner=_runner,
             composite_objective_fn=_composite_kalman_accel_objective,
             n_splits=n_splits,
@@ -739,10 +839,16 @@ def _tune_kalman(
     result = {"trailing_window": int(best.params["trailing_window"])}
     if has_nsa:
         result["nsa_weight_scale"] = float(best.params["nsa_weight_scale"])
+    if _adj_enabled and "half_life_years" in best.params:
+        result["half_life_years"] = float(best.params["half_life_years"])
 
-    logger.info("Kalman Optuna: best_obj=%.1f trailing_window=%d nsa_weight_scale=%.2f",
-                best.value, result["trailing_window"],
-                result.get("nsa_weight_scale", 1.0))
+    logger.info(
+        "Kalman Optuna: best_obj=%.1f trailing_window=%d nsa_weight_scale=%.2f "
+        "half_life_years=%s",
+        best.value, result["trailing_window"],
+        result.get("nsa_weight_scale", 1.0),
+        f"{result['half_life_years']:.2f}" if "half_life_years" in result else "n/a (untuned)",
+    )
     return result
 
 
@@ -1183,12 +1289,109 @@ def run_consensus_anchor_pipeline(
     logger.info("  Champion:  MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
                 champ_base["MAE"], champ_base["RMSE"], champ_base["Acceleration_Accuracy"])
 
-    # 3) Kalman Fusion
+    # 3) Kalman Fusion (jointly tune Kalman params + adjustment half-life)
     logger.info("Running Kalman Fusion...")
     if tune:
-        # Tune on historical-only overlap (no OOS rows)
-        kalman_params = _tune_kalman(overlap_df, consensus_df,
-                                     n_trials=n_trials, timeout=timeout)
+        # Pull the raw NSA backtest + adjustment history so the tuner can
+        # rebuild champion_pred per Optuna trial with a candidate
+        # half_life_years (drives the adjustment toward the fusion objective).
+        from Train.sandbox.experiment_predicted_adjustment import load_adjustment_history
+        nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
+        if not nsa_raw_path.exists():
+            nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
+        _nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]] = None
+        _adj_history: Optional[pd.DataFrame] = None
+        if nsa_raw_path.exists():
+            _nsa_raw_df = pd.read_csv(nsa_raw_path, parse_dates=["ds"])
+            _nsa_raw_df = _nsa_raw_df.dropna(subset=["predicted"])
+            _nsa_raw_by_ds = dict(zip(
+                pd.to_datetime(_nsa_raw_df["ds"]).tolist(),
+                _nsa_raw_df["predicted"].astype(float).tolist(),
+            ))
+            try:
+                _adj_history = load_adjustment_history()
+            except Exception as e:
+                logger.warning("Failed to load adjustment history; "
+                               "half_life_years will NOT be tuned: %s", e)
+                _adj_history = None
+        else:
+            logger.warning("NSA raw backtest not found at %s; "
+                           "half_life_years will NOT be tuned", nsa_raw_path)
+
+        kalman_params = _tune_kalman(
+            overlap_df, consensus_df,
+            n_trials=n_trials, timeout=timeout,
+            adj_history=_adj_history,
+            nsa_raw_by_ds=_nsa_raw_by_ds,
+            tune_adjustment=(_adj_history is not None and _nsa_raw_by_ds is not None),
+        )
+
+        # ── Half-life drift warning ──
+        # If the dynamic feature selection used a different half_life_years
+        # for its fusion-aligned selection target, log a WARNING. We do NOT
+        # force a re-run — the next reselection picks up the new value on
+        # its own, and a one-iteration lag is acceptable in steady state.
+        # Selection writes the value it used to dynamic_fs_selection_hl.json
+        # (see Train/train_lightgbm_nfp.py:_load_fusion_selection_target).
+        _hl_used_by_selection: Optional[float] = None
+        _hl_used_step: Optional[str] = None
+        _hl_meta_path = output_base / "consensus_anchor" / "dynamic_fs_selection_hl.json"
+        if _hl_meta_path.exists():
+            try:
+                with open(_hl_meta_path, "r") as f:
+                    _hl_meta = json.load(f)
+                _hl_used_by_selection = float(_hl_meta.get("half_life_years"))
+                _hl_used_step = str(_hl_meta.get("step_date", ""))
+            except Exception as e:
+                logger.warning("[DynFS] Could not read %s: %s", _hl_meta_path.name, e)
+
+        tuned_hl_for_drift = kalman_params.get("half_life_years")
+        if (
+            tuned_hl_for_drift is not None
+            and _hl_used_by_selection is not None
+            and abs(tuned_hl_for_drift - _hl_used_by_selection) > 1.0
+        ):
+            logger.warning(
+                "[DynFS] half_life_years drift Δ=%.2f "
+                "(selection used %.3f at step %s; Kalman tune now picked %.3f). "
+                "The next reselection will pick up the new value.",
+                tuned_hl_for_drift - _hl_used_by_selection,
+                _hl_used_by_selection, _hl_used_step or "n/a",
+                tuned_hl_for_drift,
+            )
+
+        # If half_life_years was tuned, regenerate the NSA+adjustment CSV with
+        # the tuned value so the final Kalman fusion (and downstream consumers
+        # like the predictions CSV) see the optimal champion.
+        tuned_hl = kalman_params.get("half_life_years")
+        if tuned_hl is not None and _adj_history is not None and abs(tuned_hl - 3.0) > 1e-6:
+            try:
+                from Train.Output_code.generate_output import _generate_adjustment_folder
+                logger.info("Regenerating NSA+adjustment with tuned half_life_years=%.3f", tuned_hl)
+                _adj_folder = output_base / "NSA_plus_adjustment"
+                _nsa_results = pd.read_csv(nsa_raw_path, parse_dates=["ds"])
+                from Train.data_loader import load_target_data
+                _sa_target = load_target_data(
+                    target_type="sa", release_type="first", target_source="revised",
+                )
+                _sa_results = pd.DataFrame({
+                    "ds": pd.to_datetime(_sa_target["ds"]),
+                    "actual": _sa_target["y_mom"].astype(float),
+                })
+                _generate_adjustment_folder(
+                    _nsa_results, _sa_results, _adj_folder,
+                    half_life_years=tuned_hl,
+                )
+                # Rebuild merged dataset so the rest of the pipeline reads
+                # the freshly-tuned champion.
+                merged = build_merged_dataset(output_base=output_base)
+                consensus_df, overlap_df, overlap_with_oos = split_datasets(merged)
+            except Exception as e:
+                logger.warning(
+                    "Could not regenerate NSA+adjustment with tuned half_life "
+                    "(%.3f): %s. Falling back to existing CSV (half_life=3.0).",
+                    tuned_hl, e,
+                )
     else:
         kalman_params = {"trailing_window": 18}
 

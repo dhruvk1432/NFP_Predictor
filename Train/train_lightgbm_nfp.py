@@ -177,6 +177,7 @@ from Train.config import (
     ENABLE_VARIANCE_GATE, VARIANCE_GATE_MIN_STD_RATIO, VARIANCE_GATE_MIN_DIFF_STD_RATIO,
     VARIANCE_GATE_MIN_CORR_DIFF, VARIANCE_GATE_MIN_DIFF_SIGN_ACC, VARIANCE_GATE_MIN_EXTREME_HIT_RATE,
     TUNING_OBJECTIVE_MODE_DEFAULT, TUNING_OBJECTIVE_MODE_VARIANCE,
+    NSA_TUNE_USE_KALMAN_FUSION,
     TUNING_LAMBDA_STD_RATIO, TUNING_LAMBDA_DIFF_STD_RATIO, TUNING_LAMBDA_TAIL_MAE,
     TUNING_LAMBDA_CORR_DIFF, TUNING_LAMBDA_DIFF_SIGN,
     ENABLE_VARIANCE_ENHANCEMENTS, ENHANCEMENT_SEQUENCE, ENHANCEMENT_MIN_IMPROVEMENT,
@@ -448,6 +449,272 @@ def _get_features_for_step(
     return chosen
 
 
+def _build_fusion_tuning_context(target_dates: pd.Series) -> Optional[Dict]:
+    """Build the fusion-CV context used by ``tune_hyperparameters`` when
+    its ``objective_mode='kalman_fusion'``.
+
+    Loads (once per call):
+      * Consensus PIT predictions + SA-revised actuals merged into a single
+        ``consensus_df`` shaped for ``kalman_fusion``'s noise-prior init.
+      * ``consensus_by_ds`` and ``sa_actuals_by_ds`` fast-lookup dicts.
+      * Per-``ds`` PIT-safe adjustment predictions, using the same
+        ``half_life_years`` that ``_load_fusion_selection_target`` reads (so
+        the selection target and the tuning objective agree on the adjustment
+        baseline).
+
+    Returns ``None`` if any required input (consensus, SA actuals, adjustment
+    history) cannot be loaded — the caller falls back to its non-fusion
+    objective mode in that case.
+    """
+    try:
+        from Train.Output_code.consensus_anchor_runner import (
+            _load_consensus_pit,
+            _build_pit_adjustment_cache,
+            _compute_adjustment_series,
+        )
+        from Train.data_loader import load_target_data
+        from Train.sandbox.experiment_predicted_adjustment import (
+            load_adjustment_history,
+        )
+    except Exception as e:  # pragma: no cover - guard against import errors
+        logger.warning(f"[FusionTune] Could not import fusion deps ({e}); "
+                       f"falling back to non-fusion tuning")
+        return None
+
+    # half_life_years: prefer tuned value, fall back to 3.0.
+    hl_used = 3.0
+    tuned_path = OUTPUT_DIR / 'consensus_anchor' / 'kalman_fusion' / 'tuned_params.json'
+    if tuned_path.exists():
+        try:
+            import json as _json
+            with open(tuned_path, 'r') as f:
+                _tuned = _json.load(f)
+            if isinstance(_tuned, dict) and 'half_life_years' in _tuned:
+                hl_used = float(_tuned['half_life_years'])
+        except Exception:
+            pass
+
+    try:
+        consensus_monthly = _load_consensus_pit(
+            target_type='sa', target_source='revised',
+        )
+        sa_target = load_target_data(
+            target_type='sa', release_type='first', target_source='revised',
+        )
+        adj_history = load_adjustment_history()
+    except Exception as e:
+        logger.warning(
+            f"[FusionTune] Could not load fusion context ({e}); falling back "
+            f"to non-fusion tuning"
+        )
+        return None
+
+    # consensus_df expected by kalman_fusion has [ds, consensus_pred, actual]
+    # so it can compute the prior-history variance for noise initialization.
+    sa_actuals_df = pd.DataFrame({
+        'ds': pd.to_datetime(sa_target['ds']),
+        'actual': sa_target['y_mom'].astype(float),
+    })
+    consensus_df = (
+        consensus_monthly[['ds', 'consensus_pred']]
+        .merge(sa_actuals_df, on='ds', how='outer')
+        .sort_values('ds')
+        .reset_index(drop=True)
+    )
+
+    consensus_by_ds: Dict[pd.Timestamp, float] = {
+        pd.Timestamp(d): float(v)
+        for d, v in zip(
+            pd.to_datetime(consensus_monthly['ds']).tolist(),
+            consensus_monthly['consensus_pred'].astype(float).tolist(),
+        )
+        if np.isfinite(v)
+    }
+    sa_actuals_by_ds: Dict[pd.Timestamp, float] = {
+        pd.Timestamp(d): float(v)
+        for d, v in zip(
+            pd.to_datetime(sa_target['ds']).tolist(),
+            sa_target['y_mom'].astype(float).tolist(),
+        )
+        if np.isfinite(v)
+    }
+
+    # Pre-compute PIT-safe adj_pred for every date the tuner may see.
+    unique_dates = pd.Series(pd.to_datetime(pd.unique(target_dates.values))).sort_values()
+    pit_cache = _build_pit_adjustment_cache(unique_dates, adj_history)
+    adj_values = _compute_adjustment_series(unique_dates, pit_cache, hl_used)
+    adj_pred_by_ds: Dict[pd.Timestamp, float] = {
+        pd.Timestamp(d): float(v) for d, v in zip(unique_dates, adj_values)
+    }
+
+    logger.info(
+        f"[FusionTune] Built fusion-CV context: consensus={len(consensus_by_ds)}, "
+        f"sa_actuals={len(sa_actuals_by_ds)}, adj_pred={len(adj_pred_by_ds)}, "
+        f"half_life_years={hl_used:.3f}"
+    )
+    return {
+        'consensus_df': consensus_df,
+        'consensus_by_ds': consensus_by_ds,
+        'sa_actuals_by_ds': sa_actuals_by_ds,
+        'adj_pred_by_ds': adj_pred_by_ds,
+        'half_life_years': hl_used,
+    }
+
+
+def _load_fusion_selection_target(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    target_type: str,
+    step_date: pd.Timestamp,
+) -> Tuple[pd.Series, Optional[float]]:
+    """Build the fusion-aligned selection target for the NSA branch.
+
+    Returns ``(y_sel, half_life_years_used)``.
+
+    For the NSA branch, the published forecast is produced by the Kalman
+    fusion of ``consensus + (NSA_LGBM_pred + adj_pred) + NSA_accel``. The
+    *model channel*'s actual target is ``SA_revised − adj_pred(ds)``
+    (because at fusion time ``adj_pred`` is added back). So if we want the
+    feature selection to prefer features that help the fusion (rather than
+    features that help stand-alone NSA prediction), the selection's notion
+    of ``y`` should be ``SA_revised − adj_pred``. The LightGBM model is
+    still trained on the original NSA y_mom — only the *selection*'s sense
+    of "good feature" shifts.
+
+    PIT-safe: for each ``ds`` the predicted adjustment is built from
+    history filtered by ``operational_available_date < ds``. SA_revised
+    rows with ``ds >= step_date`` never enter this construction because
+    ``X_train['ds'] < step_date`` is the caller's invariant.
+
+    The half-life is read from
+    ``_output/consensus_anchor/kalman_fusion/tuned_params.json`` if
+    present (the value the most recent Kalman tune chose); otherwise it
+    falls back to 3.0. The value used is logged and persisted to
+    ``_output/consensus_anchor/dynamic_fs_selection_hl.json`` so the
+    next Kalman re-tune can emit a drift warning.
+
+    Falls back to the legacy NSA-y_mom target (and returns
+    ``half_life_years_used=None``) when:
+      - target_type is not 'nsa'
+      - SA target / adjustment history loading fails
+      - the produced fusion target has zero finite rows
+    """
+    legacy_y_sel = pd.Series(
+        y_train.values,
+        index=pd.to_datetime(X_train['ds'].values),
+        name='y_mom',
+    ).dropna()
+
+    if str(target_type).lower() != 'nsa':
+        return legacy_y_sel, None
+
+    from Train.data_loader import load_target_data
+    from Train.sandbox.experiment_predicted_adjustment import (
+        load_adjustment_history,
+    )
+    from Train.Output_code.consensus_anchor_runner import (
+        _build_pit_adjustment_cache,
+        _compute_adjustment_series,
+    )
+
+    # ── half_life_years: read tuned value, fallback to 3.0 ──
+    hl_used = 3.0
+    tuned_path = OUTPUT_DIR / 'consensus_anchor' / 'kalman_fusion' / 'tuned_params.json'
+    if tuned_path.exists():
+        try:
+            import json as _json
+            with open(tuned_path, 'r') as f:
+                _tuned = _json.load(f)
+            if isinstance(_tuned, dict) and 'half_life_years' in _tuned:
+                hl_used = float(_tuned['half_life_years'])
+        except Exception as e:
+            logger.warning(
+                f"[DynFS] Could not read tuned half_life_years from "
+                f"{tuned_path} ({e}); using default 3.0"
+            )
+
+    # ── Load SA revised actuals and adjustment history ──
+    try:
+        sa_target = load_target_data(
+            target_type='sa', release_type='first', target_source='revised',
+        )
+        sa_y_mom_by_ds = pd.Series(
+            sa_target['y_mom'].astype(float).values,
+            index=pd.to_datetime(sa_target['ds'].values),
+        )
+        adj_history = load_adjustment_history()
+    except Exception as e:
+        logger.warning(
+            f"[DynFS] Could not load SA target / adjustment history for "
+            f"fusion-aligned selection target ({e}); falling back to NSA y_mom"
+        )
+        return legacy_y_sel, None
+
+    # ── Build PIT-filtered cache and compute per-ds adjustment values ──
+    train_dates = pd.to_datetime(X_train['ds'].values)
+    train_dates_series = pd.Series(train_dates)
+    pit_cache = _build_pit_adjustment_cache(train_dates_series, adj_history)
+    adj_values = _compute_adjustment_series(train_dates_series, pit_cache, hl_used)
+
+    # ── Assemble fusion target with row-level fallbacks ──
+    # If SA actual missing → drop row (matches existing dropna).
+    # If PIT history empty for a ds → fall back to NSA y_mom for that row.
+    out_dates: List[pd.Timestamp] = []
+    out_values: List[float] = []
+    n_pit_fallback = 0
+    y_train_arr = y_train.values
+    for i, ds in enumerate(train_dates):
+        sa_val = sa_y_mom_by_ds.get(ds, np.nan)
+        avail = pit_cache.get(ds)
+        if avail is None or avail.empty:
+            nsa_val = y_train_arr[i] if i < len(y_train_arr) else np.nan
+            if pd.isna(nsa_val):
+                continue
+            out_dates.append(ds)
+            out_values.append(float(nsa_val))
+            n_pit_fallback += 1
+            continue
+        if pd.isna(sa_val):
+            continue
+        out_dates.append(ds)
+        out_values.append(float(sa_val) - float(adj_values[i]))
+
+    if not out_dates:
+        logger.warning(
+            "[DynFS] Fusion-aligned target produced zero rows; "
+            "falling back to NSA y_mom"
+        )
+        return legacy_y_sel, None
+
+    fusion_y_sel = pd.Series(
+        out_values,
+        index=pd.DatetimeIndex(out_dates),
+        name='y_fusion',
+    )
+
+    # ── Persist the half-life used so the post-tune drift warning can read it ──
+    try:
+        hl_path = OUTPUT_DIR / 'consensus_anchor' / 'dynamic_fs_selection_hl.json'
+        hl_path.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        with open(hl_path, 'w') as f:
+            _json.dump({
+                'half_life_years': hl_used,
+                'step_date': step_date.strftime('%Y-%m'),
+                'n_rows': len(fusion_y_sel),
+                'n_pit_fallback': n_pit_fallback,
+            }, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[DynFS] Could not write {hl_path.name}: {e}")
+
+    logger.info(
+        f"[DynFS] Selection target = SA_revised − adj_pred "
+        f"(half_life_years={hl_used:.3f}, n={len(fusion_y_sel)}, "
+        f"NSA-fallback rows={n_pit_fallback})"
+    )
+    return fusion_y_sel, hl_used
+
+
 def _dynamic_reselection(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -457,10 +724,13 @@ def _dynamic_reselection(
 ) -> List[str]:
     """Two-pass recency-weighted dynamic feature re-selection.
 
-    Called every ``RESELECT_EVERY_N_MONTHS`` months during the expanding-window
-    backtest (starting from ``RESELECTION_START_DATE``).  Uses exponential decay
-    sample weights (half-life = ``RESELECTION_HALF_LIFE_MONTHS``) to bias
-    feature importance toward recent observations, adapting to structural changes.
+    Called at the scheduled reselection months during the expanding-window
+    backtest. The schedule is anchored on the LAST backtest month and steps
+    backward in ``RESELECT_EVERY_N_MONTHS`` increments: ``{anchor, anchor-N,
+    anchor-2N, ...}`` (gated by ``RESELECTION_START_DATE``).  Uses exponential
+    decay sample weights (half-life = ``RESELECTION_HALF_LIFE_MONTHS``) to
+    bias feature importance toward recent observations, adapting to
+    structural changes.
 
     **Pass 1 (Per-Source):** Partition ``X_train`` columns by data source.
     Run lightweight feature selection (stages 0, 2, 4, 5) independently per
@@ -521,11 +791,16 @@ def _dynamic_reselection(
             logger.info(f"[{label}] Source {src_name}: {len(cols)} features")
 
     # ── Build date-indexed target for the selection engine ──
-    y_sel = pd.Series(
-        y_train.values,
-        index=pd.to_datetime(X_train['ds'].values),
-        name='y_mom',
-    ).dropna()
+    # For NSA branch, swap to the fusion-aligned target so every target-aware
+    # stage (Boruta, cluster, vintage, interaction rescue, SFS) is tilted
+    # toward "features whose information makes the fusion model channel
+    # close to SA_revised", rather than "features that just predict NSA".
+    # The trained LightGBM model still uses y_train (NSA y_mom); only the
+    # selection's notion of "good feature" shifts. See
+    # _load_fusion_selection_target for PIT details and the fallback path.
+    y_sel, _hl_used_for_selection = _load_fusion_selection_target(
+        X_train, y_train, target_type, step_date,
+    )
 
     # ── Build date-indexed feature DataFrame from X_train (numeric only) ──
     X_dated = X_train[list(all_cols)].copy()
@@ -770,6 +1045,11 @@ def _is_variance_priority_target(target_type: str, target_source: str) -> bool:
 
 
 def _get_tuning_objective_mode(target_type: str, target_source: str) -> str:
+    # NSA branch optimizes directly for the fusion composite when the flag is
+    # on (this is the published-output mode). Variance-priority targets and
+    # other branches keep the legacy composite objective.
+    if str(target_type).lower() == 'nsa' and NSA_TUNE_USE_KALMAN_FUSION:
+        return 'kalman_fusion'
     if _is_variance_priority_target(target_type, target_source):
         return TUNING_OBJECTIVE_MODE_VARIANCE
     return TUNING_OBJECTIVE_MODE_DEFAULT
@@ -1483,9 +1763,8 @@ def run_expanding_window_backtest(
     # Store results
     results = []
     all_residuals = []
-    # Tracking vars for directional acceleration accuracy
+    # Tracking var for acceleration accuracy (vs-last-actual formula)
     last_actual: float = np.nan
-    last_prediction: float = np.nan
 
     # Static fallback params (used when tune=False)
     static_params = get_lgbm_params(use_huber_loss=use_huber_loss, huber_delta=huber_delta)
@@ -1518,6 +1797,24 @@ def run_expanding_window_backtest(
 
     tuned_params = None  # Cached tuned hyperparameters
     _warm_start_params = None  # Previous best params for Optuna warm-start after reselection
+
+    # ── Fusion-CV tuning context (NSA branch only) ──
+    # Built once per train_and_evaluate. Each tune call reuses this same
+    # context — consensus PIT / SA actuals / adjustment history don't
+    # change inside the backtest loop. None when NSA fusion-CV is disabled
+    # or its dependencies fail to load (the tuner then falls back to the
+    # legacy composite objective).
+    _fusion_tuning_context: Optional[Dict] = None
+    _fusion_objective_active = (
+        str(target_type).lower() == 'nsa' and NSA_TUNE_USE_KALMAN_FUSION
+    )
+    if _fusion_objective_active and tune:
+        _fusion_tuning_context = _build_fusion_tuning_context(X_full['ds'])
+        if _fusion_tuning_context is None:
+            logger.warning(
+                "[FusionTune] Fusion context unavailable — NSA tuning falls "
+                "back to the legacy composite objective."
+            )
 
     # ── Dynamic re-selection state ──
     dynamic_features: Optional[List[str]] = None   # None = not yet selected
@@ -1669,25 +1966,40 @@ def run_expanding_window_backtest(
                     tuned_params = None
                 dynamic_features = list(new_features)
 
-        # ── Dynamic re-selection (every N months, starting from 2000) ──
-        # In all-features mode: mandatory, triggered on step 0 and every N months.
-        # Reselection only fires from RESELECTION_START_DATE onward (pre-2000
-        # months reuse the features from the first reselection).
+        # ── Dynamic re-selection (anchored on the latest backtest month) ──
+        # The reselection schedule is anchored on the LAST backtest month
+        # (the prediction we care about most) and extends backward through
+        # history at N-month intervals: {anchor, anchor-N, anchor-2N, ...}.
+        # This makes the live prediction month itself a reselection step,
+        # so features are freshly selected and re-tuned for the target we
+        # are actually about to predict, instead of using a feature set that
+        # was last refreshed at an arbitrary point N months earlier.
+        #
+        # In all-features mode: mandatory bootstrap on step 0 (so the model
+        # has features at all); subsequent reselections fire only when
+        # target_month is on the schedule AND >= RESELECTION_START_DATE.
         # In legacy mode: optional, triggered only when RESELECT_EVERY_N_MONTHS > 0.
         # Per-window replay mode short-circuits this entirely — the user-curated
         # schedule from disk is authoritative.
         _reselection_start = pd.Timestamp(RESELECTION_START_DATE)
+        _reselection_anchor = backtest_months[-1]
+
+        def _is_scheduled_reselection_month(month: pd.Timestamp) -> bool:
+            """True iff ``month`` lies on {anchor - k*N : k=0,1,2,...}."""
+            if RESELECT_EVERY_N_MONTHS <= 0:
+                return False
+            diff = _months_since(_reselection_anchor, month)
+            return diff >= 0 and diff % RESELECT_EVERY_N_MONTHS == 0
+
         _trigger_reselection = False
         if _per_window_mode:
             _trigger_reselection = False
         elif _all_features_mode:
             _trigger_reselection = (
-                dynamic_features is None  # First step — always select
+                dynamic_features is None  # First step — bootstrap select
                 or (
                     target_month >= _reselection_start
-                    and RESELECT_EVERY_N_MONTHS > 0
-                    and last_reselection_date is not None
-                    and _months_since(target_month, last_reselection_date) >= RESELECT_EVERY_N_MONTHS
+                    and _is_scheduled_reselection_month(target_month)
                 )
             )
         elif RESELECT_EVERY_N_MONTHS > 0:
@@ -1695,7 +2007,7 @@ def run_expanding_window_backtest(
                 last_reselection_date is None
                 or (
                     target_month >= _reselection_start
-                    and _months_since(target_month, last_reselection_date) >= RESELECT_EVERY_N_MONTHS
+                    and _is_scheduled_reselection_month(target_month)
                 )
             )
 
@@ -1711,9 +2023,16 @@ def run_expanding_window_backtest(
                 # _dynamic_reselection raises RuntimeError on failure in all-features mode
                 dynamic_features = _dyn_result
                 last_reselection_date = target_month
+                _next_scheduled = target_month + pd.DateOffset(months=RESELECT_EVERY_N_MONTHS)
+                _next_str = (
+                    _next_scheduled.strftime('%Y-%m')
+                    if _next_scheduled <= _reselection_anchor
+                    else f"none — {target_month.strftime('%Y-%m')} is the anchor"
+                )
                 logger.info(
                     f"[Step {i}] Dynamic re-selection: {len(dynamic_features)} features "
-                    f"(next re-selection in {RESELECT_EVERY_N_MONTHS} months)"
+                    f"(anchor={_reselection_anchor.strftime('%Y-%m')}, "
+                    f"next scheduled re-selection: {_next_str})"
                 )
 
                 # Write JSON log for this reselection window
@@ -1923,6 +2242,9 @@ def run_expanding_window_backtest(
 
             with perf_phase("train.backtest.step.tuning", step=i):
                 tuning_mode = _get_tuning_objective_mode(target_type, target_source)
+                # Fall back to composite if the fusion context didn't load.
+                if tuning_mode == 'kalman_fusion' and _fusion_tuning_context is None:
+                    tuning_mode = TUNING_OBJECTIVE_MODE_DEFAULT
                 tuned_params = tune_hyperparameters(
                     X_train_for_tuning, y_train_valid, target_month=target_month,
                     use_huber_loss=use_huber_loss,
@@ -1943,6 +2265,9 @@ def run_expanding_window_backtest(
                     tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
                     tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
                     warm_start_params=_warm_start_params,
+                    fusion_context=(
+                        _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
+                    ),
                 )
                 _warm_start_params = None  # consumed
 
@@ -2051,10 +2376,15 @@ def run_expanding_window_backtest(
             dir_correct = np.nan if is_future else int(np.sign(actual) == np.sign(prediction))
 
             # ── P1-2: Directional acceleration accuracy ──
-            # accel_actual = MoM[t] - MoM[t-1]; accel_pred = pred[t] - pred[t-1]
-            if not is_future and not np.isnan(last_actual) and not np.isnan(last_prediction):
+            # Operational "vs last actual" formula: at trade time the prior
+            # month's actual is known, so the metric is whether the predicted
+            # MoM CHANGE — sign(prediction - last_actual) — matches the actual
+            # MoM change sign(actual - last_actual). Replaces the older
+            # "sign(pred - last_pred)" formulation which was contaminated by
+            # the prior month's prediction error.
+            if not is_future and not np.isnan(last_actual):
                 accel_actual = float(actual) - last_actual
-                accel_pred   = float(prediction) - last_prediction
+                accel_pred   = float(prediction) - last_actual
                 accel_correct = int(np.sign(accel_actual) == np.sign(accel_pred))
             else:
                 accel_correct = np.nan
@@ -2094,10 +2424,9 @@ def run_expanding_window_backtest(
 
         results.append(result_row)
 
-        # Update acceleration tracking vars
+        # Update acceleration tracking var
         if not is_future:
             last_actual = float(actual)
-            last_prediction = float(prediction)
 
         # Progress logging — every prediction with elapsed/ETA
         _elapsed = _time.time() - _backtest_t0
@@ -2671,7 +3000,19 @@ def train_and_evaluate(
         logger.info("Tuning hyperparameters for final production model...")
         feature_only_cols = [c for c in feature_cols if c in X_train.columns and c != 'ds']
         tuning_mode = _get_tuning_objective_mode(target_type, target_source)
-        
+        # Build the fusion-CV context locally — it's built fresh inside
+        # run_expanding_window_backtest but that variable is out of scope
+        # here. The call is cheap (~1s) and reuses the same disk artifacts.
+        _fusion_tuning_context: Optional[Dict] = None
+        if tuning_mode == 'kalman_fusion':
+            _fusion_tuning_context = _build_fusion_tuning_context(X_train['ds'])
+            if _fusion_tuning_context is None:
+                logger.warning(
+                    "[FusionTune] Fusion context unavailable for final "
+                    "production tune — falling back to legacy composite."
+                )
+                tuning_mode = TUNING_OBJECTIVE_MODE_DEFAULT
+
         # Pass the DF WITH 'ds' so inner tuning folds can manage their own point-in-time weights
         final_params = tune_hyperparameters(
             X_train[['ds'] + feature_only_cols], y_full_valid, target_month=final_target_month,
@@ -2692,6 +3033,9 @@ def train_and_evaluate(
             tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
             tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
             tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
+            fusion_context=(
+                _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
+            ),
         )
         
         final_half_life = final_params.get('half_life_months', 60.0)
@@ -2978,10 +3322,15 @@ def get_latest_prediction(
     )
 
 
-# All 2 model combos for --train-all
+# `--train-all` runs ONLY the NSA branch.
+# The SA branch has been retired from the published pipeline as of 2026-05:
+# the canonical SA-revised forecast is produced by the Kalman fusion of
+# (consensus, NSA + predicted adjustment, NSA acceleration), not by a
+# stand-alone SA LightGBM. Tuning is therefore directed at the fusion
+# objective; running an SA LightGBM model in --train-all would burn compute
+# on a branch no one publishes.
 ALL_COMBOS = [
     ('nsa', 'first', 'revised'),
-    ('sa',  'first', 'revised'),
 ]
 
 
@@ -3034,12 +3383,9 @@ def validate_post_train_all_artifacts(
                      output_root / "NSA_prediction" / "summary_statistics.csv"))
     required.append(("output::revised::NSA_importance",
                      output_root / "NSA_prediction" / "feature_importance.csv"))
-    required.append(("output::revised::SA_prediction",
-                     output_root / "SA_prediction" / "backtest_results.csv"))
-    required.append(("output::revised::SA_metrics",
-                     output_root / "SA_prediction" / "summary_statistics.csv"))
-    required.append(("output::revised::SA_importance",
-                     output_root / "SA_prediction" / "feature_importance.csv"))
+    # SA LightGBM artifacts are no longer required — the SA branch is retired.
+    # The fusion output (consensus_anchor/kalman_fusion) is the canonical
+    # SA-revised forecast.
     required.append(("output::revised::adjustment_prediction",
                      output_root / "NSA_plus_adjustment" / "backtest_results.csv"))
     required.append(("output::revised::adjustment_metrics",
@@ -3089,6 +3435,74 @@ def validate_post_train_all_artifacts(
     }
 
 
+def _read_half_life_json(path: Path) -> Optional[float]:
+    """Read ``half_life_years`` from a JSON file. Returns None if missing or unreadable.
+
+    Used by the iterative fusion-tune orchestrator to compare HL state across
+    passes. The same JSON files are written by `_load_fusion_selection_target`
+    (dynamic_fs_selection_hl.json) and `_tune_kalman` (tuned_params.json).
+    """
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    hl = data.get("half_life_years") if isinstance(data, dict) else None
+    try:
+        return float(hl) if hl is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _clear_universe_cache() -> int:
+    """Delete all universe cache files. Returns count removed.
+
+    The cache is keyed by (target_type, target_source, asof_month) — NOT by
+    half_life_years. So when iterating the fusion tune, we must invalidate
+    between passes; otherwise Pass 2's dynamic FS would silently reuse Pass 1's
+    cached features and the selection target swap (`SA_revised − adj_pred(HL_1)`)
+    would be ignored.
+    """
+    from Train.config import UNIVERSE_CACHE_DIR
+    if not UNIVERSE_CACHE_DIR.exists():
+        return 0
+    removed = 0
+    for f in UNIVERSE_CACHE_DIR.glob("universe_*.json"):
+        try:
+            f.unlink()
+            removed += 1
+        except Exception as e:
+            logger.warning(f"Failed to remove universe cache file {f}: {e}")
+    return removed
+
+
+def _read_kalman_fusion_metrics() -> Dict[str, Optional[float]]:
+    """Read MAE/RMSE/AccelAcc/DirAcc from the current Kalman fusion summary CSV.
+
+    Returns a dict with NaN/None for missing fields; never raises.
+    """
+    out: Dict[str, Optional[float]] = {
+        "MAE": None, "RMSE": None,
+        "Acceleration_Accuracy": None, "Directional_Accuracy": None,
+    }
+    summary_path = OUTPUT_DIR / "consensus_anchor" / "kalman_fusion" / "summary_statistics.csv"
+    if not summary_path.exists():
+        return out
+    try:
+        row = pd.read_csv(summary_path).iloc[0].to_dict()
+        for k in list(out.keys()):
+            if k in row:
+                try:
+                    out[k] = float(row[k])
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return out
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -3106,6 +3520,11 @@ Examples:
   # Train with specific target/release
   python Train/train_lightgbm_nfp.py --train --target nsa --release first
 
+  # Joint iterative tune: full pipeline runs up to N times, alternating
+  # NSA tuning and Kalman half-life tuning until they agree (Δhl < 0.25y).
+  # Clears universe cache between passes to force fresh FS each iteration.
+  python Train/train_lightgbm_nfp.py --iterate-fusion-tune
+
   # Predict for a specific month
   python Train/train_lightgbm_nfp.py --predict 2024-12 --target nsa
 
@@ -3116,6 +3535,14 @@ Examples:
     parser.add_argument('--train', action='store_true', help='Train model')
     parser.add_argument('--train-all', action='store_true',
                         help='Train both model variants (NSA/SA × revised) and generate comparison')
+    parser.add_argument('--iterate-fusion-tune', action='store_true',
+                        help='Run --train-all repeatedly until NSA hyperparameters and Kalman '
+                             'half-life converge (|Δhl| < 0.25y). Clears universe cache between '
+                             'passes so each iteration re-runs feature selection with the new HL.')
+    parser.add_argument('--max-fusion-passes', type=int, default=3,
+                        help='Max passes for --iterate-fusion-tune (default: 3).')
+    parser.add_argument('--fusion-converge-threshold', type=float, default=0.25,
+                        help='Stop iterating when |Δhalf_life_years| is below this (default: 0.25y).')
     parser.add_argument('--predict', type=str, help='Predict for a specific month (YYYY-MM)')
     parser.add_argument('--latest', action='store_true', help='Predict for latest available month')
     parser.add_argument('--target', type=str, default='nsa', choices=['nsa', 'sa'],
@@ -3137,7 +3564,153 @@ Examples:
 
     model_id = get_model_id(args.target, args.release, target_source)
 
-    if args.train_all:
+    if args.iterate_fusion_tune:
+        # =====================================================================
+        # ITERATIVE FUSION TUNING — joint NSA ↔ Kalman convergence
+        # =====================================================================
+        # Runs --train-all up to N times as a subprocess. After each pass we
+        # compare the half-life that the dynamic FS USED in this pass (from
+        # dynamic_fs_selection_hl.json) against the half-life that Kalman
+        # PRODUCED at the end of this pass (from tuned_params.json). When
+        # |Δhl| < threshold, the system is internally consistent — FS picked
+        # features for a HL that Kalman now confirms, and we stop. Otherwise
+        # the next pass starts with the new HL and re-runs FS + NSA Optuna
+        # + backtest + Kalman tune against that HL. Each pass gets its own
+        # archive folder so all snapshots are preserved.
+        import subprocess as _sub
+        import sys as _sys
+
+        if args.no_tune:
+            logger.error(
+                "--iterate-fusion-tune is incompatible with --no-tune. "
+                "Iteration requires Kalman's HL tune to provide a feedback "
+                "signal; with --no-tune the HL is fixed at the fallback. "
+                "Drop --no-tune or drop --iterate-fusion-tune."
+            )
+            sys.exit(2)
+
+        max_passes = max(1, int(args.max_fusion_passes))
+        converge_threshold = float(args.fusion_converge_threshold)
+
+        tuned_hl_path = OUTPUT_DIR / "consensus_anchor" / "kalman_fusion" / "tuned_params.json"
+        fs_hl_path = OUTPUT_DIR / "consensus_anchor" / "dynamic_fs_selection_hl.json"
+        iter_log_path = OUTPUT_DIR / "consensus_anchor" / "kalman_fusion" / "fusion_iteration_log.json"
+        iter_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        passes: List[Dict[str, Any]] = []
+        converged = False
+        iteration_start_hl = _read_half_life_json(tuned_hl_path)
+        logger.info("=" * 70)
+        logger.info(f"ITERATIVE FUSION TUNE — up to {max_passes} passes, "
+                    f"converge |Δhl| < {converge_threshold:.3f}y")
+        logger.info(f"  Starting HL state (tuned_params.json): {iteration_start_hl}")
+        logger.info("=" * 70)
+
+        for pass_idx in range(1, max_passes + 1):
+            hl_prior_tuned = _read_half_life_json(tuned_hl_path)
+            hl_prior_fs = _read_half_life_json(fs_hl_path)
+
+            logger.info(f"\n{'-' * 70}")
+            logger.info(f"PASS {pass_idx}/{max_passes}")
+            logger.info(f"{'-' * 70}")
+            logger.info(f"  HL prior (tuned_params.json): {hl_prior_tuned}")
+            logger.info(f"  HL prior (FS used last pass): {hl_prior_fs}")
+
+            removed = _clear_universe_cache()
+            logger.info(f"  Cleared {removed} universe cache files "
+                        f"(forces fresh FS for this pass)")
+
+            cmd = [_sys.executable, str(Path(__file__).resolve()), "--train-all"]
+            if args.no_huber_loss:
+                cmd.append("--no-huber-loss")
+            cmd.extend(["--huber-delta", str(args.huber_delta)])
+            logger.info(f"  Launching subprocess: {' '.join(cmd)}")
+
+            proc = _sub.run(cmd)
+            if proc.returncode != 0:
+                logger.error(f"  Pass {pass_idx} subprocess failed (exit {proc.returncode}); "
+                             f"aborting iteration")
+                passes.append({
+                    "pass": pass_idx,
+                    "hl_prior_tuned": hl_prior_tuned,
+                    "hl_prior_fs": hl_prior_fs,
+                    "hl_used_by_fs": _read_half_life_json(fs_hl_path),
+                    "hl_new_tuned": _read_half_life_json(tuned_hl_path),
+                    "delta": None,
+                    "fusion_metrics": _read_kalman_fusion_metrics(),
+                    "status": f"failed_exit_{proc.returncode}",
+                })
+                break
+
+            hl_new_tuned = _read_half_life_json(tuned_hl_path)
+            hl_new_fs = _read_half_life_json(fs_hl_path)
+            fusion_metrics = _read_kalman_fusion_metrics()
+
+            delta: Optional[float] = None
+            if hl_new_fs is not None and hl_new_tuned is not None:
+                delta = float(abs(hl_new_tuned - hl_new_fs))
+
+            passes.append({
+                "pass": pass_idx,
+                "hl_prior_tuned": hl_prior_tuned,
+                "hl_prior_fs": hl_prior_fs,
+                "hl_used_by_fs": hl_new_fs,
+                "hl_new_tuned": hl_new_tuned,
+                "delta": delta,
+                "fusion_metrics": fusion_metrics,
+                "status": "ok",
+            })
+
+            logger.info(f"\n  PASS {pass_idx} COMPLETE")
+            logger.info(f"    HL used by FS in this pass:   {hl_new_fs}")
+            logger.info(f"    HL produced by Kalman tune:   {hl_new_tuned}")
+            logger.info(f"    Δ = |Kalman_new − FS_used|:   "
+                        f"{delta if delta is not None else 'n/a'}")
+            logger.info(f"    Fusion MAE / RMSE / AccelAcc: "
+                        f"{fusion_metrics.get('MAE')} / "
+                        f"{fusion_metrics.get('RMSE')} / "
+                        f"{fusion_metrics.get('Acceleration_Accuracy')}")
+
+            if delta is not None and delta < converge_threshold:
+                logger.info(f"  ★ CONVERGED — Δ {delta:.3f}y < {converge_threshold:.3f}y threshold")
+                converged = True
+                break
+
+            if pass_idx == max_passes:
+                logger.warning(
+                    f"  Reached max_passes={max_passes} without convergence "
+                    f"(last Δ={delta}). Increase --max-fusion-passes if needed."
+                )
+
+        with open(iter_log_path, "w") as f:
+            json.dump({
+                "max_passes": max_passes,
+                "converge_threshold_years": converge_threshold,
+                "converged": converged,
+                "iteration_start_hl": iteration_start_hl,
+                "passes": passes,
+            }, f, indent=2)
+
+        logger.info("\n" + "=" * 70)
+        logger.info(f"ITERATIVE FUSION TUNE COMPLETE  (converged={converged}, "
+                    f"passes_run={len(passes)})")
+        logger.info(f"  Log: {iter_log_path}")
+        if passes:
+            best = min(
+                (p for p in passes if p.get("fusion_metrics", {}).get("MAE") is not None),
+                key=lambda p: p["fusion_metrics"]["MAE"],
+                default=None,
+            )
+            if best is not None:
+                bm = best["fusion_metrics"]
+                logger.info(
+                    f"  Best pass by fusion MAE: pass {best['pass']} → "
+                    f"MAE={bm.get('MAE')}, RMSE={bm.get('RMSE')}, "
+                    f"AccelAcc={bm.get('Acceleration_Accuracy')}"
+                )
+        logger.info("=" * 70)
+
+    elif args.train_all:
         # =====================================================================
         # TRAIN ALL 4 MODEL VARIANTS AND GENERATE COMPARISON
         # =====================================================================
@@ -3214,13 +3787,14 @@ Examples:
         else:
             logger.error("No models completed successfully")
 
-        # Generate combined output for revised (only target_source)
+        # Generate combined output for revised (NSA-only LightGBM; SA from
+        # the target file is just the actual series used by the adjustment +
+        # fusion stages).
         from Train.Output_code.generate_output import generate_all_output
+        from Train.data_loader import load_target_data
         nsa_id = get_model_id('nsa', 'first', 'revised')
-        sa_id = get_model_id('sa', 'first', 'revised')
-        if nsa_id in all_train_results and sa_id in all_train_results:
+        if nsa_id in all_train_results:
             nsa_r = all_train_results[nsa_id]
-            sa_r = all_train_results[sa_id]
             nsa_metadata = {
                 'feature_cols': nsa_r['feature_cols'],
                 'importance': dict(zip(
@@ -3228,27 +3802,31 @@ Examples:
                     nsa_r['model'].feature_importance(importance_type='gain')
                 )),
             }
-            sa_metadata = {
-                'feature_cols': sa_r['feature_cols'],
-                'importance': dict(zip(
-                    sa_r['feature_cols'],
-                    sa_r['model'].feature_importance(importance_type='gain')
-                )),
-            }
-            logger.info("\nGenerating combined output for revised...")
+            # SA revised actuals for the adjustment / fusion folders. Only
+            # [ds, actual] are needed downstream — we do NOT train an SA LGBM.
+            _sa_target = load_target_data(
+                target_type='sa', release_type='first', target_source='revised',
+            )
+            sa_results_actuals = pd.DataFrame({
+                'ds': pd.to_datetime(_sa_target['ds']),
+                'actual': _sa_target['y_mom'].astype(float),
+            })
+
+            logger.info("\nGenerating combined output for revised "
+                        "(NSA LightGBM + fusion-driven SA forecast)...")
             generate_all_output(
                     nsa_results=nsa_r['backtest_results'],
-                    sa_results=sa_r['backtest_results'],
+                    sa_results=sa_results_actuals,
                     nsa_model=nsa_r['model'],
-                    sa_model=sa_r['model'],
+                    sa_model=None,
                     nsa_metadata=nsa_metadata,
-                    sa_metadata=sa_metadata,
+                    sa_metadata=None,
                     nsa_X_full=nsa_r['X_full'],
-                    sa_X_full=sa_r['X_full'],
+                    sa_X_full=None,
                     nsa_y_full=nsa_r['y_full'],
-                    sa_y_full=sa_r['y_full'],
+                    sa_y_full=None,
                     nsa_residuals=nsa_r['residuals'],
-                    sa_residuals=sa_r['residuals'],
+                    sa_residuals=None,
                     output_base=OUTPUT_DIR,
                     suffix='',
                     # Archive happens at the very end of --train-all so the
@@ -3295,45 +3873,11 @@ Examples:
         except Exception as e:
             logger.warning("  Predicted adjustment failed (non-fatal): %s", e)
 
-        # Step 2: SA blend walk-forward (Optuna-tuned)
-        try:
-            from Train.sandbox.experiment_sa_blend import (
-                _load_inputs as load_blend_inputs,
-                _tune_blend_params,
-                walkforward_blend,
-                _save_outputs as save_blend_outputs,
-                BlendTuneOptions,
-            )
-            logger.info("\n[Post-2] SA blend walk-forward...")
-            blend_data = load_blend_inputs(adj_source="predicted")
-            blend_tune_opts = BlendTuneOptions(
-                enabled=tune,
-                n_trials=N_OPTUNA_TRIALS,
-                timeout=OPTUNA_TIMEOUT,
-                objective_mode="composite",
-                cv_splits=4,
-            )
-            blend_params = {"window": 18, "min_history": 12, "grid_step": 0.05}
-            if blend_tune_opts.enabled:
-                tuned = _tune_blend_params(blend_data, tune_opts=blend_tune_opts)
-                if tuned is not None:
-                    blend_params.update({
-                        "window": int(tuned["window"]),
-                        "min_history": int(tuned["min_history"]),
-                        "grid_step": float(tuned["grid_step"]),
-                        "best_score": float(tuned["best_score"]),
-                    })
-            blended = walkforward_blend(
-                blend_data,
-                window=int(blend_params["window"]),
-                min_history=int(blend_params["min_history"]),
-                grid_step=float(blend_params["grid_step"]),
-                objective_mode="composite",
-            )
-            save_blend_outputs(blended, tune_opts=blend_tune_opts, blend_params=blend_params)
-            logger.info("  SA blend walk-forward complete")
-        except Exception as e:
-            logger.warning("  SA blend walk-forward failed (non-fatal): %s", e)
+        # Step 2: SA blend walk-forward — retired alongside the SA LightGBM
+        # branch. The blend combined SA-LGBM predictions with NSA+adjustment;
+        # with SA LGBM no longer produced, the blend has nothing to blend.
+        # Kalman fusion is the canonical replacement.
+        logger.info("\n[Post-2] SA blend walk-forward — SKIPPED (SA LightGBM retired)")
 
         # Step 3: Consensus anchor (Kalman fusion + AccelOverride with Optuna)
         # Required artifact: failing this step fails the whole pipeline, since the
@@ -3406,41 +3950,37 @@ Examples:
             except Exception as e:
                 logger.warning(f"Single-branch output generation failed: {e}")
 
-            # If training NSA (default), also train SA and generate combined output
+            # If training NSA (default), generate the combined output using SA
+            # actuals from the target file (SA LightGBM is retired — fusion is
+            # the canonical SA-revised forecast).
             if args.target == 'nsa':
-                logger.info("\nNow training SA model to generate combined output...")
-                sa_result = train_and_evaluate(
+                from Train.Output_code.generate_output import generate_all_output
+                from Train.data_loader import load_target_data
+                _sa_target = load_target_data(
                     target_type='sa',
                     release_type=args.release,
                     target_source=target_source,
-                    use_huber_loss=use_huber_loss,
-                    huber_delta=args.huber_delta,
-                    tune=tune,
                 )
-                if sa_result is not None:
-                    sa_model, sa_feature_cols, sa_residuals, sa_backtest, sa_X_full, sa_y_full = sa_result
-                    sa_metadata = {
-                        'feature_cols': sa_feature_cols,
-                        'importance': dict(zip(sa_feature_cols, sa_model.feature_importance(importance_type='gain'))),
-                    }
-
-                    from Train.Output_code.generate_output import generate_all_output
-                    generate_all_output(
-                        nsa_results=backtest_results,
-                        sa_results=sa_backtest,
-                        nsa_model=model,
-                        sa_model=sa_model,
-                        nsa_metadata=metadata,
-                        sa_metadata=sa_metadata,
-                        nsa_X_full=X_full,
-                        sa_X_full=sa_X_full,
-                        nsa_y_full=y_full,
-                        sa_y_full=sa_y_full,
-                        nsa_residuals=residuals,
-                        sa_residuals=sa_residuals,
-                        output_base=OUTPUT_DIR,
-                        suffix='',
-                    )
+                sa_results_actuals = pd.DataFrame({
+                    'ds': pd.to_datetime(_sa_target['ds']),
+                    'actual': _sa_target['y_mom'].astype(float),
+                })
+                generate_all_output(
+                    nsa_results=backtest_results,
+                    sa_results=sa_results_actuals,
+                    nsa_model=model,
+                    sa_model=None,
+                    nsa_metadata=metadata,
+                    sa_metadata=None,
+                    nsa_X_full=X_full,
+                    sa_X_full=None,
+                    nsa_y_full=y_full,
+                    sa_y_full=None,
+                    nsa_residuals=residuals,
+                    sa_residuals=None,
+                    output_base=OUTPUT_DIR,
+                    suffix='',
+                )
 
     elif args.predict:
         target_month = pd.Timestamp(args.predict + '-01')

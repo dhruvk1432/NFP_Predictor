@@ -125,10 +125,10 @@ def full_metrics(actual: np.ndarray, pred: np.ndarray, label: str) -> Dict:
     medae = float(np.median(np.abs(e)))
 
     dir_acc = float(np.mean(np.sign(a) == np.sign(p)))
-    if a.size >= 2:
-        accel_acc = float(np.mean(np.sign(np.diff(a)) == np.sign(np.diff(p))))
-    else:
-        accel_acc = np.nan
+    # Acceleration: sign(actual[m] - actual[m-1]) == sign(predicted[m] - actual[m-1])
+    # via the centralized helper (operational vs-last-actual formula).
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(a, p))
 
     vk = compute_variance_kpis(a, p)
 
@@ -373,22 +373,18 @@ def approach_2_dynamic_blend(
                         best_score = score
                         best_alpha = cand
                 elif objective == "accel":
-                    if len(a) >= 2:
-                        score = float(np.mean(
-                            np.sign(np.diff(a)) == np.sign(np.diff(p))
-                        ))
-                    else:
+                    from Train.variance_metrics import acceleration_accuracy
+                    score = float(acceleration_accuracy(a, p))
+                    if not np.isfinite(score):
                         score = 0.0
                     if score > best_score:
                         best_score = score
                         best_alpha = cand
                 elif objective == "composite":
                     mae = float(np.mean(np.abs(a - p)))
-                    if len(a) >= 2:
-                        acc = float(np.mean(
-                            np.sign(np.diff(a)) == np.sign(np.diff(p))
-                        ))
-                    else:
+                    from Train.variance_metrics import acceleration_accuracy
+                    acc = float(acceleration_accuracy(a, p))
+                    if not np.isfinite(acc):
                         acc = 0.5
                     # Composite: lower is better. Penalize MAE, reward accel.
                     score = mae - 50.0 * acc

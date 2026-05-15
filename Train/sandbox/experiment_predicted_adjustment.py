@@ -71,6 +71,10 @@ def load_backtest_inputs() -> pd.DataFrame:
     Load NSA revised backtest predictions and SA revised actuals.
 
     Returns DataFrame with columns: [ds, nsa_predicted, sa_actual]
+
+    With the SA LightGBM branch retired, SA actuals are loaded from the
+    SA revised target parquet (via ``load_target_data``) when no SA LGBM
+    backtest CSV exists.
     """
     nsa_path = OUTPUT_DIR / "NSA_prediction" / "backtest_results.csv"
     sa_path = OUTPUT_DIR / "SA_prediction" / "backtest_results.csv"
@@ -78,9 +82,22 @@ def load_backtest_inputs() -> pd.DataFrame:
     nsa = pd.read_csv(nsa_path, parse_dates=["ds"])[["ds", "predicted"]].rename(
         columns={"predicted": "nsa_predicted"}
     )
-    sa = pd.read_csv(sa_path, parse_dates=["ds"])[["ds", "actual"]].rename(
-        columns={"actual": "sa_actual"}
-    )
+
+    if sa_path.exists():
+        sa = pd.read_csv(sa_path, parse_dates=["ds"])[["ds", "actual"]].rename(
+            columns={"actual": "sa_actual"}
+        )
+    else:
+        # SA LightGBM retired — pull actuals from the SA revised target file.
+        from Train.data_loader import load_target_data
+        sa_target = load_target_data(
+            target_type="sa", release_type="first", target_source="revised",
+        )
+        sa = pd.DataFrame({
+            "ds": pd.to_datetime(sa_target["ds"]),
+            "sa_actual": sa_target["y_mom"].astype(float),
+        })
+        logger.info("SA LightGBM backtest absent; using SA target parquet for actuals")
 
     merged = pd.merge(nsa, sa, on="ds", how="inner").sort_values("ds").reset_index(drop=True)
     logger.info("Loaded backtest inputs: %d months", len(merged))

@@ -102,12 +102,12 @@ def _compute_model_row(model_id: str, info: dict) -> dict | None:
             "Extreme_Hit_Rate": float(vk["extreme_hit_rate"]),
         })
 
-    # Acceleration accuracy (for blend and any model with actual + predicted)
+    # Acceleration accuracy (vs-last-actual formula): the metric the trader sees.
     if {"actual", "predicted"}.issubset(bt_valid.columns) and len(bt_valid) >= 2:
-        actual_vals = bt_valid["actual"].values
-        pred_vals = bt_valid["predicted"].values
-        accel_acc = float(np.mean(np.sign(np.diff(actual_vals)) == np.sign(np.diff(pred_vals))))
-        row["Acceleration_Accuracy"] = accel_acc
+        from Train.variance_metrics import acceleration_accuracy
+        row["Acceleration_Accuracy"] = float(acceleration_accuracy(
+            bt_valid["actual"].values, bt_valid["predicted"].values,
+        ))
 
     return row
 

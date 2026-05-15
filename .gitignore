@@ -7,6 +7,10 @@
 # Data folder
 data/
 
+# Large raw input datasets (do not commit)
+continuous_futures/
+economist_panel/
+
 # Temporary files and cache
 _temp/
 __pycache__/

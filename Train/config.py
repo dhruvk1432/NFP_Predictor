@@ -399,7 +399,13 @@ DYNAMIC_FS_NAN_MAX_RATE = 0.20
 RESELECTION_HALF_LIFE_MONTHS = 9999       # Effectively uniform weights (no decay)
 RESELECTION_START_DATE = '2000-01-01'     # Start adaptive reselection from this date (sufficient data)
 RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluster + Interaction
-RESELECTION_STAGES_PASS2 = (0, 2, 4)     # Global: Pre-funnel + Boruta + Cluster
+# Pass-2 includes Sequential Forward Selection (stage 6) so the global stage
+# explicitly scores feature subsets against the fusion-composite objective
+# (MAE − λ_accel·accel_acc − λ_dir·dir_acc). SFS is the only place direct
+# acceleration reward enters selection — every other stage (Boruta, cluster)
+# only sees y_sel's level, not its sign-of-change. Pass-1 keeps stage 6 off
+# because per-source folds are too small for accel/dir to be informative.
+RESELECTION_STAGES_PASS2 = (0, 2, 4, 6)  # Global: Pre-funnel + Boruta + Cluster + SFS
 
 # =============================================================================
 # TIER-A UNIVERSE DISTILLATION (Hierarchical reselection — see faster.md)
@@ -482,9 +488,25 @@ TUNING_LAMBDA_DIFF_SIGN = 12.0
 TUNING_LAMBDA_ACCEL = 15.0          # Penalize poor acceleration accuracy
 TUNING_LAMBDA_DIR = 10.0            # Penalize poor directional accuracy
 
-# Kalman fusion composite objective (post-training consensus anchor)
-KALMAN_LAMBDA_ACCEL = 50.0          # Aggressive: prioritize acceleration
-KALMAN_LAMBDA_DIR = 30.0            # Aggressive: prioritize direction
+# Kalman fusion + SFS + NSA-fusion-CV scoring objective.
+# Set to ZERO to optimize for MAE alone — the user's working hypothesis is
+# that good level prediction (low MAE/RMSE) will produce good acceleration
+# and direction as a downstream consequence. The aggressive 50/30 weighting
+# previously drove the optimizer to trade ~12 MAE points for ~7pp accel,
+# pushing the fusion ABOVE consensus on MAE/RMSE. With both lambdas zeroed,
+# `_composite_kalman_accel_objective` reduces to plain MAE, which all three
+# optimization paths (SFS Pass-2, NSA Optuna in 'kalman_fusion' mode, and
+# the post-hoc Kalman tune) consume.
+KALMAN_LAMBDA_ACCEL = 0.0           # Pure-MAE mode: no accel reward
+KALMAN_LAMBDA_DIR = 0.0             # Pure-MAE mode: no direction reward
+
+# ── NSA LightGBM tuning objective ──
+# When True, NSA hyperparameter tuning scores each Optuna trial by running
+# the FULL fusion pipeline on the inner CV (LGBM → adjustment → Kalman →
+# composite against SA revised). When False, NSA falls back to the legacy
+# composite objective scored against NSA y_mom. Turn off if a fusion-CV run
+# misbehaves; the Kalman-tuning step still happens post-training either way.
+NSA_TUNE_USE_KALMAN_FUSION = True
 
 # Targets exempt from the enhancement stack but still using composite tuning.
 # SA revised is a low-variance target; the enhancement stages (dynamics,

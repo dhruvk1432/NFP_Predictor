@@ -217,19 +217,17 @@ def compute_nsa_acceleration_features(
 
     # ── 5. Rolling 12m NSA acceleration accuracy (credibility weight) ──
     # How often did the NSA model correctly predict the DIRECTION of NSA acceleration?
+    # Operational "vs last actual" formula: sign(pred[m] - actual[m-1])
+    # vs sign(actual[m] - actual[m-1]). Matches the fusion-level metric.
     hist_with_actual = hist[hist["actual"].notna()]
     recent = hist_with_actual.tail(13)
     if len(recent) >= 3:
-        actuals = recent["actual"].values.astype(float)
-        preds = recent["predicted"].values.astype(float)
-        actual_diffs = np.diff(actuals)
-        pred_diffs = np.diff(preds)
-        n = min(len(actual_diffs), len(pred_diffs))
-        if n >= 2:
-            accel_correct = np.sign(actual_diffs[:n]) == np.sign(pred_diffs[:n])
-            features["nsa_accel_accuracy_12m"] = float(np.mean(accel_correct))
-        else:
-            features["nsa_accel_accuracy_12m"] = np.nan
+        from Train.variance_metrics import acceleration_accuracy
+        _acc = acceleration_accuracy(
+            recent["actual"].values.astype(float),
+            recent["predicted"].values.astype(float),
+        )
+        features["nsa_accel_accuracy_12m"] = float(_acc) if np.isfinite(_acc) else np.nan
     else:
         features["nsa_accel_accuracy_12m"] = np.nan
 

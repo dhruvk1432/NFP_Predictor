@@ -93,11 +93,13 @@ SOURCES = {
     'ADP': DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
     'NOAA': DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots" / "decades",
     'Prosper': DATA_PATH / "Exogenous_data" / "prosper" / "decades",
+    'Futures': DATA_PATH / "Exogenous_data" / "exogenous_futures_data" / "decades",
+    'EconomistPanel': DATA_PATH / "Exogenous_data" / "exogenous_economist_data" / "decades",
 }
 
 # Ordered by typical execution time (longest to shortest) to optimize ProcessPool scheduling
 SOURCE_EXEC_ORDER = ['FRED_Employment_NSA', 'FRED_Employment_SA', 'FRED_Exogenous',
-                     'Unifier', 'Prosper', 'NOAA', 'ADP']
+                     'Unifier', 'Prosper', 'NOAA', 'ADP', 'Futures', 'EconomistPanel']
 
 # All 4 combinations of target category and target source
 TARGET_COMBOS = [

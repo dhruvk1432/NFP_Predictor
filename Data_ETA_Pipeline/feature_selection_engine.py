@@ -47,6 +47,12 @@ install_hooks()
 SEED = 42
 MIN_VALID_OBS = 60
 TRIAL_EVAL_MAX_WORKERS_DEFAULT = 4
+
+# Minimum number of validation rows in an SFS fold for the composite's
+# accel/dir terms to be informative. Below this, sign-flip noise dominates
+# at the KALMAN_LAMBDA_* weights, so we use raw MAE on that fold and only
+# include the composite terms when N >= floor.
+MIN_COMPOSITE_FOLD_SIZE = 18
 BORUTA_SHADOW_CAP_MAX = 500
 DEFAULT_RECENCY_MONTHS = 3
 NOAA_RECENCY_MONTHS = 6
@@ -2084,6 +2090,33 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                     )
                 )
 
+        # ── Fusion-composite scoring ──
+        # SFS is now Pass-2's direct lever for the fusion objective: instead
+        # of pure MAE per fold, we score `MAE − λ_accel·accel_acc − λ_dir·dir_acc`
+        # using the operational vs-last-actual accel formula. accel_acc and
+        # dir_acc are only included for folds with at least
+        # MIN_COMPOSITE_FOLD_SIZE validation rows; smaller folds revert to
+        # raw MAE on that fold (sign-flip noise on tiny folds × λ_accel=50
+        # would overwhelm the actual MAE signal). KALMAN_LAMBDA_* match the
+        # Kalman-tune objective in Train/Output_code/consensus_anchor_runner.
+        from Train.variance_metrics import acceleration_accuracy as _accel_acc_fn
+        from Train.config import (
+            KALMAN_LAMBDA_ACCEL as _LAM_ACCEL,
+            KALMAN_LAMBDA_DIR as _LAM_DIR,
+        )
+
+        def _fold_terms(y_true_arr, preds_arr):
+            """Return (fold_mae, fold_accel_or_nan, fold_dir_or_nan)."""
+            y_true_arr = np.asarray(y_true_arr, dtype=float)
+            preds_arr = np.asarray(preds_arr, dtype=float)
+            fold_mae = float(np.mean(np.abs(y_true_arr - preds_arr)))
+            if y_true_arr.size < MIN_COMPOSITE_FOLD_SIZE:
+                return fold_mae, float("nan"), float("nan")
+            accel = _accel_acc_fn(y_true_arr, preds_arr)
+            accel = float(accel) if np.isfinite(accel) else float("nan")
+            dir_acc = float(np.mean(np.sign(y_true_arr) == np.sign(preds_arr)))
+            return fold_mae, accel, dir_acc
+
         def _cv_mae_raw(feature_set):
             with perf_phase("fs.sfs.cv_eval", n_features=len(feature_set)):
                 inc_counter("fs.sfs.cv_calls", 1)
@@ -2093,7 +2126,7 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                 )
                 if not feature_set:
                     return float('inf')
-                maes = []
+                fold_results = []  # list of (mae, accel_or_nan, dir_or_nan)
                 if use_precomputed_fold_features:
                     # Phase 2 SFS optimization (parity-safe): build the feature
                     # matrix once per subset evaluation and slice rows via NumPy.
@@ -2105,13 +2138,15 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                             model = lgb.LGBMRegressor(**LGB_PARAMS)
                             model.fit(X_sub_arr[train_idx], y_train_fold)
                             preds = model.predict(X_sub_arr[test_idx])
-                            maes.append(np.mean(np.abs(y_test_fold - preds)))
+                            fold_results.append(_fold_terms(y_test_fold, preds))
                     else:
                         for train_idx, test_idx in fold_indices:
                             model = lgb.LGBMRegressor(**LGB_PARAMS)
                             model.fit(X_sub_arr[train_idx], y_curr.iloc[train_idx])
                             preds = model.predict(X_sub_arr[test_idx])
-                            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
+                            fold_results.append(
+                                _fold_terms(y_curr.iloc[test_idx].values, preds)
+                            )
                 else:
                     X_sub = X_curr[feature_set]
                     if use_precomputed_fold_targets:
@@ -2119,14 +2154,27 @@ def sequential_forward_selection(X, y, candidate_features, boruta_hits=None,
                             model = lgb.LGBMRegressor(**LGB_PARAMS)
                             _safe_lgb_fit(model, X_sub.iloc[train_idx], y_train_fold)
                             preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
-                            maes.append(np.mean(np.abs(y_test_fold - preds)))
+                            fold_results.append(_fold_terms(y_test_fold, preds))
                     else:
                         for train_idx, test_idx in fold_indices:
                             model = lgb.LGBMRegressor(**LGB_PARAMS)
                             _safe_lgb_fit(model, X_sub.iloc[train_idx], y_curr.iloc[train_idx])
                             preds = _safe_lgb_predict(model, X_sub.iloc[test_idx])
-                            maes.append(np.mean(np.abs(y_curr.iloc[test_idx].values - preds)))
-                return np.mean(maes)
+                            fold_results.append(
+                                _fold_terms(y_curr.iloc[test_idx].values, preds)
+                            )
+
+                # Aggregate folds into the composite. MAE averages over all
+                # folds; accel/dir average only over folds large enough to be
+                # informative — folds below MIN_COMPOSITE_FOLD_SIZE contribute
+                # only to MAE.
+                maes = [r[0] for r in fold_results]
+                valid_accel = [r[1] for r in fold_results if np.isfinite(r[1])]
+                valid_dir = [r[2] for r in fold_results if np.isfinite(r[2])]
+                mean_mae = float(np.mean(maes))
+                mean_accel = float(np.mean(valid_accel)) if valid_accel else 0.0
+                mean_dir = float(np.mean(valid_dir)) if valid_dir else 0.0
+                return float(mean_mae - _LAM_ACCEL * mean_accel - _LAM_DIR * mean_dir)
 
         mae_cache = {}
         mae_cache_lock = Lock()

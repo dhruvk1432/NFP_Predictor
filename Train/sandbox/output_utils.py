@@ -33,7 +33,14 @@ except Exception:
 
 
 def _compute_directional_metrics(backtest: pd.DataFrame) -> Dict[str, float]:
-    """Directional and acceleration accuracy on valid backtest rows."""
+    """Directional and acceleration accuracy on valid backtest rows.
+
+    Acceleration uses the operational "vs last actual" formula
+    (sign(p[m] − a[m−1]) vs sign(a[m] − a[m−1])) via the centralized
+    helper in Train/variance_metrics. The older sign(diff(pred))
+    formula gave a different number, which leaked into the fusion's
+    summary_statistics.csv before this fix.
+    """
     if backtest.empty or not {"actual", "predicted"}.issubset(backtest.columns):
         return {
             "Directional_Accuracy": float("nan"),
@@ -44,12 +51,8 @@ def _compute_directional_metrics(backtest: pd.DataFrame) -> Dict[str, float]:
     pred = backtest["predicted"].values.astype(float)
     dir_acc = float(np.mean(np.sign(actual) == np.sign(pred)))
 
-    if len(backtest) >= 2:
-        accel_actual = np.diff(actual)
-        accel_pred = np.diff(pred)
-        accel_acc = float(np.mean(np.sign(accel_actual) == np.sign(accel_pred)))
-    else:
-        accel_acc = float("nan")
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(actual, pred))
 
     return {
         "Directional_Accuracy": dir_acc,
@@ -128,10 +131,15 @@ def _to_per_month(backtest: pd.DataFrame) -> list[Dict]:
     pred = backtest["predicted"].values.astype(float)
 
     dir_correct = (np.sign(actual) == np.sign(pred)).astype(int)
+    # Per-month accel flag: sign(actual[m] - actual[m-1])
+    #                   == sign(predicted[m] - actual[m-1])
+    # (operational vs-last-actual formula, matching variance_metrics.acceleration_accuracy)
     accel_correct = np.full(len(backtest), np.nan)
     if len(backtest) >= 2:
+        actual_change = np.diff(actual)               # actual[m] - actual[m-1]
+        pred_change = pred[1:] - actual[:-1]           # predicted[m] - actual[m-1]
         accel_correct[1:] = (
-            np.sign(np.diff(actual)) == np.sign(np.diff(pred))
+            np.sign(actual_change) == np.sign(pred_change)
         ).astype(int)
 
     for i, (_, row) in enumerate(backtest.iterrows()):

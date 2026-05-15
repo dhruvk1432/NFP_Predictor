@@ -100,10 +100,11 @@ def _extract_metrics(src_dir: Path) -> Dict[str, float]:
                         "Directional_Accuracy",
                         float(np.mean(np.sign(actual) == np.sign(pred))),
                     )
-                    if len(valid) >= 2:
-                        accel = float(np.mean(np.sign(np.diff(actual)) == np.sign(np.diff(pred))))
-                    else:
-                        accel = float("nan")
+                    # Acceleration: sign(actual[m] - actual[m-1])
+                    #            == sign(predicted[m] - actual[m-1])
+                    # via the centralized helper (operational vs-last-actual).
+                    from Train.variance_metrics import acceleration_accuracy
+                    accel = float(acceleration_accuracy(actual, pred))
                     metrics.setdefault("Acceleration_Accuracy", accel)
                     metrics.setdefault("N_Backtest", float(len(valid)))
         except Exception:

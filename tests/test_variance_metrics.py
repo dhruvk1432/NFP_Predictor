@@ -15,9 +15,28 @@ def test_compute_variance_kpis_detects_variance_collapse():
 
     k = compute_variance_kpis(actual, predicted)
 
+    # Variance collapse is caught by std_ratio / diff_std_ratio.
     assert k["std_ratio"] < 0.2
     assert k["diff_std_ratio"] < 0.2
-    assert k["diff_sign_accuracy"] <= 0.6
+    # diff_sign_accuracy uses the operational "vs last actual" formula now
+    # (sign(p[m] - a[m-1]) vs sign(a[m] - a[m-1])). A flat-mean predictor
+    # actually scores ~0.7 on a zero-mean random series because mean
+    # reversion lines up directionally, so we no longer assert it as a
+    # collapse signal — the std-based KPIs catch collapse on their own.
+
+
+def test_diff_sign_accuracy_hostile_predictor_scores_low():
+    """A predictor that systematically *opposes* the direction-from-prior-actual
+    should score below 0.5 under the new formula."""
+    rng = np.random.RandomState(2)
+    actual = np.cumsum(rng.randn(200)) * 10.0  # random walk
+    # Predict actual_prev minus the true change → guaranteed-wrong direction.
+    predicted = np.empty_like(actual)
+    predicted[0] = actual[0]
+    predicted[1:] = actual[:-1] - (actual[1:] - actual[:-1])
+
+    k = compute_variance_kpis(actual, predicted)
+    assert k["diff_sign_accuracy"] <= 0.2
 
 
 def test_compute_variance_kpis_well_calibrated_series():

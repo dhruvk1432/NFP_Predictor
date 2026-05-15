@@ -48,16 +48,11 @@ def evaluate(name: str, pred: np.ndarray, actual: np.ndarray = actual):
     mae = np.mean(np.abs(err))
     rmse = np.sqrt(np.mean(err**2))
     kpis = compute_variance_kpis(actual, pred)
-    # Acceleration accuracy
-    n_acc = 0
-    n_acc_correct = 0
-    for i in range(1, len(actual)):
-        actual_change = actual[i] - actual[i - 1]
-        pred_change = pred[i] - pred[i - 1]
-        n_acc += 1
-        if np.sign(actual_change) == np.sign(pred_change):
-            n_acc_correct += 1
-    accel_acc = n_acc_correct / n_acc if n_acc > 0 else 0
+    # Acceleration accuracy: sign(actual[m] - actual[m-1])
+    #                     == sign(predicted[m] - actual[m-1])
+    # via the centralized helper (operational vs-last-actual formula).
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(actual, pred))
     # Directional accuracy (sign of prediction matches sign of actual)
     dir_acc = np.mean(np.sign(pred) == np.sign(actual))
     print(f"  {name:45s}  MAE={mae:6.1f}  RMSE={rmse:6.1f}  "

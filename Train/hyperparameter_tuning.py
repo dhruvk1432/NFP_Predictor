@@ -38,7 +38,11 @@ from Train.config import (
     TUNING_LAMBDA_DIR,
     LGBM_DETERMINISM,
 )
-from Train.variance_metrics import compute_variance_kpis, composite_objective_score
+from Train.variance_metrics import (
+    compute_variance_kpis,
+    composite_objective_score,
+    acceleration_accuracy,
+)
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -59,6 +63,116 @@ try:
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
+
+
+def _score_fold_kalman_fusion(
+    model,
+    X_tr_feats: pd.DataFrame,
+    X_val_feats: pd.DataFrame,
+    ds_tr: np.ndarray,
+    ds_val: np.ndarray,
+    *,
+    fusion_context: Dict,
+) -> float:
+    """Score one inner CV fold by running the full fusion pipeline.
+
+    Pipeline per fold:
+      1. Predict NSA on the COMBINED training + validation rows (the training
+         portion is in-sample, used only as Kalman's "history" for adaptive
+         noise estimation; the validation portion is OOS and is the scoring
+         target).
+      2. For each ds, add the pre-computed PIT-safe adjustment to form the
+         model channel: ``champion_pred = nsa_pred + adj_pred(ds)``.
+      3. Merge with consensus PIT and SA-revised actuals for those ds.
+      4. Run Kalman fusion with **default** params (trailing_window=18,
+         nsa_weight_scale=1.0) — Kalman's own tune happens AFTER training,
+         so we approximate its behavior here with the canonical defaults.
+      5. Compute the fusion composite
+         ``MAE − KALMAN_LAMBDA_ACCEL·accel_acc − KALMAN_LAMBDA_DIR·dir_acc``
+         on the validation rows only.
+
+    PIT invariants:
+      - SA actuals at the validation rows are the SCORE target — model never
+        sees them as features. Same as the outer backtest.
+      - Adjustment predictions are PIT-filtered per ds (built once in the
+        fusion_context cache, mirroring `_build_pit_adjustment_cache`).
+      - Consensus values are PIT-correct (loaded by `_load_consensus_pit`
+        from master snapshots).
+      - Training-fold NSA predictions are in-sample, but they're only fed
+        into Kalman's trailing-window noise estimator — not used as the
+        scoring target.
+
+    Returns:
+        Composite score (lower is better), or ``+inf`` if the fold cannot
+        be scored (no valid validation rows with consensus + SA actual).
+    """
+    from Train.Output_code.consensus_anchor_runner import (
+        kalman_fusion,
+        _composite_kalman_accel_objective,
+    )
+
+    consensus_by_ds: Dict[pd.Timestamp, float] = fusion_context["consensus_by_ds"]
+    sa_actuals_by_ds: Dict[pd.Timestamp, float] = fusion_context["sa_actuals_by_ds"]
+    adj_pred_by_ds: Dict[pd.Timestamp, float] = fusion_context["adj_pred_by_ds"]
+    consensus_df: pd.DataFrame = fusion_context["consensus_df"]
+
+    # Predict NSA on training + validation. We need the training-fold
+    # predictions to give Kalman enough history to estimate noise; we
+    # don't score them.
+    try:
+        nsa_tr = np.asarray(model.predict(X_tr_feats), dtype=float)
+        nsa_val = np.asarray(model.predict(X_val_feats), dtype=float)
+    except Exception:
+        return float("inf")
+
+    ds_all = np.concatenate([np.asarray(ds_tr), np.asarray(ds_val)])
+    nsa_all = np.concatenate([nsa_tr, nsa_val])
+
+    # Build overlap_df by aligning consensus + adj + actual per ds.
+    rows: List[Dict] = []
+    for i, ds in enumerate(ds_all):
+        ts = pd.Timestamp(ds)
+        cons = consensus_by_ds.get(ts)
+        if cons is None or not np.isfinite(cons):
+            continue  # Kalman drops rows without consensus
+        adj = adj_pred_by_ds.get(ts, 0.0)
+        champ = float(nsa_all[i]) + float(adj)
+        actual = sa_actuals_by_ds.get(ts, np.nan)
+        rows.append({
+            "ds": ts,
+            "consensus_pred": float(cons),
+            "champion_pred": champ,
+            "nsa_pred": champ,
+            "actual": float(actual) if actual is not None and np.isfinite(actual) else np.nan,
+        })
+
+    if not rows:
+        return float("inf")
+
+    overlap_df = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
+
+    # Run Kalman fusion with default params (Kalman's own tune is post-training).
+    try:
+        res_df, _ = kalman_fusion(
+            overlap_df, consensus_df,
+            trailing_window=18, use_nsa_accel=True, nsa_weight_scale=1.0,
+        )
+    except Exception:
+        return float("inf")
+
+    # Score validation rows only (strict OOS).
+    val_set = set(pd.Timestamp(d) for d in ds_val)
+    val_mask = (
+        res_df["ds"].isin(val_set)
+        & res_df["actual"].notna()
+        & res_df["predicted"].notna()
+    )
+    if int(val_mask.sum()) < 3:
+        return float("inf")
+
+    actual_arr = res_df.loc[val_mask, "actual"].to_numpy(dtype=float)
+    pred_arr = res_df.loc[val_mask, "predicted"].to_numpy(dtype=float)
+    return float(_composite_kalman_accel_objective(actual_arr, pred_arr))
 
 
 @profiled("train.tuning.total")
@@ -88,6 +202,7 @@ def tune_hyperparameters(
     warm_start_params: Optional[Dict] = None,
     lambda_accel: float = TUNING_LAMBDA_ACCEL,
     lambda_dir: float = TUNING_LAMBDA_DIR,
+    fusion_context: Optional[Dict] = None,
 ) -> Dict:
     """
     Tune LightGBM hyperparameters using Optuna to find the optimal model configuration
@@ -236,6 +351,36 @@ def tune_hyperparameters(
                 callbacks=callbacks,
             )
 
+            # ── kalman_fusion objective ──
+            # Score the trial by running the FULL fusion pipeline on the
+            # validation fold: predict NSA → add adjustment → fuse via Kalman
+            # against consensus + SA-revised actuals → score the fusion's
+            # composite (MAE − λ_accel·accel − λ_dir·dir). This picks
+            # hyperparameters that make the FUSION accurate, not the
+            # stand-alone NSA fit accurate — exactly what we want now that
+            # Kalman fusion is the published output.
+            if objective_mode == 'kalman_fusion':
+                if fusion_context is None:
+                    raise ValueError(
+                        "objective_mode='kalman_fusion' requires fusion_context "
+                        "(consensus_df, consensus_by_ds, sa_actuals_by_ds, "
+                        "adj_pred_by_ds). None was provided."
+                    )
+                # ds_tr and ds_val are needed for the Kalman alignment and
+                # the val-only scoring mask.
+                ds_tr_arr = X_tr['ds'].values
+                ds_val_arr = X_val['ds'].values
+                fold_score = _score_fold_kalman_fusion(
+                    model=model,
+                    X_tr_feats=X_tr_feats,
+                    X_val_feats=X_val_feats,
+                    ds_tr=ds_tr_arr,
+                    ds_val=ds_val_arr,
+                    fusion_context=fusion_context,
+                )
+                fold_scores.append(fold_score)
+                continue  # skip the variance / composite branches
+
             preds = model.predict(X_val_feats)
             y_val_arr = y_val.values.astype(float)
             pred_arr = np.asarray(preds, dtype=float)
@@ -245,12 +390,10 @@ def tune_hyperparameters(
                 kpis = compute_variance_kpis(
                     y_val_arr, pred_arr, tail_quantile=tail_quantile
                 )
-                # Compute acceleration accuracy (need ≥3 samples for diff)
-                accel_acc = 0.0
-                if y_val_arr.size >= 3:
-                    da = np.diff(y_val_arr)
-                    dp = np.diff(pred_arr)
-                    accel_acc = float(np.mean(np.sign(da) == np.sign(dp)))
+                # Acceleration accuracy using the operational "vs last actual"
+                # formula (sign(p[m] - a[m-1]) vs sign(a[m] - a[m-1])).
+                _accel = acceleration_accuracy(y_val_arr, pred_arr)
+                accel_acc = 0.0 if not np.isfinite(_accel) else float(_accel)
 
                 # Compute directional accuracy
                 dir_acc = 0.0

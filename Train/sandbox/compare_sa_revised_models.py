@@ -59,10 +59,10 @@ def _compute_dir_accel(backtest: pd.DataFrame) -> Tuple[float, float]:
     actual = valid["actual"].values.astype(float)
     pred = valid["predicted"].values.astype(float)
     dir_acc = float(np.mean(np.sign(actual) == np.sign(pred)))
-    if len(valid) >= 2:
-        accel_acc = float(np.mean(np.sign(np.diff(actual)) == np.sign(np.diff(pred))))
-    else:
-        accel_acc = float("nan")
+    # Acceleration: sign(actual[m] - actual[m-1]) == sign(predicted[m] - actual[m-1])
+    # via the centralized helper (operational vs-last-actual formula).
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(actual, pred))
     return dir_acc, accel_acc
 
 

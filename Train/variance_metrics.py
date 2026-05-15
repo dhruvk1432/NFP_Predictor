@@ -29,6 +29,34 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     return 0.0 if np.isnan(c) else float(c)
 
 
+def acceleration_accuracy(actual: np.ndarray, predicted: np.ndarray) -> float:
+    """Acceleration / directional-change accuracy using the operationally
+    meaningful "vs last actual" formula.
+
+    Definition (the metric the live trader actually sees):
+        actual_change[m] = actual[m] - actual[m-1]
+        pred_change[m]   = predicted[m] - actual[m-1]      # uses last KNOWN actual
+        accuracy = mean( sign(actual_change) == sign(pred_change) )
+
+    This differs from the older `sign(diff(pred))` formulation by using the
+    prior month's *actual* (which is known at trade time) instead of the prior
+    month's *prediction* (which may have been biased). Aligned with the
+    Kalman fusion's target operational signal.
+
+    Returns NaN for input sequences shorter than 2.
+    """
+    a = np.asarray(actual, dtype=float)
+    p = np.asarray(predicted, dtype=float)
+    if a.size != p.size or a.size < 2:
+        return float("nan")
+    da = a[1:] - a[:-1]
+    dp = p[1:] - a[:-1]
+    valid = np.isfinite(da) & np.isfinite(dp)
+    if not valid.any():
+        return float("nan")
+    return float(np.mean(np.sign(da[valid]) == np.sign(dp[valid])))
+
+
 def compute_variance_kpis(
     actual: np.ndarray,
     predicted: np.ndarray,
@@ -80,10 +108,10 @@ def compute_variance_kpis(
 
     corr_level = _safe_corr(a, p)
     corr_diff = _safe_corr(da, dp) if da.size >= 2 else 0.0
-    if da.size > 0:
-        diff_sign_accuracy = float(np.mean(np.sign(da) == np.sign(dp)))
-    else:
-        diff_sign_accuracy = 0.0
+    # diff_sign_accuracy now uses the operational "vs last actual" formula
+    # (see acceleration_accuracy above): sign(p[m] - a[m-1]) vs sign(a[m] - a[m-1]).
+    _accel_acc_kpi = acceleration_accuracy(a, p)
+    diff_sign_accuracy = 0.0 if (a.size < 2 or not np.isfinite(_accel_acc_kpi)) else _accel_acc_kpi
 
     abs_a = np.abs(a)
     abs_err = np.abs(err)

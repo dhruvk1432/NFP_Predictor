@@ -41,14 +41,13 @@ def compute_metrics(df, actual_col="actual", pred_col="predicted"):
     # Directional accuracy: both predicted and actual same sign
     dir_acc = ((df[actual_col] > 0) == (df[pred_col] > 0)).mean()
 
-    # Acceleration accuracy
-    actual_diff = df[actual_col].diff()
-    pred_diff = df[pred_col].diff()
-    valid = actual_diff.notna() & pred_diff.notna()
-    if valid.sum() > 0:
-        accel_acc = ((actual_diff[valid] > 0) == (pred_diff[valid] > 0)).mean()
-    else:
-        accel_acc = np.nan
+    # Acceleration accuracy: sign(actual[m] - actual[m-1])
+    #                    == sign(predicted[m] - actual[m-1])
+    # via the centralized helper (operational vs-last-actual formula).
+    from Train.variance_metrics import acceleration_accuracy
+    accel_acc = float(acceleration_accuracy(
+        df[actual_col].values, df[pred_col].values,
+    ))
     return {"MAE": mae, "RMSE": rmse, "DirAcc": dir_acc, "AccelAcc": accel_acc}
 
 

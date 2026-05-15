@@ -185,21 +185,28 @@ def _generate_adjustment_folder(
     nsa_results: pd.DataFrame,
     sa_results: pd.DataFrame,
     folder: Path,
+    half_life_years: float = 3.0,
 ) -> None:
     """
     Generate the NSA + PIT-safe predicted seasonal adjustment folder.
 
-    Uses an exponentially-weighted average of same-calendar-month historical
-    adjustments (half-life = 3 years) to predict the seasonal adjustment
-    factor, then applies it to the NSA prediction.
+    Uses an exponentially-weighted median of same-calendar-month historical
+    adjustments to predict the seasonal adjustment factor, then applies it
+    to the NSA prediction.
 
     This is fully PIT-safe: for each target month, only adjustment data
     with operational_available_date < target_ds is used.
 
     Args:
         nsa_results: NSA backtest results DataFrame.
-        sa_results: SA backtest results DataFrame.
+        sa_results: SA backtest results DataFrame (needs at minimum
+            [ds, actual] for SA revised).
         folder: Destination folder path.
+        half_life_years: Half-life (years) for the exponential decay of
+            same-calendar-month weights. The default of 3.0 is a sane
+            starting point; the consensus-anchor stage now tunes this
+            against the Kalman fusion objective and re-invokes this
+            function with the tuned value.
     """
     from Train.sandbox.experiment_predicted_adjustment import (
         ExpWeightedMedianCovidExcludedPredictor,
@@ -210,7 +217,7 @@ def _generate_adjustment_folder(
 
     # Load full historical adjustment series (SA_MoM - NSA_MoM back to 1990)
     adj_history = load_adjustment_history()
-    predictor = ExpWeightedMedianCovidExcludedPredictor(half_life_years=3.0)
+    predictor = ExpWeightedMedianCovidExcludedPredictor(half_life_years=half_life_years)
 
     # Merge NSA and SA results on date. Keep ALL NSA rows that have a
     # prediction (including OOS future months where actual is NaN); join on
@@ -303,6 +310,7 @@ def _generate_predictions_folder(
     folder: Path,
     output_base: Optional[Path] = None,
 ) -> None:
+    """SA arguments may be None when the SA LightGBM branch is retired."""
     """
     Generate the forecast for the *next* unreleased NFP month using the
     production models.
@@ -323,10 +331,12 @@ def _generate_predictions_folder(
 
     rows = []
     nsa_oos: Dict[pd.Timestamp, float] = {}
-    for label, model, metadata, X_full, y_full, residuals in [
+    _branches = [
         ("NSA", nsa_model, nsa_metadata, nsa_X_full, nsa_y_full, nsa_residuals),
-        ("SA", sa_model, sa_metadata, sa_X_full, sa_y_full, sa_residuals),
-    ]:
+    ]
+    if sa_model is not None and sa_X_full is not None and sa_y_full is not None:
+        _branches.append(("SA", sa_model, sa_metadata, sa_X_full, sa_y_full, sa_residuals))
+    for label, model, metadata, X_full, y_full, residuals in _branches:
         feature_cols = metadata["feature_cols"]
         future_mask = y_full.isna()
         if not future_mask.any():
@@ -449,15 +459,15 @@ def generate_all_output(
     nsa_results: pd.DataFrame,
     sa_results: pd.DataFrame,
     nsa_model,
-    sa_model,
-    nsa_metadata: Dict,
-    sa_metadata: Dict,
-    nsa_X_full: pd.DataFrame,
-    sa_X_full: pd.DataFrame,
-    nsa_y_full: pd.Series = None,
-    sa_y_full: pd.Series = None,
-    nsa_residuals: List = None,
-    sa_residuals: List = None,
+    sa_model=None,
+    nsa_metadata: Optional[Dict] = None,
+    sa_metadata: Optional[Dict] = None,
+    nsa_X_full: Optional[pd.DataFrame] = None,
+    sa_X_full: Optional[pd.DataFrame] = None,
+    nsa_y_full: Optional[pd.Series] = None,
+    sa_y_full: Optional[pd.Series] = None,
+    nsa_residuals: Optional[List] = None,
+    sa_residuals: Optional[List] = None,
     output_base: Optional[Path] = None,
     suffix: str = '',
     archive: bool = True,
@@ -465,19 +475,29 @@ def generate_all_output(
     """
     Generate the complete output folder structure.
 
+    The SA LightGBM branch has been retired from the published pipeline — the
+    fusion (consensus + NSA+adjustment + NSA-accel) is the canonical SA-revised
+    output. SA-related arguments are optional: pass them to render an SA
+    diagnostic folder, omit them to skip SA-LightGBM artifacts entirely. The
+    NSA+adjustment folder always runs (it only needs SA actuals, which are
+    expected on ``sa_results['actual']``).
+
     Args:
         nsa_results: NSA backtest results DataFrame.
-        sa_results: SA backtest results DataFrame.
+        sa_results: DataFrame providing at minimum [ds, actual] for SA revised
+            — used by the NSA+adjustment folder as the actuals to compare
+            against. If a full SA LGBM backtest is passed (with predicted/error),
+            the SA prediction folder will also be rendered.
         nsa_model: Trained NSA LightGBM Booster.
-        sa_model: Trained SA LightGBM Booster.
+        sa_model: Trained SA LightGBM Booster (optional; SA-pred folder skipped if None).
         nsa_metadata: NSA model metadata (feature_cols, importance, etc.).
-        sa_metadata: SA model metadata.
+        sa_metadata: SA model metadata (optional).
         nsa_X_full: NSA full training feature matrix (for SHAP).
-        sa_X_full: SA full training feature matrix (for SHAP).
+        sa_X_full: SA full training feature matrix (optional).
         nsa_y_full: NSA target series (to identify future months).
-        sa_y_full: SA target series (to identify future months).
+        sa_y_full: SA target series (optional).
         nsa_residuals: NSA OOS residuals from backtest (for confidence intervals).
-        sa_residuals: SA OOS residuals from backtest (for confidence intervals).
+        sa_residuals: SA OOS residuals (optional).
         output_base: Base output directory. Defaults to settings.OUTPUT_DIR (_output/).
         suffix: Suffix appended to output folder names (e.g., '_revised').
 
@@ -487,24 +507,31 @@ def generate_all_output(
     if output_base is None:
         output_base = OUTPUT_DIR
 
+    _sa_lgbm_enabled = sa_model is not None and sa_X_full is not None
+
     logger.info("=" * 60)
     logger.info("GENERATING OUTPUT")
     logger.info(f"Output directory: {output_base}")
+    if not _sa_lgbm_enabled:
+        logger.info("SA LightGBM branch is OFF — fusion is the canonical SA output")
     logger.info("=" * 60)
 
     # 1) NSA prediction folder
     logger.info(f"\n[1/5] NSA Prediction{suffix}")
     nsa_folder = output_base / f"NSA_prediction{suffix}"
     _generate_prediction_folder(
-        nsa_results, nsa_model, nsa_metadata, nsa_X_full, nsa_folder, f"NSA{suffix}",
+        nsa_results, nsa_model, nsa_metadata or {}, nsa_X_full, nsa_folder, f"NSA{suffix}",
     )
 
-    # 2) SA prediction folder
-    logger.info(f"\n[2/5] SA Prediction{suffix}")
-    sa_folder = output_base / f"SA_prediction{suffix}"
-    _generate_prediction_folder(
-        sa_results, sa_model, sa_metadata, sa_X_full, sa_folder, f"SA{suffix}",
-    )
+    # 2) SA prediction folder (diagnostic only — skipped when SA LightGBM is OFF)
+    if _sa_lgbm_enabled:
+        logger.info(f"\n[2/5] SA Prediction{suffix}")
+        sa_folder = output_base / f"SA_prediction{suffix}"
+        _generate_prediction_folder(
+            sa_results, sa_model, sa_metadata or {}, sa_X_full, sa_folder, f"SA{suffix}",
+        )
+    else:
+        logger.info(f"\n[2/5] SA Prediction{suffix} — SKIPPED (SA LGBM retired)")
 
     # 3) NSA + PIT-safe predicted seasonal adjustment folder
     logger.info(f"\n[3/5] NSA + Predicted Seasonal Adjustment{suffix}")
@@ -514,13 +541,18 @@ def generate_all_output(
     # 4) Forward predictions folder
     logger.info(f"\n[4/5] Forward Predictions{suffix}")
     pred_folder = output_base / f"Predictions{suffix}"
-    if nsa_y_full is not None and sa_y_full is not None:
+    if nsa_y_full is not None:
         _generate_predictions_folder(
-            nsa_model, sa_model,
-            nsa_metadata, sa_metadata,
-            nsa_X_full, sa_X_full,
-            nsa_y_full, sa_y_full,
-            nsa_residuals or [], sa_residuals or [],
+            nsa_model,
+            sa_model if _sa_lgbm_enabled else None,
+            nsa_metadata or {},
+            (sa_metadata or {}) if _sa_lgbm_enabled else None,
+            nsa_X_full,
+            sa_X_full if _sa_lgbm_enabled else None,
+            nsa_y_full,
+            sa_y_full if _sa_lgbm_enabled else None,
+            nsa_residuals or [],
+            (sa_residuals or []) if _sa_lgbm_enabled else None,
             pred_folder,
             output_base=output_base,
         )
@@ -528,20 +560,16 @@ def generate_all_output(
         logger.warning("  Skipping predictions folder — y_full not provided")
 
     # 5) Archive: copy folders into a timestamped snapshot.
-    # Skipped when called from `--train-all`, which defers archiving until
-    # after the post-training consensus anchor step so the archive captures
-    # the full final state including the 4-way scorecard.
     if archive:
         logger.info("\n[5/5] Archiving output")
-        archive_outputs(
-            output_base,
-            folders=[
-                f"NSA_prediction{suffix}",
-                f"SA_prediction{suffix}",
-                f"NSA_plus_adjustment{suffix}",
-                f"Predictions{suffix}",
-            ],
-        )
+        _archive_folders = [
+            f"NSA_prediction{suffix}",
+            f"NSA_plus_adjustment{suffix}",
+            f"Predictions{suffix}",
+        ]
+        if _sa_lgbm_enabled:
+            _archive_folders.insert(1, f"SA_prediction{suffix}")
+        archive_outputs(output_base, folders=_archive_folders)
     else:
         logger.info("\n[5/5] Archiving deferred to end of pipeline")
 

@@ -21,11 +21,23 @@ initial NFP release (i.e., after the M+1 NFP release).
 from pathlib import Path
 from typing import List, Optional, Tuple
 import json
+import os
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE, RESELECT_EVERY_N_MONTHS
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer from env (e.g. for grid_search.py per-cell overrides)."""
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
 
 
 # =============================================================================
@@ -277,7 +289,7 @@ HALF_LIFE_MIN_MONTHS = 12
 HALF_LIFE_MAX_MONTHS = 120
 
 # Optuna hyperparameter tuning
-N_OPTUNA_TRIALS = 25        # Number of Optuna trials per tuning run
+N_OPTUNA_TRIALS = _env_int("N_OPTUNA_TRIALS", 25)   # Reverted 2026-05-15 from 50 → 25 (Step 4 regression). Grid search overrides via env.
 OPTUNA_TIMEOUT = 300        # Max seconds per tuning run
 TUNE_EVERY_N_MONTHS = 12   # Re-tune hyperparameters every N months in backtest
 
@@ -380,7 +392,7 @@ DYNAMIC_FS_STAGES_PASS2 = (0, 1, 2, 4)
 
 # Hard cap on total features after the global pass-2 reduction (exogenous +
 # target-derived + calendar + revision all counted together).
-DYNAMIC_FS_PASS2_MAX_FEATURES = 80
+DYNAMIC_FS_PASS2_MAX_FEATURES = _env_int("DYNAMIC_FS_PASS2_MAX_FEATURES", 80)  # Reverted 2026-05-15 from 120 → 80 (Step 4 regression: cap=120 made NSA noisier; nsa_weight_scale collapsed 0.55→0.12). Grid overrides via env.
 
 # Boruta iterations for dynamic re-selection (lower than offline for speed).
 DYNAMIC_FS_BORUTA_RUNS = 50
@@ -399,13 +411,14 @@ DYNAMIC_FS_NAN_MAX_RATE = 0.20
 RESELECTION_HALF_LIFE_MONTHS = 9999       # Effectively uniform weights (no decay)
 RESELECTION_START_DATE = '2000-01-01'     # Start adaptive reselection from this date (sufficient data)
 RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluster + Interaction
-# Pass-2 includes Sequential Forward Selection (stage 6) so the global stage
-# explicitly scores feature subsets against the fusion-composite objective
-# (MAE − λ_accel·accel_acc − λ_dir·dir_acc). SFS is the only place direct
-# acceleration reward enters selection — every other stage (Boruta, cluster)
-# only sees y_sel's level, not its sign-of-change. Pass-1 keeps stage 6 off
-# because per-source folds are too small for accel/dir to be informative.
-RESELECTION_STAGES_PASS2 = (0, 2, 4, 6)  # Global: Pre-funnel + Boruta + Cluster + SFS
+# Pass-2 historically included Sequential Forward Selection (stage 6) to score
+# feature subsets against the fusion-composite objective. Reverted 2026-05-15:
+# SFS with patience=3 / min_mae_improvement_pct=0.5% collapsed the surviving
+# feature count from ~80 → ~13-17 across reselections and pushed fusion MAE
+# from 93.96 → 100.61. The composite objective also degenerates under pure-MAE
+# weights (λ_accel = λ_dir = 0). Stage 6 stays off until those issues are
+# addressed (small positive lambdas + a re-tuned SFS stopping rule).
+RESELECTION_STAGES_PASS2 = (0, 2, 4)  # Global: Pre-funnel + Boruta + Cluster (SFS reverted 2026-05-15)
 
 # =============================================================================
 # TIER-A UNIVERSE DISTILLATION (Hierarchical reselection — see faster.md)
@@ -497,8 +510,13 @@ TUNING_LAMBDA_DIR = 10.0            # Penalize poor directional accuracy
 # `_composite_kalman_accel_objective` reduces to plain MAE, which all three
 # optimization paths (SFS Pass-2, NSA Optuna in 'kalman_fusion' mode, and
 # the post-hoc Kalman tune) consume.
-KALMAN_LAMBDA_ACCEL = 0.0           # Pure-MAE mode: no accel reward
-KALMAN_LAMBDA_DIR = 0.0             # Pure-MAE mode: no direction reward
+# Reintroduced 2026-05-15 at 5/5 (down from prior 50/30 overshoot). Pure-MAE
+# mode (0/0) produced a near-flat HL surface — iterative-fusion-tune passes
+# oscillated HL across {1.19, 4.49, 1.34, 7.87} without converging. Small
+# positive lambdas restore objective curvature, identify HL globally, and
+# cost ~0.3-0.8 MAE in exchange for ~3-5pp AccelAcc.
+KALMAN_LAMBDA_ACCEL = 5.0           # Small positive: adds curvature in HL/window axes
+KALMAN_LAMBDA_DIR = 5.0             # Small positive: identifies HL globally
 
 # ── NSA LightGBM tuning objective ──
 # When True, NSA hyperparameter tuning scores each Optuna trial by running
@@ -507,6 +525,17 @@ KALMAN_LAMBDA_DIR = 0.0             # Pure-MAE mode: no direction reward
 # composite objective scored against NSA y_mom. Turn off if a fusion-CV run
 # misbehaves; the Kalman-tuning step still happens post-training either way.
 NSA_TUNE_USE_KALMAN_FUSION = True
+
+# ── Joint Optuna over (NSA params, half_life_years, Kalman params) ──
+# When True, every reselection step runs a single Optuna study over the
+# union of NSA LightGBM params + adjustment half_life_years + Kalman fusion
+# params, scored by the fusion composite on nested expanding-window CV.
+# Closes the residual decoupling between NSA tuning (which had to freeze
+# HL and Kalman params) and the post-hoc Kalman tune. Trades ~30-50min per
+# reselection for tighter joint optimum + better stability across cadence
+# steps. The post-hoc `_tune_kalman` step is skipped when joint params are
+# already on disk.
+JOINT_OPTUNA = True
 
 # Targets exempt from the enhancement stack but still using composite tuning.
 # SA revised is a low-variance target; the enhancement stages (dynamics,

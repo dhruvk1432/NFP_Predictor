@@ -1706,7 +1706,7 @@ def cluster_redundancy(X, feature_list, target_series,
             # Zero out correlations where overlap is insufficient
             low_overlap = overlap_matrix < min_overlap
             np.fill_diagonal(low_overlap, False)  # diagonal is self-overlap, always fine
-            corr_values = corr.values
+            corr_values = corr.to_numpy(copy=True)
             corr_values[low_overlap] = 0.0
             corr = pd.DataFrame(corr_values, index=corr.index, columns=corr.columns)
 

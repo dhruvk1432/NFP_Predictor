@@ -1292,6 +1292,37 @@ def run_consensus_anchor_pipeline(
     # 3) Kalman Fusion (jointly tune Kalman params + adjustment half-life)
     logger.info("Running Kalman Fusion...")
     if tune:
+        # ── Joint-tune short-circuit ────────────────────────────────────────
+        # If train_lightgbm_nfp ran with JOINT_OPTUNA=True it has already
+        # chosen (half_life_years, trailing_window, nsa_weight_scale) via a
+        # single joint study. Reuse those params here and skip the post-hoc
+        # _tune_kalman Optuna call entirely. The downstream HL-regen logic
+        # below still runs.
+        _joint_params_path = output_base / "consensus_anchor" / "kalman_fusion" / "joint_tuned_params.json"
+        kalman_params: Optional[Dict] = None
+        if _joint_params_path.exists():
+            try:
+                with open(_joint_params_path, "r") as _fp:
+                    _jp = json.load(_fp)
+                kalman_params = {
+                    "trailing_window": int(_jp["trailing_window"]),
+                    "nsa_weight_scale": float(_jp["nsa_weight_scale"]),
+                    "half_life_years": float(_jp["half_life_years"]),
+                }
+                logger.info(
+                    "[JointTune] reusing joint_tuned_params.json: "
+                    "HL=%.2fy tw=%d ws=%.2f (step_date=%s, best_score=%.2f)",
+                    kalman_params["half_life_years"],
+                    kalman_params["trailing_window"],
+                    kalman_params["nsa_weight_scale"],
+                    _jp.get("step_date", "?"),
+                    float(_jp.get("best_score", float("nan"))),
+                )
+            except Exception as e:
+                logger.warning("[JointTune] could not read %s (%s); falling back to _tune_kalman",
+                               _joint_params_path.name, e)
+                kalman_params = None
+
         # Pull the raw NSA backtest + adjustment history so the tuner can
         # rebuild champion_pred per Optuna trial with a candidate
         # half_life_years (drives the adjustment toward the fusion objective).
@@ -1318,13 +1349,14 @@ def run_consensus_anchor_pipeline(
             logger.warning("NSA raw backtest not found at %s; "
                            "half_life_years will NOT be tuned", nsa_raw_path)
 
-        kalman_params = _tune_kalman(
-            overlap_df, consensus_df,
-            n_trials=n_trials, timeout=timeout,
-            adj_history=_adj_history,
-            nsa_raw_by_ds=_nsa_raw_by_ds,
-            tune_adjustment=(_adj_history is not None and _nsa_raw_by_ds is not None),
-        )
+        if kalman_params is None:
+            kalman_params = _tune_kalman(
+                overlap_df, consensus_df,
+                n_trials=n_trials, timeout=timeout,
+                adj_history=_adj_history,
+                nsa_raw_by_ds=_nsa_raw_by_ds,
+                tune_adjustment=(_adj_history is not None and _nsa_raw_by_ds is not None),
+            )
 
         # ── Half-life drift warning ──
         # If the dynamic feature selection used a different half_life_years

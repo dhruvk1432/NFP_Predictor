@@ -46,6 +46,10 @@ from Data_ETA_Pipeline.feature_selection_engine import (
     load_snapshot_wide, _classify_series, run_full_source_pipeline, MIN_VALID_OBS
 )
 from Train.data_loader import load_target_data, sanitize_feature_name
+from Train.feature_engineering_sa_nsa_gap import (
+    FEATURE_COLS as SA_NSA_GAP_FEATURE_COLS,
+    build_sa_nsa_gap_features_for_snapshot,
+)
 
 logger = setup_logger(__file__, TEMP_DIR)
 install_hooks()
@@ -1099,6 +1103,7 @@ def _run_unified_no_selection(
                     if master.empty:
                         return month_key, 0, None
                     master['date'] = pd.to_datetime(master['date'])
+                    master = _augment_with_sa_nsa_gap(master, snap_date)
                     master['snapshot_date'] = snap_date
                     save_path = _snapshot_path(unified_dir, obs_month)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1256,6 +1261,75 @@ def _load_all_sources_from_cache(obs_month: pd.Timestamp,
     return master
 
 
+# Process-level cache for adjustment history (loaded once per worker).
+# Used by _augment_with_sa_nsa_gap below.
+_ADJ_HISTORY_CACHE: pd.DataFrame | None = None
+
+
+def _get_adj_history_cached() -> pd.DataFrame | None:
+    """Lazy load + cache the realized adjustment history (SA-NSA gap source)."""
+    global _ADJ_HISTORY_CACHE
+    if _ADJ_HISTORY_CACHE is not None:
+        return _ADJ_HISTORY_CACHE
+    try:
+        from Train.sandbox.experiment_predicted_adjustment import load_adjustment_history
+        _ADJ_HISTORY_CACHE = load_adjustment_history()
+    except Exception as e:
+        logger.warning(f"[sa_nsa_gap] adjustment history unavailable, gap features disabled: {e}")
+        _ADJ_HISTORY_CACHE = None
+    return _ADJ_HISTORY_CACHE
+
+
+def _augment_with_sa_nsa_gap(
+    master: pd.DataFrame,
+    snapshot_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Merge PIT-safe SA-NSA gap features into a master snapshot DataFrame.
+
+    PIT invariant: for each row at ``date = d`` the gap features only use
+    adjustment values with ``operational_available_date < snapshot_date`` AND
+    ``ds < d``. Enforcement lives in ``build_sa_nsa_gap_features_for_snapshot``.
+
+    If the adjustment history is unavailable, ``master`` is returned
+    unchanged (with the gap-feature columns absent). Downstream feature
+    selection and training already tolerate missing-column inputs.
+    """
+    if master.empty or 'date' not in master.columns:
+        return master
+
+    adj_history = _get_adj_history_cached()
+    if adj_history is None:
+        return master
+
+    try:
+        target_dates = pd.DatetimeIndex(pd.to_datetime(master['date'])).normalize().unique()
+        gap = build_sa_nsa_gap_features_for_snapshot(
+            snapshot_date=pd.Timestamp(snapshot_date),
+            target_dates=target_dates,
+            adj_history=adj_history,
+        )
+    except Exception as e:
+        logger.warning(f"[sa_nsa_gap] feature build failed for snapshot_date={snapshot_date}: {e}")
+        return master
+
+    if gap.empty:
+        return master
+
+    # Sanitize column names for parity with the rest of the master pipeline.
+    gap = gap.rename(columns={c: sanitize_feature_name(str(c)) for c in gap.columns if c != 'date'})
+
+    # Avoid clobbering pre-existing columns of the same name.
+    overlap = [c for c in gap.columns if c != 'date' and c in master.columns]
+    if overlap:
+        logger.warning(f"[sa_nsa_gap] gap columns collide with existing master columns; "
+                       f"dropping master copies: {overlap}")
+        master = master.drop(columns=overlap)
+
+    master_date = pd.to_datetime(master['date']).dt.normalize()
+    master = master.assign(date=master_date)
+    return master.merge(gap, on='date', how='left')
+
+
 def _get_progress_path(target_cat: str, target_source: str) -> Path:
     """Path for the branch progress checkpoint file."""
     progress_dir = MASTER_BASE / "progress"
@@ -1391,6 +1465,7 @@ def _materialize_single_master_snapshot(
         return month_key, 0
 
     master['date'] = pd.to_datetime(master['date'])
+    master = _augment_with_sa_nsa_gap(master, snap_date)
     master['snapshot_date'] = snap_date
 
     save_path = _snapshot_path(target_master_dir, obs_month)

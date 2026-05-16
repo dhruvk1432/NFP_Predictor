@@ -59,3 +59,9 @@ _output/
 
 # Archive bundles — never commit large zips
 *.zip
+
+# AWS toolkit — never commit private keys or per-machine state
+aws/.keys/
+aws/.state/
+aws/config.env
+aws/config.local.env

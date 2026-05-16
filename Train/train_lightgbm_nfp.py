@@ -177,7 +177,7 @@ from Train.config import (
     ENABLE_VARIANCE_GATE, VARIANCE_GATE_MIN_STD_RATIO, VARIANCE_GATE_MIN_DIFF_STD_RATIO,
     VARIANCE_GATE_MIN_CORR_DIFF, VARIANCE_GATE_MIN_DIFF_SIGN_ACC, VARIANCE_GATE_MIN_EXTREME_HIT_RATE,
     TUNING_OBJECTIVE_MODE_DEFAULT, TUNING_OBJECTIVE_MODE_VARIANCE,
-    NSA_TUNE_USE_KALMAN_FUSION,
+    NSA_TUNE_USE_KALMAN_FUSION, JOINT_OPTUNA,
     TUNING_LAMBDA_STD_RATIO, TUNING_LAMBDA_DIFF_STD_RATIO, TUNING_LAMBDA_TAIL_MAE,
     TUNING_LAMBDA_CORR_DIFF, TUNING_LAMBDA_DIFF_SIGN,
     ENABLE_VARIANCE_ENHANCEMENTS, ENHANCEMENT_SEQUENCE, ENHANCEMENT_MIN_IMPROVEMENT,
@@ -449,6 +449,30 @@ def _get_features_for_step(
     return chosen
 
 
+def _save_joint_tuned_params(joint_result: Dict, step_date: pd.Timestamp) -> None:
+    """Persist joint-Optuna params to joint_tuned_params.json.
+
+    Format mirrors the existing ``tuned_params.json`` so downstream readers
+    (``consensus_anchor_runner._tune_kalman`` skip-logic) can consume it
+    without translation. ``step_date`` is logged so a stale file from a
+    previous reselection is easy to spot.
+    """
+    import json as _json
+    out_dir = OUTPUT_DIR / 'consensus_anchor' / 'kalman_fusion'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'source': 'joint_tuning',
+        'step_date': pd.Timestamp(step_date).strftime('%Y-%m-%d'),
+        'half_life_years': float(joint_result['half_life_years']),
+        'trailing_window': int(joint_result['kalman_params']['trailing_window']),
+        'nsa_weight_scale': float(joint_result['kalman_params']['nsa_weight_scale']),
+        'best_score': float(joint_result.get('best_score', float('nan'))),
+        'n_trials_run': int(joint_result.get('n_trials_run', 0)),
+    }
+    with open(out_dir / 'joint_tuned_params.json', 'w') as f:
+        _json.dump(payload, f, indent=2)
+
+
 def _build_fusion_tuning_context(target_dates: pd.Series) -> Optional[Dict]:
     """Build the fusion-CV context used by ``tune_hyperparameters`` when
     its ``objective_mode='kalman_fusion'``.
@@ -604,6 +628,16 @@ def _load_fusion_selection_target(
         index=pd.to_datetime(X_train['ds'].values),
         name='y_mom',
     ).dropna()
+
+    # FS-A REVERTED (2026-05-15): empirically the fusion-aligned target
+    # SA_revised − adj_pred(HL) collapsed feature count from 80→17 and bumped
+    # fusion MAE from 93.96→100.61 vs the simpler NSA y_mom target. The
+    # smaller residual signal causes SFS stopping (min 0.5% MAE improvement,
+    # patience=3) to terminate too early. Restored NSA y_mom as the selection
+    # target. Fusion-aligned construction below is kept as dead code for
+    # future revival (would require non-zero KALMAN_LAMBDA_* to give the
+    # objective curvature first).
+    return legacy_y_sel, None
 
     if str(target_type).lower() != 'nsa':
         return legacy_y_sel, None
@@ -1816,6 +1850,30 @@ def run_expanding_window_backtest(
                 "back to the legacy composite objective."
             )
 
+    # ── Joint Optuna context (NSA branch only, requires JOINT_OPTUNA=True) ──
+    # When enabled, every reselection runs a single study over NSA params +
+    # adjustment HL + Kalman params, then writes joint_tuned_params.json so
+    # the post-hoc Kalman tune skips its own search.
+    _joint_tuning_context: Optional[Dict] = None
+    _joint_active = (
+        JOINT_OPTUNA
+        and str(target_type).lower() == 'nsa'
+        and tune
+    )
+    if _joint_active:
+        try:
+            from Train.joint_tuning import build_joint_fusion_context
+            _joint_tuning_context = build_joint_fusion_context(X_full['ds'])
+        except Exception as e:
+            logger.warning(f"[JointTune] context build failed ({e}); disabling joint tuning")
+            _joint_tuning_context = None
+        if _joint_tuning_context is None:
+            logger.warning(
+                "[JointTune] Joint Optuna requested but context unavailable — "
+                "falling back to separate NSA + Kalman tunes."
+            )
+            _joint_active = False
+
     # ── Dynamic re-selection state ──
     dynamic_features: Optional[List[str]] = None   # None = not yet selected
     last_reselection_date: Optional[pd.Timestamp] = None
@@ -2245,30 +2303,43 @@ def run_expanding_window_backtest(
                 # Fall back to composite if the fusion context didn't load.
                 if tuning_mode == 'kalman_fusion' and _fusion_tuning_context is None:
                     tuning_mode = TUNING_OBJECTIVE_MODE_DEFAULT
-                tuned_params = tune_hyperparameters(
-                    X_train_for_tuning, y_train_valid, target_month=target_month,
-                    use_huber_loss=use_huber_loss,
-                    objective_mode=tuning_mode,
-                    lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
-                    lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
-                    lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
-                    lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
-                    lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
-                    tail_quantile=VARIANCE_TAIL_QUANTILE,
-                    tail_weighting=(
-                        ENABLE_TAIL_AWARE_WEIGHTING
-                        and _is_variance_priority_target(target_type, target_source)
-                    ),
-                    tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
-                    tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
-                    tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
-                    tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
-                    tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
-                    warm_start_params=_warm_start_params,
-                    fusion_context=(
-                        _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
-                    ),
-                )
+
+                if _joint_active and _joint_tuning_context is not None and tuning_mode == 'kalman_fusion':
+                    # Joint Optuna: single study over NSA + HL + Kalman params.
+                    from Train.joint_tuning import tune_full_pipeline_joint
+                    joint_result = tune_full_pipeline_joint(
+                        X_train_for_tuning, y_train_valid, target_month=target_month,
+                        fusion_context=_joint_tuning_context,
+                        use_huber_loss=use_huber_loss,
+                        warm_start_params=_warm_start_params,
+                    )
+                    tuned_params = joint_result['lgbm_params']
+                    _save_joint_tuned_params(joint_result, step_date=target_month)
+                else:
+                    tuned_params = tune_hyperparameters(
+                        X_train_for_tuning, y_train_valid, target_month=target_month,
+                        use_huber_loss=use_huber_loss,
+                        objective_mode=tuning_mode,
+                        lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
+                        lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
+                        lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
+                        lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
+                        lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
+                        tail_quantile=VARIANCE_TAIL_QUANTILE,
+                        tail_weighting=(
+                            ENABLE_TAIL_AWARE_WEIGHTING
+                            and _is_variance_priority_target(target_type, target_source)
+                        ),
+                        tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
+                        tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+                        tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
+                        tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
+                        tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
+                        warm_start_params=_warm_start_params,
+                        fusion_context=(
+                            _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
+                        ),
+                    )
                 _warm_start_params = None  # consumed
 
         params = tuned_params if tune and tuned_params is not None else static_params
@@ -3013,30 +3084,61 @@ def train_and_evaluate(
                 )
                 tuning_mode = TUNING_OBJECTIVE_MODE_DEFAULT
 
-        # Pass the DF WITH 'ds' so inner tuning folds can manage their own point-in-time weights
-        final_params = tune_hyperparameters(
-            X_train[['ds'] + feature_only_cols], y_full_valid, target_month=final_target_month,
-            use_huber_loss=use_huber_loss,
-            objective_mode=tuning_mode,
-            lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
-            lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
-            lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
-            lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
-            lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
-            tail_quantile=VARIANCE_TAIL_QUANTILE,
-            tail_weighting=(
-                ENABLE_TAIL_AWARE_WEIGHTING
-                and _is_variance_priority_target(target_type, target_source)
-            ),
-            tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
-            tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
-            tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
-            tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
-            tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
-            fusion_context=(
-                _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
-            ),
+        _joint_final_active = (
+            JOINT_OPTUNA
+            and str(target_type).lower() == 'nsa'
+            and tuning_mode == 'kalman_fusion'
         )
+        _joint_final_ctx: Optional[Dict] = None
+        if _joint_final_active:
+            try:
+                from Train.joint_tuning import build_joint_fusion_context
+                _joint_final_ctx = build_joint_fusion_context(X_train['ds'])
+            except Exception as e:
+                logger.warning(f"[JointTune] final-tune context build failed ({e})")
+                _joint_final_ctx = None
+            if _joint_final_ctx is None:
+                _joint_final_active = False
+                logger.warning(
+                    "[JointTune] joint final tune requested but context unavailable — "
+                    "falling back to separate tunes."
+                )
+
+        if _joint_final_active and _joint_final_ctx is not None:
+            from Train.joint_tuning import tune_full_pipeline_joint
+            joint_result = tune_full_pipeline_joint(
+                X_train[['ds'] + feature_only_cols], y_full_valid,
+                target_month=final_target_month,
+                fusion_context=_joint_final_ctx,
+                use_huber_loss=use_huber_loss,
+            )
+            final_params = joint_result['lgbm_params']
+            _save_joint_tuned_params(joint_result, step_date=final_target_month)
+        else:
+            # Pass the DF WITH 'ds' so inner tuning folds can manage their own point-in-time weights
+            final_params = tune_hyperparameters(
+                X_train[['ds'] + feature_only_cols], y_full_valid, target_month=final_target_month,
+                use_huber_loss=use_huber_loss,
+                objective_mode=tuning_mode,
+                lambda_std_ratio=TUNING_LAMBDA_STD_RATIO,
+                lambda_diff_std_ratio=TUNING_LAMBDA_DIFF_STD_RATIO,
+                lambda_tail_mae=TUNING_LAMBDA_TAIL_MAE,
+                lambda_corr_diff=TUNING_LAMBDA_CORR_DIFF,
+                lambda_diff_sign=TUNING_LAMBDA_DIFF_SIGN,
+                tail_quantile=VARIANCE_TAIL_QUANTILE,
+                tail_weighting=(
+                    ENABLE_TAIL_AWARE_WEIGHTING
+                    and _is_variance_priority_target(target_type, target_source)
+                ),
+                tail_weight_abs_level_quantile=TAIL_WEIGHT_ABS_LEVEL_QUANTILE,
+                tail_weight_abs_diff_quantile=TAIL_WEIGHT_ABS_DIFF_QUANTILE,
+                tail_weight_level_boost=TAIL_WEIGHT_LEVEL_BOOST,
+                tail_weight_diff_boost=TAIL_WEIGHT_DIFF_BOOST,
+                tail_weight_max_multiplier=TAIL_WEIGHT_MAX_MULTIPLIER,
+                fusion_context=(
+                    _fusion_tuning_context if tuning_mode == 'kalman_fusion' else None
+                ),
+            )
         
         final_half_life = final_params.get('half_life_months', 60.0)
         # Reattach the targets and half_life so train_lightgbm_model can recompute internally

@@ -1,137 +1,135 @@
 # NFP Predictor
 
-An institutional-grade machine learning pipeline for forecasting U.S. Non-Farm Payrolls (NFP) month-over-month employment changes. Built on LightGBM with expanding-window walk-forward validation, consensus-anchored Kalman fusion, and multimodal data sources (FRED, ADP, NOAA, Unifier, Prosper).
+An institutional-grade forecasting pipeline for the U.S. Non-Farm Payrolls (NFP) month-over-month (MoM) print. The production output is a **Kalman-filter fusion** of three channels — the Reuters/LSEG economists' consensus poll, an NSA LightGBM model run through a PIT-safe seasonal-adjustment overlay, and the NSA-implied acceleration signal — Optuna-tuned against a composite objective on a 5-fold nested expanding-window CV.
 
-The production output is a **Kalman-filter fusion** of three independent signals — economists' consensus poll, the SA-blend champion, and the NSA-derived acceleration channel — Optuna-tuned on a composite objective that weights MAE, acceleration accuracy, and directional accuracy.
+The system is built around three strict invariants:
 
-**Headline OOS results (59-month walk-forward, SA revised target):**
+1. **Point-in-time (PIT) correctness.** Every feature at target month $t$ must have been publicly known *strictly before* the BLS NFP release date for $t$. No same-day leakage, no peeked vintages, no `last_revision_date` shortcuts.
+2. **Walk-forward only.** All metrics come from an expanding-window backtest — never K-fold CV, never random shuffles. The model is retrained from scratch each month using only data available before that month's NFP release.
+3. **Native NaN handling.** LightGBM's split-finding algorithm consumes NaN directly. The pipeline never forward-fills or imputes feature values (the staggered start dates — FRED 1948, ADP 2001, Prosper 2009, Futures 2002, Economist Panel 2022 — encode genuine information that imputation would destroy).
 
-| Forecast | MAE | RMSE | DirAcc | AccelAcc | Notes |
-|---|---|---|---|---|---|
-| **Kalman Fusion (NSA)** | **108.8** | **155.2** | **98.3%** | **58.6%** | Production model |
-| Baseline Consensus | 109.7 | 166.0 | 96.6% | 44.8% | Economists' mean poll |
-| AccelOverride (k=0.50) | 111.4 | 167.3 | 96.6% | 48.3% | Direction-vote variant |
-| Kalman + AccelOverride post-filter | 119.2 | 172.0 | 96.6% | 51.7% | Hybrid variant |
-| Baseline Champion (NSA+Adj) | 164.6 | 206.3 | 88.1% | 62.1% | Standalone model channel |
+> **Architectural note (2026-05):** A standalone SA LightGBM model is no longer trained. The canonical SA-revised forecast is produced by the Kalman fusion, not by a stand-alone SA LightGBM. `--train-all` now runs only the NSA branch; the SA branch was retired because (a) tuning compute is better directed at the fusion objective, and (b) the fusion already beats a stand-alone SA LightGBM on every error metric.
 
-Kalman Fusion edges consensus on every error metric **and** lifts acceleration accuracy by ~14 percentage points — the gain that matters most for catching turning points. The pipeline ships all four forecasts side-by-side under [`_output/consensus_anchor/`](_output/consensus_anchor/) so the operator can audit the full ensemble each release.
+---
 
-The architecture is explicitly designed around **point-in-time (PIT) correctness**, **dynamic feature selection**, and **consensus-anchored fusion** to prevent lookahead bias and adapt to structural regime changes.
+## Headline results (production backtest — 58 OOS months, SA-revised target)
+
+| Forecast | MAE | RMSE | DirAcc | AccelAcc | STD Ratio | Diff STD Ratio | Role |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **Kalman Fusion (NSA)** | **92.7** | **130.9** | **96.6%** | **70.2%** | 0.81 | 0.71 | **Production** |
+| Baseline Consensus | 101.3 | 144.0 | 96.6% | 66.7% | 0.82 | 0.41 | Anchor / benchmark |
+| Baseline Champion (NSA + Adj) | 191.7 | 249.1 | 81.0% | 64.9% | 1.46 | 2.39 | Diagnostic channel only |
+
+Kalman Fusion beats the consensus poll on **every** error metric (MAE −8.6, RMSE −13.1) while simultaneously lifting acceleration accuracy by **+3.5 percentage points** — the gain that matters most for catching turning points. The NSA + Adjustment "Champion" is not used as a stand-alone forecast (its raw level error is large); it is consumed only as the second Kalman observation channel and as the input to the NSA-acceleration channel.
+
+`AccelOverride` and `Kalman + AccelOverride post-filter` variants were removed on **2026-05-11** after consistently underperforming Consensus on the 60-month backtest window. The pipeline now emits exactly two anchored forecasts (Kalman Fusion + Baseline Consensus) plus the Baseline Champion as a diagnostic overlay.
 
 ---
 
 ## Table of Contents
 
-1. [The NFP Challenge: Why This is Hard](#1-the-nfp-challenge-why-this-is-hard)
-2. [System Architecture](#2-system-architecture)
+1. [Why NFP forecasting is hard](#1-why-nfp-forecasting-is-hard)
+2. [System architecture](#2-system-architecture)
 3. [Quickstart](#3-quickstart)
-4. [Repository Structure](#4-repository-structure)
-5. [Point-In-Time (PIT) Data Integrity](#5-point-in-time-pit-data-integrity)
-6. [Data Sources — Deep Dive](#6-data-sources--deep-dive)
+4. [Repository structure](#4-repository-structure)
+5. [Point-in-time data integrity](#5-point-in-time-data-integrity)
+6. [Data sources — deep dive](#6-data-sources--deep-dive)
    - [6.1 FRED Employment](#61-fred-employment)
    - [6.2 FRED Exogenous](#62-fred-exogenous)
    - [6.3 ADP Employment](#63-adp-employment)
    - [6.4 NOAA Storm Events](#64-noaa-storm-events)
    - [6.5 LSEG Unifier](#65-lseg-unifier)
    - [6.6 Prosper Consumer Sentiment](#66-prosper-consumer-sentiment)
-7. [Feature Selection Engine](#7-feature-selection-engine)
-   - [7.0 Stage 0: Variance Filter](#70-stage-0-variance-filter)
-   - [7.1 Stage 1: Dual Filter](#71-stage-1-dual-filter)
-   - [7.2 Stage 2: Boruta](#72-stage-2-boruta)
-   - [7.3 Stage 3: Vintage Stability](#73-stage-3-vintage-stability)
-   - [7.4 Stage 4: Cluster Redundancy](#74-stage-4-cluster-redundancy)
-   - [7.5 Stage 5: Interaction Rescue](#75-stage-5-interaction-rescue)
-   - [7.6 Stage 6: Sequential Forward Selection](#76-stage-6-sequential-forward-selection)
-8. [Master Snapshot Aggregation](#8-master-snapshot-aggregation)
-9. [Training Pipeline — Deep Dive](#9-training-pipeline--deep-dive)
-   - [9.1 Data Loading](#91-data-loading)
-   - [9.2 Feature Engineering](#92-feature-engineering)
-   - [9.3 Expanding Window Backtest](#93-expanding-window-backtest)
-   - [9.4 Dynamic Feature Selection](#94-dynamic-feature-selection)
-   - [9.5 NSA Acceleration Features for SA](#95-nsa-acceleration-features-for-sa)
-   - [9.6 Branch-Target Feature Selection](#96-branch-target-feature-selection)
-   - [9.7 Sample Weighting](#97-sample-weighting)
-   - [9.8 Model Training (LightGBM)](#98-model-training-lightgbm)
-   - [9.9 Hyperparameter Tuning (Optuna)](#99-hyperparameter-tuning-optuna)
-   - [9.10 Variance Enhancement Stack](#910-variance-enhancement-stack)
-   - [9.11 Prediction Intervals](#911-prediction-intervals)
-   - [9.12 Baselines and Keep Rule](#912-baselines-and-keep-rule)
-10. [Variance Capture Metrics](#10-variance-capture-metrics)
-11. [Model Variants](#11-model-variants)
-12. [Running the Pipeline](#12-running-the-pipeline)
-13. [Configuration Reference](#13-configuration-reference)
-14. [Output Artifacts](#14-output-artifacts)
-15. [Consensus Anchor Fusion (Post-Training)](#15-consensus-anchor-fusion-post-training)
-16. [Reproducibility](#16-reproducibility)
-17. [Testing and Linting](#17-testing-and-linting)
-18. [Economic Shock Handling](#18-economic-shock-handling)
-19. [Troubleshooting](#19-troubleshooting)
+   - [6.7 Continuous Futures](#67-continuous-futures)
+   - [6.8 Economist Panel](#68-economist-panel)
+7. [Feature selection engine](#7-feature-selection-engine)
+8. [Master snapshot aggregation](#8-master-snapshot-aggregation)
+9. [Training pipeline — deep dive](#9-training-pipeline--deep-dive)
+10. [The Kalman Fusion forecast (production)](#10-the-kalman-fusion-forecast-production)
+11. [Iterative fusion tuning](#11-iterative-fusion-tuning)
+12. [Running the pipeline](#12-running-the-pipeline)
+13. [Configuration reference](#13-configuration-reference)
+14. [Output artifacts](#14-output-artifacts)
+15. [Reproducibility and determinism](#15-reproducibility-and-determinism)
+16. [Testing and linting](#16-testing-and-linting)
+17. [Economic shock handling](#17-economic-shock-handling)
+18. [Troubleshooting](#18-troubleshooting)
 
 ---
 
-## 1. The NFP Challenge: Why This is Hard
+## 1. Why NFP forecasting is hard
 
-Forecasting NFP is notoriously difficult for quantitative models due to four structural realities:
+The Bureau of Labor Statistics' NFP print is among the most scrutinized macroeconomic releases in the world. It is also notoriously hard to forecast quantitatively, for four structural reasons:
 
-1. **Aggressive Revisions:** The initial Bureau of Labor Statistics (BLS) release is heavily revised in subsequent months. Models trained naively on "finalized" historical data will suffer severe lookahead bias by assuming they had clean data that didn't exist in real-time.
-2. **Asynchronous Availability:** Economic indicators are published at mismatched frequencies (daily, weekly, monthly) with varying lag times (e.g., NOAA storm data arrives ~75 days late). Aligning these without peeking into the future requires rigorous data versioning.
-3. **Regime Non-Stationarity:** The economy fundamentally breaks its own rules. Relationships that held during the "Great Moderation" (pre-2008) often decoupled or inverted during the Global Financial Crisis (GFC) or the 2020 COVID-19 shock.
-4. **High-Dimensional Instability:** Thousands of macroeconomic series contain spurious or transient correlations. Without temporally-aware feature selection, complex models will catastrophically overfit to this noise.
+1. **Aggressive revisions.** The first BLS print is revised in M+1 and again at the annual benchmark. A model trained on "finalized" historical values pretends to have had clean data in real time and develops severe lookahead bias. The system therefore distinguishes `total_nsa_first_release.parquet` (what BLS first put on the wire) from `y_nsa_revised.parquet` (the once-revised MoM that appears at M+1) and trains against the **revised** target.
+2. **Asynchronous availability.** Indicators publish at daily, weekly, and monthly frequencies with lag times spanning hours (FRED financial data) to ~75 days (NOAA storm details). Aligning these without peeking into the future requires rigorous data versioning.
+3. **Regime non-stationarity.** Relationships that held in the Great Moderation broke down in 2008 and inverted again in 2020. Features that fit the pre-pandemic regime can become actively misleading in the post-COVID labor market.
+4. **High-dimensional instability.** The full FRED employment hierarchy alone exposes ~17,000 candidate columns after feature engineering. Without temporally-aware feature selection, any sufficiently expressive model overfits these correlations into noise.
 
 ---
 
-## 2. System Architecture
+## 2. System architecture
 
 ```mermaid
 flowchart TD
-    subgraph "Phase 1: Raw Ingestion"
-        FRED[FRED APIs<br/>~295 Employment Series<br/>+ 10 Exogenous Indicators]
-        ADP[ADP Payrolls<br/>investing.com API]
-        NOAA[NOAA Weather<br/>Storm Events + CPI Deflation]
-        Unifier[Unifier / LSEG<br/>ISM, Housing, Retail, UMich<br/>+ NFP Consensus Poll]
-        Prosper[Prosper Surveys<br/>Consumer Mood, Spending, Employment]
+    subgraph Phase1["Phase 1: Raw ingestion (PIT-tagged)"]
+        FRED[FRED employment<br/>~295 series, NSA+SA<br/>ALFRED vintage]
+        FREDX[FRED exogenous<br/>VIX, claims, oil, yields<br/>S&P 500 - Yahoo Finance]
+        ADP[ADP employment<br/>investing.com API]
+        NOAA[NOAA storm events<br/>75d lag, CPI-deflated]
+        Unifier[LSEG / Unifier<br/>ISM, retail, UMich<br/>+ NFP consensus poll]
+        Prosper[Prosper surveys<br/>mood, spending, employment]
+        Futures[Continuous futures<br/>19 contracts: rates, equity,<br/>FX, vol, commodities]
+        Econ[Economist panel<br/>top-4 forecasters + ensemble]
     end
 
-    subgraph "Phase 2: Time-Shielding"
-        Snap[Monthly PIT Snapshots<br/>Strict release_date < nfp_release_date<br/>No same-day leakage]
+    subgraph Phase2["Phase 2: Per-source PIT snapshots"]
+        Snap[Monthly long-format parquets<br/>release_date &lt; nfp_release_date]
     end
 
-    subgraph "Phase 3: All-Features Storage"
-        Master[Master Wide Snapshots<br/>~15,500 features per month<br/>All-features mode]
+    subgraph Phase3["Phase 3: Master snapshots (all-features mode)"]
+        Master[Wide-format master snapshots<br/>nsa/revised, sa/revised<br/>~15k+ engineered features]
     end
 
-    subgraph "Phase 4: Walk-Forward Validation"
-        Pool[Feature Engineering<br/>Calendar + Employment Lags<br/>+ Revision + NSA Accel Features]
-        DynFS[Dynamic Reselection<br/>2-Pass Per-Source + Global<br/>Max 80 Features, Every 6mo]
-        Train[Expanding-Window LightGBM<br/>+ Optuna Composite Tuning<br/>+ NSA Enhancement Stack]
+    subgraph Phase4["Phase 4: Walk-forward NSA training"]
+        FE[Feature engineering<br/>calendar + survey week + lags<br/>+ revision deltas + NSA accel]
+        DynFS[Dynamic feature reselection<br/>every 24 months<br/>2-pass per-source then global<br/>capped at 80 features]
+        LGBM[Expanding-window LightGBM<br/>Optuna composite tuning<br/>scored against fusion CV<br/>variance enhancement stack]
     end
 
-    subgraph "Phase 5: Consensus Anchor Fusion"
-        Adj[NSA + Predicted<br/>Seasonal Adjustment]
-        Kalman[Kalman Fusion - production<br/>cons + champion + NSA accel]
-        AccelOv[AccelOverride<br/>cons base + direction vote]
-        Hybrid[Kalman + AccelOverride<br/>post-filter hybrid]
-        Cons[Baseline Consensus<br/>untouched poll]
+    subgraph Phase5["Phase 5: Post-training fusion"]
+        ExpAdj[PIT-safe seasonal adjustment<br/>ExpWeightedMedian, COVID-excluded<br/>half-life tuned by fusion Optuna]
+        Kalman[Kalman fusion - production<br/>info-filter, 3 channels<br/>cons + champion + nsa accel<br/>adaptive trailing-window noise]
+        Cons[Baseline consensus<br/>raw Reuters/LSEG poll]
     end
 
     FRED --> Snap
+    FREDX --> Snap
     ADP --> Snap
     NOAA --> Snap
     Unifier --> Snap
     Prosper --> Snap
+    Futures --> Snap
+    Econ --> Snap
 
     Snap --> Master
-    Master --> Pool
-    Pool --> DynFS
-    DynFS --> Train
-    Train --> Adj
-    Train --> Kalman
+    Master --> FE
+    FE --> DynFS
+    DynFS --> LGBM
+    LGBM --> ExpAdj
+    ExpAdj --> Kalman
+    LGBM --> Kalman
     Unifier --> Cons
     Cons --> Kalman
-    Cons --> AccelOv
-    Kalman --> Hybrid
-    AccelOv --> Hybrid
 ```
+
+The shape of each phase is:
+
+- **Phase 1 — Ingestion.** Each source has its own loader under `Data_ETA_Pipeline/`. Loaders are decoupled and can be re-run independently.
+- **Phase 2 — Per-source PIT snapshots.** Each source writes one parquet per target month under `data/Exogenous_data/{source}/decades/{decade}s/{year}/{YYYY-MM}.parquet`, containing only rows with `release_date < nfp_release_date(target_month)`.
+- **Phase 3 — Master aggregation.** [`create_master_snapshots.py`](Data_ETA_Pipeline/create_master_snapshots.py) joins all source snapshots into a single wide-format parquet per target month, in "all-features" mode (selection deferred to walk-forward time).
+- **Phase 4 — NSA training.** [`train_lightgbm_nfp.py --train-all`](Train/train_lightgbm_nfp.py) walks forward one month at a time, re-running dynamic feature selection every 24 months, with Optuna re-tuning the LightGBM hyperparameters every 12 months against the *fusion-CV composite* (not against NSA's own y_mom).
+- **Phase 5 — Fusion.** [`consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py) runs the Kalman fusion against the SA-revised target, jointly tuning the adjustment half-life, the Kalman trailing window, and the NSA acceleration weight.
 
 ---
 
@@ -144,447 +142,461 @@ flowchart TD
 
 ### Install
 
-The project is packaged via [`pyproject.toml`](pyproject.toml). Core runtime dependencies (pandas, numpy, scikit-learn, LightGBM, fredapi, requests, etc.) are installed alongside the package itself:
-
 ```bash
 pip install -e .
-```
-
-For Optuna-driven hyperparameter tuning and development tooling (ruff, pytest, pre-commit):
-
-```bash
-pip install -e ".[dev,hyperopt]"
+pip install -e ".[dev,hyperopt]"   # Optuna + ruff + pytest + pre-commit
 pre-commit install
 ```
 
-> **Note:** A standalone `requirements.txt` is no longer maintained — `pyproject.toml` is the single source of truth.
+[`pyproject.toml`](pyproject.toml) is the single source of truth for dependencies; there is no `requirements.txt`.
 
 ### Configure environment
 
-Copy the template and fill in your credentials:
-
-```bash
-cp .env .env.local    # or edit .env directly — it is not committed to git
-```
-
-Required variables in `.env`:
+Required entries in `.env` (see [settings.py](settings.py:59)):
 
 | Variable | Description |
 |---|---|
-| `FRED_API_KEY` | FRED API key (required) |
-| `UNIFIER_USER` | Unifier API username (required) |
-| `UNIFIER_TOKEN` | Unifier API token (required) |
-| `DATA_PATH` | Path to data directory (default: `./data`) |
+| `FRED_API_KEY` | FRED API key |
+| `UNIFIER_USER` / `UNIFIER_TOKEN` | LSEG/Unifier API credentials |
+| `DATA_PATH` | Path to data directory (e.g. `./data`) |
 | `START_DATE` | Training start date (e.g. `1990-01-01`) |
-| `BACKTEST_MONTHS` | Number of backtest months (e.g. `36`) |
+| `BACKTEST_MONTHS` | Walk-forward backtest length (e.g. `60`) |
 
-Optional: `END_DATE`, `MODEL_TYPE`, `TARGET_TYPE`, `OUTPUT_DIR` (default `_output`), `TEMP_DIR` (default `_temp`), `DEBUG`, `REFRESH_CACHE`, `RESELECT_EVERY_N_MONTHS` (default `6`).
+Optional: `END_DATE`, `OUTPUT_DIR` (default `_output`), `TEMP_DIR` (default `./_temp`), `MODEL_TYPE`, `TARGET_TYPE`, `DEBUG`, `REFRESH_CACHE`, `RESELECT_EVERY_N_MONTHS` (default `6`; the committed `.env` ships `24`), `USE_PER_WINDOW_FEATURES` (replay mode — see §9.4).
 
 ### Smoke test
 
 ```bash
-# Verify environment is configured and directories are accessible
-python settings.py
-
-# Run the test suite
-pytest tests/ -v
+python settings.py        # creates output/temp/cache directories
+pytest tests/ -v          # ~30s test suite
 ```
 
 ---
 
-## 4. Repository Structure
+## 4. Repository structure
 
 ```
 NFP_Predictor/
-├── settings.py                          # Central config: env vars, paths, logger factory
-├── run_full_project.py                  # Pipeline orchestrator (data → master snapshots → train)
-├── analyze_seasonal_adjustment.py       # SARIMA seasonal adjustment analysis
+├── settings.py                          # Env-var loader, paths, logger factory
+├── run_full_project.py                  # Orchestrator: load → prepare → train
+├── analyze_seasonal_adjustment.py       # SA factor analysis (SARIMA / decomp)
 │
-├── Data_ETA_Pipeline/                   # Phase 1–3: Ingestion, PIT snapshots, feature selection
-│   ├── fred_employment_pipeline.py      # FRED employment series (NSA + SA, ALFRED vintage)
-│   ├── load_fred_exogenous.py           # FRED exogenous series (weekly jobless claims, VIX, etc.)
-│   ├── adp_pipeline.py                  # ADP payroll snapshots from investing.com
-│   ├── noaa_pipeline.py                 # NOAA weather data (75-day lag modelling + CPI deflation)
-│   ├── load_unifier_data.py             # Unifier survey data (vendor timestamp repair)
-│   ├── load_prosper_data.py             # Prosper consumer sentiment surveys
-│   ├── feature_selection_engine.py      # 7-stage regime-aware feature selection (stages 0–6)
-│   ├── create_master_snapshots.py       # Aggregates all sources → master parquets
-│   ├── nfp_release_calendar.py          # BLS NFP release date calendar (first Friday rule)
-│   ├── perf_stats.py                    # Performance profiling decorators + JSON dumps
-│   ├── perf_summary.py                  # Performance summary utilities
-│   ├── utils.py                         # ETL utilities (snapshot paths, MultiIndex helpers)
-│   ├── test_feature_selection.py        # Feature selection tests
-│   └── analyze_noaa_weights_vintage.py  # NOAA weighting analysis
+├── Data_ETA_Pipeline/                   # Phases 1–3
+│   ├── fred_employment_pipeline.py      # FRED employment (NSA+SA, ALFRED vintages, BLS schedule)
+│   ├── load_fred_exogenous.py           # FRED exogenous + S&P 500 (Yahoo Finance fallback)
+│   ├── adp_pipeline.py                  # ADP employment via investing.com
+│   ├── noaa_pipeline.py                 # NOAA storm events, CPI-deflated, state-weighted
+│   ├── load_unifier_data.py             # LSEG / Unifier (ISM, retail, consensus poll, …)
+│   ├── load_prosper_data.py             # Prosper consumer surveys
+│   ├── load_futures_data.py             # 19 continuous-futures contracts (PIT month-end)
+│   ├── load_economist_panel.py          # Top-4 economist forecasts + ensemble mean
+│   ├── nfp_release_calendar.py          # BLS NFP release calendar (first-Friday rule)
+│   ├── feature_selection_engine.py      # 7-stage selection (Pre-screen → Dual → Boruta → Vintage → Cluster → Interaction → SFS)
+│   ├── create_master_snapshots.py       # Merges all source snapshots into master wide parquets
+│   ├── perf_stats.py / perf_summary.py  # Profiling decorators + JSON dumps
+│   └── utils.py                         # Snapshot paths, sanitization helpers
 │
-├── Prepare_Data/                        # Target-construction utilities
-│   └── build_revised_targets.py         # Build once-revised NFP targets from FRED vintages
+├── Train/                               # Phases 4–5
+│   ├── train_lightgbm_nfp.py            # Main entrypoint (--train, --train-all, --iterate-fusion-tune)
+│   ├── config.py                        # Hyperparameters, paths, all knobs
+│   ├── data_loader.py                   # Master-snapshot loading + pivot_snapshot_to_wide
+│   ├── feature_engineering.py           # Calendar + survey week + lag features
+│   ├── model.py                         # LightGBM fit/predict, sample weights, intervals
+│   ├── hyperparameter_tuning.py         # Optuna with nested TimeSeriesSplit
+│   ├── nsa_acceleration.py              # 8 PIT-safe NSA-acceleration features (legacy SA channel)
+│   ├── candidate_pool.py                # Union of FS survivors (cached)
+│   ├── short_pass_selection.py          # Per-step top-K gain/correlation filter
+│   ├── branch_target_selection.py       # Target-derived feature selector
+│   ├── revision_features.py             # master[M] vs master[M-1] revision deltas
+│   ├── prune_snapshots_to_selected_features.py
+│   ├── reduce_features.py               # Post-selection reduction helpers
+│   ├── variance_metrics.py              # KPIs + composite objective
+│   ├── universe_cache.py                # Tier-A universe distillation (disabled by default)
+│   ├── training_dataset_cache.py        # Cached training matrices keyed by FS survivors
+│   ├── baselines.py                     # Naive baselines + keep-rule gating
+│   ├── data_load_check.py               # CLI utility for snapshot sanity checks
+│   ├── rerun_post_train_adj_and_consensus.py  # Re-run adjustment + fusion without retraining
+│   ├── sandbox/                         # Standalone experiments (see Train/sandbox/README.md)
+│   └── Output_code/
+│       ├── consensus_anchor_runner.py   # Kalman fusion + Optuna joint tune (production)
+│       ├── generate_output.py           # Orchestrator: NSA / NSA+Adj / Predictions / Archive
+│       ├── model_comparison.py          # Multi-variant scorecard (CSV + HTML)
+│       ├── metrics.py                   # RMSE, MAE, coverage, acceleration accuracy
+│       ├── feature_importance.py        # Gain-based importance dumps
+│       └── plots.py                     # Backtest, SHAP, ACF/PACF plots
 │
-├── Train/                               # Phase 4–5: Model training and output
-│   ├── train_lightgbm_nfp.py            # Main entrypoint: expanding-window backtest
-│   ├── config.py                        # Hyperparameters, paths, valid target configs
-│   ├── data_loader.py                   # Master snapshot loading + pivot_snapshot_to_wide()
-│   ├── feature_engineering.py           # Calendar, survey-week, employment lag features
-│   ├── model.py                         # LightGBM fit/predict helpers (safe wrappers)
-│   ├── hyperparameter_tuning.py         # Optuna tuning with inner TimeSeriesSplit
-│   ├── baselines.py                     # Naive baselines (prior month, rolling mean)
-│   ├── candidate_pool.py                # Union of feature-selection survivors (cached)
-│   ├── short_pass_selection.py          # Per-step top-K feature filter (walk-forward)
-│   ├── branch_target_selection.py       # Branch-target derived feature selection
-│   ├── revision_features.py             # Revision-specific feature construction
-│   ├── nsa_acceleration.py              # PIT-safe NSA acceleration features for SA model
-│   ├── reduce_features.py               # Post-selection feature reduction utilities
-│   ├── prune_snapshots_to_selected_features.py  # Trim master snapshots to selected columns
-│   ├── variance_metrics.py              # Variance KPIs and composite objective
-│   ├── sandbox/                         # Standalone experiments (CatBoost, XGBoost, SA blend, etc.)
-│   └── Output_code/                     # Output generation modules
-│       ├── model_comparison.py          # Multi-variant scorecard (CSV + styled HTML)
-│       ├── generate_output.py           # Orchestrates all output artefacts
-│       ├── metrics.py                   # RMSE, MAE, coverage calculations
-│       ├── plots.py                     # Backtest, SHAP, and diagnostic plots
-│       ├── feature_importance.py        # Gain-based importance analysis
-│       └── consensus_anchor_runner.py   # Post-training Kalman / AccelOverride fusion
+├── scripts/                             # CLI utilities
+│   ├── predict_next_nfp.py              # Forward NSA prediction + intervals
+│   ├── nsa_then_kalman.py               # Re-run NSA training + Kalman fusion in one shot
+│   ├── kalman_only.py                   # Re-run just the Kalman fusion against existing CSVs
+│   ├── continue_kalman.py               # Append a new month to an existing fusion run
+│   ├── reconstruct_nsa_and_kalman.py    # Rebuild NSA + fusion from preserved feature schedules
+│   ├── check_data_freshness.py          # Verify each source is up-to-date before release day
+│   ├── benchmark_keep_rule.py           # Keep-rule benchmark reports
+│   ├── directional_accuracy.py          # Directional / acceleration hit-rate analysis
+│   ├── revision_analysis.py             # Revision autocorrelation diagnostics
+│   ├── ab_feature_selection.py          # A/B harness for FS variants
+│   ├── test_stage0_prescreen.py         # Smoke test for the Stage-0 Spearman pre-screen
+│   ├── trim_pre1990_rows.py             # One-off: trim pre-1990 rows from cached snapshots
+│   └── generate_presentation_assets.py  # LaTeX/Beamer assets
 │
-├── scripts/                             # Utility / diagnostic scripts
-│   ├── predict_next_nfp.py              # Production inference: next-month prediction + intervals
-│   ├── check_data_freshness.py          # Verify data is up-to-date before release day
-│   ├── benchmark_keep_rule.py           # Run keep-rule benchmark reports
-│   ├── directional_accuracy.py          # Directional hit-rate analysis
-│   ├── revision_analysis.py             # NFP revision autocorrelation analysis
-│   ├── ab_feature_selection.py          # A/B harness for feature-selection variants
-│   ├── test_stage0_prescreen.py         # Smoke test for Stage-0 Spearman pre-screen
-│   ├── trim_pre1990_rows.py             # Trim pre-1990 rows from cached snapshots
-│   └── generate_presentation_assets.py  # Produce charts/tables for the LaTeX deck
-│
-├── utils/                               # Shared utilities
-│   ├── transforms.py                    # SymLog, COVID winsorization, Z-score helpers
+├── utils/                               # Shared transforms
+│   ├── transforms.py                    # SymLog, COVID winsorization, z-scoring, lean features
 │   ├── paths.py                         # Cross-platform path helpers
-│   └── benchmark_harness.py             # A/B timing harness for algorithm comparisons
+│   └── benchmark_harness.py             # A/B timing harness
 │
-├── tests/                               # pytest test suite
-├── experiments/                         # Ad-hoc experiment scripts and notes
+├── Best_features_selected/              # Tracked-in-git snapshot of the BEST dynamic-FS JSONs
+│   ├── nsa_revised/                     # Best feature schedule for the NSA branch
+│   └── sa_revised/                      # Legacy SA-branch schedule (kept for reference)
 │
-├── data/                                # Data root (not committed; set via DATA_PATH)
+├── aws/                                 # EC2 training toolkit (m7i.4xlarge by default)
+│
+├── tests/                               # pytest suite (~6 pre-existing failures — see MEMORY.md)
+├── experiments/                         # Ad-hoc research notes
+│
+├── data/                                # Not committed; set via DATA_PATH
 │   ├── fred_data/decades/               # Raw FRED vintage snapshots
 │   ├── fred_data_prepared_{nsa,sa}/     # Prepared FRED employment snapshots
-│   ├── Exogenous_data/                  # Per-source parquets (ADP, NOAA, Unifier, Prosper, FRED exog)
-│   ├── master_snapshots/{nsa,sa}/       # Feature-selected master snapshots
-│   └── NFP_target/                      # Target parquets (total_nsa_first_release.parquet, etc.)
+│   ├── Exogenous_data/                  # Per-source snapshots
+│   │   ├── exogenous_fred_data/         # FRED exogenous
+│   │   ├── exogenous_unifier_data/      # LSEG Unifier
+│   │   ├── ADP_data/, ADP_snapshots/    # ADP raw + PIT snapshots
+│   │   ├── NOAA_data/, exogenous_noaa_snapshots/
+│   │   ├── prosper/                     # Prosper survey snapshots
+│   │   ├── exogenous_futures_data/      # Continuous-futures snapshots
+│   │   └── exogenous_economist_data/    # Economist panel snapshots
+│   ├── master_snapshots/{nsa,sa}/revised/   # Master wide-format parquets
+│   └── NFP_target/                      # total_*_first_release.parquet, y_*_revised.parquet
 │
-├── _output/                             # Pipeline output artefacts
-│   ├── NSA_prediction/, SA_prediction/  # Per-track backtest results, plots, SHAP
+├── continuous_futures/                  # Raw daily continuous-futures CSVs (~220 files)
+├── economist_panel/                     # by_economist/*.parquet + contributors.parquet
+│
+├── _output/                             # Pipeline outputs (gitignored)
+│   ├── NSA_prediction/                  # NSA branch backtest, plots, SHAP
 │   ├── NSA_plus_adjustment/             # NSA + PIT-safe seasonal adjustment
-│   ├── consensus_anchor/                # 4-way consensus-anchored ensemble
-│   ├── dynamic_selection/               # Cached dynamic feature-selection artefacts
+│   ├── consensus_anchor/                # PRODUCTION: Kalman fusion + baseline consensus
+│   ├── Predictions/                     # Forward predictions with CIs
+│   ├── models/lightgbm_nfp/             # Saved models + multi-variant scorecard
+│   ├── dynamic_selection/               # Per-window feature JSONs (24-month cohort)
+│   ├── cache/                           # Universe / training-dataset / FS caches
 │   ├── sandbox/                         # Sandbox experiment outputs
-│   ├── backtest/, models/, Predictions/ # Standard training artefacts
-│   └── Archive/                         # Timestamped snapshots of previous runs
-├── _temp/                               # Logs and performance profiling JSON files
+│   └── Archive/YYYY-MM-DD_HHMMSS/       # Timestamped snapshots of past full runs
+├── _temp/                               # Logs + perf-profiling JSON
 │
-├── presentation.tex / presentation.pdf  # Beamer presentation deck
-├── pyproject.toml                       # Build config, runtime + dev deps, ruff, pytest
+├── presentation.tex / presentation.pdf  # Beamer deck
+├── pyproject.toml                       # Build config + ruff + pytest config
 ├── .pre-commit-config.yaml
-└── .github/workflows/test.yml           # CI: pytest × Python 3.10–3.12, ruff, mypy
+└── .github/workflows/test.yml           # CI: pytest × Py 3.10/3.11/3.12 + ruff + mypy
 ```
 
 ---
 
-## 5. Point-In-Time (PIT) Data Integrity
+## 5. Point-in-time data integrity
 
-**Target:** Month-over-month change in U.S. Non-Farm Payrolls (`y_mom`). The once-revised MoM (from the M+1 FRED snapshot) is the primary ground-truth target.
+**Target.** Month-over-month change in U.S. Non-Farm Payrolls (`y_mom`). The once-revised MoM — extracted from the M+1 FRED vintage snapshot — is the primary ground-truth target.
 
-**Fundamental constraint:** Every feature `X_i` mapped to prediction month `t` must satisfy:
+**The fundamental constraint.** For any feature $X_i$ mapped to prediction month $t$:
 
-```
-feature_release_date < target_release_date(t)
-```
+$$\text{release\_date}(X_i) < \text{nfp\_release\_date}(t)$$
 
-This strict inequality (`<`, not `<=`) prevents same-day leakage, meaning even data published on the exact day of the NFP release is excluded.
+Strict `<`, never `<=` — this prevents same-day leakage, so even data published on the morning of the NFP release is excluded from that release's feature set.
 
-### How PIT is enforced per source
+### How each source enforces PIT
 
 | Source | Mechanism | Detail |
 |---|---|---|
-| **FRED Employment** | ALFRED vintage snapshots | `realtime_start` tracks when each data revision became public. Missing pre-2009 release dates use heuristic imputation based on first-Friday logic or complex 3-tier gate system. |
-| **FRED Exogenous** | Vintage backfill + NFP-windowed weekly aggregation | Weekly claims data (CCNSA, CCSA) is bucketed using NFP release windows, not calendar months: data released between `NFP(M-1)` and `NFP(M)` goes into month M. |
-| **ADP** | `release_date < nfp_release_date` | Strict inequality filter on ADP publication dates. |
-| **NOAA** | 75-day lag model | Storm data modelled as `month-end + 75 days` (NCEI documented standard). Optional NFP-relative adjustment. |
-| **Unifier** | Median publication lag repair | Unifier API overwrites `first_release_date` with `timestamp` when the field is missing, causing lookahead bias. Repaired by computing per-series `median_lag_days` from historical data with valid release dates, then backfilling. |
-| **Prosper** | `release_date < nfp_release_date` | Strict inequality filter on survey publication dates. |
+| **FRED Employment** | ALFRED vintage snapshots | `realtime_start` tracks the moment each revision became public. Pre-2009 release dates are filled by a 3-tier gate (first-Friday → partial-metadata backfill → closest candidate). |
+| **FRED Exogenous** | Vintage backfill + NFP-windowed weekly aggregation | Weekly series (CCNSA, CCSA, WEI) are bucketed by NFP release windows, not by calendar month: data released between `NFP(M-1)` and `NFP(M)` enters month `M`. |
+| **ADP** | `release_date < nfp_release_date` | Strict inequality on investing.com publication dates. |
+| **NOAA** | 75-day lag model | Storm details modelled as `month_end + 75d` (NCEI documented processing delay). Optional NFP-relative adjustment. |
+| **Unifier (LSEG)** | Median-lag repair | The Unifier API fills `first_release_date` with the API call's `timestamp` when missing — a silent lookahead bug. We repair it by computing each series' empirical `median_lag_days` from rows that have valid `first_release_date` and backfilling. |
+| **Prosper** | `release_date < nfp_release_date` | Strict inequality on survey publication dates. |
+| **Futures** | Anchor to last trading day of month | Per-future monthly observations are anchored to the last trading day. A snapshot at `snap_date` only includes monthly rows with `release_date < snap_date`. |
+| **Economist Panel** | `first_release_date < snap_date` | Each forecast row keeps the economist's `first_release_date` as the canonical publication timestamp. The Top-4 ensemble's `release_date` is the MAX of constituent `first_release_dates`, so the ensemble is only "known" once all members have filed. |
 
-### Release Date Imputation (FRED Employment)
+### FRED release-date imputation
 
-For historical FRED data where `realtime_start` is unavailable (pre-2009), two imputation strategies are used:
+For historical FRED data where `realtime_start` is unavailable (pre-2009), two imputation strategies are used (see [`fred_employment_pipeline.py`](Data_ETA_Pipeline/fred_employment_pipeline.py)):
 
-1. **First-release files** (`impute_target_release_date_simple`): Simple first-Friday-of-month logic.
-2. **Last-release files** (`impute_target_release_date_complex`): Complex 3-tier gate system:
-   - **Option 1:** Extended backfill for very old data (pre-2009) where no release metadata exists.
+1. **First-release files** (`impute_target_release_date_simple`): first-Friday-of-month logic.
+2. **Last-release files** (`impute_target_release_date_complex`): 3-tier gate:
+   - **Option 1:** Extended backfill for very old data (pre-2009) with no release metadata.
    - **Option 2:** Intermediate backfill for series with partial metadata.
-   - **Option 3:** Closest candidate respecting snapshot timing constraints.
+   - **Option 3:** Closest candidate respecting snapshot timing.
 
 ---
 
-## 6. Data Sources — Deep Dive
+## 6. Data sources — deep dive
 
 ### 6.1 FRED Employment
 
-**File:** `Data_ETA_Pipeline/fred_employment_pipeline.py`
+**File:** [`Data_ETA_Pipeline/fred_employment_pipeline.py`](Data_ETA_Pipeline/fred_employment_pipeline.py)
 
-**Purpose:** The core employment target variable (NFP itself) and the full disaggregated FRED employment hierarchy — ~295 series total (NSA + SA pairs across ~150 entities), organized in a 7-level hierarchy.
+**Purpose.** The target itself (NFP MoM) and the full disaggregated employment hierarchy — ~295 series across ~150 entities × {NSA, SA}.
 
-**Hierarchy:**
+**Hierarchy (7 levels).**
 
 ```
 Level 0: Total (NSA + SA)
 Level 1: Private vs Government
-Level 2: Goods-Producing vs Service-Providing (private); Federal / State / Local (govt)
-Level 3: Mining & Logging, Construction, Manufacturing, Trade, Financial, Professional, etc.
-Level 4+: Sub-industry breakdowns (e.g., Durable Goods, Food Services, Health Care)
+Level 2: Goods-Producing vs Service-Providing  (Federal / State / Local for government)
+Level 3: Mining & Logging, Construction, Manufacturing, Trade, Financial, Professional, …
+Level 4+: Sub-industry breakdowns (Durable Goods, Food Services, Health Care, …)
 ```
 
-**Key mechanics:**
+Series are defined as a Python dict `FRED_EMPLOYMENT_CODES` that maps hierarchical names (e.g. `total.private.goods.manufacturing_nsa`) to FRED IDs (e.g. `CEU3000000001`). The dot-delimited names become `total_private_goods_manufacturing_nsa` once `sanitize_feature_name()` runs at master-snapshot time.
 
-- All series are defined in the `FRED_EMPLOYMENT_CODES` dictionary, which maps hierarchical names (e.g. `total.private.goods.manufacturing_nsa`) to FRED series IDs (`CEU3000000001`).
-- **ALFRED vintage downloads:** `_fetch_one_all_asof()` fetches each series with full revision history via the Federal Reserve's ALFRED API, preserving `realtime_start` metadata.
-- **BLS schedule scraping:** `scrape_bls_employment_situation_schedule()` scrapes the BLS website for the official NFP release schedule. Falls back to `HARDCODED_RELEASE_DATES` for known-but-not-yet-published dates.
-- **NFP timing utilities (cached):** `get_nfp_release_for_month()` and `get_nfp_release_map()` return the exact release date for each target month. `calculate_median_offset_from_nfp()` computes the typical lag between a series' release and the NFP release.
-- **Audit alignment:** `_align_audit_to_total_calendar()` aligns all series' `realtime_start` dates to the `total_nsa` release calendar, ensuring consistent timing across the hierarchy.
+**Per-series feature engineering — 9 features each.**
 
-**Per-series feature engineering (9 features each):**
-
-For each of the 159 employment series, the pipeline computes:
+For each series $s$:
 
 | Feature | Formula | Purpose |
 |---|---|---|
-| `_latest` | Raw level value | Current employment level |
-| `_MoM` | `level[t] - level[t-1]` | Month-over-month absolute change |
-| `_MoM_pct` | `(level[t] - level[t-1]) / level[t-1]` | Month-over-month percentage change |
-| `_3m` | `level[t] - level[t-3]` | 3-month change |
-| `_6m` | `level[t] - level[t-6]` | 6-month change |
-| `_YoY` | `level[t] - level[t-12]` | Year-over-year change |
-| `_12m_pct_change` | `(level[t] - level[t-12]) / level[t-12]` | Year-over-year percentage change |
-| `_rolling_3m` | `mean(MoM[t], MoM[t-1], MoM[t-2])` | 3-month rolling mean of MoM |
-| `_volatility` | `std(MoM[t:t-3])` | 3-month rolling standard deviation |
+| `_latest` | level | Current employment level |
+| `_MoM` | $L_t - L_{t-1}$ | MoM absolute change |
+| `_MoM_pct` | $(L_t - L_{t-1}) / L_{t-1}$ | MoM percent change |
+| `_3m` | $L_t - L_{t-3}$ | 3-month change |
+| `_6m` | $L_t - L_{t-6}$ | 6-month change |
+| `_YoY` | $L_t - L_{t-12}$ | YoY change |
+| `_12m_pct_change` | $(L_t - L_{t-12}) / L_{t-12}$ | YoY percent change |
+| `_rolling_3m` | $\frac{1}{3}\sum_{i=0}^{2}\Delta L_{t-i}$ | 3-month rolling mean of MoM |
+| `_volatility` | $\text{std}(\Delta L_{t-3:t})$ | 3-month rolling std of MoM |
 
-This yields several thousand FRED employment features per snapshot before feature selection.
+This yields ~17,000 candidate FRED employment columns before any selection.
 
-**Target files produced:**
+**Targets produced.**
 
 ```
-DATA_PATH/NFP_target/total_nsa_first_release.parquet   # NSA first release (primary target)
+DATA_PATH/NFP_target/total_nsa_first_release.parquet   # NSA first release
 DATA_PATH/NFP_target/total_sa_first_release.parquet    # SA first release
-DATA_PATH/NFP_target/y_nsa_revised.parquet             # NSA revised (once-revised MoM from M+1)
-DATA_PATH/NFP_target/y_sa_revised.parquet              # SA revised
+DATA_PATH/NFP_target/y_nsa_revised.parquet             # NSA once-revised (M+1 vintage)
+DATA_PATH/NFP_target/y_sa_revised.parquet              # SA once-revised — fusion target
 ```
 
-**Snapshot directory structure:**
+**Cached snapshots.**
 
 ```
-DATA_PATH/fred_data/decades/{decade}s/{year}/{YYYY-MM}.parquet            # Raw
-DATA_PATH/fred_data_prepared_{nsa|sa}/decades/{decade}s/{year}/{YYYY-MM}.parquet  # Prepared
+DATA_PATH/fred_data/decades/{decade}s/{year}/{YYYY-MM}.parquet                   # Raw
+DATA_PATH/fred_data_prepared_{nsa|sa}/decades/{decade}s/{year}/{YYYY-MM}.parquet # Prepared
 ```
 
 ---
 
 ### 6.2 FRED Exogenous
 
-**File:** `Data_ETA_Pipeline/load_fred_exogenous.py`
+**File:** [`Data_ETA_Pipeline/load_fred_exogenous.py`](Data_ETA_Pipeline/load_fred_exogenous.py)
 
-**Purpose:** Macroeconomic indicator snapshots synchronized with NFP release dates — financial stress, oil, yields, volatility, and weekly jobless claims.
+**Purpose.** Macroeconomic indicators — financial stress, oil, yields, volatility, and weekly jobless claims.
 
-**Series (10 indicators):**
+**Series.**
 
-| Series | FRED ID | Frequency | Description |
+| Series | FRED ID | Frequency | Role |
 |---|---|---|---|
-| Credit Spreads | BAMLH0A0HYM2 | Daily | High-yield corporate bond spread (risk appetite proxy) |
-| Yield Curve | T10Y2Y | Daily | 10Y-2Y Treasury spread (recession predictor) |
-| Oil Prices | DCOILWTICO | Daily | WTI crude oil (energy sector signal) |
-| VIX | VIXCLS | Daily | CBOE Volatility Index (market fear gauge) |
-| S&P 500 | — (Yahoo Finance) | Daily | Equity market level (FRED only has data from 2016+) |
+| Credit Spreads | BAMLH0A0HYM2 | Daily | High-yield corporate spread (risk appetite) |
+| Yield Curve | T10Y2Y | Daily | 10Y–2Y Treasury spread (recession predictor) |
+| Oil Prices | DCOILWTICO | Daily | WTI crude (energy sector signal) |
+| VIX | VIXCLS | Daily | CBOE VIX (market fear) |
+| S&P 500 | (Yahoo Finance) | Daily | Equity level (FRED only carries data from 2016+; Yahoo fallback for the full history) |
 | Financial Stress | STLFSI4 | Weekly | St. Louis Fed Financial Stress Index |
-| Weekly Economic Index | WEI | Weekly | NY Fed Weekly Economic Index |
-| Continued Claims (NSA) | CCNSA | Weekly | Ongoing unemployment claims (not seasonally adjusted) |
-| Continued Claims (SA) | CCSA | Weekly | Ongoing unemployment claims (seasonally adjusted) |
+| Weekly Economic Index | WEI | Weekly | NY Fed WEI |
+| Continued Claims (NSA) | CCNSA | Weekly | Ongoing unemployment claims (NSA) |
+| Continued Claims (SA) | CCSA | Weekly | Ongoing unemployment claims (SA) |
 
-**Binary regime indicators (NOT differenced):**
+**Binary regime indicators (no differencing).** Computed on the raw series but excluded from pct_change pipelines because differencing a binary is meaningless:
 
-These are computed from the raw series but excluded from standard differencing/pct_change pipelines because their binary nature makes such transforms meaningless:
+- `VIX_panic_regime` — VIX > 40
+- `VIX_high_regime` — VIX > 25
+- `SP500_bear_market` — S&P 500 drawdown > 20%
+- `SP500_crash_month` — monthly return < −10%
+- `SP500_circuit_breaker` — daily drop > 7%
 
-- `VIX_panic_regime`: VIX > 40
-- `VIX_high_regime`: VIX > 25
-- `SP500_bear_market`: S&P 500 drawdown > 20%
-- `SP500_crash_month`: S&P 500 monthly return < -10%
-- `SP500_circuit_breaker`: S&P 500 daily drop > 7%
-
-**Weekly claims aggregation (NFP-windowed):**
-
-Weekly data (CCNSA, CCSA, WEI) requires special handling. Calendar-month aggregation would leak future information because some weeks span month boundaries. Instead:
+**NFP-windowed weekly aggregation.** Calendar-month aggregation of weekly series leaks future information whenever a week spans the month boundary. Instead, the pipeline buckets weekly observations between consecutive NFP releases:
 
 ```python
-# Data released between NFP(M-1) and NFP(M) goes into month M bucket
+# Data released between NFP(M-1) and NFP(M) → month M
 aggregate_weekly_to_monthly_nfp_based(weekly_df, nfp_release_map)
 ```
 
-This respects the actual publication schedule. A claim reported on January 15th (after the January NFP release on January 10th) goes into February's bucket, matching what an analyst would actually have in hand.
+A claim reported January 15th (after the January NFP release on January 10th) is bucketed into February — matching what an analyst would actually have in hand.
 
-**Spike statistics:** `calculate_weekly_spike_stats()` captures extreme weekly spikes (e.g., the March 2020 COVID unemployment claims explosion) as separate features, since standard monthly aggregation would dilute the signal.
+**Spike statistics.** `calculate_weekly_spike_stats()` retains weekly maxima as separate features (e.g. the March 2020 unemployment-claims explosion) — monthly aggregation would dilute the signal.
 
-**API resilience:** `fred_api_call_with_retry()` uses exponential backoff (2s, 4s, 8s) with thread-safe rate limiting at 0.8s per request via `_rate_limited_fetch()`.
-
-**Output:**
-
-```
-DATA_PATH/Exogenous_data/exogenous_fred_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
-```
+**API resilience.** `fred_api_call_with_retry()` uses exponential backoff (2s, 4s, 8s) with a thread-safe 0.8s/request rate limit via `_rate_limited_fetch()`.
 
 ---
 
 ### 6.3 ADP Employment
 
-**File:** `Data_ETA_Pipeline/adp_pipeline.py`
+**File:** [`Data_ETA_Pipeline/adp_pipeline.py`](Data_ETA_Pipeline/adp_pipeline.py)
 
-**Purpose:** Alternative private-sector employment measure from ADP (via investing.com API), providing an independent signal from the BLS establishment survey.
+**Purpose.** Alternative private-sector employment measure from ADP (via investing.com event API), providing an independent signal from the BLS establishment survey.
 
-**Data source:** investing.com REST API (event_id=1), returning ADP National Employment Change in thousands — already native-aligned with NFP's unit of measurement.
+**Pipeline.**
 
-**Pipeline:**
-
-1. **`fetch_adp_from_api()`** — Pulls historical event occurrences with `actual` reported values. Captures both `date` (reference period) and `release_date` (publication date). Historical data back to ~2001.
-2. **`create_adp_snapshots()`** — Creates PIT snapshots:
-   - Strict filter: `release_date < nfp_release_date` (no same-day leakage)
-   - Keeps the most recent (freshest) ADP value for each reference month
-   - Applies feature transforms: `pct_change`, `compute_all_features()` in lean mode (no symlog — tree-invariant)
-3. **`validate_snapshots()`** — Post-creation validation confirms no PIT violations exist
-
-**Output:**
-
-```
-DATA_PATH/Exogenous_data/ADP_data/ADP_Employment_Change.parquet          # Raw
-DATA_PATH/Exogenous_data/ADP_snapshots/decades/{decade}s/{year}/{YYYY-MM}.parquet  # Snapshots
-```
+1. `fetch_adp_from_api()` — Pulls historical event occurrences with `actual` values, capturing both `date` (reference period) and `release_date` (publication date). Data back to ~2001.
+2. `create_adp_snapshots()` — Strict `release_date < nfp_release_date` filter, keeps freshest ADP value per reference month, then applies lean feature transforms (`pct_change`, MoM, rolling).
+3. `validate_snapshots()` — Post-creation audit confirming no PIT violations.
 
 ---
 
 ### 6.4 NOAA Storm Events
 
-**File:** `Data_ETA_Pipeline/noaa_pipeline.py`
+**File:** [`Data_ETA_Pipeline/noaa_pipeline.py`](Data_ETA_Pipeline/noaa_pipeline.py)
 
-**Purpose:** Economic impact of severe weather events, inflation-adjusted to present-day dollars. Natural disasters are a real but undermodeled source of NFP volatility (construction shutdowns, service disruptions).
+**Purpose.** Economic impact of severe weather, inflation-adjusted to present-day dollars. Natural disasters are a real but undermodelled source of NFP volatility (construction shutdowns, service disruptions).
 
-**Pipeline stages:**
+**Pipeline.**
 
-1. **Download & parse:** Downloads StormEvents_details CSV files (gzip) from NCEI. `parse_damage_value()` converts BLS-style strings ("25K", "1.5M", "0") to dollar amounts. `add_begin_datetime_column()` constructs event timestamps from `BEGIN_YEARMONTH`, `BEGIN_DAY`, `BEGIN_TIME`.
-
-2. **State-level aggregation:** Aggregates events by state and month:
-   - `total_damage_real` = property + crop damage (CPI-adjusted via `CPIAUCSL` from FRED)
-   - `property_damage_real` / `crop_damage_real` (CPI-adjusted separately)
-   - `deaths_direct` / `deaths_indirect` / `injuries_direct` / `injuries_indirect`
-
-3. **Employment-weighted national aggregation:** `create_noaa_weighted_snapshots()` builds state-to-national aggregates weighted by each state's share of total non-farm employment. This ensures that a Category 5 hurricane hitting Texas (large employment share) contributes more than the same storm hitting Wyoming.
-
-4. **Release date modeling:** `calculate_noaa_release_date()` applies a 75-day lag after month-end (NCEI's documented processing delay). Optional NFP-relative adjustment via `apply_nfp_relative_adjustment()`.
-
-**Output:**
-
-```
-DATA_PATH/Exogenous_data/NOAA_data/{STATE}_NOAA_data.parquet             # Per-state
-DATA_PATH/Exogenous_data/NOAA_data/US_NOAA_data.parquet                  # National
-DATA_PATH/Exogenous_data/NOAA_data/NOAA_master.parquet                   # Master (long-format)
-DATA_PATH/Exogenous_data/exogenous_noaa_snapshots/decades/.../*.parquet  # PIT snapshots
-```
+1. **Download & parse.** StormEvents_details CSVs from NCEI. `parse_damage_value()` converts BLS-style damage strings (`25K`, `1.5M`) to dollars. `add_begin_datetime_column()` builds event timestamps from `BEGIN_YEARMONTH / BEGIN_DAY / BEGIN_TIME`.
+2. **State-level aggregation.** Per-state, per-month:
+   - `total_damage_real` = property + crop damage, CPI-deflated via `CPIAUCSL`
+   - `property_damage_real`, `crop_damage_real`
+   - `deaths_direct`, `deaths_indirect`, `injuries_direct`, `injuries_indirect`
+3. **Employment-weighted national aggregation.** `create_noaa_weighted_snapshots()` weights each state by its share of national non-farm employment. A Category-5 hurricane in Texas matters more than the same storm in Wyoming.
+4. **Release-date modelling.** `calculate_noaa_release_date()` applies a 75-day lag after month-end (NCEI processing delay), optionally adjusted relative to the next NFP release via `apply_nfp_relative_adjustment()`.
 
 ---
 
 ### 6.5 LSEG Unifier
 
-**File:** `Data_ETA_Pipeline/load_unifier_data.py`
+**File:** [`Data_ETA_Pipeline/load_unifier_data.py`](Data_ETA_Pipeline/load_unifier_data.py)
 
-**Purpose:** Leading economic indicators from the Unifier / LSEG API — ISM surveys, housing, retail sales, consumer confidence, and the critical NFP consensus poll.
+**Purpose.** Leading economic indicators from the LSEG / Unifier API — ISM surveys, housing, retail, consumer confidence, and **the NFP consensus poll** (which is the fusion's anchor).
 
-**Series (11 indicators):**
+**Series (11).**
 
-| Series | Unifier Code | Description |
+| Series | Unifier code | Role |
 |---|---|---|
-| ISM Manufacturing Index | USNAPMEM | Factory sector expansion/contraction |
-| ISM Non-Manufacturing Index | USNPNE..Q | Services sector expansion/contraction |
-| CB Consumer Confidence | USCNFCONQ | Conference Board consumer survey |
-| Avg Weekly Hours (All Private) | — | Leading indicator of labor demand |
+| ISM Manufacturing | USNAPMEM | Factory expansion / contraction |
+| ISM Non-Manufacturing | USNPNE..Q | Services expansion / contraction |
+| CB Consumer Confidence | USCNFCONQ | Conference Board survey |
+| Avg Weekly Hours (All Private) | — | Leading labor-demand indicator |
 | Avg Weekly Hours (Manufacturing) | — | Manufacturing-specific labor signal |
-| Avg Hourly Earnings (Private) | — | Wage tightness indicator |
-| Housing Starts | USHOUSE.O | Residential construction activity |
-| Retail Sales | USRETTOTB | Consumer spending (100% release date completeness) |
-| Empire State Mfg Survey | USFRNFMFQ | Regional PMI (first released each month) |
-| UMich Consumer Expectations | — | Forward-looking consumer sentiment |
+| Avg Hourly Earnings | — | Wage tightness |
+| Housing Starts | USHOUSE.O | Residential construction |
+| Retail Sales | USRETTOTB | Consumer spending |
+| Empire State Manufacturing | USFRNFMFQ | Regional PMI (first of the month) |
+| UMich Consumer Expectations | — | Forward-looking sentiment |
 | Industrial Production | USIPTOT.G | Total industrial output |
-| **NFP Consensus Poll** | — | LSEG/Reuters economists' mean NFP forecast |
+| **NFP Consensus Poll** | — | Reuters / LSEG economists' mean NFP forecast — **the fusion anchor** |
 
-**Critical PIT issue and fix:**
+**The PIT bug, and the fix.** The Unifier API will silently fill `first_release_date` with the API call's `timestamp` when the field is missing. Naively trusting that field would back-date every historical observation to today. The fix in [`get_effective_release_and_value_vectorized()`](Data_ETA_Pipeline/load_unifier_data.py):
 
-The Unifier API has a data integrity bug: when `first_release_date` is missing for a data point, the system incorrectly fills `last_revision_date` with the API call's `timestamp` (today's date). If used naively, this would make historical data appear to have been available today — catastrophic lookahead bias.
+- **Case 1 — `first_release_date` is NaN:** Never use `last_revision_date`. Backfill with the series' empirical `median_lag_days` (computed from rows that *do* have valid `first_release_date`).
+- **Case 2 — `first_release_date` exists:** Use the most recent value released before `snap_date`.
+- **All cases:** Strict `<`, never `<=`.
 
-**Solution:** `get_effective_release_and_value_vectorized()`:
-- **Case 1:** Missing `first_release_date` → NEVER use `last_revision_date`; instead, backfill using the series' empirical `median_lag_days` (computed from observations where `first_release_date` is present).
-- **Case 2:** Has `first_release_date` → Use the most recent value available before the snapshot date.
-- **All cases:** Strict `<` inequality: `release_date < snap_date`.
+**Zero-centered series.** Empire State Manufacturing and Challenger Job Cuts oscillate around zero, where `pct_change` is meaningless. The `ZERO_CENTERED_SERIES` constant skips `pct_change` for these.
 
-**Zero-centered series:** Empire State Manufacturing and Challenger Job Cuts are naturally zero-centered (positive = expansion, negative = contraction). The `ZERO_CENTERED_SERIES` constant ensures that `pct_change` is skipped for these (as it would be meaningless or undefined around zero).
-
-**NFP consensus:** `_fetch_consensus_series()` fetches the Reuters/LSEG economists' mean NFP forecast. Release date is set to the last day of the month (consensus is finalized before the NFP release).
-
-**Output:**
-
-```
-DATA_PATH/Exogenous_data/exogenous_unifier_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
-```
+**NFP consensus.** `_fetch_consensus_series()` fetches the Reuters/LSEG poll mean; `release_date` is set to the last day of the month (the poll is finalized before the NFP release).
 
 ---
 
 ### 6.6 Prosper Consumer Sentiment
 
-**File:** `Data_ETA_Pipeline/load_prosper_data.py`
+**File:** [`Data_ETA_Pipeline/load_prosper_data.py`](Data_ETA_Pipeline/load_prosper_data.py)
 
-**Purpose:** Monthly consumer survey data measuring mood, spending intentions, and employment expectations — leading indicators that often foreshadow labor market shifts.
+**Purpose.** Monthly consumer survey: mood, spending intentions, and employment expectations — leading indicators that often foreshadow labor-market shifts.
 
-**Top predictors:**
-- Prosper Consumer Spending Forecast
-- Consumer Mood Index
-- Employment environment expectations
-- Employment status breakdowns
+**Mechanics.**
 
-**Survey demographics:** US 18+, 18-34, Males, Females
+- **Parallel fetching** with rate limiting (≤ 10 req/s).
+- **Retired-question filter** (`filter_unwanted_series`) removes discontinued questions.
+- **Employment series merge.** Pre-September 2009: single "I am employed" question. Post-September 2009: split into "full-time" + "part-time". `merge_employment_series()` recombines them into a continuous "I am employed = FT + PT" series, avoiding a structural break.
+- **PIT.** Strict `release_date < nfp_release_date`.
 
-**Key mechanics:**
+---
 
-- **Parallel fetching:** `fetch_single_key()` with rate limiting (max 10 requests/sec).
-- **Retired question filtering:** `filter_unwanted_series()` removes discontinued survey questions (e.g., "I am retired").
-- **Employment series merge:** `merge_employment_series()` solves a historical multicollinearity problem:
-  - Pre-September 2009: Single "I am employed" question.
-  - Post-September 2009: Split into "full-time" + "part-time".
-  - The pipeline merges both into a continuous "I am employed" feature (FT + PT), avoiding a structural break in the time series.
-- **PIT filtering:** `release_date < nfp_release_date` (strict inequality).
+### 6.7 Continuous Futures
 
-**Output:**
+**File:** [`Data_ETA_Pipeline/load_futures_data.py`](Data_ETA_Pipeline/load_futures_data.py)
+
+**Purpose.** Forward-looking, real-time market-implied signals for rates, equity sentiment, FX, volatility, and industrial commodities — chosen from the literature on macro release surprises (Andersen et al. 2003; Fleming & Remolona 1997; Kuttner 2001; Gürkaynak, Sack & Swanson 2005; Faust et al. 2007; Bekaert et al. 2013).
+
+**The 19 contracts (hardcoded in [`FUTURES`](Data_ETA_Pipeline/load_futures_data.py:79)).**
+
+| Group | Display name | Ticker | Class |
+|---|---|---|---|
+| Rate expectations | FedFunds | `&ZQ` | rate |
+| | SOFR_3M | `&SR3` | rate |
+| Treasury curve | Treasury_2Y, 5Y, 10Y, 30Y | `&ZT &ZF &ZN &ZB` | rate |
+| Equity sentiment | SP500, Nasdaq100, Russell2000 | `&ES &NQ &RTY` | equity |
+| FX | DollarIndex, EUR_USD, JPY_USD | `&DX &6E &6J` | fx |
+| Volatility | VIX | `&VX` | vol |
+| Industrial commodities | Copper, WTI_Crude, Brent_Crude, NatGas | `&HG &CL &BRN &NG` | commodity |
+| Precious metals | Gold, Silver | `&GC &SI` | commodity |
+
+**Variant choice (plain vs back-adjusted).** A subtle but consequential design point:
+
+- **Levels (price / yield interpretation):** plain (non-back-adjusted) close. For rate futures the plain close follows the `100 − implied_rate` convention; back-adjustment destroys that.
+- **Returns / momentum / realized vol:** derived from the `_CCB` back-adjusted series, which removes roll-induced discontinuities.
+
+**Monthly features.** For each contract: `close` (level), `log_return` (close-to-close on CCB), `realized_vol` ($\sqrt{252} \cdot \text{std}$ of daily CCB log returns intra-month), `log_range` ($\log(\text{high}_{ccb}/\text{low}_{ccb})$). Rate contracts also emit `implied_rate = 100 − close` (plain series only).
+
+**Anchoring.** Per-future monthly rows are anchored to the **last trading day of the calendar month**. The snapshot at `snap_date` keeps only rows with `release_date < snap_date`.
+
+**Output.** `DATA_PATH/Exogenous_data/exogenous_futures_data/decades/...`
+
+---
+
+### 6.8 Economist Panel
+
+**File:** [`Data_ETA_Pipeline/load_economist_panel.py`](Data_ETA_Pipeline/load_economist_panel.py)
+
+**Purpose.** A deterministic, hand-curated panel of the four economists who have historically been the most accurate forecasters of the SA first-release MoM. Their forecasts (and an equal-weight ensemble mean) enter the master snapshot as PIT-correct features.
+
+**The 4 hardcoded panellists** (validated against `y_sa_revised.y_mom` on the 36 shared months Apr 2022 → Sep 2025):
+
+```python
+TOP_4_ECONOMISTS = [
+    "CONTINUUM ECON",
+    "NATIONWIDE INSUR",
+    "DANSKE BK",
+    "AIB",
+]
+```
+
+The list is **deliberately deterministic** — not auto-ranked at every run. Re-ranking would produce a different feature set each month and prevent feature stability.
+
+**Per-economist feature.** `NFP_Forecast_<EconShortName>` — the economist's first-release-value forecast (thousands of SA MoM jobs), with `release_date = first_release_date`.
+
+**Ensemble feature.** `NFP_Forecast_Top4Mean` — equal-weight mean of the panellists who filed for that month (≥ 2 of 4). The ensemble's `release_date = MAX` of constituent `first_release_date`s, so the ensemble is only "known" after every available member has filed.
+
+**Data inputs (at project root).**
 
 ```
-DATA_PATH/Exogenous_data/prosper/decades/{decade}s/{year}/{YYYY-MM}.parquet
+economist_panel/by_economist/US_XXXXX.parquet
+economist_panel/contributors.parquet
+NFP_target/y_sa_revised.parquet
+```
+
+**Outputs.**
+
+```
+_output/economist_panel/rankings_full.csv   # full per-economist × window RMSE/MAE table (transparency)
+_output/economist_panel/top_economists.csv  # 4 hardcoded picks + metrics
+DATA_PATH/Exogenous_data/exogenous_economist_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
 ```
 
 ---
 
-## 7. Feature Selection Engine
+## 7. Feature selection engine
 
-**File:** `Data_ETA_Pipeline/feature_selection_engine.py`
+**File:** [`Data_ETA_Pipeline/feature_selection_engine.py`](Data_ETA_Pipeline/feature_selection_engine.py)
 
-The feature selection engine is a 7-stage pipeline (Stages 0–6) designed to reduce the massive feature space (~17k+ from FRED employment alone) to a tractable set while preserving genuine predictive signal. It runs independently per data source and per historical regime, with results cached to support incremental reruns.
+A 7-stage funnel (Stages 0–6) that reduces ~17k+ raw FRED employment columns plus the other sources to a tractable subset while preserving genuine predictive signal. It runs **independently per data source** and **per historical regime**, with results cached for incremental reruns.
 
-**Default pipeline:** Stages (0, 1, 2, 3, 4) — omits Stages 5 and 6, whose signal is redundant with the train-time short-pass selection that re-derives features every backtest step.
+**Default pipeline:** Stages `(0, 1, 2, 3, 4)`. Stages 5 and 6 are omitted because the train-time short-pass and dynamic reselection already re-derive a top-60 / top-80 set each backtest step, and SFS with aggressive stopping was shown (2026-05-15) to collapse the surviving feature count from ~80 → ~13–17 and push fusion MAE from 93.96 → 100.61.
 
-**LightGBM safety helpers used throughout:**
-- `_sanitize_lgb_col_name()` — Removes JSON-forbidden characters (`[]{}:,"` etc.)
+**LightGBM safety helpers (used across all stages).**
+
+- `_sanitize_lgb_col_name()` — Strips JSON-forbidden characters (`[]{}:,"` etc.)
 - `_get_lgb_column_schema()` — Caches sanitization (max 4,096 entries)
-- `_prepare_lgb_frame()` — Aligns columns without copying data
-- `_safe_lgb_fit()` / `_safe_lgb_predict()` — Preserve column mapping through training and prediction
+- `_prepare_lgb_frame()` — Aligns columns without copying
+- `_safe_lgb_fit() / _safe_lgb_predict()` — Preserve column mapping through training and prediction
 
-**LightGBM parameters (feature selection context):**
+**LightGBM params used inside FS.**
+
 ```python
 LGB_PARAMS = {
     'objective': 'regression',
@@ -592,753 +604,667 @@ LGB_PARAMS = {
     'n_estimators': 100,
     'learning_rate': 0.05,
     'num_leaves': 31,
-    'n_jobs': 1,       # macOS + ProcessPoolExecutor + n_jobs=-1 = OOM deadlock
+    'n_jobs': 1,         # macOS + ProcessPoolExecutor + n_jobs=-1 = OOM deadlock
     'random_state': 42,
 }
 ```
 
----
+### Stage 0 — Variance filter (+ optional Spearman pre-screen)
 
-### 7.0 Stage 0: Variance Filter
+`_variance_filter()`. Drops near-constant columns where ≥ 97% of non-NaN values are identical.
 
-**Function:** `_variance_filter()`
+**Two-tier fast path.** Tier 1 uses `nunique()`: `≤ 1` → drop, `> 5` → keep, `2–5` → pass to Tier 2 which runs an exact mode-frequency check with `np.unique`. Requires ≥ 30 non-NaN values per column.
 
-**Purpose:** Remove near-constant features where ≥97% of non-NaN values are identical. These provide no information gain for tree splits.
+**Pre-screen.** When a source has > 5,000 features (FRED Employment), Stage 0 runs a vectorized Spearman pre-screen with BH-FDR α = 0.30 before passing anything to Stage 1. Empirically this cuts Stage 1 input by ~78% (~10+ min → ~2 min) with zero observed signal loss.
 
-**Two-tier approach for efficiency on large feature sets:**
+### Stage 1 — Dual filter
 
-- **Tier 1 (fast):** `nunique()` classification:
-  - `nunique ≤ 1` → constant → **drop**
-  - `nunique > 5` → variable → **keep** (impossible for 97% to be one value)
-  - `nunique 2–5` → ambiguous → pass to Tier 2
-- **Tier 2 (exact):** `np.unique()` per-column for the ambiguous set, computing the exact mode frequency.
+Two parallel signals are unioned.
 
-**Minimum observations:** Requires at least 30 non-NaN values per column.
+**A) Purged expanding correlation.** `_purged_expanding_corr()` + `_deduplicate_group()`.
 
-**Pre-screen (>5,000 features):** When a source has more than 5,000 features (e.g., FRED Employment at ~17k), Stage 0 includes a vectorized Spearman pre-screen with BH-FDR α=0.30. This reduces Stage 1 input by ~78%, cutting runtime from ~10+ minutes to ~2 minutes with zero empirical signal loss.
+$$\text{weighted\_corr} = \frac{\sum_w w \cdot |\rho_w|}{\sum_w w}, \qquad w = \sqrt{\text{window\_size}}$$
 
----
+A 3-month purge gap separates training and evaluation windows to prevent information bleed. Expanding (not rolling) windows handle staggered start dates (FRED 1948, ADP 2001, Prosper 2009). Spearman is used instead of Pearson for monotonic robustness.
 
-### 7.1 Stage 1: Dual Filter
+**Deduplication via hierarchical clustering.** Spearman correlation matrix → agglomerative clustering with average linkage (threshold 0.95) → keep the per-cluster feature with highest target correlation. For massive groups (> 5,000), the deduper chunks first, then iteratively merges with shuffling to expose cross-chunk correlations.
 
-Two independent signals are combined: statistical correlation and tree-based importance.
+**B) Random-subspace LightGBM.** Trains many small LightGBM models on random feature subsets, aggregating gain importance to capture non-linear signal that correlation alone misses.
 
-**A) Purged Expanding Correlation**
+### Stage 2 — Boruta
 
-**Function:** `_purged_expanding_corr()` + `_deduplicate_group()`
+Shadow-feature permutation test (100 runs offline, 50 runs in dynamic reselection mode). For each iteration, every real feature is paired with a permuted "shadow" copy; the model is trained on real + shadow; the shadow max is recorded; a real feature is "confirmed" if its importance exceeds shadow max in a statistically significant number of iterations (binomial test). Capped at 500 features to prevent memory blow-up.
 
-Computes the relationship between each feature and the target using expanding (not rolling) windows with a purge gap:
+### Stage 3 — Vintage stability
 
-```
-weighted_corr = mean(correlations, weights = sqrt(window_sizes))
-```
+Rejects features whose predictive relationship with the target has structurally shifted over time. Exponential recency weighting across hard-coded macro regimes (defined in [`create_master_snapshots.py`](Data_ETA_Pipeline/create_master_snapshots.py:79)):
 
-- **3-month purge gap** between training and evaluation windows prevents information leakage across adjacent time points.
-- **Expanding windows** (not rolling) with multiple evaluation points handle staggered start dates (FRED starts ~1948, ADP starts ~2010).
-- **Weighting:** Larger windows get more weight via `sqrt(window_size)`.
+| Regime | Start |
+|---|---|
+| Pre-GFC Great Moderation | 1998-01-01 |
+| GFC Shock + Repair | 2008-01-01 |
+| Late-Cycle Long Expansion | 2015-01-01 |
+| COVID Shock + Great Resignation | 2020-03-01 |
+| Inflation Tightening & Soft Landing | 2022-03-01 |
+| AI and Trump Era with More Volatility | 2025-02-01 |
 
-**Deduplication via Hierarchical Clustering:**
-- Spearman correlation matrix computed (correlation threshold = 0.95)
-- Agglomerative clustering with average linkage
-- From each cluster, the feature with highest target correlation is kept
-- **Chunked processing** for massive groups (>5,000 features):
-  - Phase 1: Chunk dedup locally (within chunks)
-  - Phase 2: Iterative merge with shuffling to expose cross-chunk correlations
+**Recency windows.** Default 3 months; NOAA gets 6 months (storms are inherently noisier).
 
-**B) Random Subspace LightGBM:**
-Trains models on random feature subsets to capture non-linear importance that correlation alone would miss.
+### Stage 4 — Cluster redundancy
 
----
+NaN-aware Spearman hierarchical clustering. Because different features have different histories, standard Pearson/Spearman correlation either drops most rows or produces unstable estimates. The NaN-aware implementation computes pairwise correlations using only the overlapping non-NaN periods. From each cluster, the feature with the strongest target correlation is retained.
 
-### 7.2 Stage 2: Boruta
+### Stage 5 — Interaction rescue *(omitted by default)*
 
-**Purpose:** Shadow-feature randomized permutation test (100 runs) to identify features that are genuinely more important than random noise.
+Two-phase: single-feature and split-pair interactions. Recovers features whose marginal importance is weak but joint importance is large. Omitted because the train-time short-pass already re-derives interactions each step.
 
-**Algorithm:**
-1. For each of 100 iterations, create "shadow features" by randomly permuting each real feature's values.
-2. Train LightGBM on real + shadow features together.
-3. Record the maximum importance among all shadow features (the "shadow max").
-4. A real feature is "confirmed" if its importance exceeds the shadow max in a statistically significant number of iterations (binomial test).
+### Stage 6 — Sequential forward selection *(omitted by default)*
 
-**Guard:** Maximum 500 features passed to Boruta to prevent memory explosion on very wide datasets.
+Walk-forward greedy SFS with embargo. Was briefly re-enabled in May 2026 against the fusion-composite objective; reverted on 2026-05-15 after `patience=3 / min_mae_improvement_pct=0.5%` collapsed the surviving feature count from ~80 to ~13–17 and pushed fusion MAE from 93.96 to 100.61.
 
----
-
-### 7.3 Stage 3: Vintage Stability
-
-**Purpose:** Reject features whose predictive relationship with the target has structurally shifted over time. A feature that was highly correlated with NFP in 2005 but uncorrelated since 2020 is unstable and unreliable.
-
-**Mechanism:** Exponential recency weighting across hard-coded macroeconomic regimes:
-
-| Regime | Start Date | Description |
-|---|---|---|
-| Pre-GFC Great Moderation | 1998-01-01 | Stable macro environment |
-| GFC Shock + Repair | 2008-01-01 | Financial crisis and recovery |
-| Late-Cycle Long Expansion | 2015-01-01 | Extended post-GFC expansion |
-| COVID Shock + Great Resignation | 2020-03-01 | Pandemic disruption |
-| Inflation Tightening & Soft Landing | 2022-03-01 | Fed rate hike cycle |
-| AI and Trump Era | 2025-02-01 | Current regime |
-
-**Recency windows:**
-- Default: 3 months
-- NOAA: 6 months (weather data is inherently noisier)
-
-Features must maintain stable predictive power across recent regimes to pass this stage.
-
----
-
-### 7.4 Stage 4: Cluster Redundancy
-
-**Purpose:** Collapse groups of collinear survivors into single representatives, reducing redundancy without losing coverage.
-
-**Method:** NaN-aware Spearman hierarchical clustering.
-
-The key innovation is NaN-awareness: since different features have different historical coverage (FRED starts 1948, ADP starts 2001, Prosper starts 2009), standard Pearson/Spearman correlation would either drop most rows or produce unreliable estimates. The NaN-aware implementation computes pairwise correlations using only the overlapping non-NaN periods for each pair.
-
-From each cluster, the feature with the strongest target correlation is retained.
-
----
-
-### 7.5 Stage 5: Interaction Rescue (Optional)
-
-**Purpose:** Recover features that appear individually weak but interact powerfully with other features or the target.
-
-**Two-phase detection:**
-1. **Single-feature interactions:** Features whose importance jumps when combined with specific other features.
-2. **Split-pair interactions:** Pairs of features that, when split on jointly, reveal structure invisible in marginal analysis.
-
-Omitted from the default pipeline (Stage 5 is redundant with train-time short-pass selection).
-
----
-
-### 7.6 Stage 6: Sequential Forward Selection (Optional)
-
-**Purpose:** Walk-forward cross-validation with embargo to greedily build the optimal feature subset.
-
-**Algorithm:** Starting with an empty set, iteratively add the feature that most improves out-of-sample prediction accuracy (with an embargo period between train and test to prevent leakage). Stop when adding features yields diminishing returns.
-
-Omitted from the default pipeline (computationally expensive, redundant with train-time selection).
-
----
-
-### Feature Selection Caching
-
-Results are cached at three levels to support incremental reruns:
+### Caching layout
 
 | Cache | Location | TTL | Key |
 |---|---|---|---|
-| Per-source | `source_caches/source_{source}_{target}_{source}.json` | 30 days | Source name + target config |
-| Per-regime | `regime_caches/selected_features_{target}_{source}_{cutoff}.json` | 30 days | Cutoff month |
-| Branch-level | `selected_features_{target_type}_{target_source}.json` | 30 days | Branch mode |
+| Per-source | `source_caches/source_{source}_{target}_{source}.json` | 30 days | source + target config |
+| Per-regime | `regime_caches/selected_features_{target}_{source}_{cutoff}.json` | 30 days | regime cutoff month |
+| Branch-level | `selected_features_{target_type}_{target_source}.json` | 30 days | target branch |
 
-Cache version: `"2026-02-24-regime-cache-v1"`.
+Cache schema version: `"2026-02-24-regime-cache-v1"`.
 
 ---
 
-## 8. Master Snapshot Aggregation
+## 8. Master snapshot aggregation
 
-**File:** `Data_ETA_Pipeline/create_master_snapshots.py`
+**File:** [`Data_ETA_Pipeline/create_master_snapshots.py`](Data_ETA_Pipeline/create_master_snapshots.py)
 
-**Purpose:** Combine all 7 source-specific snapshot directories into a single wide-format `.parquet` file per month, with automatic feature selection applied.
-
-**Source directories:**
+Combines all 9 source-specific snapshot directories into a single wide-format `.parquet` per target month. Sources, in execution order (longest-runtime first, so ProcessPool stays busy):
 
 ```python
 SOURCES = {
     'FRED_Employment_NSA': DATA_PATH / "fred_data_prepared_nsa" / "decades",
-    'FRED_Employment_SA':  DATA_PATH / "fred_data_prepared_sa" / "decades",
-    'FRED_Exogenous':      DATA_PATH / "Exogenous_data" / "exogenous_fred_data" / "decades",
-    'Unifier':             DATA_PATH / "Exogenous_data" / "exogenous_unifier_data" / "decades",
-    'ADP':                 DATA_PATH / "Exogenous_data" / "ADP_snapshots" / "decades",
-    'NOAA':                DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots" / "decades",
-    'Prosper':             DATA_PATH / "Exogenous_data" / "prosper" / "decades",
+    'FRED_Employment_SA':  DATA_PATH / "fred_data_prepared_sa"  / "decades",
+    'FRED_Exogenous':      DATA_PATH / "Exogenous_data" / "exogenous_fred_data"     / "decades",
+    'Unifier':             DATA_PATH / "Exogenous_data" / "exogenous_unifier_data"  / "decades",
+    'ADP':                 DATA_PATH / "Exogenous_data" / "ADP_snapshots"           / "decades",
+    'NOAA':                DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots"/ "decades",
+    'Prosper':             DATA_PATH / "Exogenous_data" / "prosper"                 / "decades",
+    'Futures':             DATA_PATH / "Exogenous_data" / "exogenous_futures_data"  / "decades",
+    'EconomistPanel':      DATA_PATH / "Exogenous_data" / "exogenous_economist_data"/ "decades",
 }
 ```
 
-**Target combos:**
+**Target combos.**
 
 ```python
 TARGET_COMBOS = [('nsa', 'revised'), ('sa', 'revised')]
 ```
 
-**Feature selection target modes:**
+Both NSA and SA master snapshots are built (the SA snapshots are still consumed by the consensus-anchor stage for its PIT consensus loader and as the SA-revised actuals; the SA LightGBM itself is retired).
 
-| Mode | Use Case | Description |
+**Feature-selection target modes.**
+
+| Mode | When used | Target signal |
 |---|---|---|
-| `'mom'` | NSA targets | Feature selection target = month-over-month change |
-| `'delta_mom'` | — | Change in MoM (acceleration) |
-| `'model_aligned'` | SA targets | Blended objective: level (0.30) + MoM_diff (0.55) + direction (0.15) |
+| `'mom'` | NSA branch | Month-over-month change |
+| `'delta_mom'` | — | Acceleration (Δ MoM) |
+| `'model_aligned'` | SA branch | Blended: level (0.30) + MoM_diff (0.55) + direction (0.15) |
 
-**Data start floor:** `1990-01-01` — Pre-1990 data is extremely sparse for non-FRED sources and degrades selection quality.
+**Data start floor.** `1990-01-01`. Pre-1990 data is extremely sparse for non-FRED sources and degrades selection quality.
 
-**Execution order (by runtime):**
-1. FRED_Employment_NSA
-2. FRED_Employment_SA
-3. FRED_Exogenous
-4. Unifier
-5. Prosper
-6. NOAA
-7. ADP
+**Execution order.** `FRED_Employment_NSA → FRED_Employment_SA → FRED_Exogenous → Unifier → Prosper → NOAA → ADP → Futures → EconomistPanel`.
 
-**Feature selection stages (configurable via `NFP_FS_STAGES` env var):**
-- Default: `(0, 1, 2, 3, 4)` — ~5 min/source
-- Fast: `NFP_FS_STAGES="0,1,4"` — ~3 min/source
-- Full: `NFP_FS_STAGES="0,1,2,3,4,5,6"` — ~10 min/source
+**Stage selection via env var.**
 
-**Output:**
+```bash
+NFP_FS_STAGES="0,1,2,3,4"         # default — ~5 min/source
+NFP_FS_STAGES="0,1,4"             # fast    — ~3 min/source
+NFP_FS_STAGES="0,1,2,3,4,5,6"     # full    — ~10 min/source
+```
+
+**Output layout.**
 
 ```
 DATA_PATH/master_snapshots/{nsa|sa}/revised/decades/{decade}s/{year}/{YYYY-MM}.parquet
 ```
 
----
-
-## 9. Training Pipeline — Deep Dive
-
-### 9.1 Data Loading
-
-**File:** `Train/data_loader.py`
-
-The data loader bridges ETL output to training input. Key functions:
-
-**`load_master_snapshot(target_month, target_type, target_source)`** — Loads the pre-merged, feature-selected wide-format parquet for a given month. Results are cached in a module-level `_snapshot_cache` dictionary to avoid redundant I/O during the expanding-window backtest.
-
-**`load_target_data(target_type, release_type, target_source)`** — Loads the NFP target series (`y_mom`). For revised targets, reads the `_audit_asof_*.parquet` files to determine boundary vintage availability.
-
-**`pivot_snapshot_to_wide(snapshot_df)`** — Converts long-format source snapshots to wide-format training features. Feature names are sanitized (replacing `%`, `+`, `[`, `]`, etc.) for LightGBM compatibility.
-
-**`batch_lagged_target_features(y_series, months)`** — Vectorized computation of lagged target features. For each snapshot month, computes 9 derived features from the target itself (latest, MoM, MoM%, 3m, 6m, YoY, 12m_pct, rolling_3m, volatility).
-
-**NOAA staleness handling:** Since NOAA data arrives ~75 days late, a forward-fill of up to `NOAA_MAX_FFILL_MONTHS = 6` months is applied, with a staleness indicator (`__staleness_months`) feature tracking how stale the data is.
-
-**NaN philosophy:** No imputation. LightGBM handles NaN natively via its split-finding algorithm. Different features have different start dates (FRED ~1948, ADP ~2001, Prosper ~2009), and forcing imputation would introduce artificial patterns.
+Selection JSON cache: `DATA_PATH/master_snapshots/selected_features_{nsa|sa}_revised.json`. When this file has `"mode": "all_features"`, the master snapshots store every lean feature and selection is deferred to walk-forward time (the production setup).
 
 ---
 
-### 9.2 Feature Engineering
+## 9. Training pipeline — deep dive
 
-**File:** `Train/feature_engineering.py`
+### 9.1 Data loading
 
-Calendar and structural features that capture BLS-specific timing patterns:
+**File:** [`Train/data_loader.py`](Train/data_loader.py)
 
-**Cyclical encoding (preserves December → January proximity):**
+| Function | Role |
+|---|---|
+| `load_master_snapshot(target_month, target_type, target_source)` | Loads the pre-merged, "all-features" wide parquet. Module-level `_snapshot_cache` avoids redundant I/O during the walk-forward. |
+| `load_target_data(target_type, release_type, target_source)` | Loads `y_mom` from the target parquet. For revised targets, also reads `_audit_asof_*.parquet` to determine boundary vintage availability. |
+| `pivot_snapshot_to_wide(snapshot_df, target_month, cutoff_date)` | Long → wide pivot with PIT cutoff enforcement. Column names sanitized for LightGBM. |
+| `batch_lagged_target_features(y_series, months)` | Vectorized branch-target lag features (9 per series, see §6.1). |
 
-```
-month_sin = sin(2π × month / 12)
-month_cos = cos(2π × month / 12)
-quarter_sin = sin(2π × quarter / 4)
-quarter_cos = cos(2π × quarter / 4)
-```
+**NOAA staleness handling.** Because NOAA arrives ~75 days late, a forward-fill of up to `NOAA_MAX_FFILL_MONTHS = 6` months is applied, with a `__staleness_months` indicator so the model can learn to discount stale weather data.
 
-This is superior to one-hot encoding for tree models because it represents the circular nature of time — December (month 12) is mathematically adjacent to January (month 1).
+**NaN philosophy.** No imputation. LightGBM consumes NaN natively; different sources have genuinely different start dates and forcing imputation would invent patterns that did not exist.
 
-**Survey interval features:**
+### 9.2 Feature engineering
 
-The BLS defines the NFP reference week as the pay period containing the 12th of the month. The function `get_survey_week_date()` finds the Sunday beginning that week, and `calculate_weeks_between_surveys()` computes the gap:
+**File:** [`Train/feature_engineering.py`](Train/feature_engineering.py)
 
-```
-weeks_since_last_survey = days_between_12ths / 7   (typically 4 or 5)
-is_5_week_month = 1 if weeks_since_last_survey == 5 else 0
-```
+**Cyclical calendar encoding.** Preserves December ↔ January adjacency that one-hot encoding would break:
 
-This is critical for NSA prediction: a 5-week interval allows more accumulated job growth/loss between survey periods, systematically inflating NSA counts.
+$$\text{month\_sin} = \sin(2\pi \cdot \text{month}/12), \quad \text{month\_cos} = \cos(2\pi \cdot \text{month}/12)$$
 
-**BLS timing indicators:**
-- `is_jan = 1` — January: BLS updates seasonal adjustment factors (structural break risk)
-- `is_july = 1` — July: Mid-year benchmark revision month
-- `year` — Secular trend capture
+Same construction for `quarter_sin / quarter_cos`.
 
-**SA calendar filtering:** SA series have seasonality stripped by BLS, so month/quarter cyclical encodings and seasonal flags are redundant. Only `weeks_since_last_survey`, `is_5_week_month`, and `year` are kept for SA models (configured via `SA_CALENDAR_FEATURES_KEEP` in `config.py`).
-
----
-
-### 9.3 Expanding Window Backtest
-
-**File:** `Train/train_lightgbm_nfp.py`
-
-The core of the entire system. The expanding window backtest simulates real-time deployment by marching forward one month at a time:
+**Survey-interval features.** The BLS reference week is the pay period containing the 12th of the month. `get_survey_week_date()` finds the Sunday beginning that week, and `calculate_weeks_between_surveys()` computes the gap (typically 4 or 5 weeks):
 
 ```
-FOR each target_month in [oldest_backtest_month, ..., latest]:
-    1. EXPANDING WINDOW: X_train = all data strictly before target_month
-    2. FEATURE ENGINEERING: Calendar + employment lags + revision features (parallel via joblib)
-    3. DYNAMIC FEATURE SELECTION: If reselection is due (every N months):
-         - Pass 1: Per-source selection (stages 0,2,4,5) independently
-         - Pass 2: Global cross-source reduction to ≤ 50 features
-    4. SHORT-PASS SELECTION: Top-K from candidate pool (LightGBM gain or weighted corr)
-    5. HYPERPARAMETER TUNING: Optuna (every TUNE_EVERY_N_MONTHS = 12 months)
-    6. MODEL TRAINING: LightGBM on selected features with sample weights
-    7. VARIANCE ENHANCEMENTS: Sequential stack (amplitude → shock → dynamics → acceleration → regime)
-    8. PREDICTION: Forecast for target_month with confidence intervals
-    9. BASELINES: Compute naive baseline predictions
-   10. STORE: Result row with prediction, error, intervals, directional accuracy
+weeks_since_last_survey = days_between_12ths / 7
+is_5_week_month        = 1 if weeks_since_last_survey == 5 else 0
 ```
 
-**No time-travel guarantee:**
+A 5-week interval lets more job growth accumulate between survey weeks and systematically inflates NSA counts — critical for the NSA branch.
+
+**BLS-timing indicators.**
+
+- `is_jan` — January: BLS updates seasonal-adjustment factors (structural-break risk)
+- `is_july` — Mid-year benchmark revision month
+- `year` — Secular trend
+
+**SA calendar filtering.** SA series have seasonality stripped by BLS, so month/quarter cyclical encodings and seasonal flags are redundant. Only `weeks_since_last_survey`, `is_5_week_month`, and `year` are kept for SA (`SA_CALENDAR_FEATURES_KEEP` in `config.py`).
+
+### 9.3 Expanding-window backtest
+
+**File:** [`Train/train_lightgbm_nfp.py`](Train/train_lightgbm_nfp.py)
+
+The core of the system. The walk-forward simulates real-time deployment:
+
+```text
+FOR each target_month in [oldest_backtest_month .. latest]:
+  1. EXPANDING WINDOW: X_train = all rows whose release_date < nfp_release_date(target_month)
+  2. FEATURE ENGINEERING: calendar + survey-week + branch-target lags + revision deltas + NSA-accel
+                          (parallelized via joblib)
+  3. DYNAMIC RESELECTION: every 24 months (RESELECT_EVERY_N_MONTHS):
+       Pass 1 — per-source FS (stages 0,2,4,5), uniform weights, 2000-01-01 onward
+       Pass 2 — global cross-source reduction to ≤ 80 features
+  4. SHORT-PASS: top-60 features per step (LightGBM gain), branch-target features merged on top
+  5. HYPERPARAMETER TUNING: Optuna every 12 months (TUNE_EVERY_N_MONTHS)
+                            objective = fusion-CV composite (NSA_TUNE_USE_KALMAN_FUSION=True)
+  6. MODEL TRAINING: LightGBM on selected features with exp-decay sample weights
+  7. VARIANCE ENHANCEMENTS: amplitude → shock → dynamics → acceleration → regime
+                            each stage kept only if Δcomposite ≥ 0.25
+  8. PREDICTION: forecast for target_month + 50/80/95% empirical intervals
+  9. BASELINES: prior_y / rolling_mean_6 from training data only
+  10. STORE: { ds, actual, predicted, error, intervals, coverage, dir_correct, accel_correct, … }
+```
+
+**No time travel.**
+
 - Model retrained from scratch each step
-- Features strictly from data available BEFORE `target_month`
-- Release-date cutoff (not `target_month`) matches real-world data availability
-- COVID winsorization applied per-fold (not globally), preventing leakage of the knowledge that COVID happened
+- Features strictly from data released before `nfp_release_date(target_month)`
+- Release-date cutoff (not target month) matches real-world data availability
+- COVID winsorization applied **per fold** — the model doesn't "know" COVID happened until the expanding window reaches March 2020
 
-**Directional accuracy tracking:**
+**Directional & acceleration accuracy.**
+
+$$\text{dir\_correct} = \mathbb{1}\big[\text{sign}(y_t) = \text{sign}(\hat{y}_t)\big]$$
+$$\text{accel\_correct} = \mathbb{1}\big[\text{sign}(\hat{y}_t - y_{t-1}) = \text{sign}(y_t - y_{t-1})\big]$$
+
+The second formula is the **operational** definition used throughout the consensus-anchor stage: a forecast is "accelerating correctly" when it bets in the same direction (relative to the last *actual*) as the realised move.
+
+### 9.4 Dynamic feature reselection
+
+Master snapshots are built in "all-features" mode, so dynamic reselection at walk-forward time is the **sole** feature-selection path.
+
+**Two-pass architecture (Train/train_lightgbm_nfp.py:_dynamic_reselection).**
+
+| Pass | Scope | Stages | Hard cap |
+|---|---|---|---|
+| Pass 1 | Per source (FRED Employment NSA/SA, FRED Exogenous, Unifier, ADP, NOAA, Prosper, Futures, EconomistPanel) | `(0, 2, 4, 5)` — light pre-funnel + Boruta + Cluster + Interaction | per-source quota |
+| Pass 2 | Cross-source union + target-derived + calendar + revision | `(0, 2, 4)` — global Pre-funnel + Boruta + Cluster (SFS reverted 2026-05-15) | `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` |
+
+**Reselection frequency.** Controlled by `RESELECT_EVERY_N_MONTHS` (`.env` ships `24`). At 24 months, a 60-month backtest gets ~3 reselection events plus the initial bootstrap.
+
+**Sample weighting for reselection.** Equal weights (`RESELECTION_HALF_LIFE_MONTHS = 9999`) — empirically, recency-biased reselection (HL=36) caused massive feature churn (Jaccard 0.23 between consecutive reselections). Equal weights select features with **durable** long-term predictive power; the per-step short-pass handles short-term adaptation.
+
+**NaN evaluation window.** Features are judged on their NaN rate from `2010-01-01` onward (`DYNAMIC_FS_NAN_EVAL_START`). Pre-2010 NaN is tolerated since many sources didn't exist before then. Maximum acceptable NaN rate: 20% (`DYNAMIC_FS_NAN_MAX_RATE`).
+
+**Per-window cache.** Each reselection writes its survivors to `_output/dynamic_selection/{target}_{source}/{step_date}.json`. With `RESELECT_EVERY_N_MONTHS=24` and a 60-month backtest, this typically contains 4–5 JSONs:
 
 ```
-dir_correct    = sign(actual) == sign(prediction)
-accel_correct  = sign(Δactual) == sign(Δprediction)
-    where Δ = MoM[t] - MoM[t-1]
+_output/dynamic_selection/nsa_revised/
+├── 2021-06.json
+├── 2022-05.json
+├── 2023-05.json
+├── 2024-05.json
+└── 2026-05.json   ← step_date for current production run
 ```
 
-**Output per backtest step:**
-```python
-result_row = {
-    'ds': target_month,
-    'actual': actual_value,
-    'predicted': predicted_value,
-    'error': actual - predicted,
-    'lower_50', 'upper_50', 'lower_80', 'upper_80', 'lower_95', 'upper_95',
-    'in_50_interval', 'in_80_interval', 'in_95_interval',
-    'n_train_samples', 'n_features',
-    'dir_correct', 'accel_correct',
-    'prediction_strategy',  # 'base', 'amplitude', 'shock', etc.
-    'baseline_last_y', 'baseline_last_y_error',
-    'baseline_rolling_mean_6', 'baseline_rolling_mean_6_error',
-}
-```
+**Replay mode** (`USE_PER_WINDOW_FEATURES=True`). Reuses the saved JSON cohort to reproduce a prior reselection run without re-running the slow feature-selection stage — handy for re-tuning the fusion against a fixed feature schedule. Best-known schedules are preserved under [`Best_features_selected/`](Best_features_selected/).
 
----
+### 9.5 NSA acceleration features
 
-### 9.4 Dynamic Feature Selection
+**File:** [`Train/nsa_acceleration.py`](Train/nsa_acceleration.py)
 
-When master snapshots contain ALL lean features (indicated by `mode: "all_features"` in the feature selection cache), dynamic reselection is the sole feature selection path.
+Originally designed for the (now-retired) SA LightGBM, these 8 PIT-safe features encode the NSA channel's directional / acceleration signal. They are still computed during the walk-forward and used (a) by the Kalman fusion's NSA observation channel and (b) as injected features when training an SA model (only invoked when an SA branch is enabled, which is no longer the default).
 
-**Two-pass architecture:**
-
-**Pass 1 (per-source):** Run feature selection independently on each source's features using stages (0, 1, 2, 4, 5, 6):
-- FRED Employment NSA
-- FRED Employment SA
-- FRED Exogenous
-- Unifier
-- ADP
-- NOAA
-- Prosper
-
-**Pass 2 (global):** Combine all Pass-1 survivors plus target-derived features, then reduce to a hard cap of `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` using stages (0, 1, 2, 4).
-
-**Reselection frequency:** Controlled by `RESELECT_EVERY_N_MONTHS` (default: 6), loaded from `.env` via `settings.py`.
-
-**NaN evaluation window:** Features are judged on NaN rate from `2010-01-01` onward. Earlier NaN (from pre-2010 data gaps) is tolerated since many sources simply didn't exist before then. Maximum acceptable NaN rate: 20% (`DYNAMIC_FS_NAN_MAX_RATE`).
-
-**Uniform sample weighting for reselection:**
-- `RESELECTION_HALF_LIFE_MONTHS = 9999` — Effectively uniform weights (no recency decay), selecting features with durable long-term predictive power
-- `RESELECTION_START_DATE = '2000-01-01'` — Only start adaptive reselection when sufficient data exists
-- Stage config: Pass 1 uses `RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)`, Pass 2 uses `RESELECTION_STAGES_PASS2 = (0, 2, 4)`
-- `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` — Hard cap after global reduction
-
----
-
-### 9.5 NSA Acceleration Features for SA
-
-**File:** `Train/nsa_acceleration.py`
-
-When running `--train-all`, the NSA model trains first. Its backtest results are then used to compute 8 PIT-safe acceleration features that are injected into the SA model's training data at each backtest step:
-
-| Feature | Description |
-|---------|-------------|
-| `nsa_pred_delta` | NSA predicted MoM change: `nsa_pred[t] - actual_nsa[t-1]` |
-| `nsa_pred_accel` | NSA predicted acceleration (2nd derivative) |
-| `nsa_pred_direction` | Sign of `nsa_pred_delta` |
-| `nsa_actual_accel` | Actual NSA acceleration at t-1 (from revised target) |
+| Feature | Definition |
+|---|---|
+| `nsa_pred_delta` | $\hat{y}^{nsa}_t - y_{t-1}^{nsa}$ — predicted MoM change |
+| `nsa_pred_accel` | Predicted 2nd derivative |
+| `nsa_pred_direction` | sign(`nsa_pred_delta`) |
+| `nsa_actual_accel` | $y_{t-1} - y_{t-2}$ from revised target |
 | `nsa_accel_accuracy_12m` | Rolling 12-month NSA acceleration accuracy (credibility) |
 | `nsa_residual_trend_6m` | Slope of NSA residuals (bias drift signal) |
-| `nsa_sa_accel_corr_12m` | Rolling correlation of NSA vs SA acceleration (bridge) |
-| `nsa_sa_gap_delta` | Change in SA-NSA gap (seasonal adjustment dynamics) |
+| `nsa_sa_accel_corr_12m` | Rolling correlation of NSA vs SA acceleration |
+| `nsa_sa_gap_delta` | $\Delta (SA - NSA)$ — seasonal adjustment dynamics |
 
-These features are **always included** (like calendar features) — not subject to dynamic reselection. They bridge the NSA model's acceleration signal into SA space.
+**Short-pass selection** (`Train/short_pass_selection.py`): `SHORTPASS_TOPK = 60`, `SHORTPASS_METHOD = 'lgbm_gain'`. Features with < 10 valid observations get `corr = 0` to suppress spurious selection from sparse coverage.
 
-**Short-pass selection configuration** (`Train/short_pass_selection.py`):
-- `SHORTPASS_TOPK = 60` — Features selected per step (configurable in 40–80 range)
-- `SHORTPASS_METHOD = 'lgbm_gain'` — Default method (alternative: `'weighted_corr'`)
-- `SHORTPASS_HALF_LIFE = None` — Reuses the backtest step's half-life
+### 9.6 Branch-target feature selection
 
-Features with fewer than 10 valid observations get `corr = 0` to prevent spurious selection from sparse coverage.
+**File:** [`Train/branch_target_selection.py`](Train/branch_target_selection.py)
 
----
+Target-derived features (e.g. `nfp_nsa_mom_lag6`, `nfp_nsa_rolling_3m`) are selected **separately** from snapshot features and merged on top. Redundancy is greedy-correlation pruned at `corr_threshold = 0.90, min_overlap = 24`.
 
-### 9.6 Branch-Target Feature Selection
+**Ranking methods.**
 
-**File:** `Train/branch_target_selection.py`
-
-Target-derived features (e.g., `nfp_nsa_MoM`, `nfp_nsa_rolling_3m`) are selected separately from snapshot features and merged on top.
-
-**Redundancy pruning:** Greedy correlation-based pruning with `corr_threshold = 0.90` and `min_overlap = 24` months.
-
-**Ranking methods:**
-
-**A) `weighted_corr`** (used for NSA): Simple weighted absolute correlation with target.
-
-**B) `dynamics_composite`** (used for SA): Multi-signal composite ranking designed to capture variance dynamics:
+- **`weighted_corr`** (NSA default): simple weighted |corr(feature, target)|.
+- **`dynamics_composite`** (SA, when active): multi-signal composite:
 
 | Signal | Weight | Formula |
-|---|---|---|
-| Level correlation | 0.25 | `corr(feature, y)` |
-| Delta correlation | 0.25 | `corr(Δfeature, Δy)` |
-| Direction separation | 0.15 | `tanh(effect_size)` for sign separation |
-| Magnitude correlation | 0.20 | `corr(|Δfeature|, |Δy|)` |
-| Sign agreement | 0.10 | Coherence of `sign(Δfeature)` vs `sign(Δy)` |
+|---|---:|---|
+| Level correlation | 0.25 | $\rho(x, y)$ |
+| Delta correlation | 0.25 | $\rho(\Delta x, \Delta y)$ |
+| Direction separation | 0.15 | $\tanh(\text{effect\_size})$ on $\text{sign}(\Delta x)$ |
+| Magnitude correlation | 0.20 | $\rho(\|\Delta x\|, \|\Delta y\|)$ |
+| Sign agreement | 0.10 | Coherence of $\text{sign}(\Delta x)$ vs $\text{sign}(\Delta y)$ |
 | Tail amplitude | 0.05 | Alignment in extreme regimes |
 
-**Selection counts:**
-- Default: `BRANCH_TARGET_FS_TOPK = 8` features
-- Variance-priority targets (SA): `BRANCH_TARGET_FS_TOPK_VARIANCE = 20` features
+**Counts.** `BRANCH_TARGET_FS_TOPK = 8` default; `BRANCH_TARGET_FS_TOPK_VARIANCE = 20` for variance-priority targets (SA).
 
----
+### 9.7 Sample weighting
 
-### 9.7 Sample Weighting
+**File:** [`Train/model.py`](Train/model.py) — `calculate_sample_weights()`
 
-**File:** `Train/model.py` — `calculate_sample_weights()`
+Exponential-decay weighting:
 
-Recent observations are more relevant than distant ones. The pipeline uses exponential decay weighting:
+$$w_i = \exp\left(-\ln 2 \cdot \frac{\text{distance\_months}}{\text{half\_life}}\right), \qquad \text{distance\_months} = \frac{t_{\text{target}} - t_i}{30.436875}$$
 
-```
-w_i = exp(-ln(2) × distance_months / half_life_months)
+with $\text{half\_life} \in [12, 120]$ months, tuned by Optuna. Weights are renormalised so $\overline{w} = 1$ (preserves LightGBM's learning-rate scale).
 
-where:
-    distance_months = (target_month - sample_date) / 30.436875
-    half_life_months ∈ [12, 120], tuned by Optuna
-```
+**Tail-aware boost (variance-priority targets).**
 
-Weights are normalized so `mean(w) = 1.0`, preserving LightGBM's learning rate scale.
-
-**Tail-aware weighting** (for variance-priority targets):
-
-Additionally boosts the weight of observations with extreme values or large month-over-month changes:
-
-```
-mult = 1.0 (base)
-if |y_i| >= quantile(|y|, 0.80):  mult *= 1.35   (level boost)
-if |Δy_i| >= quantile(|Δy|, 0.80): mult *= 1.35  (diff boost)
+```text
+mult = 1.0
+if |y_i|        ≥ q80(|y|) : mult ×= 1.35
+if |Δy_i|       ≥ q80(|Δy|): mult ×= 1.35
 mult = clip(mult, 1.0, 2.50)
 w_final = w_decay × mult
 ```
 
-This ensures the model doesn't simply minimize average error while ignoring the large, important moves.
+Prevents the model from minimising mean error while ignoring the large, important moves.
 
----
+### 9.8 Model training (LightGBM)
 
-### 9.8 Model Training (LightGBM)
+**File:** [`Train/model.py`](Train/model.py) — `train_lightgbm_model()`
 
-**File:** `Train/model.py` — `train_lightgbm_model()`
-
-**Default hyperparameters:**
+**Default hyperparameters (from `DEFAULT_LGBM_PARAMS`).**
 
 ```python
-DEFAULT_LGBM_PARAMS = {
-    'objective': 'regression',    # or 'huber' for outlier robustness
-    'metric': 'mae',
+{
+    'objective': 'regression',
+    'metric':    'mae',
     'boosting_type': 'gbdt',
     'learning_rate': 0.03,
-    'num_leaves': 31,
+    'num_leaves':    31,
     'min_data_in_leaf': 5,
-    'max_depth': 6,
+    'max_depth':     6,
     'feature_fraction': 0.8,
     'bagging_fraction': 0.8,
-    'bagging_freq': 5,
-    'verbose': -1,
-    'random_state': 42,
-    'n_jobs': -1,
+    'bagging_freq':  5,
+    'verbose':       -1,
+    'n_jobs':        -1,
+    # LGBM_DETERMINISM: seeds + deterministic=True + force_col_wise=True
+    # → bit-identical predictions across runs, regardless of n_jobs
+    'random_state':  42, 'seed': 42, 'bagging_seed': 42,
+    'feature_fraction_seed': 42, 'data_random_seed': 42, 'extra_seed': 42,
+    'objective_seed': 42, 'deterministic': True, 'force_col_wise': True,
 }
 ```
 
-**Training process:**
+**Training process.**
 
-1. **Data cleaning:** Replace `inf` with `NaN` (LightGBM handles NaN but not inf). Only drop rows where the target is NaN — NaN features are kept (LightGBM's native split-finding handles them mathematically).
+1. **Cleaning.** Replace `inf` with `NaN`. Drop rows where the target is NaN. Keep NaN features (LightGBM handles them natively).
+2. **CV phase.** 5-fold `TimeSeriesSplit`, train on earlier folds, validate on later, accumulate OOF predictions + residuals.
+3. **Final fit.** Train on all data with an 85/15 chronological split for early stopping (`EARLY_STOPPING_ROUNDS = 50`, max `NUM_BOOST_ROUND = 1000`).
+4. **Feature importance.** Gain-based, top 15 logged.
 
-2. **Cross-validation phase** (5-fold `TimeSeriesSplit`):
-   - For each fold: train on chronologically earlier data, validate on later data.
-   - Accumulate out-of-fold (OOF) predictions and residuals.
-   - No data leakage: fold splits are strictly temporal.
+**Why LightGBM.** Its split-finding tries both branches for missing values and picks the side that maximises gain — which is exactly what you want for staggered historical datasets.
 
-3. **Final model phase:**
-   - Train on all data with an 85% / 15% chronological split for early stopping.
-   - Early stopping patience: 50 rounds.
-   - Maximum boosting rounds: 1,000.
+### 9.9 Hyperparameter tuning (Optuna)
 
-4. **Feature importance:** Extracted by gain (how much each feature reduces loss). Top 15 logged.
+**File:** [`Train/hyperparameter_tuning.py`](Train/hyperparameter_tuning.py)
 
-5. **Output:** `(trained_model, feature_importance_dict, final_residuals)`
+**Leakage-safe design.** Inner `TimeSeriesSplit` (5 folds) within each outer expanding-window step. The outer backtest provides training data up to `target_month - 1`; the inner CV splits that into train/val folds. No future data can leak.
 
-**Why LightGBM?** Its split-finding algorithm mathematically handles NaN values by trying both the left and right branch for missing values and choosing whichever reduces loss more. This is critical for our staggered historical datasets where different features have different start dates.
-
----
-
-### 9.9 Hyperparameter Tuning (Optuna)
-
-**File:** `Train/hyperparameter_tuning.py`
-
-**Leakage-safe design:** Uses inner `TimeSeriesSplit` (5 folds) within each outer expanding window step. The outer backtest provides training data up to `target_month - 1`; the inner CV splits this further into train/validation folds for hyperparameter evaluation. No future data ever leaks into the search.
-
-**Search space:**
+**Search space.**
 
 | Parameter | Range | Scale |
 |---|---|---|
-| `learning_rate` | [0.005, 0.15] | Log |
-| `num_leaves` | [15, 127] | Linear |
-| `max_depth` | [3, 8] | Linear |
-| `min_data_in_leaf` | [1, 50] | Linear |
-| `feature_fraction` | [0.4, 1.0] | Linear |
-| `bagging_fraction` | [0.5, 1.0] | Linear |
-| `bagging_freq` | [1, 10] | Linear |
-| `lambda_l1` | [1e-8, 10.0] | Log |
-| `lambda_l2` | [1e-8, 10.0] | Log |
-| `half_life_months` | [12, 120] | Linear |
-| `huber_delta` | [25, 500] | Linear (if Huber loss enabled) |
+| `learning_rate` | [0.005, 0.15] | log |
+| `num_leaves` | [15, 127] | linear |
+| `max_depth` | [3, 8] | linear |
+| `min_data_in_leaf` | [1, 50] | linear |
+| `feature_fraction` | [0.4, 1.0] | linear |
+| `bagging_fraction` | [0.5, 1.0] | linear |
+| `bagging_freq` | [1, 10] | linear |
+| `lambda_l1` | [1e-8, 10.0] | log |
+| `lambda_l2` | [1e-8, 10.0] | log |
+| `half_life_months` | [12, 120] | linear |
+| `huber_delta` | [25, 500] | linear (if Huber enabled) |
 
-**Objective function per trial:**
+**NSA tuning objective (new).** With `NSA_TUNE_USE_KALMAN_FUSION = True`, every Optuna trial scores its candidate hyperparameters by running the **full fusion pipeline** on inner-CV folds and computing the fusion-composite:
 
-For each inner CV fold:
-1. Train LightGBM with the trial's suggested parameters.
-2. Predict on the fold's validation data.
-3. Compute the fold score:
-   - If `objective_mode = 'mae'`: score = MAE (default).
-   - If `objective_mode = 'composite'`: weighted combination (see §10).
-4. Return: `mean(fold_scores)`.
+$$\text{score} = \text{MAE}_{\text{fusion}} - \lambda_{\text{accel}} \cdot \text{AccelAcc}_{\text{fusion}} - \lambda_{\text{dir}} \cdot \text{DirAcc}_{\text{fusion}}$$
 
-**Optimization:**
-- Sampler: Tree-structured Parzen Estimator (TPE) with seed=42
-- Pruner: `MedianPruner(n_startup_trials=10, n_warmup_steps=20)` — prunes unpromising trials early
-- Budget: 25 trials max, 300 second timeout
-- Re-tune frequency: Every 12 months of backtest time (`TUNE_EVERY_N_MONTHS`)
+with $\lambda_{\text{accel}} = \lambda_{\text{dir}} = 5.0$ (`KALMAN_LAMBDA_ACCEL = KALMAN_LAMBDA_DIR = 5.0`). The small positive lambdas were re-introduced 2026-05-15 after pure-MAE tuning produced a near-flat half-life surface and the iterative-fusion-tune oscillated HL across {1.19, 4.49, 1.34, 7.87} without converging. Small positive lambdas restore curvature and globally identify HL at a cost of ~0.3–0.8 MAE in exchange for ~3–5pp AccelAcc.
 
-**Warm-start:** After feature reselection, the previous best parameters are seeded as Trial 0, letting Optuna explore around a known-good prior instead of starting cold.
+This is the key insight: **NSA hyperparameters are chosen for how well they make the fusion forecast perform**, not for how well NSA fits its own y_mom. If the fusion is the deployed forecast, the fusion is the objective.
 
----
+**Optimisation.** TPE sampler (`seed=42`), `MedianPruner(n_startup_trials=10, n_warmup_steps=20)`, 25 trials, 300s timeout, re-tune every 12 months. After feature reselection, the previous best params are seeded as Trial 0 (warm start).
 
-### 9.10 Variance Enhancement Stack
+### 9.10 Variance enhancement stack
 
-After the base LightGBM prediction, a sequential stack of enhancement stages can be applied. Each stage is kept only if it improves the composite score by at least `ENHANCEMENT_MIN_IMPROVEMENT = 0.25`.
+A sequential post-base-prediction stack. Each stage is kept only if it improves the composite score by ≥ `ENHANCEMENT_MIN_IMPROVEMENT = 0.25` on the validation slice.
 
-**Enhancement sequences:**
-- **NSA:** `('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')` — Full stack
-- **SA:** `('amplitude',)` — Amplitude calibration only (RMSE improvement observed; further stages add noise)
+**NSA sequence:** `('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')` — full stack.
+**SA sequence (when applicable):** `('amplitude',)` — amplitude only; the others added noise.
 
-```
-base prediction → amplitude_cal → shock → dynamics → acceleration → regime
-                  ↓               ↓        ↓          ↓             ↓
-          Validation score evaluated at each stage
-          Keep stage if: improvement ≥ 0.25
+```text
+base → amplitude_cal → shock → dynamics → acceleration → regime
+       ↓               ↓        ↓           ↓             ↓
+        validation composite evaluated at each stage; stage kept iff Δscore ≥ 0.25
 ```
 
-**Stage A: Amplitude Calibration**
+**Stage A — Amplitude calibration.**
 
-```
-y_calibrated = intercept + slope × y_predicted
-where (intercept, slope) = polyfit(y_pred_val, y_actual_val, 1)
-slope ∈ [0.50, 3.00]
-```
+$$\hat{y}^{cal} = a + b \cdot \hat{y}, \qquad (a, b) = \text{polyfit}(\hat{y}_{val}, y_{val}, 1), \quad b \in [0.50, 3.00]$$
 
-Corrects systematic under- or over-prediction of magnitude. Minimum 12 samples required.
+Min 12 samples. Corrects systematic under- / over-prediction of magnitude.
 
-**Stage B: Residual Shock Model**
+**Stage B — Residual shock model.** Shallow LightGBM (`max_depth=3, num_leaves=15, 200 rounds`) on Stage-A residuals. If error has structure (e.g. larger during high-VIX months), it gets captured.
 
-Trains a separate shallow LightGBM (max_depth=3, num_leaves=15, 200 rounds) on the residual errors from Stage A. If the residual error has structure (e.g., errors are larger during high-VIX periods), this model captures it.
+**Stage C — Multi-target dynamics.** Three models in parallel:
 
-**Stage C: Multi-Target Dynamics Model**
-
-Simultaneously models three aspects of the target:
-- **Level model:** Current best predictions (baseline or post-enhancement)
-- **Magnitude model:** Predict |Δy| (absolute acceleration magnitude)
-- **Direction model:** Binary classifier for sign(Δy)
+- **Level model:** current best predictions
+- **Magnitude model:** $|\Delta y|$
+- **Direction model:** binary classifier for $\text{sign}(\Delta y)$
 
 **Blending:**
 
-```
-delta_core = 0.70 × delta_signed_mag + 0.30 × current_delta
-conf = |p_up - 0.5|                      # Direction classifier confidence
-blend_enforced = min(0.80 × conf, 1.0)   # Max directional override strength
-delta_final = (1 - blend_enforced) × delta_core + blend_enforced × delta_enforced
-```
-
-Minimum direction confidence: `|p_up - 0.5| > 0.12` to trigger enforcement.
-Magnitude floor: 1.0 (avoids near-zero signed-delta collapse).
-
-**Stage D: Acceleration Model**
-
-Trains a separate LightGBM on the acceleration target (change in MoM):
-
-```
-y_accel[t] = y[t] - y[t-1]
-Reconstructed: y_pred[t] = y[t-1] + accel_pred[t]
+```text
+delta_core      = 0.70 · delta_signed_mag + 0.30 · current_delta
+conf            = |p_up - 0.5|
+blend_enforced  = min(0.80 · conf, 1.0)
+delta_final     = (1 - blend_enforced) · delta_core + blend_enforced · delta_enforced
 ```
 
-**Stage E: Regime Router**
+Direction enforcement only fires when $|p_{up} - 0.5| > 0.12$; magnitude floor 1.0 prevents near-zero collapse.
 
-Partitions training data by target volatility (quantile-based at 0.75):
-- **Low-volatility expert:** Trained on calm periods
-- **High-volatility expert:** Trained on turbulent periods
-- **Router classifier:** Logistic model predicting `P(high_volatility)`
-- **Soft blend:** `y_final = (1 - p_high) × y_low + p_high × y_high`
+**Stage D — Acceleration model.** Separate LightGBM on $y_t - y_{t-1}$, reconstructing $\hat{y}_t = y_{t-1} + \widehat{\Delta y}_t$.
 
-Minimum 20 samples per regime class required.
+**Stage E — Regime router.** Splits training by target volatility (quantile 0.75): low-vol expert + high-vol expert + logistic router predicting $P(\text{high\_vol})$. Soft blend $\hat{y} = (1 - p_{\text{high}}) \cdot \hat{y}_{\text{low}} + p_{\text{high}} \cdot \hat{y}_{\text{high}}$. Min 20 samples per regime.
 
----
+### 9.11 Prediction intervals
 
-### 9.11 Prediction Intervals
+**File:** [`Train/model.py`](Train/model.py) — `calculate_prediction_intervals()`
 
-**File:** `Train/model.py` — `calculate_prediction_intervals()`
+Non-parametric empirical intervals on historical OOS residuals (no Gaussian assumption):
 
-Non-parametric empirical intervals based on historical out-of-sample residuals. No Gaussian assumption.
-
-```
-For confidence_level in [0.50, 0.80, 0.95]:
-    α = 1 - confidence_level
+```text
+for L in [0.50, 0.80, 0.95]:
+    α = 1 - L
     lower_resid = quantile(residuals, α/2)
     upper_resid = quantile(residuals, 1 - α/2)
-    interval = [prediction + lower_resid, prediction + upper_resid]
+    interval    = [prediction + lower_resid, prediction + upper_resid]
 ```
 
-Requires at least 10 residuals for reliable quantile estimation; falls back to rough scaling otherwise.
+Requires ≥ 10 residuals; falls back to rough scaling otherwise. Forward predictions use up to the last 36 OOS residuals.
 
-For forward predictions, up to the last 36 OOS residuals are used.
+### 9.12 Baselines and keep-rule
 
----
+**File:** [`Train/baselines.py`](Train/baselines.py)
 
-### 9.12 Baselines and Keep Rule
+**Baselines** (computed each step from training data only):
 
-**File:** `Train/baselines.py`
+| Baseline | Formula |
+|---|---|
+| `baseline_last_y` | `y_train.dropna().iloc[-1]` — random walk |
+| `baseline_rolling_mean_6` | `mean(y_train.dropna().tail(6))` |
 
-**Baselines (computed per backtest step using ONLY training data):**
-
-| Baseline | Formula | Description |
-|---|---|---|
-| `baseline_last_y` | `y_train.dropna().iloc[-1]` | Most recent observed MoM (random walk) |
-| `baseline_rolling_mean_6` | `mean(y_train.dropna().tail(6))` | Average of last 6 months |
-
-**Keep Rule:**
-
-The keep rule prevents deployment of a model that performs worse than naive baselines:
+**Keep rule.** Prevents deployment of a model worse than the best naive baseline:
 
 ```python
-KEEP_RULE_ENABLED = True
-KEEP_RULE_WINDOW_M = 12        # Trailing OOS months to evaluate
-KEEP_RULE_TOLERANCE = 0.0      # Max allowed MAE degradation vs best baseline
-KEEP_RULE_ACTION = 'skip_save' # 'fail' | 'fallback_to_baseline' | 'skip_save'
+KEEP_RULE_ENABLED      = True
+KEEP_RULE_WINDOW_M     = 12       # trailing OOS months
+KEEP_RULE_TOLERANCE    = 0.0      # max allowed MAE degradation vs best baseline
+KEEP_RULE_ACTION       = 'skip_save'   # 'fail' | 'fallback_to_baseline' | 'skip_save'
 ```
 
-If the model's trailing 12-month MAE exceeds the best baseline's MAE by more than the tolerance, the configured action is taken.
+If trailing-12-month MAE > best baseline MAE + tolerance, the configured action triggers.
 
----
+### 9.13 Variance KPIs and composite objective
 
-## 10. Variance Capture Metrics
+**File:** [`Train/variance_metrics.py`](Train/variance_metrics.py)
 
-**File:** `Train/variance_metrics.py`
+Standard error metrics (RMSE, MAE) can mask **variance collapse** — where a model predicts the general trend but flattens month-to-month amplitude. The pipeline tracks:
 
-Standard error metrics (RMSE, MAE) can mask a critical failure mode: **variance collapse**, where the model predicts the general trend but flattens month-to-month amplitude. The pipeline tracks a comprehensive set of variance KPIs:
-
-| Metric | Formula | Target | Interpretation |
+| Metric | Formula | Target | Reads as |
 |---|---|---|---|
-| `std_ratio` | `std(predicted) / std(actual)` | 1.0 | Amplitude preservation (< 1.0 = flattening) |
-| `diff_std_ratio` | `std(Δpredicted) / std(Δactual)` | 1.0 | MoM acceleration amplitude |
-| `corr_level` | `corr(actual, predicted)` | > 0.8 | Overall trend following |
-| `corr_diff` | `corr(Δactual, Δpredicted)` | > 0.6 | Change-of-change correlation |
-| `diff_sign_accuracy` | `mean(sign(Δactual) == sign(Δpredicted))` | > 0.65 | Did the model get the direction of change right? |
-| `tail_mae` | `mean(|error|` where `|actual| ≥ 75th pctile)` | minimize | Error on the large, important moves |
-| `extreme_hit_rate` | `% of |actual| ≥ 90th pctile` captured by `|predicted| ≥ 90th pctile` | > 0.60 | Extreme event detection recall |
+| `std_ratio` | $\sigma(\hat{y})/\sigma(y)$ | 1.0 | Amplitude preservation (< 1 = flattening) |
+| `diff_std_ratio` | $\sigma(\Delta\hat{y})/\sigma(\Delta y)$ | 1.0 | MoM acceleration amplitude |
+| `corr_level` | $\rho(y, \hat{y})$ | > 0.8 | Trend following |
+| `corr_diff` | $\rho(\Delta y, \Delta \hat{y})$ | > 0.6 | Change-of-change correlation |
+| `diff_sign_accuracy` | $\overline{\mathbb{1}[\text{sign}(\Delta y) = \text{sign}(\Delta \hat{y})]}$ | > 0.65 | Did the direction of change come out right? |
+| `tail_mae` | mean$|e|$ where $|y| \ge q_{75}(\|y\|)$ | min | Error on the large, important moves |
+| `extreme_hit_rate` | % of $\|y\| \ge q_{90}$ captured by $\|\hat{y}\| \ge q_{90}$ | > 0.60 | Extreme-event recall |
 
-**Composite objective score (minimization):**
+**LightGBM Optuna composite (NSA, non-fusion mode):**
 
-```
-score = mae
-      + 25.0 × |1.0 - std_ratio|
-      + 25.0 × |1.0 - diff_std_ratio|
-      +  0.20 × tail_mae
-      + 20.0 × (1.0 - corr_diff)
-      + 12.0 × (1.0 - diff_sign_accuracy)
-      + 15.0 × (1.0 - accel_accuracy)
-      + 10.0 × (1.0 - dir_accuracy)
-```
+$$\text{score} = \text{MAE} + 25 |1 - r_{\sigma}| + 25 |1 - r_{\sigma\Delta}| + 0.20\,\text{tail\_MAE} + 20(1 - \rho_{\Delta}) + 12(1 - \text{sign\_acc}) + 15(1 - \text{accel\_acc}) + 10(1 - \text{dir\_acc})$$
 
-Used by Optuna tuning when `objective_mode = 'composite'` (configured for variance-priority targets like SA).
+**Fusion-CV composite (NSA, when `NSA_TUNE_USE_KALMAN_FUSION=True`):**
 
-**Variance promotion gates (SA):**
-
-| Gate | Minimum |
-|---|---|
-| `std_ratio` | 0.60 |
-| `diff_std_ratio` | 0.45 |
-| `corr_diff` | 0.25 |
-| `diff_sign_accuracy` | 0.55 |
-| `extreme_hit_rate` | 0.25 |
+$$\text{score} = \text{MAE}_{\text{fusion}} - 5 \cdot \text{accel\_acc}_{\text{fusion}} - 5 \cdot \text{dir\_acc}_{\text{fusion}}$$
 
 ---
 
-## 11. Model Variants
+## 10. The Kalman Fusion forecast (production)
 
-The pipeline trains **2 model variants** by default (via `--train-all`):
+**File:** [`Train/Output_code/consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py)
 
-| Model ID | Target | Feature Source | Purpose |
-|---|---|---|---|
-| `nsa_first_revised` | Non-Seasonally Adjusted | Revised features | NSA prediction using once-revised data |
-| `sa_first_revised` | Seasonally Adjusted | Revised features | SA prediction using once-revised data |
+After the NSA branch finishes its walk-forward, the consensus-anchor runner fuses three signals into the production forecast against the **SA-revised** target.
 
-**Revised models** predict the once-revised MoM change, available ~1 month after the initial NFP release (i.e., after the M+1 NFP release). The `predict_nfp_mom()` function enforces `operational_available_date` checks and raises `RuntimeError` if called before the revised data is available.
+### 10.1 Inputs
 
-**Target series mapping:**
-- NSA: `total_nsa` (FRED series)
-- SA: `total` (FRED series)
+| Channel | Source | Role |
+|---|---|---|
+| `consensus_pred` | NFP_Consensus_Mean from master snapshots (PIT-loaded per target month) | Anchor / always-on observation |
+| `champion_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (fallback: SA blend sandbox) | Primary model channel |
+| `nsa_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (same series) | NSA-implied delta → level for the third Kalman channel |
+| `actual` | `data/NFP_target/y_sa_revised.parquet` | Ground truth (SA-revised MoM) |
+
+The "Champion" feeding the Kalman is the **NSA + Adjustment** trajectory — NSA's MoM prediction plus a PIT-safe seasonal-adjustment overlay computed by `ExpWeightedMedianCovidExcludedPredictor`. NSA + Adjustment outperforms the legacy SA-blend sandbox as a Kalman channel because its acceleration dynamics translate better to the SA target.
+
+### 10.2 The state-space model
+
+**State.** A scalar random walk:
+
+$$x_t = x_{t-1} + w_t, \qquad w_t \sim \mathcal{N}(0, Q)$$
+
+**Observations.** Three simultaneous channels:
+
+$$c_t = x_t + v^c_t, \qquad v^c \sim \mathcal{N}(0, R_c)$$
+$$m_t = x_t + v^m_t, \qquad v^m \sim \mathcal{N}(0, R_m)$$
+$$a_t = x_t + v^a_t, \qquad v^a \sim \mathcal{N}(0, R_a)$$
+
+where $c_t$ is the consensus, $m_t$ is the champion, and $a_t$ is the NSA-implied level constructed as $a_t = y_{t-1}^{\text{actual}} + (\hat{y}^{\text{nsa}}_t - y_{t-1}^{\text{actual}})$.
+
+**Information-filter update.** Implemented exactly because it generalises trivially to N channels and to dropping channels with NaN:
+
+$$P^{-1}_{post} = P^{-1}_{prior} + R_c^{-1} + R_m^{-1} + s \cdot R_a^{-1}$$
+$$x_{post} = P_{post} \left( P^{-1}_{prior} \cdot x_{prior} + R_c^{-1} \cdot c_t + R_m^{-1} \cdot m_t + s \cdot R_a^{-1} \cdot a_t \right)$$
+
+where $s = $ `nsa_weight_scale` is the tuned NSA-channel precision multiplier.
+
+**Prediction step.** $x_{prior} = x_{post,t-1}, \quad P_{prior} = P_{post,t-1} + Q.$
+
+**At each step,** if the actual is known, we collapse the posterior to it (`x_hat = actual, P = 1e-6`); otherwise we propagate the posterior.
+
+### 10.3 Adaptive trailing-window noise estimation
+
+$R_c, R_m, R_a, Q$ are **re-estimated each step** from a COVID-clean trailing window of size `trailing_window` (tuned ∈ [6, 36]):
+
+$$R_c \approx \widehat{\text{Var}}\big(\text{actual} - \text{consensus}\big)_{\text{trailing}}, \qquad R_m \approx \widehat{\text{Var}}\big(\text{actual} - \text{champion}\big)_{\text{trailing}}$$
+$$Q \approx \widehat{\text{Var}}\big(\Delta\text{actual}\big)_{\text{trailing}}, \qquad R_a \approx \widehat{\text{Var}}\big(\text{actual} - \text{nsa\_pred}\big)_{\text{trailing}}$$
+
+When the COVID-clean window is too small (< 4 obs), the last-good estimate is reused. The COVID exclusion is critical: Mar/Apr/May 2020 are winsorized at parquet write time, so including them in `var(...)` collapses the noise estimate.
+
+The first step uses noise priors computed from the full **pre-backtest** consensus history (60-month tail) so the prior cannot peek at any month that will later be evaluated.
+
+### 10.4 Joint Optuna tune (production knob)
+
+`_tune_kalman()` jointly tunes three parameters by nested expanding-window CV (5 chronological folds) against the composite objective:
+
+$$\text{score} = \text{MAE}_{\text{fusion}} - 5 \cdot \text{AccelAcc}_{\text{fusion}} - 5 \cdot \text{DirAcc}_{\text{fusion}}$$
+
+| Parameter | Range | Meaning |
+|---|---|---|
+| `trailing_window` | [6, 36] | Adaptive noise estimation window |
+| `nsa_weight_scale` | [0.1, 3.0] | Multiplier for $R_a^{-1}$ (NSA channel precision) |
+| `half_life_years` | [0.5, 8.0] | Half-life for the PIT-safe seasonal adjustment that produces the champion |
+
+The half-life is tuned **inside the Kalman objective** — for each trial, the champion column is rebuilt in-memory using `ExpWeightedMedianCovidExcludedPredictor(half_life_years=hl)` on a pre-built PIT cache, then the trial's Kalman fit is scored. This means the adjustment is optimised for what makes the **fusion** work, not for what makes the adjustment alone look good.
+
+**Current tuned values** (`_output/consensus_anchor/kalman_fusion/tuned_params.json`):
+
+```json
+{
+  "trailing_window":   24,
+  "nsa_weight_scale":  0.55,
+  "half_life_years":   1.67
+}
+```
+
+After the tune, if `tuned_hl` differs from the static default (3.0y), the runner regenerates `_output/NSA_plus_adjustment/backtest_results.csv` with the tuned HL and rebuilds the merged dataset, so the final fusion sees the optimal champion.
+
+**Half-life drift warning.** The runner reads `_output/consensus_anchor/dynamic_fs_selection_hl.json` — written by the dynamic FS path with the HL it used to construct its selection target — and warns when $|\text{HL}_{\text{tune}} - \text{HL}_{\text{selection}}| > 1.0$ year. This is the feedback signal consumed by `--iterate-fusion-tune` (see §11).
+
+### 10.5 The two surviving forecasts
+
+| Forecast | What it is | Status |
+|---|---|---|
+| **Kalman Fusion (NSA)** | Information-filter fuse of consensus + champion + NSA-implied delta | Production |
+| **Baseline Consensus** | Raw Reuters/LSEG mean poll | Reported alongside Kalman as the benchmark |
+| Baseline Champion (NSA + Adj) | The model's own backtest, untouched | Diagnostic only — large standalone MAE |
+
+`AccelOverride` and `Kalman + AccelPostFilter` were dropped on **2026-05-11** after consistently underperforming Consensus on the 60-month window.
+
+### 10.6 Outputs
+
+```
+_output/consensus_anchor/
+├── merged_consensus_model.csv          # Merged inputs (cons + champion + nsa + actual)
+├── comparison_metrics.csv              # Full metric block for all three forecasts (all / non-COVID / COVID-only)
+├── comparison_metrics.png              # Bar charts (MAE/RMSE + DirAcc/AccelAcc)
+├── comparison_overlay.png              # Time-series overlay vs actual
+├── comparison_scorecard.html           # Sortable HTML scorecard with embedded plots
+├── dynamic_fs_selection_hl.json        # HL that dynamic FS used (drift-warning input)
+│
+├── baseline_consensus/                 # Raw consensus, full diagnostic bundle
+│   ├── backtest_results.csv
+│   ├── summary_statistics.csv
+│   ├── summary_metrics.json
+│   ├── backtest_predictions.png
+│   ├── summary_table.png
+│   └── acf_*.csv / pacf_*.csv / acf_pacf_diagnostics.png
+│
+└── kalman_fusion/                      # PRODUCTION — same bundle + tuned_params + iteration log
+    ├── backtest_results.csv
+    ├── summary_statistics.csv
+    ├── summary_metrics.json
+    ├── tuned_params.json               # {trailing_window, nsa_weight_scale, half_life_years}
+    ├── fusion_iteration_log.json       # Iterative-fusion-tune trace (if used)
+    └── (acf/pacf/plots as above)
+```
 
 ---
 
-## 12. Running the Pipeline
-
-### Full pipeline (recommended)
+## 11. Iterative fusion tuning
 
 ```bash
-# End-to-end: fetch data → feature selection → master snapshots → train all variants
+python Train/train_lightgbm_nfp.py --iterate-fusion-tune
+```
+
+Runs `--train-all` repeatedly as a subprocess. After each pass the orchestrator compares:
+
+- **`HL_selection`** — the adjustment half-life that *dynamic FS* used inside its selection target on this pass.
+- **`HL_tune`** — the half-life that the post-training *Kalman tune* picked at the end of this pass.
+
+When $|HL_{\text{tune}} - HL_{\text{selection}}| < 0.25$ years the system is internally consistent — FS picked features for a half-life that Kalman now confirms, and the loop exits. Otherwise the next pass starts from the new HL, invalidates the universe cache (so dynamic FS reruns against the new selection target), and re-runs NSA Optuna + backtest + Kalman tune.
+
+```
+--max-fusion-passes <int>        # default 3
+--fusion-converge-threshold <y>  # default 0.25
+```
+
+A log is written to `_output/consensus_anchor/kalman_fusion/fusion_iteration_log.json` so each pass and its fusion metrics are inspectable.
+
+**Why iterate?** Because the dynamic FS selection target is `SA_revised − adj_pred(HL)` — features are picked for how well they explain whatever residual structure remains after the SA-NSA adjustment is removed. If HL changes, the residual structure changes, and a different feature set might be optimal. The iterative loop chases a fixed point of (HL, features, hyperparameters).
+
+---
+
+## 12. Running the pipeline
+
+### Full pipeline
+
+```bash
+# End-to-end: load → prepare → train (NSA only) → fusion
 python run_full_project.py
 
-# Fresh start: delete all local data and re-download from scratch
+# Fresh: delete all local data and re-download
 python run_full_project.py --fresh
 ```
 
 ### Individual stages
 
 ```bash
-# Data collection + preparation only (no training)
-python run_full_project.py --stage data
-
-# Data loading only (fetch from external APIs)
-python run_full_project.py --stage load
-
-# Data preparation only (feature selection + build master snapshots; assumes load is complete)
-python run_full_project.py --stage prepare
-
-# Training only (master snapshots must already exist)
-python run_full_project.py --stage train
-
-# Training without Optuna tuning (faster, uses static defaults)
-python run_full_project.py --stage train --no-tune
-
-# Skip specific data sources (comma-separated)
-python run_full_project.py --skip noaa,prosper
-
-# List all pipeline steps
-python run_full_project.py --list-steps
+python run_full_project.py --stage data       # load + prepare only
+python run_full_project.py --stage load       # raw ingestion only
+python run_full_project.py --stage prepare    # feature selection + master snapshots
+python run_full_project.py --stage train      # training only (assumes data exists)
+python run_full_project.py --stage train --no-tune   # static defaults (faster)
+python run_full_project.py --skip noaa,prosper       # skip specific sources
+python run_full_project.py --list-steps              # show all pipeline steps
 ```
 
-### Direct training script
+> Note: `run_full_project.py` currently wires the 6 long-standing sources (FRED Employment, FRED Exogenous, ADP, NOAA, Prosper, Unifier). The Futures and EconomistPanel loaders ([`load_futures_data.py`](Data_ETA_Pipeline/load_futures_data.py), [`load_economist_panel.py`](Data_ETA_Pipeline/load_economist_panel.py)) are run standalone before master-snapshot aggregation; their outputs land in `data/Exogenous_data/exogenous_futures_data/` and `data/Exogenous_data/exogenous_economist_data/`, which `create_master_snapshots.py` then picks up.
+
+### Direct training
 
 ```bash
-# Train single model (default: nsa, first release)
-python Train/train_lightgbm_nfp.py --train
+# Train just the NSA branch
+python Train/train_lightgbm_nfp.py --train --target nsa
 
-# Train with specific target/release
-python Train/train_lightgbm_nfp.py --train --target sa --release first
-
-# Train all variants and generate comparison scorecard
+# Train all variants and run the post-training fusion (production setup)
 python Train/train_lightgbm_nfp.py --train-all
 
-# Train without Optuna (faster for debugging)
-python Train/train_lightgbm_nfp.py --train --no-tune
+# Iterative joint fusion tune
+python Train/train_lightgbm_nfp.py --iterate-fusion-tune
 
 # Predict for a specific historical month
 python Train/train_lightgbm_nfp.py --predict 2024-12 --target nsa
@@ -1350,340 +1276,240 @@ python Train/train_lightgbm_nfp.py --latest --target nsa
 ### Production inference
 
 ```bash
-# Generate next-month NFP prediction with confidence intervals
 python scripts/predict_next_nfp.py --target nsa
-python scripts/predict_next_nfp.py --target sa --output report.json
+python scripts/predict_next_nfp.py --target nsa --output report.json
 ```
 
-### Diagnostic utilities
+### Re-run the fusion against existing CSVs
 
 ```bash
-# Check whether data sources are up-to-date
-python scripts/check_data_freshness.py
-
-# Run keep-rule benchmark reports
-python scripts/benchmark_keep_rule.py
-
-# Directional hit-rate analysis on backtest results
-python scripts/directional_accuracy.py
-
-# NFP revision autocorrelation analysis
-python scripts/revision_analysis.py
+python scripts/kalman_only.py                  # re-run just the Kalman fusion
+python scripts/nsa_then_kalman.py              # re-train NSA + re-run fusion
+python scripts/continue_kalman.py              # extend a fusion run by one month
+python scripts/reconstruct_nsa_and_kalman.py   # rebuild from preserved feature schedules
 ```
 
-### Environment variable overrides
+### Diagnostics
 
 ```bash
-# Fast feature selection (skip Boruta and Vintage stages)
-NFP_FS_STAGES="0,1,4" python run_full_project.py
-
-# Full benchmarking (all 7 stages)
-NFP_FS_STAGES="0,1,2,3,4,5,6" python run_full_project.py
-
-# Enable performance profiling
-NFP_PERF=1 python run_full_project.py
+python scripts/check_data_freshness.py     # are all sources up-to-date?
+python scripts/benchmark_keep_rule.py      # keep-rule report
+python scripts/directional_accuracy.py     # dir / accel hit-rate analysis
+python scripts/revision_analysis.py        # NFP revision autocorrelations
 ```
+
+### Environment overrides
+
+```bash
+NFP_FS_STAGES="0,1,4"               # fast feature selection
+NFP_FS_STAGES="0,1,2,3,4,5,6"       # full feature selection
+NFP_PERF=1 python run_full_project.py    # enable performance profiling
+NFP_PERF_SKIP_REVISIONS=1                # skip revision-feature block (profiling)
+```
+
+### AWS training
+
+A persistent EC2 toolkit is shipped under [`aws/`](aws/) — provision, push code, fire-and-forget training, S3-sync outputs, auto-stop. See [`aws/README.md`](aws/README.md).
 
 ---
 
-## 13. Configuration Reference
+## 13. Configuration reference
 
-### `settings.py` — Central Configuration
+### `.env` (loaded by `settings.py`)
 
-| Variable | Source | Description |
-|---|---|---|
-| `FRED_API_KEY` | `.env` (required) | FRED API credentials |
-| `UNIFIER_USER` / `UNIFIER_TOKEN` | `.env` (required) | Unifier API credentials |
-| `DATA_PATH` | `.env` (required) | Root data directory |
-| `START_DATE` | `.env` (required) | Training start date |
-| `BACKTEST_MONTHS` | `.env` (required) | Number of backtest months |
-| `END_DATE` | `.env` (optional) | Defaults to today |
-| `OUTPUT_DIR` | `.env` (optional) | Default: `_output` |
-| `TEMP_DIR` | `.env` (optional) | Default: `_temp` |
-| `RESELECT_EVERY_N_MONTHS` | `.env` (optional) | Feature reselection frequency (default: 6) |
-| `DEBUG` | `.env` (optional) | Enable debug logging |
-| `REFRESH_CACHE` | `.env` (optional) | Force cache refresh |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FRED_API_KEY` | yes | — | FRED API key |
+| `UNIFIER_USER` / `UNIFIER_TOKEN` | yes | — | LSEG / Unifier creds |
+| `DATA_PATH` | yes | — | Data root |
+| `START_DATE` | yes | — | Training start (e.g. `1990-01-01`) |
+| `BACKTEST_MONTHS` | yes | — | Walk-forward length (e.g. `60`) |
+| `END_DATE` | no | today | Optional cap |
+| `MODEL_TYPE` | no | `"univariate"` | Target file prefix (`total_…` vs `y_…`) |
+| `TARGET_TYPE` | no | `"revised_mom"` | Default target type |
+| `OUTPUT_DIR` | no | `_output` | Output root |
+| `TEMP_DIR` | no | `./_temp` | Log / perf root |
+| `DELIM` | no | `.` | Separator used in series codes |
+| `DEBUG` | no | `False` | Verbose logging |
+| `REFRESH_CACHE` | no | `False` | Force cache refresh |
+| `RESELECT_EVERY_N_MONTHS` | no | `6` (committed `.env` ships `24`) | Dynamic FS frequency |
+| `USE_PER_WINDOW_FEATURES` | no | `False` | Replay mode (re-use saved JSON cohort) |
 
-### `Train/config.py` — Training Configuration
+### `Train/config.py` — training knobs
 
-**LightGBM defaults:**
+**LightGBM defaults:** see `DEFAULT_LGBM_PARAMS` in [`Train/config.py`](Train/config.py:243). Includes a `LGBM_DETERMINISM` block (`deterministic=True, force_col_wise=True, seed=42` everywhere) so the same data + hyperparameters yield bit-identical predictions across runs.
 
-| Parameter | Value |
+**Training constants.**
+
+| Constant | Value | Description |
+|---|---:|---|
+| `N_CV_SPLITS` | 5 | Inner TimeSeriesSplit folds |
+| `NUM_BOOST_ROUND` | 1000 | Max boosting rounds |
+| `EARLY_STOPPING_ROUNDS` | 50 | Early-stopping patience |
+| `HALF_LIFE_MIN_MONTHS` / `MAX_MONTHS` | 12 / 120 | Optuna HL bounds |
+| `N_OPTUNA_TRIALS` | 25 | Trials per tune |
+| `OPTUNA_TIMEOUT` | 300 | Seconds per tune |
+| `TUNE_EVERY_N_MONTHS` | 12 | Re-tune cadence |
+| `CONFIDENCE_LEVELS` | [0.50, 0.80, 0.95] | Empirical interval levels |
+| `SHORTPASS_TOPK` | 60 | Top-K per step (`lgbm_gain`) |
+| `DYNAMIC_FS_PASS2_MAX_FEATURES` | 80 | Hard cap after Pass 2 global reduction |
+| `RESELECTION_HALF_LIFE_MONTHS` | 9999 | Equal weights for reselection |
+| `RESELECTION_START_DATE` | `2000-01-01` | Earliest reselection step |
+| `RESELECTION_STAGES_PASS1` | `(0, 2, 4, 5)` | Per-source stages in dynamic FS |
+| `RESELECTION_STAGES_PASS2` | `(0, 2, 4)` | Global stages in dynamic FS |
+| `KALMAN_LAMBDA_ACCEL` | 5.0 | Composite-objective weight on acceleration accuracy |
+| `KALMAN_LAMBDA_DIR` | 5.0 | Composite-objective weight on directional accuracy |
+| `NSA_TUNE_USE_KALMAN_FUSION` | True | NSA Optuna scores against the fusion-CV composite |
+| `USE_UNIVERSE_CACHE` | False | Tier-A universe distillation (gated until parity validated) |
+
+**Variance-enhancement configuration.**
+
+| Constant | Value |
 |---|---|
-| `learning_rate` | 0.03 |
-| `num_leaves` | 31 |
-| `min_data_in_leaf` | 5 |
-| `max_depth` | 6 |
-| `feature_fraction` | 0.8 |
-| `bagging_fraction` | 0.8 |
-| `metric` | `mae` |
+| `ENHANCEMENT_SEQUENCE` | `('amplitude','shock','dynamics','acceleration','regime')` |
+| `SA_ENHANCEMENT_SEQUENCE` | `('amplitude',)` |
+| `ENHANCEMENT_MIN_IMPROVEMENT` | 0.25 |
+| `AMPLITUDE_CAL_SLOPE_MIN / MAX` | 0.50 / 3.00 |
+| `DYNAMICS_DELTA_BLEND` | 0.70 |
+| `DYNAMICS_DIRECTION_CONFIDENCE` | 0.12 |
+| `DYNAMICS_DIRECTION_BLEND` | 0.80 |
+| `REGIME_HIGHVOL_QUANTILE` | 0.75 |
+| `REGIME_MIN_CLASS_SAMPLES` | 20 |
 
-**Training constants:**
-
-| Constant | Value | Description |
-|---|---|---|
-| `N_CV_SPLITS` | 5 | TimeSeriesSplit folds |
-| `NUM_BOOST_ROUND` | 1,000 | Max boosting rounds |
-| `EARLY_STOPPING_ROUNDS` | 50 | Early stopping patience |
-| `HALF_LIFE_MIN_MONTHS` | 12 | Minimum sample weight half-life (Optuna) |
-| `HALF_LIFE_MAX_MONTHS` | 120 | Maximum sample weight half-life (Optuna) |
-| `N_OPTUNA_TRIALS` | 25 | Trials per tuning run |
-| `OPTUNA_TIMEOUT` | 300 | Max seconds per tuning run |
-| `TUNE_EVERY_N_MONTHS` | 12 | Re-tune frequency |
-| `CONFIDENCE_LEVELS` | [0.50, 0.80, 0.95] | Prediction interval levels |
-| `SHORTPASS_TOPK` | 60 | Features per backtest step |
-| `DYNAMIC_FS_PASS2_MAX_FEATURES` | 80 | Hard cap after global reduction |
-| `KALMAN_LAMBDA_ACCEL` | 50.0 | Composite-objective weight on acceleration accuracy (consensus tuning) |
-| `KALMAN_LAMBDA_DIR` | 30.0 | Composite-objective weight on directional accuracy (consensus tuning) |
-
-**Variance enhancement configuration:**
-
-| Constant | Value | Description |
-|---|---|---|
-| `ENHANCEMENT_SEQUENCE` | `('amplitude', 'shock', 'dynamics', 'acceleration', 'regime')` | NSA stack |
-| `SA_ENHANCEMENT_SEQUENCE` | `('amplitude',)` | SA stack |
-| `ENHANCEMENT_MIN_IMPROVEMENT` | 0.25 | Minimum composite score improvement to keep stage |
-| `AMPLITUDE_CAL_SLOPE_MIN/MAX` | 0.50 / 3.00 | Amplitude calibration slope bounds |
-| `DYNAMICS_DELTA_BLEND` | 0.70 | Delta model vs current blend ratio |
-| `DYNAMICS_DIRECTION_CONFIDENCE` | 0.12 | Min classifier confidence for sign override |
-| `DYNAMICS_DIRECTION_BLEND` | 0.80 | Max directional override strength |
-
-**Feature selection stage presets:**
+**Feature-selection stage presets.**
 
 | Preset | Stages | Runtime |
 |---|---|---|
-| `FS_STAGES_DEFAULT` | (0, 1, 2, 3, 4) | ~5 min/source |
-| `FS_STAGES_FAST` | (0, 1, 4) | ~3 min/source |
-| `FS_STAGES_FAST_VINTAGE` | (0, 1, 3, 4) | ~3 min/source |
-| `FS_STAGES_FAST_BORUTA` | (0, 1, 2, 4) | ~4 min/source |
-| `FS_STAGES_FULL` | (0, 1, 2, 3, 4, 5, 6) | ~10 min/source |
+| `FS_STAGES_DEFAULT` | `(0,1,2,3,4)` | ~5 min/source |
+| `FS_STAGES_FAST` | `(0,1,4)` | ~3 min/source |
+| `FS_STAGES_FAST_VINTAGE` | `(0,1,3,4)` | ~3 min/source |
+| `FS_STAGES_FAST_BORUTA` | `(0,1,2,4)` | ~4 min/source |
+| `FS_STAGES_FULL` | `(0,1,2,3,4,5,6)` | ~10 min/source |
 
 ---
 
-## 14. Output Artifacts
+## 14. Output artifacts
 
-A completed training run deposits results under `_output/`:
+A successful `--train-all` run produces:
 
 ```
 _output/
 ├── NSA_prediction/
 │   ├── backtest_results.csv         # Per-month OOS predictions vs actuals
 │   ├── backtest_predictions.png     # Line chart with 80% CI shading
-│   ├── feature_importance.csv       # Gain-based feature rankings
-│   ├── shap_values.png              # SHAP beeswarm plot (top 20 features)
+│   ├── feature_importance.csv       # Gain-based rankings
+│   ├── shap_values.png              # SHAP beeswarm (top 20)
 │   ├── summary_statistics.csv       # RMSE, MAE, coverage, variance KPIs
-│   └── summary_table.png            # Metrics + top-5 features table image
+│   └── summary_table.png            # Metrics + top-5 features image
 │
-├── SA_prediction/                   # Same structure as NSA
-│
-├── NSA_plus_adjustment/             # NSA + PIT-safe seasonal adjustment
-│   ├── backtest_predictions.png     # NSA pred + exp-weighted adjustment vs actual SA
-│   ├── backtest_results.csv
+├── NSA_plus_adjustment/             # NSA + PIT-safe seasonal adjustment overlay
+│   ├── backtest_results.csv         # The "champion" Kalman input
+│   ├── backtest_predictions.png
 │   ├── summary_statistics.csv
 │   └── summary_table.png
 │
-├── consensus_anchor/                # Post-training Kalman / AccelOverride fusion (see §15)
-│   ├── kalman_fusion/               # Production model
+├── consensus_anchor/                # PRODUCTION
+│   ├── kalman_fusion/               # ← the production forecast
 │   ├── baseline_consensus/
-│   ├── accel_override/
-│   ├── kalman_accel_postfilter/
+│   ├── merged_consensus_model.csv
 │   ├── comparison_metrics.csv
-│   ├── comparison_overlay.png
 │   ├── comparison_metrics.png
+│   ├── comparison_overlay.png
 │   ├── comparison_scorecard.html
-│   └── merged_consensus_model.csv
+│   └── dynamic_fs_selection_hl.json
 │
 ├── Predictions/
-│   └── predictions.csv              # Forward predictions with 50/80/95% CIs
+│   └── predictions.csv              # Forward predictions with 50/80/95% CIs,
+│                                    # augmented with the Kalman / Consensus OOS rows
 │
 ├── models/lightgbm_nfp/
-│   ├── nsa_first_revised/           # Saved model + metadata
-│   ├── sa_first_revised/
-│   ├── model_comparison.csv         # Multi-variant scorecard
+│   ├── nsa_first_revised/           # Saved model + metadata + metrics JSON
+│   ├── model_comparison.csv         # Multi-variant scorecard (NSA-only in current setup)
 │   └── model_comparison.html        # Styled HTML with conditional formatting
 │
-├── backtest/                        # Raw backtest artefacts
-├── dynamic_selection/               # Cached per-cutoff dynamic FS survivors
-├── sandbox/                         # Sandbox experiment outputs (CatBoost, XGBoost, blends)
-└── Archive/YYYY-MM-DD_HHMMSS/       # Timestamped snapshots of previous runs
+├── dynamic_selection/               # Per-step JSON feature schedules
+│   └── nsa_revised/{YYYY-MM}.json   # n_features ≤ 80 each
+│
+├── cache/                           # FS / training-dataset / universe caches
+├── economist_panel/                 # Per-economist rankings + Top-4 panel
+├── sandbox/                         # Sandbox experiment outputs (see Train/sandbox/README.md)
+└── Archive/YYYY-MM-DD_HHMMSS/       # Timestamped snapshots of past full runs
 ```
 
-### Model Comparison Scorecard
+### Model comparison scorecard
 
-**File:** `Train/Output_code/model_comparison.py`
+`Train/Output_code/model_comparison.py`:`generate_comparison_scorecard()` produces a side-by-side metrics table across whatever trained variants are present (currently NSA-only since SA was retired).
 
-`generate_comparison_scorecard()` produces a side-by-side metrics table comparing all trained variants:
+**Metric blocks.** Error (RMSE/MAE/MedAE/MaxAE/MeanError), coverage (50/80/95% interval), variance (STD Ratio, Diff STD Ratio, Corr Diff, Diff Sign Acc), tail (Tail MAE, Extreme Hit Rate), acceleration (Acceleration Accuracy). The HTML version applies conditional formatting (green = best per metric).
 
-**Metrics included:**
-- Error: RMSE, MAE, Median AE, Max AE, Mean Error
-- Coverage: 50%, 80%, 95% prediction interval coverage
-- Variance: STD Ratio, Diff STD Ratio, Corr Diff, Diff Sign Accuracy
-- Tail: Tail MAE, Extreme Hit Rate
-- Acceleration: Momentum prediction accuracy
+### NSA + seasonal adjustment
 
-The HTML output uses conditional formatting (green highlights for best values per metric).
+[`Train/Output_code/generate_output.py`](Train/Output_code/generate_output.py)`:_generate_adjustment_folder()` uses `ExpWeightedMedianCovidExcludedPredictor` with `half_life_years` (default 3.0, retuned to ~1.67 by the post-training Kalman):
 
-### NSA + Seasonal Adjustment
-
-**File:** `Train/Output_code/generate_output.py` — `_generate_adjustment_folder()`
-
-Uses an `ExpWeightedMonthlyAvgPredictor` with 3-year half-life to predict seasonal adjustment factors:
-
-1. Load full historical adjustment series (`SA_MoM - NSA_MoM` back to 1990)
-2. For each backtest month, predict the adjustment using only data with `operational_available_date < target_ds` (PIT-safe)
-3. Apply: `adjusted_predicted = NSA_predicted + predicted_adjustment`
-4. Compare against actual SA values
+1. Load full historical adjustment series (`SA_MoM − NSA_MoM` back to 1990).
+2. For each backtest month, predict the adjustment using only data with `operational_available_date < target_ds` (PIT-safe).
+3. Apply: `adjusted_predicted = NSA_predicted + predicted_adjustment`.
+4. Compare against actual SA values.
 
 ---
 
-## 15. Consensus Anchor Fusion (Post-Training)
+## 15. Reproducibility and determinism
 
-**File:** [`Train/Output_code/consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py)
-
-After the main backtest, this module merges the LSEG/Reuters NFP consensus poll with the model's own predictions and produces **four side-by-side forecasts** so the operator can see the full ensemble. The production output is **Kalman Fusion (NSA)**; the other three are reported as comparators.
-
-### Inputs
-
-The runner builds its merged dataset on-the-fly from:
-
-| Channel | Source | Role |
-|---|---|---|
-| `consensus_pred` | Latest Unifier snapshot — `NFP_Consensus_Mean` | Anchor / always-on observation |
-| `champion_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (fallback: SA blend sandbox) | Primary model channel |
-| `nsa_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` | NSA acceleration channel for Kalman |
-| `nsa_raw_pred` | `_output/NSA_prediction/backtest_results.csv` | Direction-vote tiebreaker for AccelOverride |
-| `actual` | `data/NFP_target/y_sa_revised.parquet` | Ground truth (SA revised MoM) |
-
-### The four forecasts
-
-**1. Kalman Fusion (NSA)** — production model. Information-filter form, three observation channels (consensus, SA-blend champion, NSA-implied delta lifted to a level via the prior actual). Adaptive trailing-window noise estimation per step (`R_c`, `R_m`, `R_a`, `Q`).
-
-```
-State:   x_t = x_{t-1} + w_t  (random walk)
-Update:  P_post = 1 / (1/P_prior + 1/R_c + 1/R_m + w_a/R_a)
-         x_post = P_post · (x_prior/P_prior + cons/R_c + champ/R_m + nsa_level/R_a)
-```
-
-**2. Baseline Consensus** — Reuters/LSEG mean poll, untouched. The honest benchmark to beat.
-
-**3. AccelOverride** — keeps consensus as the level anchor; flips the directional component only when ≥ 2 of 3 signals (consensus, champion, NSA raw) vote against it. `magnitude_mode ∈ {'consensus','blend','model'}` controls how much model magnitude is mixed in.
-
-**4. Kalman + AccelOverride post-filter** — hybrid: take the Kalman level, then apply AccelOverride direction logic on top of it.
-
-### Optuna tuning (composite objective)
-
-Both Kalman and AccelOverride are tuned with TPE, optimising:
-
-```
-score = MAE − KALMAN_LAMBDA_ACCEL · accel_acc − KALMAN_LAMBDA_DIR · dir_acc
-```
-
-with `KALMAN_LAMBDA_ACCEL = 50.0` and `KALMAN_LAMBDA_DIR = 30.0` (set in [`Train/config.py`](Train/config.py)). Search spaces:
-
-| Variant | Tuned parameters |
-|---|---|
-| Kalman Fusion | `trailing_window ∈ [6, 36]`, `nsa_weight_scale ∈ [0.1, 3.0]` |
-| AccelOverride | `kappa ∈ [0.1, 0.9]`, `magnitude_mode ∈ {consensus, blend, model}` |
-
-Trial budget = `N_OPTUNA_TRIALS = 25`, timeout = `OPTUNA_TIMEOUT = 300 s`. Both fall back to defaults if Optuna isn't installed (`trailing_window=18`, `kappa=0.5`, `magnitude_mode='consensus'`).
-
-### Backtest results (59 OOS months, SA revised target)
-
-| Forecast | MAE | RMSE | DirAcc | AccelAcc | STD Ratio | Diff STD Ratio |
-|---|---:|---:|---:|---:|---:|---:|
-| **Kalman Fusion (NSA)** | **108.8** | **155.2** | **98.3%** | **58.6%** | 0.87 | 0.72 |
-| Baseline Consensus | 109.7 | 166.0 | 96.6% | 44.8% | 0.96 | 0.46 |
-| AccelOverride (k=0.50, consensus) | 111.4 | 167.3 | 96.6% | 48.3% | 0.96 | 0.55 |
-| Kalman + AccelOverride post-filter | 119.2 | 172.0 | 96.6% | 51.7% | 0.87 | 0.74 |
-| Baseline Champion (NSA+Adj) | 164.6 | 206.3 | 88.1% | 62.1% | 1.03 | 1.45 |
-
-Kalman Fusion is the only forecast that beats consensus on **every** error metric while also lifting acceleration accuracy by ~14 percentage points. The standalone champion has the highest raw acceleration accuracy but pays for it with much higher level error and over-amplified variance — it is most useful as a *channel* in the Kalman update, not as the final forecast.
-
-### Outputs
-
-```
-_output/consensus_anchor/
-├── merged_consensus_model.csv          # Merged input dataset (consensus + all model channels)
-├── comparison_metrics.csv              # All four forecasts + champion, full metric suite
-├── comparison_metrics.png              # Side-by-side bar charts (MAE/RMSE + DirAcc/AccelAcc)
-├── comparison_overlay.png              # Overlay: actual vs each forecast
-├── comparison_scorecard.html           # Sortable HTML scorecard with embedded plots
-├── kalman_fusion/                      # Production model
-│   ├── backtest_results.csv
-│   ├── summary_statistics.csv
-│   ├── summary_metrics.json
-│   ├── tuned_params.json               # {trailing_window, nsa_weight_scale}
-│   ├── backtest_predictions.png
-│   ├── summary_table.png
-│   └── acf_*.csv / pacf_*.csv / acf_pacf_diagnostics.png
-├── baseline_consensus/                 # Untouched consensus poll
-├── accel_override/                     # tuned_params.json: {kappa, magnitude_mode}
-└── kalman_accel_postfilter/            # Hybrid Kalman + direction override
-```
+- **Global RNG.** `train_lightgbm_nfp.py` pins `PYTHONHASHSEED`, the stdlib `random` module, and `np.random` to seed `42` before any other import touches them.
+- **LightGBM.** Every relevant seed is set (`random_state, seed, bagging_seed, feature_fraction_seed, data_random_seed, extra_seed, objective_seed`), plus `deterministic=True, force_col_wise=True`. Predictions are bit-identical across runs regardless of `n_jobs`.
+- **Optuna.** `TPESampler(seed=42)`.
+- **Walk-forward.** Strictly chronological — never shuffled.
+- **Caveat (preserved on purpose).** Inside `feature_selection_engine.py:LGB_PARAMS`, determinism is **not** forced (no `deterministic=True, force_col_wise=True`). Some best-known dynamic-reselection JSONs were produced by a non-deterministic Boruta/LightGBM run; re-running fresh reselection will NOT reproduce them. The "lucky" runs are preserved under [`Best_features_selected/`](Best_features_selected/) and can be replayed via `USE_PER_WINDOW_FEATURES=True`.
 
 ---
 
-## 16. Reproducibility
-
-- **Random seeds:** LightGBM uses `random_state: 42` in `DEFAULT_LGBM_PARAMS`. Optuna uses `TPESampler(seed=42)`.
-- **Determinism:** Expanding-window splits are strictly chronological with no shuffling.
-- **Run tracking:** Performance profiling JSON files are written to `_temp/perf/` for each pipeline run (process ID + timestamp stamped). Archived output snapshots are saved to `_output/Archive/`.
-
----
-
-## 17. Testing and Linting
+## 16. Testing and linting
 
 ```bash
-# Run full test suite
-pytest tests/ -v
-
-# Run with coverage
-pytest tests/ -v --cov=Train --cov=utils --cov-report=term-missing
-
-# Lint (ruff)
-ruff check .
-
-# Type check (non-blocking; known stubs missing for some dependencies)
-mypy Train/ utils/ --ignore-missing-imports
+pytest tests/ -v                              # full suite (~30s)
+pytest tests/ -v --cov=Train --cov=utils      # with coverage
+ruff check .                                  # lint
+mypy Train/ utils/ --ignore-missing-imports   # non-blocking type check
 ```
 
-CI is configured in `.github/workflows/test.yml` and runs pytest + ruff + mypy across Python 3.10, 3.11, and 3.12 on every push to `main`.
+CI lives in `.github/workflows/test.yml`: pytest + ruff + mypy across Python 3.10 / 3.11 / 3.12 on every push to `main`.
 
-**Ruff configuration** (`pyproject.toml`):
-- Line length: 120 characters
-- Rules: E (errors), F (Pyflakes), W (warnings), I (isort), UP (pyupgrade), B (bugbear), SIM (simplify)
+**Ruff configuration** (`pyproject.toml`): line length 120; rules `E, F, W, I, UP, B, SIM`.
 
----
-
-## 18. Economic Shock Handling
-
-To maintain stability across massive dislocations (2008 GFC, 2020 COVID shock):
-
-- **COVID Winsorization** (`utils/transforms.py`): Spring 2020 extreme values are clipped to non-COVID distribution quantiles. Applied per-fold during the backtest (not globally), preserving PIT correctness — the model doesn't "know" COVID happened until it reaches March 2020 in the expanding window.
-- **Symmetric Log Transforms:** Heavy-tailed features optionally undergo SymLog: `sign(x) × ln(1 + |x|)`. Compresses extreme kurtosis while handling negative bounds and preserving zero values.
-- **Post-1990 Anchor:** `DATA_START_FLOOR = 1990-01-01` removes pre-1990 sparsity from peripheral survey metrics.
-- **Regime-Aware Selection:** Feature selection Stage 3 (Vintage Stability) explicitly tests feature stability across hard-coded macroeconomic regimes, rejecting features that only worked in a single regime.
+> **Known pre-existing failures.** A handful of tests fail on a clean `HEAD` for reasons unrelated to the production code (model-id format expectations, cadence math, .env state, slow IO). They are tracked but should not be chased as regressions when iterating.
 
 ---
 
-## 19. Troubleshooting
+## 17. Economic shock handling
+
+- **COVID winsorization** (`utils/transforms.py`). Spring 2020 extreme values are clipped to non-COVID distribution quantiles. **Applied per-fold** during the backtest (not globally) — preserves PIT correctness: the model only "knows" COVID happened once the expanding window reaches March 2020.
+- **Symmetric log transforms.** Heavy-tailed features optionally undergo SymLog: $\text{sign}(x) \cdot \ln(1 + |x|)$. Compresses extreme kurtosis while handling negative values and preserving zero.
+- **Post-1990 anchor.** `DATA_START_FLOOR = 1990-01-01` removes pre-1990 sparsity.
+- **Regime-aware selection.** Feature-selection Stage 3 explicitly tests feature stability across hard-coded macro regimes (see §7) and rejects features that only worked in a single regime.
+- **COVID-clean noise estimation in the Kalman.** Trailing-window noise statistics exclude COVID months so they aren't dragged toward zero by the winsorized flat values.
+
+---
+
+## 18. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `RuntimeError: Missing required environment variable` | Set the variable in `.env`; see §3 for required variables |
+| `RuntimeError: Missing required environment variable` | Set the variable in `.env`; see §3 |
 | LightGBM OpenMP error on macOS | `brew install libomp` |
 | `FileNotFoundError: No master snapshots found` | Run `python run_full_project.py --stage data` first |
-| `optuna` import error | `pip install optuna` or use `--no-tune` to skip tuning |
-| Empty `_output/` | Ensure training stage completes without errors; check `_temp/*.log` |
-| OOM deadlock on macOS with multiprocessing | Feature selection engine uses `n_jobs=1` for LightGBM internally; if issue persists, reduce `SHORTPASS_TOPK` |
-| Feature selection cache stale | Delete `DATA_PATH/master_snapshots/*.json` or `source_caches/` and `regime_caches/` directories |
-| `RuntimeError: operational_available_date` | Revised models cannot predict before M+1 NFP release; wait or use first-release targets |
+| `optuna` import error | `pip install optuna` or use `--no-tune` |
+| Empty `_output/` | Ensure training completes; tail `_temp/*.log` |
+| OOM deadlock on macOS w/ multiprocessing | FS engine uses `n_jobs=1` for LightGBM internally; if it persists, lower `SHORTPASS_TOPK` |
+| Stale feature-selection cache | Delete `DATA_PATH/master_snapshots/*.json` or `source_caches/` and `regime_caches/` directories |
+| `RuntimeError: operational_available_date` | Revised models can't predict before M+1 NFP release; wait or use first-release targets |
+| `comparison_anchor::kalman_fusion missing` | Post-training fusion step failed; check `_temp/train_lightgbm_nfp_logger.log` |
+| HL drift warning after `--train-all` | Run `--iterate-fusion-tune` to converge dynamic-FS HL with Kalman HL |
 
 ---
 
 ## License
 
-Private / Internal Use
+Private / Internal Use.
 
 ## Author
 

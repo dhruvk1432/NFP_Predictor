@@ -19,7 +19,9 @@ import pandas as pd
 from dotenv import load_dotenv
 
 pd.set_option("display.max_columns", None)
-warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+_setting_with_copy_warning = getattr(pd.errors, "SettingWithCopyWarning", None)
+if _setting_with_copy_warning is not None:
+    warnings.filterwarnings("ignore", category=_setting_with_copy_warning)
 
 load_dotenv()
 
@@ -78,6 +80,7 @@ BACKTEST_DIR   = OUTPUT_DIR / "backtest"
 
 def setup_logger(script_path: str, temp_dir: Path) -> logging.Logger:
     script_name = Path(script_path).stem
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
     log_file_path = temp_dir / f"{script_name}_logger.log"
     error_log_file_path = temp_dir / f"{script_name}_errors.log"
 

@@ -367,8 +367,8 @@ def fetch_economist_snapshots(start_date=START_DATE, end_date=END_DATE):
         # Forecast values are MoM levels in thousands — pct_change copies cross zero
         # (recessionary months can be negative), so skip pct_change on all series here.
         skip_pct = set(snap["series_name"].unique())
-        snap = add_pct_change_copies(snap, skip_series=skip_pct)
-        snap = compute_all_features(snap, lean=True)
+        snap = add_pct_change_copies(snap, skip_series=skip_pct, source_name="EconomistPanel")
+        snap = compute_all_features(snap, lean=True, source_name="EconomistPanel")
 
         snap.to_parquet(save_path)
         snapshots_written += 1

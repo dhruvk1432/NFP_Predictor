@@ -502,8 +502,12 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
 
             # Lean mode: skip symlog (trees are monotone-invariant), drop 12m
             # diff z-scores and level z-scores.
-            full_snap = add_pct_change_copies(full_snap, skip_series=problematic_features)
-            full_snap = compute_all_features(full_snap, lean=True)
+            full_snap = add_pct_change_copies(
+                full_snap,
+                skip_series=problematic_features,
+                source_name="Unifier",
+            )
+            full_snap = compute_all_features(full_snap, lean=True, source_name="Unifier")
 
             full_snap.to_parquet(save_path)
             snapshots_written += 1

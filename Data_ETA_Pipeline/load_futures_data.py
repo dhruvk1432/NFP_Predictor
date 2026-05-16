@@ -341,8 +341,8 @@ def fetch_futures_snapshots(start_date=START_DATE, end_date=END_DATE):
                            ("_realized_vol", "_log_return", "_implied_rate_diff_1m"))
                     or s.startswith("YieldCurve_")}
 
-        snap = add_pct_change_copies(snap, skip_series=skip_pct)
-        snap = compute_all_features(snap, lean=True)
+        snap = add_pct_change_copies(snap, skip_series=skip_pct, source_name="Futures")
+        snap = compute_all_features(snap, lean=True, source_name="Futures")
 
         snap.to_parquet(save_path)
         snapshots_written += 1

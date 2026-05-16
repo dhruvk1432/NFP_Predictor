@@ -53,9 +53,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Step 3 baseline (proven good): cap=80, cadence=24, trials=25 → MAE=94.45.
 # Grid extends in all three dimensions to find the optimum.
 CAP_VALUES: list[int] = [60, 80, 100, 120]              # 4
-CADENCE_VALUES: list[int] = [6, 12, 18, 24]              # 4
-TRIALS_VALUES: list[int] = [25, 50]                       # 2
-# Total cells: 4 × 4 × 2 = 32
+# Early signal at cadence=24 was promising (best MAE=97.37 at cap=100, t=25),
+# so we extended the cadence sweep up to 60. cadence=60 with BACKTEST_MONTHS=60
+# means features are selected once at the start and never re-selected — a
+# clean static-FS upper bound. Cells run in `cadence_desc` order, so the new
+# (likely-best) high-cadence cells run first.
+CADENCE_VALUES: list[int] = [6, 12, 18, 24, 30, 36, 48, 60]   # 8
+TRIALS_VALUES: list[int] = [25, 50]                            # 2
+# Total cells: 4 × 8 × 2 = 64
 
 # Order cells by descending cadence so cheap cells run first (fewer reselections
 # ⇒ faster), giving us partial signal early in the run.
@@ -115,6 +120,73 @@ def _cell_id(idx: int, cap: int, cad: int, trials: int) -> str:
     return f"cell_{idx:02d}_cap{cap}_cad{cad}_t{trials}"
 
 
+# --- S3 durability --------------------------------------------------------
+# Resolved once at process start so per-cell pushes don't repeatedly call STS.
+_S3_BUCKET: str | None = None
+_S3_BUCKET_LOCK = threading.Lock()
+
+def _resolve_s3_bucket() -> str:
+    """Return s3 bucket name; derive from account id (sts:GetCallerIdentity
+    is always permitted by AWS). Falls back to S3_BUCKET env var if set
+    (allows local testing with a different bucket)."""
+    global _S3_BUCKET
+    if _S3_BUCKET is not None:
+        return _S3_BUCKET
+    with _S3_BUCKET_LOCK:
+        if _S3_BUCKET is not None:
+            return _S3_BUCKET
+        env_bucket = os.getenv("S3_BUCKET", "").strip()
+        if env_bucket:
+            _S3_BUCKET = env_bucket
+            return _S3_BUCKET
+        try:
+            r = subprocess.run(
+                ["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            account = r.stdout.strip()
+            _S3_BUCKET = f"nfp-predictor-{account}"
+        except Exception as e:
+            _safe_print(f"  WARN: could not resolve account id ({e}); "
+                        f"per-cell S3 push will fall back to env S3_BUCKET if set.")
+            _S3_BUCKET = ""
+        return _S3_BUCKET
+
+
+def _push_cell_to_s3(cell_dir: Path, cid: str) -> None:
+    """Sync one cell's directory to s3://<bucket>/_output_grid/<cell>/.
+    Also pushes grid_results.csv so the leaderboard is durable after every
+    cell. Quiet by design — only logs on failure."""
+    bucket = _resolve_s3_bucket()
+    if not bucket:
+        return
+    cell_name = cell_dir.name
+    # Push the cell's outputs.
+    cmd_cell = [
+        "aws", "s3", "sync", str(cell_dir) + "/",
+        f"s3://{bucket}/_output_grid/{cell_name}/",
+        "--only-show-errors",
+        "--exclude", "*.tmp", "--exclude", ".DS_Store",
+    ]
+    r1 = subprocess.run(cmd_cell, capture_output=True, text=True, timeout=600)
+    if r1.returncode != 0:
+        _safe_print(f"  [{cid}] WARN: cell s3 sync exit={r1.returncode}: "
+                    f"{(r1.stderr or '').strip()[:200]}")
+    # Push the cumulative grid_results.csv so the leaderboard is always
+    # recoverable from S3 (no race: this whole block is single-threaded per
+    # call, and aws s3 cp is atomic from the server's perspective).
+    if RESULTS_CSV.exists():
+        r2 = subprocess.run(
+            ["aws", "s3", "cp", str(RESULTS_CSV),
+             f"s3://{bucket}/_output_grid/grid_results.csv",
+             "--only-show-errors"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r2.returncode != 0:
+            _safe_print(f"  [{cid}] WARN: grid_results.csv s3 cp "
+                        f"exit={r2.returncode}: {(r2.stderr or '').strip()[:200]}")
+
+
 def _build_cell_list() -> list[dict]:
     cells = []
     for cap, cad, trials in itertools.product(CAP_VALUES, CADENCE_VALUES, TRIALS_VALUES):
@@ -131,16 +203,23 @@ def _build_cell_list() -> list[dict]:
     return cells
 
 
-def _load_done_indices() -> set[int]:
+def _load_done_keys() -> set[tuple[int, int, int]]:
+    """Resume on (cap, cadence, trials) identity, not idx. This makes resume
+    safe when the grid spec changes between runs (e.g. adding new cadence
+    values) — the integer idx would otherwise shift and either re-run done
+    cells or skip ones that should run.
+    """
     if not RESULTS_CSV.exists():
         return set()
     try:
         df = pd.read_csv(RESULTS_CSV)
     except Exception:
         return set()
-    if "idx" not in df.columns:
+    if not all(c in df.columns for c in ("cap", "cadence", "trials")):
         return set()
-    return set(int(x) for x in df["idx"].dropna().tolist())
+    df = df.dropna(subset=["cap", "cadence", "trials"])
+    return {(int(r["cap"]), int(r["cadence"]), int(r["trials"]))
+            for _, r in df.iterrows()}
 
 
 def _append_result(row: dict) -> None:
@@ -180,6 +259,25 @@ def _extract_metrics(cell_dir: Path) -> dict:
 
 def _run_one_cell(cell: dict) -> dict:
     cid = _cell_id(cell["idx"], cell["cap"], cell["cadence"], cell["trials"])
+
+    # Honor STOP for cells that are queued but haven't started yet.
+    # (The submission-loop STOP check fires once at submit time; with
+    # ThreadPoolExecutor we submit all futures up-front, so the only way
+    # a "drain" actually drains is for each cell to self-skip here when
+    # its turn comes.) Skipped cells get a sentinel row so they don't end
+    # up in grid_results.csv — the next launch resumes them naturally.
+    if STOP_FILE.exists():
+        _safe_print(f"[grid {datetime.utcnow().strftime('%H:%M:%S')}] "
+                    f"SKIP {cid}  (STOP file present; drain in progress)")
+        return {
+            "idx": cell["idx"], "cap": cell["cap"],
+            "cadence": cell["cadence"], "trials": cell["trials"],
+            "exit_code": -3,  # sentinel: "skipped due to STOP"
+            "cell_dir": str((GRID_DIR / cid).resolve()),
+            "started_at": "", "finished_at": "", "elapsed_min": 0.0,
+            "_skipped_by_stop": True,
+        }
+
     cell_dir = (GRID_DIR / cid).resolve()
     cell_dir.mkdir(parents=True, exist_ok=True)
 
@@ -261,6 +359,17 @@ def _run_one_cell(cell: dict) -> dict:
     mae_str = f"MAE={mae:.2f}" if mae is not None else "MAE=N/A"
     _safe_print(f"[grid {datetime.utcnow().strftime('%H:%M:%S')}] END   {cid}  "
                 f"exit={exit_code}  elapsed={elapsed_min:.1f}min  {mae_str}")
+
+    # Durability: push this cell's outputs to S3 the moment it finishes.
+    # The instance role has s3:PutObject scoped to nfp-predictor-* buckets.
+    # The bucket name is derived from the account id via sts:GetCallerIdentity
+    # (always permitted). Failures here are warnings, not fatal — the local
+    # EBS copy still exists.
+    try:
+        _push_cell_to_s3(cell_dir, cid)
+    except Exception as e:
+        _safe_print(f"  [{cid}] WARN: S3 push failed: {e}")
+
     return row
 
 
@@ -268,7 +377,7 @@ def main() -> int:
     GRID_DIR.mkdir(parents=True, exist_ok=True)
 
     cells = _build_cell_list()
-    done_idx = _load_done_indices()
+    done_keys = _load_done_keys()
 
     print("=" * 72)
     print(f"Grid search: {len(cells)} cells")
@@ -279,19 +388,23 @@ def main() -> int:
     print(f"  per-cell timeout: {PER_CELL_TIMEOUT_S // 3600}h")
     print(f"  parallelism: up to {MAX_PARALLEL_CELLS} cells × {CORES_PER_CELL} "
           f"cores each (= {MAX_PARALLEL_CELLS * CORES_PER_CELL} cores total)")
-    print(f"  resume: skipping {len(done_idx)} already-done cells")
+    print(f"  resume: skipping {len(done_keys)} already-done cells "
+          f"(by cap,cadence,trials)")
     print(f"  output: {GRID_DIR}")
     print(f"  stop:   `touch {STOP_FILE}` halts new submissions; "
           f"in-flight cells finish.")
     print("=" * 72)
 
+    def _is_done(c: dict) -> bool:
+        return (c["cap"], c["cadence"], c["trials"]) in done_keys
+
     # Print SKIP messages up-front so the parallel output below is clean.
     for cell in cells:
-        if cell["idx"] in done_idx:
+        if _is_done(cell):
             cid = _cell_id(cell["idx"], cell["cap"], cell["cadence"], cell["trials"])
             print(f"SKIP cell {cell['idx']:>2}  {cid}  (already in {RESULTS_CSV.name})")
 
-    remaining = [c for c in cells if c["idx"] not in done_idx]
+    remaining = [c for c in cells if not _is_done(c)]
     if not remaining:
         print("All cells already done.")
         return 0
@@ -323,6 +436,9 @@ def main() -> int:
             except Exception as e:
                 cid = _cell_id(c["idx"], c["cap"], c["cadence"], c["trials"])
                 _safe_print(f"FAILED cell {cid}: {e}")
+                continue
+            # Don't write skip-sentinel rows; resume should re-run them.
+            if row.get("_skipped_by_stop"):
                 continue
             _append_result(row)
 

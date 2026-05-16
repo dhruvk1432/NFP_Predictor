@@ -277,8 +277,8 @@ def create_adp_snapshots(start_date: str = START_DATE, end_date: str = END_DATE)
         snapshot_df = snapshot_df[['date', 'series_name', 'value', 'snapshot_date', 'release_date']]
 
         # Lean mode: skip symlog (trees are monotone-invariant), reduced features.
-        snapshot_df = add_pct_change_copies(snapshot_df)
-        snapshot_df = compute_all_features(snapshot_df, lean=True)
+        snapshot_df = add_pct_change_copies(snapshot_df, source_name="ADP")
+        snapshot_df = compute_all_features(snapshot_df, lean=True, source_name="ADP")
 
         # Determine file path
         year = event_date.year

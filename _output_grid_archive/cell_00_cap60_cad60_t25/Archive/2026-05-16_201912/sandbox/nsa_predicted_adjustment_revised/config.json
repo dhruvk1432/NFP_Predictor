@@ -1,0 +1,13 @@
+{
+  "selected_model": "exp_weighted_avg",
+  "selection_metric": "sa_composite",
+  "models_evaluated": [
+    "sarima",
+    "monthly_avg",
+    "12m_complement",
+    "same_month_ly",
+    "exp_weighted_avg",
+    "linreg_month_trend"
+  ],
+  "n_backtest_months": 58
+}

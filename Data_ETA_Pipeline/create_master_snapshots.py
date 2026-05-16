@@ -50,6 +50,12 @@ from Train.feature_engineering_sa_nsa_gap import (
     FEATURE_COLS as SA_NSA_GAP_FEATURE_COLS,
     build_sa_nsa_gap_features_for_snapshot,
 )
+from utils.feature_generation_policy import (
+    current_feature_policy_mode,
+    feature_policy_schema_version,
+    filter_wide_features,
+    write_feature_policy_report,
+)
 
 logger = setup_logger(__file__, TEMP_DIR)
 install_hooks()
@@ -1003,6 +1009,11 @@ def _batch_load_source_all_features(
         # Sanitise feature names (replace JSON-unsafe chars) — vectorised rename
         rename_map = {c: sanitize_feature_name(str(c)) for c in raw_feature_cols}
         wide = wide.rename(columns=rename_map)
+        wide = filter_wide_features(wide, source_name)
+
+        post_cols = [c for c in wide.columns if c not in meta_cols]
+        if not post_cols:
+            continue
 
         result[obs_month.strftime('%Y-%m')] = wide
 
@@ -1159,6 +1170,8 @@ def _run_unified_no_selection(
     marker = {
         "mode": "all_features",
         "generated_at": datetime.now().isoformat(),
+        "feature_generation_policy": current_feature_policy_mode(),
+        "feature_policy_schema_version": feature_policy_schema_version(),
         "note": "Master snapshots contain ALL lean features from all sources. "
                 "Feature selection is deferred to backtest-time dynamic reselection.",
     }
@@ -1167,6 +1180,10 @@ def _run_unified_no_selection(
         with open(marker_path, 'w') as f:
             json.dump(marker, f, indent=2)
         logger.info(f"[no-selection] Wrote marker: {marker_path.name}")
+
+    report_path = write_feature_policy_report()
+    if report_path is not None:
+        logger.info(f"[no-selection] Wrote feature policy report: {report_path}")
 
     logger.info("[no-selection] Master snapshot generation complete.")
 
@@ -1327,6 +1344,7 @@ def _augment_with_sa_nsa_gap(
 
     master_date = pd.to_datetime(master['date']).dt.normalize()
     master = master.assign(date=master_date)
+    gap = filter_wide_features(gap, "SA_NSA_Gap")
     return master.merge(gap, on='date', how='left')
 
 

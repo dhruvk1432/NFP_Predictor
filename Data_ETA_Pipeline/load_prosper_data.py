@@ -395,7 +395,7 @@ def fetch_prosper_snapshots(start_date=START_DATE, end_date=END_DATE, max_worker
             # Lean mode: skip symlog (trees are monotone-invariant), reduced features.
             # NOTE: pct_change skipped entirely — Prosper data is already in percentages,
             # so diff already captures the change in percentage points
-            snap_data = compute_all_features(snap_data, lean=True)
+            snap_data = compute_all_features(snap_data, lean=True, source_name="Prosper")
 
             snap_data.to_parquet(save_path, index=False)
             snapshots_written += 1

@@ -9,6 +9,12 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
+from utils.feature_generation_policy import (
+    filter_long_features,
+    filter_wide_features,
+    should_generate_intermediate_feature,
+)
+
 
 def apply_symlog(x: np.ndarray | pd.Series | float) -> np.ndarray | pd.Series | float:
     """
@@ -88,7 +94,8 @@ def inverse_log1p(y: np.ndarray | pd.Series | float) -> np.ndarray | pd.Series |
 
 def add_symlog_copies(
     df: pd.DataFrame,
-    skip_series: frozenset = frozenset()
+    skip_series: frozenset = frozenset(),
+    source_name: str | None = None,
 ) -> pd.DataFrame:
     # IMPORTANT: This must run BEFORE add_pct_change_copies() to prevent
     # creating symlog copies of derived series (pct_chg, symlog_pct_chg).
@@ -127,12 +134,22 @@ def add_symlog_copies(
     if 'series_code' in symlog_df.columns:
         symlog_df['series_code'] = symlog_df['series_code'].astype(str) + '_symlog'
 
+    if source_name is not None:
+        keep_series = {
+            s for s in symlog_df['series_name'].astype(str).unique()
+            if should_generate_intermediate_feature(source_name, s)
+        }
+        symlog_df = symlog_df[symlog_df['series_name'].astype(str).isin(keep_series)]
+        if symlog_df.empty:
+            return df
+
     return pd.concat([df, symlog_df], ignore_index=True)
 
 
 def add_pct_change_copies(
     df: pd.DataFrame,
-    skip_series: frozenset = frozenset()
+    skip_series: frozenset = frozenset(),
+    source_name: str | None = None,
 ) -> pd.DataFrame:
     """
     Create pct-change-transformed copies of raw AND symlog series.
@@ -174,6 +191,11 @@ def add_pct_change_copies(
         pct_group['value'] = group['value'].pct_change() * 100
         # Raw series X → X_pct_chg, Symlog series X_symlog → X_symlog_pct_chg
         pct_group['series_name'] = series_name + '_pct_chg'
+        if source_name is not None and not should_generate_intermediate_feature(
+            source_name,
+            str(pct_group['series_name'].iloc[0]),
+        ):
+            continue
         if 'series_code' in pct_group.columns:
             pct_group['series_code'] = pct_group['series_code'].astype(str) + '_pct_chg'
         pct_blocks.append(pct_group)
@@ -216,6 +238,7 @@ def compute_all_features(
     df: pd.DataFrame,
     skip_series: frozenset = frozenset(),
     lean: bool = False,
+    source_name: str | None = None,
 ) -> pd.DataFrame:
     """
     Compute the full suite of derived features for all series in a long-format DataFrame.
@@ -336,8 +359,13 @@ def compute_all_features(
 
             final_output_list.append(lag_block)
 
+    if not final_output_list:
+        return df.iloc[0:0].copy()
+
     result = pd.concat(final_output_list, ignore_index=True)
     result = result.dropna(subset=['value'])
+    if source_name is not None:
+        result = filter_long_features(result, source_name, feature_col='series_name')
     return result
 
 
@@ -361,6 +389,7 @@ def compute_features_wide(
     long_df: pd.DataFrame,
     apply_mom: bool = True,
     lean: bool = False,
+    source_name: str | None = None,
 ) -> pd.DataFrame:
     """
     Vectorized wide-format feature computation for FRED employment snapshots.
@@ -517,6 +546,8 @@ def compute_features_wide(
 
     final_wide = pd.concat(lag_frames, axis=1)
     final_wide.index.name = 'date'
+    if source_name is not None:
+        final_wide = filter_wide_features(final_wide, source_name)
 
     return final_wide
 

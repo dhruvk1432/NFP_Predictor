@@ -1,0 +1,37 @@
+{
+  "model_id": "nsa_first_revised",
+  "run_date": "2026-05-16",
+  "backtest_months": 3,
+  "overall": {
+    "rmse": 58.826584143784544,
+    "mae": 58.826584143784544,
+    "bias": -58.826584143784544,
+    "dir_acc": 1.0,
+    "accel_acc": NaN,
+    "coverage_50": 1.0,
+    "coverage_80": 1.0,
+    "coverage_95": 1.0,
+    "trailing_12m_mae": NaN,
+    "n_backtest": 1,
+    "std_ratio": 0.0,
+    "diff_std_ratio": 0.0,
+    "corr_level": 0.0,
+    "corr_diff": 0.0,
+    "diff_sign_accuracy": 0.0,
+    "tail_mae": 58.826584143784544,
+    "extreme_hit_rate": 1.0,
+    "strategy_counts": {
+      "base": 3
+    }
+  },
+  "per_month": [
+    {
+      "ds": "2026-03",
+      "actual": 571.0,
+      "predicted": 629.8265841437845,
+      "error": -58.826584143784544,
+      "dir_correct": 1,
+      "accel_correct": null
+    }
+  ]
+}

@@ -46,6 +46,7 @@ from settings import (
     RESELECT_EVERY_N_MONTHS, USE_PER_WINDOW_FEATURES,
 )
 from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump_perf_json, register_atexit_dump
+from experiments.sidecars.integration import attach_sidecar_features
 
 # Import from modular components
 from Train.config import (
@@ -222,6 +223,76 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 
+def _feature_engineering_parallel_settings() -> Tuple[int, Optional[str]]:
+    raw_jobs = os.getenv("NFP_TRAIN_FEATURE_N_JOBS", "").strip()
+    if raw_jobs:
+        try:
+            n_jobs = int(raw_jobs)
+        except ValueError:
+            logger.warning(
+                "Invalid NFP_TRAIN_FEATURE_N_JOBS=%r; using all processors",
+                raw_jobs,
+            )
+            n_jobs = -1
+    else:
+        n_jobs = -1
+
+    backend = os.getenv("NFP_TRAIN_FEATURE_BACKEND", "").strip() or None
+    if backend and backend not in {"loky", "threading", "multiprocessing"}:
+        logger.warning(
+            "Invalid NFP_TRAIN_FEATURE_BACKEND=%r; using joblib default",
+            backend,
+        )
+        backend = None
+    return n_jobs, backend
+
+
+def _coverage_protected_sources() -> set[str]:
+    """Sources allowed to survive sparse-history cleanup with a lower floor.
+
+    Futures and economist forecasts can be valuable in live inference even when
+    local historical collection was spotty.  This guardrail keeps those already
+    culled source families in the candidate universe without relaxing the rule
+    globally.
+    """
+    raw = os.getenv(
+        "NFP_TRAIN_COVERAGE_PROTECTED_SOURCES",
+        "Futures,EconomistPanel",
+    ).strip()
+    if not raw or raw.lower() in {"off", "none", "false", "0"}:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _coverage_protected_min_non_nan() -> int:
+    raw = os.getenv("NFP_TRAIN_COVERAGE_PROTECTED_MIN_NON_NAN", "48").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid NFP_TRAIN_COVERAGE_PROTECTED_MIN_NON_NAN=%r; using 48",
+            raw,
+        )
+        return 48
+
+
+def _coverage_protected_max_staleness_months() -> Optional[int]:
+    raw = os.getenv(
+        "NFP_TRAIN_COVERAGE_PROTECTED_MAX_STALENESS_MONTHS",
+        "12",
+    ).strip()
+    if not raw or raw.lower() in {"off", "none", "false"}:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid NFP_TRAIN_COVERAGE_PROTECTED_MAX_STALENESS_MONTHS=%r; using 12",
+            raw,
+        )
+        return 12
+
+
 def clean_features(
     X: pd.DataFrame,
     y: pd.Series,
@@ -271,9 +342,42 @@ def clean_features(
     X_work = X_work.drop(columns=['ds'], errors='ignore')
     X_work = X_work.replace([np.inf, -np.inf], np.nan)
 
+    protected_sources = _coverage_protected_sources()
+    protected_min_non_nan = _coverage_protected_min_non_nan()
+    protected_max_staleness = _coverage_protected_max_staleness_months()
+    protected_cols: set[str] = set()
+    if protected_sources:
+        ds_values = (
+            pd.to_datetime(X['ds'], errors='coerce')
+            if 'ds' in X.columns
+            else pd.Series(pd.NaT, index=X_work.index)
+        )
+        max_ds = ds_values.max()
+        for col in X_work.columns:
+            source = _coverage_source_for_column(col)
+            if source not in protected_sources:
+                continue
+            observed = X_work[col].notna()
+            observed_count = int(observed.sum())
+            if observed_count < protected_min_non_nan:
+                continue
+            if protected_max_staleness is not None and pd.notna(max_ds) and 'ds' in X.columns:
+                last_observed = ds_values.loc[observed].max()
+                if pd.isna(last_observed):
+                    continue
+                months_stale = (
+                    (max_ds.year - last_observed.year) * 12
+                    + (max_ds.month - last_observed.month)
+                )
+                if months_stale > protected_max_staleness:
+                    continue
+            protected_cols.add(col)
+
     # Stage 1: Global sparsity filter (same as before)
     non_nan_counts = X_work.notna().sum()
-    sparse_cols = non_nan_counts[non_nan_counts < min_non_nan].index.tolist()
+    sparse_candidates = non_nan_counts[non_nan_counts < min_non_nan].index.tolist()
+    sparse_cols = [col for col in sparse_candidates if col not in protected_cols]
+    sparse_protected = len(sparse_candidates) - len(sparse_cols)
     X_work = X_work.drop(columns=sparse_cols)
 
     # Stage 2: Post-2010 NaN rate filter
@@ -289,13 +393,22 @@ def clean_features(
         if n_modern > 0:
             X_modern = X.loc[modern_mask, X_work.columns].replace([np.inf, -np.inf], np.nan)
             nan_rates = X_modern.isna().sum() / n_modern
-            modern_nan_dropped = nan_rates[nan_rates > max_rate].index.tolist()
+            modern_nan_candidates = nan_rates[nan_rates > max_rate].index.tolist()
+            modern_nan_dropped = [
+                col for col in modern_nan_candidates if col not in protected_cols
+            ]
+            modern_nan_protected = len(modern_nan_candidates) - len(modern_nan_dropped)
             X_work = X_work.drop(columns=modern_nan_dropped)
+        else:
+            modern_nan_protected = 0
+    else:
+        modern_nan_protected = 0
 
     logger.info(
         f"Feature cleaning: dropped {len(sparse_cols)} sparse (<{min_non_nan} non-NaN), "
         f"{len(modern_nan_dropped)} high-NaN post-{eval_start}, "
-        f"{len(X_work.columns)} remaining"
+        f"{len(X_work.columns)} remaining "
+        f"(coverage-protected: {sparse_protected} sparse, {modern_nan_protected} high-NaN)"
     )
 
     return list(X_work.columns)
@@ -325,6 +438,24 @@ _UNIFIER_PREFIXES = (
 _ADP_PREFIXES = ('ADP_', 'adp_')
 _NOAA_PREFIXES = ('NOAA_', 'noaa_', 'storm_', 'hurricane_')
 _PROSPER_PREFIXES = ('Consumer_Mood', 'Prosper_', 'Consumer_Spending')
+_FUTURES_PREFIXES = (
+    'Treasury_', 'FedFunds_', 'SOFR_', 'WTI_Crude_', 'NatGas_', 'Gold_',
+    'Copper_', 'DollarIndex_', 'EuroFX_', 'YenFX_', 'SP500_Futures_',
+)
+_ECONOMIST_PREFIXES = ('NFP_Forecast_', 'Economist_', 'economist_')
+_SA_NSA_GAP_PREFIXES = ('sanagap_',)
+_DERIVED_CONTROL_PREFIXES = (
+    'is_', 'month_', 'quarter_', 'year', 'weeks_since_', 'nfp_', 'rev_master_',
+)
+
+
+def _coverage_source_for_column(col: str) -> Optional[str]:
+    """Return source labels used by sparse-history coverage protections."""
+    if col.startswith(_FUTURES_PREFIXES):
+        return 'Futures'
+    if col.startswith(_ECONOMIST_PREFIXES):
+        return 'EconomistPanel'
+    return None
 
 
 def _classify_columns_by_source(
@@ -347,6 +478,10 @@ def _classify_columns_by_source(
         'ADP': [],
         'NOAA': [],
         'Prosper': [],
+        'Futures': [],
+        'EconomistPanel': [],
+        'SA_NSA_Gap': [],
+        'DerivedControls': [],
         'Unknown': [],
     }
 
@@ -368,6 +503,14 @@ def _classify_columns_by_source(
             groups['NOAA'].append(col)
         elif col.startswith(_PROSPER_PREFIXES):
             groups['Prosper'].append(col)
+        elif col.startswith(_FUTURES_PREFIXES):
+            groups['Futures'].append(col)
+        elif col.startswith(_ECONOMIST_PREFIXES):
+            groups['EconomistPanel'].append(col)
+        elif col.startswith(_SA_NSA_GAP_PREFIXES):
+            groups['SA_NSA_Gap'].append(col)
+        elif col.startswith(_DERIVED_CONTROL_PREFIXES):
+            groups['DerivedControls'].append(col)
         else:
             groups['Unknown'].append(col)
 
@@ -857,7 +1000,10 @@ def _dynamic_reselection(
     # per-source Boruta loop entirely. PIT invariant (enforced inside
     # load_latest_universe): the cache's asof must be ≤ step_date.
     massive_sources = ['FRED_Employment_NSA', 'FRED_Employment_SA']
-    small_sources = ['FRED_Exogenous', 'Unifier', 'ADP', 'NOAA', 'Prosper']
+    small_sources = [
+        'FRED_Exogenous', 'Unifier', 'ADP', 'NOAA', 'Prosper',
+        'Futures', 'EconomistPanel', 'SA_NSA_Gap',
+    ]
     pass1_survivors: Dict[str, List[str]] = {}
 
     from Train.config import USE_UNIVERSE_CACHE, UNIVERSE_REFRESH_MONTHS
@@ -953,10 +1099,13 @@ def _dynamic_reselection(
                     src_name, feats = future.result()
                     pass1_survivors[src_name] = feats
 
-        # Include Unknown-source features (pass them through directly)
-        unknown_cols = source_groups.get('Unknown', [])
-        if unknown_cols:
-            pass1_survivors['Unknown'] = unknown_cols
+        # Include deterministic derived controls directly; these were
+        # previously in the Unknown bucket before source attribution was
+        # tightened for feature-culling reports.
+        for direct_source in ('DerivedControls', 'Unknown'):
+            direct_cols = source_groups.get(direct_source, [])
+            if direct_cols:
+                pass1_survivors[direct_source] = direct_cols
 
     total_pass1 = sum(len(v) for v in pass1_survivors.values())
     logger.info(
@@ -1618,12 +1767,24 @@ def build_training_dataset(
             target_lags_lookup,
         ))
 
-    logger.info(f"Starting parallel feature engineering for {len(tasks)} months using all processors...")
-
-    # Execute in parallel
-    results = Parallel(n_jobs=-1, verbose=5)(
-        delayed(_process_single_month_task)(*args) for args in tasks
-    )
+    n_jobs, backend = _feature_engineering_parallel_settings()
+    backend_msg = f" with {backend} backend" if backend else ""
+    if n_jobs == 1:
+        logger.info(
+            f"Starting sequential feature engineering for {len(tasks)} months"
+        )
+        results = [_process_single_month_task(*args) for args in tasks]
+    else:
+        logger.info(
+            f"Starting parallel feature engineering for {len(tasks)} months "
+            f"with n_jobs={n_jobs}{backend_msg}..."
+        )
+        parallel_kwargs = {"n_jobs": n_jobs, "verbose": 5}
+        if backend:
+            parallel_kwargs["backend"] = backend
+        results = Parallel(**parallel_kwargs)(
+            delayed(_process_single_month_task)(*args) for args in tasks
+        )
 
     # Filter out None results (skipped months)
     valid_results = [r for r in results if r[0] is not None]
@@ -1770,6 +1931,8 @@ def run_expanding_window_backtest(
     if X_full.empty:
         logger.error("Failed to build training dataset")
         return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+
+    X_full = attach_sidecar_features(X_full, output_dir=OUTPUT_DIR, logger=logger)
 
     # COVID-winsorize X_full and y_full ONCE upfront so training, prediction
     # (X_pred = X_full.iloc[[target_idx]]), AND the production model fit (which

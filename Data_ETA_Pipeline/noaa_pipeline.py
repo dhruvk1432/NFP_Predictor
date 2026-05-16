@@ -1234,11 +1234,11 @@ def create_noaa_weighted_snapshots(
             
             # Create pct_change variants
             # Skip series? No, these are continuous indices, so pct_change is valid
-            final_indices = add_pct_change_copies(final_indices)
+            final_indices = add_pct_change_copies(final_indices, source_name="NOAA")
 
             # Lean mode: reduced feature suite (no symlog already, also drop 12m
             # diff z-scores and level z-scores).
-            final_indices = compute_all_features(final_indices, lean=True)
+            final_indices = compute_all_features(final_indices, lean=True, source_name="NOAA")
 
             # --- FINAL FILTERING ---
             # Ensure no lookahead bias: filter out data not known by snap_date

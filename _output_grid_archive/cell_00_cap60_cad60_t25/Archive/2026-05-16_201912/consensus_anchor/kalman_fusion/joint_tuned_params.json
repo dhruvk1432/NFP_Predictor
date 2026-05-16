@@ -1,0 +1,9 @@
+{
+  "source": "joint_tuning",
+  "step_date": "2026-03-01",
+  "half_life_years": 3.0328547402673047,
+  "trailing_window": 33,
+  "nsa_weight_scale": 0.2378625299025971,
+  "best_score": 102.6432621487611,
+  "n_trials_run": 25
+}

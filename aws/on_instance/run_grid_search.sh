@@ -36,6 +36,28 @@ log "==== ensuring runtime deps (jinja2, optuna-integration[lightgbm]) ===="
 python -m pip install --quiet 'jinja2>=3' 'optuna-integration[lightgbm]' 2>&1 | tee -a "${LOG_FILE}" || \
   log "WARN: pip install partial failure; continuing."
 
+# ---------------- heartbeat sync (durability) ------------------------------
+# Continuously sync _output_grid/ to S3 every 5 min so even in-flight cell
+# state is durably backed up, not just on cell completion. Idempotent across
+# launches via a PID marker.
+BUCKET="${S3_BUCKET:-nfp-predictor-989571801493}"
+HB_MARKER=/tmp/nfp_heartbeat_sync.pid
+if [[ -f "${HB_MARKER}" ]] && kill -0 "$(cat "${HB_MARKER}")" 2>/dev/null; then
+  log "Heartbeat sync already running (PID=$(cat "${HB_MARKER}"))"
+else
+  nohup bash -c "
+    while :; do
+      aws s3 sync ${PROJECT_DIR}/_output_grid/ s3://${BUCKET}/_output_grid/ \
+        --exclude \"*.tmp\" --exclude \".DS_Store\" --only-show-errors 2>/dev/null || true
+      sleep 300
+    done
+  " > /tmp/heartbeat_sync.log 2>&1 &
+  HB_PID=$!
+  disown
+  echo $HB_PID > "${HB_MARKER}"
+  log "Heartbeat sync started, PID=${HB_PID} (every 5 min -> s3://${BUCKET}/_output_grid/)"
+fi
+
 # ---------------- grid search ----------------------------------------------
 log "==== Train/grid_search.py ===="
 stdbuf -oL -eL python Train/grid_search.py 2>&1 | tee -a "${LOG_FILE}"

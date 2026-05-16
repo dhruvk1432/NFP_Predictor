@@ -225,9 +225,21 @@ def feature_source(feature: str) -> str:
     if "__" in feature:
         return feature.split("__", 1)[0]
     if feature.startswith("nfp_"):
-        return "Target"
+        return "DerivedControls"
+    if feature.startswith(("rev_master_", "is_", "month_", "quarter_", "year", "weeks_since_")):
+        return "DerivedControls"
+    if feature.startswith("sanagap_"):
+        return "SA_NSA_Gap"
     if "consensus" in feature.lower():
         return "Consensus"
+    if feature.startswith(("Treasury_", "FedFunds_", "SOFR_", "WTI_Crude_", "NatGas_", "Gold_", "Copper_", "DollarIndex_", "EuroFX_", "YenFX_")):
+        return "Futures"
+    if feature.startswith(("NFP_Forecast_", "Economist_")):
+        return "EconomistPanel"
+    if feature.startswith(("NOAA_", "storm_", "hurricane_")):
+        return "NOAA"
+    if feature.startswith(("Prosper_", "Consumer_Mood", "Consumer_Spending")):
+        return "Prosper"
     if feature.startswith(("CC", "IC", "AW", "CES", "total", "private")):
         return "FRED_Employment"
     return feature.split("_", 1)[0] if "_" in feature else "Other"

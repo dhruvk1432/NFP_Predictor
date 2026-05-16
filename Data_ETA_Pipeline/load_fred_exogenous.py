@@ -1324,8 +1324,17 @@ def fetch_fred_exogenous_snapshots(start_date=START_DATE, end_date=END_DATE, max
 
             # Lean mode: skip symlog variants (trees are monotone-invariant),
             # drop 12m diff z-scores and level z-scores to reduce feature count.
-            full_snap = add_pct_change_copies(full_snap, skip_series=pct_change_skip)
-            full_snap = compute_all_features(full_snap, skip_series=BINARY_REGIME_FEATURES, lean=True)
+            full_snap = add_pct_change_copies(
+                full_snap,
+                skip_series=pct_change_skip,
+                source_name="FRED_Exogenous",
+            )
+            full_snap = compute_all_features(
+                full_snap,
+                skip_series=BINARY_REGIME_FEATURES,
+                lean=True,
+                source_name="FRED_Exogenous",
+            )
 
             # CRITICAL: Filter out data not yet released at snapshot time
             # This prevents lookahead bias from including monthly aggregates

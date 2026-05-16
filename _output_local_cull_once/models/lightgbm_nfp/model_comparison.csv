@@ -1,0 +1,2 @@
+Model,RMSE,MAE,Median_AE,Max_AE,Mean_Error,50%_Coverage,80%_Coverage,95%_Coverage,N_Features,N_Train_Obs,N_Backtest_Months,STD_Ratio,Diff_STD_Ratio,Corr_Diff,Diff_Sign_Accuracy,Tail_MAE,Extreme_Hit_Rate,Role
+nsa_first_revised,58.826584143784544,58.826584143784544,58.826584143784544,58.826584143784544,-58.826584143784544,100.0,100.0,100.0,80,436,1,0.0,0.0,0.0,0.0,58.826584143784544,1.0,CHAMPION

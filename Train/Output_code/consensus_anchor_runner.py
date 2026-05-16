@@ -51,6 +51,13 @@ from utils.transforms import (
     is_covid_month,
     COVID_EXCLUDE_MONTHS,
 )
+from experiments.sidecars.integration import (
+    merge_sidecar_observations,
+    sidecar_max_precision_share,
+    sidecar_observation_columns,
+    sidecar_router_enabled,
+    sidecar_router_values,
+)
 
 logger = setup_logger(__file__, TEMP_DIR)
 
@@ -381,6 +388,8 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
         merged["actual"] = merged["actual"].combine_first(merged["actual_from_target"])
         merged = merged.drop(columns=["actual_from_target"])
 
+    merged = merge_sidecar_observations(merged, output_dir=output_base, logger=logger)
+
     merged = merged.sort_values("ds").reset_index(drop=True)
     return merged
 
@@ -443,11 +452,15 @@ def kalman_fusion(
     keep_cols = ["ds", "actual", "consensus_pred", "champion_pred"]
     if "nsa_pred" in overlap_df.columns:
         keep_cols.append("nsa_pred")
+    sidecar_cols = [c for c in overlap_df.columns if c.startswith("sidecar_")]
+    keep_cols.extend(sidecar_cols)
     df = overlap_df[keep_cols].copy()
     df = df.dropna(subset=["consensus_pred", "champion_pred"])
     df = df.sort_values("ds").reset_index(drop=True)
 
     has_nsa = "nsa_pred" in df.columns and use_nsa_accel
+    sidecar_obs_cols = sidecar_observation_columns(df)
+    sidecar_active = bool(sidecar_obs_cols) or (bool(sidecar_cols) and sidecar_router_enabled())
 
     # Initialize noise parameters from consensus history strictly BEFORE the first
     # backtest month so the noise prior cannot peek into months that will later be
@@ -508,14 +521,28 @@ def kalman_fusion(
             # else: keep R_c, R_m, Q at the most recent estimates (or inits)
         # else: keep R_c, R_m, Q at the most recent estimates (or inits)
 
+        router_risk, router_confidence = sidecar_router_values(row)
+        Q_step = Q * (1.0 + 0.75 * router_risk)
+        R_m_step = R_m
+        if router_confidence > 0 and use_model and len(hist_valid) >= 1:
+            prev_actual = float(hist_valid["actual"].iloc[-1])
+            champion_delta = float(row["champion_pred"]) - prev_actual
+            side_sign_cols = [c for c in df.columns if c.startswith("sidecar_") and c.endswith("__predicted_accel_sign")]
+            signs = [
+                float(row[c]) for c in side_sign_cols
+                if pd.notna(row.get(c)) and float(row[c]) != 0.0
+            ]
+            if signs and np.sign(np.mean(signs)) != np.sign(champion_delta):
+                R_m_step = R_m * (1.0 + router_confidence)
+
         # Prediction step
         x_prior = x_hat
-        P_prior = P + Q
+        P_prior = P + Q_step
 
         # Update step: multi-observation Kalman (information filter)
         info_prior = 1.0 / P_prior
         info_c = 1.0 / R_c
-        info_m = 1.0 / R_m if use_model else 0.0
+        info_m = 1.0 / R_m_step if use_model else 0.0
 
         # NSA acceleration channel: observes delta, converted to level
         info_a = 0.0
@@ -550,12 +577,43 @@ def kalman_fusion(
             else:
                 info_a = nsa_weight_scale / R_a
 
-        P_post = 1.0 / (info_prior + info_c + info_m + info_a)
+        sidecar_terms: List[Tuple[float, float]] = []
+        if sidecar_obs_cols and len(hist_valid) >= 6:
+            for col in sidecar_obs_cols:
+                obs = row.get(col)
+                if pd.isna(obs):
+                    continue
+                hist_side = hist_valid[hist_valid[col].notna()] if col in hist_valid.columns else pd.DataFrame()
+                hist_side = hist_side[~is_covid_month(hist_side["ds"])] if not hist_side.empty else hist_side
+                if len(hist_side) >= 4:
+                    recent_err = (hist_side["actual"] - hist_side[col]).values[-trailing_window:]
+                    R_s = float(np.var(recent_err, ddof=1)) + 1e-6
+                else:
+                    R_s = max(R_c, R_m if use_model else R_c) * 4.0
+                conf_col = col.replace("__predicted_mom", "__confidence")
+                confidence = row.get(conf_col, 0.5)
+                confidence = float(np.clip(confidence, 0.05, 1.0)) if pd.notna(confidence) else 0.25
+                sidecar_terms.append((confidence / R_s, float(obs)))
+
+        sidecar_info_raw = float(sum(info for info, _ in sidecar_terms))
+        sidecar_info = sidecar_info_raw
+        base_info = info_prior + info_c + info_m + info_a
+        cap_share = sidecar_max_precision_share()
+        if sidecar_info > 0 and cap_share < 1.0:
+            cap_info = (cap_share / max(1.0 - cap_share, 1e-6)) * base_info
+            if sidecar_info > cap_info > 0:
+                scale = cap_info / sidecar_info
+                sidecar_terms = [(info * scale, obs) for info, obs in sidecar_terms]
+                sidecar_info = cap_info
+
+        total_info = info_prior + info_c + info_m + info_a + sidecar_info
+        P_post = 1.0 / total_info
         x_post = P_post * (
             info_prior * x_prior
             + info_c * row["consensus_pred"]
             + (info_m * row["champion_pred"] if use_model else 0.0)
             + (info_a * nsa_level_implied if info_a > 0 else 0.0)
+            + sum(info * obs for info, obs in sidecar_terms)
         )
 
         pred = x_post
@@ -567,13 +625,20 @@ def kalman_fusion(
             x_hat = x_post
             P = P_post
 
-        results.append({
+        result_row = {
             "ds": row["ds"],
             "actual": row["actual"],
             "predicted": pred,
             "consensus_pred": row["consensus_pred"],
             "error": row["actual"] - pred if pd.notna(row["actual"]) else np.nan,
-        })
+        }
+        if sidecar_active:
+            result_row.update({
+                "sidecar_precision_share": sidecar_info / total_info if total_info > 0 else 0.0,
+                "sidecar_router_risk": router_risk,
+                "sidecar_router_confidence": router_confidence,
+            })
+        results.append(result_row)
 
     res_df = pd.DataFrame(results)
     label = "Kalman_Fusion" if use_model else "Kalman_Consensus_Only"

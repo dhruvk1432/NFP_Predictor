@@ -304,13 +304,43 @@ to 70.2% while MAE stayed near the recoverable baseline. Future runs should
 preserve that shape. Do not accept a model that gains acceleration accuracy but
 loses materially on MAE, RMSE, or stress-month behavior.
 
-### 5. Standalone SA Is Weak
+### 5. The Old Standalone SA Model Is Weak, But A Modern Direct SA Model Is Still Promising
 
 The current and baseline SA LightGBM forecasts are both too weak to be a
 production peer. Static blend diagnostics assign SA zero optimal weight when
 blending current Kalman/consensus/NSA/SA on the full current panel.
 
-The correct use of SA is probably:
+This should not be interpreted as evidence that direct SA prediction is a dead
+end. The old SA branch is outdated relative to the current repo: it does not
+fully exploit the newer individual economist panel, continuous futures, SA-NSA
+gap features, direct feature-generation blocks, current leakage fixes, current
+dynamic-FS machinery, or fusion-aware tuning. We may be losing many features
+that are weak for NSA level prediction but highly relevant for the SA revised
+target directly.
+
+Feature families that may be better suited to direct SA than NSA:
+
+- Consensus level, consensus revisions, economist-panel dispersion, and
+  individual forecaster disagreement. These are already expressed in SA terms
+  by market/economist participants, so forcing them through NSA plus adjustment
+  can throw away information.
+- Daily futures/rates/equity/FX/volatility windows immediately before the NFP
+  release. These may capture market-implied expectations or risk regimes around
+  the SA headline rather than the raw NSA payroll count.
+- SA target-history transforms: lagged SA revised MoM, SA momentum, SA
+  acceleration, rolling volatility, trend breaks, and low-payroll/negative-print
+  regime flags.
+- Consensus-residual features: variables that predict `SA_revised - consensus`
+  may have little value for raw NSA prediction but large value as a direct
+  consensus correction.
+- SA-NSA gap features: gap level, seasonal strength, volatility, and trend may
+  be useful in a direct SA model as indicators of when seasonal adjustment is
+  unusually unstable.
+- Release-calendar and survey-window features: timing of the reference week,
+  weekday placement, pre-release claims/ADP/ISM windows, and weather or strike
+  shocks may affect the headline SA surprise more than the NSA level.
+
+The correct use of the current old SA model is probably:
 
 - SA target-history features.
 - SA momentum/acceleration features.
@@ -321,7 +351,14 @@ The correct use of SA is probably:
 
 The wrong use is likely:
 
-- A fully reactivated standalone SA LightGBM with equal production status.
+- Reactivating the old standalone SA LightGBM unchanged and giving it equal
+  production status.
+
+The promising use is:
+
+- Build a new direct-SA sidecar from the current feature universe, current PIT
+  fixes, and current tuning/evaluation discipline, then let the fusion/model
+  averaging layer decide how much trust it deserves.
 
 ### 6. NSA Plus Adjustment Is Too Volatile
 
@@ -485,6 +522,86 @@ Failure modes:
 - If adjustment history is sparse, gap features can be unstable.
 - Gap features should not become a backdoor for revised-target leakage.
 - Gap features may help only specific months and hurt average performance.
+
+#### Modern Direct SA Sidecar
+
+Current repo issue:
+
+- The historical SA branch is stale. Its poor MAE says the old implementation
+  is not production-ready; it does not prove that direct SA prediction cannot
+  add value.
+- Current dynamic selection is optimized around the NSA/fusion path, so it may
+  discard features whose strongest relationship is to the SA revised headline
+  or to the consensus residual.
+- Several newer feature families are naturally SA-facing: economist forecasts,
+  consensus microstructure, market-implied futures moves, SA-NSA gap behavior,
+  and headline-surprise regimes.
+
+Goal:
+
+- Build a fresh direct-SA model as a **sidecar source of truth**, not as an
+  immediate production replacement.
+- Use it to predict either `SA_revised` directly or `SA_revised - consensus`.
+- Feed its output into fusion/model averaging only after it proves
+  out-of-sample value.
+
+Model targets to test:
+
+- Direct level: `SA_revised`.
+- Consensus residual: `SA_revised - consensus`.
+- Directional residual: sign and magnitude bucket of `SA_revised - consensus`.
+- Acceleration: sign of `SA_revised[t] - SA_revised[t-1]`.
+- Distributional target: quantiles around `SA_revised` or residual error.
+
+Feature sets to test:
+
+- SA target-history block: SA lags, momentum, acceleration, rolling volatility,
+  rolling mean, and regime flags.
+- Consensus/economist block: consensus level, top-4 mean, individual
+  economist forecasts, disagreement, dispersion, forecaster revisions, and
+  top-k rolling accuracy weights.
+- Futures block: pre-release rates/curve/equity/FX/vol windows at 1d, 3d, 5d,
+  10d, and 21d horizons.
+- Event-surprise block: ADP, claims, ISM employment, JOLTS, Challenger, NFIB,
+  consumer-confidence labor differential, and other release-calendar surprises
+  where timestamps are clean.
+- Gap block: `sanagap_*` features, gap volatility, gap trend, and seasonal
+  strength.
+- Current NSA/fusion features: only those that survive a direct-SA audit, not
+  the entire NSA-selected feature set by default.
+
+How to let the main model use it:
+
+- As a fourth Kalman observation with high initial measurement noise and
+  rolling noise updates.
+- As a consensus-residual correction: `final = consensus + bounded_direct_sa_residual`.
+- As a model-average candidate with constrained prequential weights.
+- As a router: increase/decrease NSA channel weight when direct-SA confidence
+  disagrees with consensus in a historically reliable regime.
+- As an uncertainty signal: widen intervals or raise tail-risk flags when
+  direct-SA, consensus, and NSA disagree.
+- As a feature into the Kalman fusion state update, not necessarily as a raw
+  level forecast.
+
+Acceptance criteria:
+
+- It must beat consensus on residual MAE or improve the fused forecast
+  prequentially.
+- It must receive nonzero rolling weight without full-sample tuning leakage.
+- It must improve at least one of: full MAE, stress-panel MAE, tail MAE,
+  2026-03/late-2022 failure cases, or uncertainty calibration.
+- If it only improves acceleration/direction but hurts level MAE, use it as a
+  router or uncertainty input, not as a point-forecast peer.
+
+Implementation constraints:
+
+- Do not reuse the old SA branch as-is.
+- Start with an artifact-only or sandbox direct-SA experiment.
+- Reuse the current PIT loaders and master snapshots.
+- Give direct SA its own feature-selection target; do not inherit the NSA
+  selected set.
+- Save selected features/source counts so we can see which "lost" features the
+  SA sidecar recovers.
 
 #### New Feature Generation Blocks
 
@@ -1259,22 +1376,31 @@ Do not combine winners until single-axis behavior is known.
 
 ### Phase 4: SA Complement Tests
 
-Goal: Decide whether SA should enter as features, sidecar, or observation.
+Goal: rebuild SA as a modern sidecar and decide whether it should enter as
+features, a residual correction, a high-noise observation, a router, or a
+model-average candidate.
 
 Tests:
 
-1. SA LightGBM standalone, current form.
-2. SA-derived features only.
-3. SA-NSA gap features only.
-4. Direct SA acceleration classifier.
-5. SA as high-noise Kalman observation.
-6. SA residual versus consensus.
+1. Old SA LightGBM unchanged, only as a stale baseline.
+2. Fresh direct-SA LightGBM on the current feature universe with a direct-SA
+   feature-selection target.
+3. Direct consensus-residual model: predict `SA_revised - consensus`.
+4. SA-derived target-history features only.
+5. Consensus/economist/futures/gap feature blocks in direct SA, one at a time.
+6. Direct SA acceleration classifier.
+7. Direct SA quantile/error-width model.
+8. Direct SA as high-noise Kalman observation.
+9. Direct SA residual correction with bounded shrinkage.
+10. Direct SA as model-average candidate with rolling constrained weights.
 
 Accept SA only if:
 
 - It improves full MAE or stress-panel MAE after prequential validation.
 - It receives nontrivial rolling weight out-of-sample.
 - It improves uncertainty/failure detection even if not point MAE.
+- It recovers feature families that are plausibly SA-relevant and not merely
+  noisy duplicates of consensus.
 
 ### Phase 5: Fork Acceleration Integration
 
@@ -1432,8 +1558,12 @@ Excellent win:
 6. Run post-baseline source attribution: economist panel on/off, futures on/off,
    SA-NSA gap on/off, new feature generation on/off.
 7. Run one-axis ablations around the 92.66 checkpoint and best AWS finalist.
-8. Reproduce fork direct-acceleration on current PIT data.
-9. Build a small model-average layer over consensus and finalists.
-10. Extend LSEG/WRDS data only after the current new-source attribution is done,
+8. Build a sandbox modern direct-SA sidecar with its own SA feature-selection
+   target and compare direct level, consensus-residual, and acceleration
+   targets.
+9. Reproduce fork direct-acceleration on current PIT data.
+10. Build a small model-average layer over consensus and finalists, including
+    direct SA only if it earns nonzero prequential weight.
+11. Extend LSEG/WRDS data only after the current new-source attribution is done,
     starting with richer economist-panel metadata, event-calendar surprises, and
     pre-release futures windows.

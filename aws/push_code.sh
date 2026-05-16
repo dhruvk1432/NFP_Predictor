@@ -27,6 +27,8 @@ rsync -avz --delete \
   --exclude '.DS_Store' \
   --exclude 'data/' \
   --exclude '_output/' \
+  --exclude '_output_grid/' \
+  --exclude '_output_grid_archive/' \
   --exclude '_temp/' \
   --exclude 'continuous_futures/' \
   --exclude 'economist_panel/' \

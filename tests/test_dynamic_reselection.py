@@ -154,6 +154,66 @@ class TestCleanFeaturesNaNPruning:
         assert 'feat_a' in result
         assert 'feat_b' in result
 
+    def test_futures_and_economist_survive_spotty_but_recent_history(
+        self, sample_X_with_dates, sample_y, monkeypatch
+    ):
+        """Coverage-protected sources keep live-useful series with spotty history."""
+        from Train.train_lightgbm_nfp import clean_features
+
+        monkeypatch.setenv(
+            "NFP_TRAIN_COVERAGE_PROTECTED_SOURCES",
+            "Futures,EconomistPanel",
+        )
+        monkeypatch.setenv("NFP_TRAIN_COVERAGE_PROTECTED_MIN_NON_NAN", "48")
+        monkeypatch.setenv("NFP_TRAIN_COVERAGE_PROTECTED_MAX_STALENESS_MONTHS", "12")
+
+        X = sample_X_with_dates.copy()
+        X["Treasury_10Y_close"] = np.nan
+        X["NFP_Forecast_AIB"] = np.nan
+        recent_idx = X.index[-60:]
+        X.loc[recent_idx, "Treasury_10Y_close"] = np.arange(len(recent_idx))
+        X.loc[recent_idx, "NFP_Forecast_AIB"] = np.arange(len(recent_idx))
+
+        result = clean_features(
+            X,
+            sample_y,
+            min_non_nan=100,
+            nan_eval_start="2010-01-01",
+            nan_max_rate=0.20,
+        )
+
+        assert "Treasury_10Y_close" in result
+        assert "NFP_Forecast_AIB" in result
+        assert "modern_bad" not in result
+
+    def test_coverage_protection_does_not_keep_stale_source_features(
+        self, sample_X_with_dates, sample_y, monkeypatch
+    ):
+        """Sparse protected-source features still need recent availability."""
+        from Train.train_lightgbm_nfp import clean_features
+
+        monkeypatch.setenv(
+            "NFP_TRAIN_COVERAGE_PROTECTED_SOURCES",
+            "Futures,EconomistPanel",
+        )
+        monkeypatch.setenv("NFP_TRAIN_COVERAGE_PROTECTED_MIN_NON_NAN", "48")
+        monkeypatch.setenv("NFP_TRAIN_COVERAGE_PROTECTED_MAX_STALENESS_MONTHS", "12")
+
+        X = sample_X_with_dates.copy()
+        X["Treasury_10Y_close"] = np.nan
+        stale_idx = X.index[:60]
+        X.loc[stale_idx, "Treasury_10Y_close"] = np.arange(len(stale_idx))
+
+        result = clean_features(
+            X,
+            sample_y,
+            min_non_nan=100,
+            nan_eval_start="2010-01-01",
+            nan_max_rate=0.20,
+        )
+
+        assert "Treasury_10Y_close" not in result
+
 
 # =============================================================================
 # TEST: CONFIG CONSTANTS
@@ -445,6 +505,22 @@ class TestClassifyColumnsBySource:
                 'Consumer_Spending_latest']
         groups = _classify_columns_by_source(cols)
         assert len(groups['Prosper']) == 3
+
+    def test_new_source_prefixes(self):
+        from Train.train_lightgbm_nfp import _classify_columns_by_source
+
+        cols = [
+            'Treasury_10Y_close',
+            'NFP_Forecast_CONTINUUM_ECON',
+            'sanagap_adj_lag1',
+            'is_jan',
+            'rev_master_mean',
+        ]
+        groups = _classify_columns_by_source(cols)
+        assert groups['Futures'] == ['Treasury_10Y_close']
+        assert groups['EconomistPanel'] == ['NFP_Forecast_CONTINUUM_ECON']
+        assert groups['SA_NSA_Gap'] == ['sanagap_adj_lag1']
+        assert groups['DerivedControls'] == ['is_jan', 'rev_master_mean']
 
     def test_unknown_columns(self):
         """Unrecognized columns should go to 'Unknown' bucket."""

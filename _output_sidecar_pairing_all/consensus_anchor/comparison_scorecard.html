@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Consensus Anchor Scorecard</title>
+<style>
+ body { font-family: -apple-system, system-ui, Helvetica, Arial, sans-serif;
+        margin: 24px; color: #111; }
+ h1 { font-size: 22px; margin-bottom: 8px; }
+ h2 { font-size: 16px; margin-top: 28px; }
+ table.metrics { border-collapse: collapse; font-size: 13px; }
+ table.metrics th, table.metrics td { padding: 6px 10px; border-bottom: 1px solid #eee; text-align: right; }
+ table.metrics th:first-child, table.metrics td:first-child { text-align: left; }
+ table.metrics tr:hover td { background: #f6f8fa; }
+ img { max-width: 100%; border: 1px solid #eee; margin-top: 8px; }
+ .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+</style></head>
+<body>
+ <h1>Consensus Anchor — 4-Way Forecast Scorecard</h1>
+ <p>Sorted by MAE. Backtest period: 58 months.</p>
+ <table class="dataframe metrics">
+  <thead>
+    <tr style="text-align: right;">
+      <th>Forecast</th>
+      <th>N</th>
+      <th>RMSE</th>
+      <th>MAE</th>
+      <th>MSE</th>
+      <th>ME_Bias</th>
+      <th>MedAE</th>
+      <th>SMAPE_pct</th>
+      <th>Directional_Accuracy</th>
+      <th>Acceleration_Accuracy</th>
+      <th>STD_Ratio</th>
+      <th>Diff_STD_Ratio</th>
+      <th>Corr_Level</th>
+      <th>Corr_Diff</th>
+      <th>Diff_Sign_Accuracy</th>
+      <th>Tail_MAE</th>
+      <th>Extreme_Hit_Rate</th>
+      <th>NonCovid_RMSE</th>
+      <th>NonCovid_MAE</th>
+      <th>NonCovid_MSE</th>
+      <th>NonCovid_ME_Bias</th>
+      <th>NonCovid_MedAE</th>
+      <th>NonCovid_SMAPE_pct</th>
+      <th>NonCovid_Directional_Accuracy</th>
+      <th>NonCovid_Acceleration_Accuracy</th>
+      <th>NonCovid_STD_Ratio</th>
+      <th>NonCovid_Diff_STD_Ratio</th>
+      <th>NonCovid_Corr_Level</th>
+      <th>NonCovid_Corr_Diff</th>
+      <th>NonCovid_Diff_Sign_Accuracy</th>
+      <th>NonCovid_Tail_MAE</th>
+      <th>NonCovid_Extreme_Hit_Rate</th>
+      <th>CovidOnly_RMSE</th>
+      <th>CovidOnly_MAE</th>
+      <th>CovidOnly_MSE</th>
+      <th>CovidOnly_ME_Bias</th>
+      <th>CovidOnly_MedAE</th>
+      <th>CovidOnly_SMAPE_pct</th>
+      <th>CovidOnly_Directional_Accuracy</th>
+      <th>CovidOnly_Acceleration_Accuracy</th>
+      <th>CovidOnly_STD_Ratio</th>
+      <th>CovidOnly_Diff_STD_Ratio</th>
+      <th>CovidOnly_Corr_Level</th>
+      <th>CovidOnly_Corr_Diff</th>
+      <th>CovidOnly_Diff_Sign_Accuracy</th>
+      <th>CovidOnly_Tail_MAE</th>
+      <th>CovidOnly_Extreme_Hit_Rate</th>
+      <th>N_NonCovid</th>
+      <th>N_Covid</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Kalman_Fusion_NSA</td>
+      <td>58</td>
+      <td>134.195</td>
+      <td>94.700</td>
+      <td>18008.370</td>
+      <td>34.799</td>
+      <td>71.711</td>
+      <td>45.080</td>
+      <td>0.966</td>
+      <td>0.702</td>
+      <td>0.787</td>
+      <td>0.778</td>
+      <td>0.731</td>
+      <td>0.346</td>
+      <td>0.702</td>
+      <td>137.370</td>
+      <td>0.167</td>
+      <td>134.195</td>
+      <td>94.700</td>
+      <td>18008.370</td>
+      <td>34.799</td>
+      <td>71.711</td>
+      <td>45.080</td>
+      <td>0.966</td>
+      <td>0.702</td>
+      <td>0.787</td>
+      <td>0.778</td>
+      <td>0.731</td>
+      <td>0.346</td>
+      <td>0.702</td>
+      <td>137.370</td>
+      <td>0.167</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>58</td>
+      <td>0</td>
+    </tr>
+    <tr>
+      <td>Baseline_Consensus</td>
+      <td>58</td>
+      <td>144.029</td>
+      <td>101.276</td>
+      <td>20744.241</td>
+      <td>33.448</td>
+      <td>68.500</td>
+      <td>47.082</td>
+      <td>0.966</td>
+      <td>0.667</td>
+      <td>0.816</td>
+      <td>0.413</td>
+      <td>0.685</td>
+      <td>0.033</td>
+      <td>0.667</td>
+      <td>161.200</td>
+      <td>0.333</td>
+      <td>144.029</td>
+      <td>101.276</td>
+      <td>20744.241</td>
+      <td>33.448</td>
+      <td>68.500</td>
+      <td>47.082</td>
+      <td>0.966</td>
+      <td>0.667</td>
+      <td>0.816</td>
+      <td>0.413</td>
+      <td>0.685</td>
+      <td>0.033</td>
+      <td>0.667</td>
+      <td>161.200</td>
+      <td>0.333</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>58</td>
+      <td>0</td>
+    </tr>
+    <tr>
+      <td>Baseline_Champion</td>
+      <td>58</td>
+      <td>234.788</td>
+      <td>186.120</td>
+      <td>55125.520</td>
+      <td>72.889</td>
+      <td>129.869</td>
+      <td>91.683</td>
+      <td>0.810</td>
+      <td>0.684</td>
+      <td>1.273</td>
+      <td>1.849</td>
+      <td>0.483</td>
+      <td>0.452</td>
+      <td>0.684</td>
+      <td>263.684</td>
+      <td>0.333</td>
+      <td>234.788</td>
+      <td>186.120</td>
+      <td>55125.520</td>
+      <td>72.889</td>
+      <td>129.869</td>
+      <td>91.683</td>
+      <td>0.810</td>
+      <td>0.684</td>
+      <td>1.273</td>
+      <td>1.849</td>
+      <td>0.483</td>
+      <td>0.452</td>
+      <td>0.684</td>
+      <td>263.684</td>
+      <td>0.333</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>58</td>
+      <td>0</td>
+    </tr>
+  </tbody>
+</table>
+ <h2>Forecast overlay</h2>
+ <img src="comparison_overlay.png" alt="overlay" />
+ <h2>Metrics comparison</h2>
+ <img src="comparison_metrics.png" alt="metrics" />
+ <h2>Per-forecast diagnostics</h2>
+ <div class="grid">
+  <div><h3>Baseline Consensus</h3><img src="baseline_consensus/backtest_predictions.png"/></div>
+  <div><h3>Kalman Fusion (NSA)</h3><img src="kalman_fusion/backtest_predictions.png"/></div>
+ </div>
+</body></html>

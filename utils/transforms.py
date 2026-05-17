@@ -701,25 +701,43 @@ def winsorize_covid_period(
     covid_end: str = COVID_END_DEFAULT,
     lower_percentile: float = 0.01,
     upper_percentile: float = 0.99,
+    reference_end: str | pd.Timestamp = COVID_START_DEFAULT,
 ) -> pd.DataFrame | pd.Series:
-    """
-    Winsorize values during the COVID period by clipping them to quantile
-    boundaries computed from the non-COVID portion of the data.
+    """Winsorize COVID-period values using a PIT-safe pre-COVID reference window.
 
-    This keeps the same number of rows (preserving time-series continuity)
-    while neutralizing extreme COVID-era outliers that would otherwise
-    distort correlations and other statistical measures.
+    Models the economist's view: COVID is a real-time-observable shock; the
+    natural way to neutralize it without "destroying" the model is to clip
+    COVID-period values to the historical (pre-COVID) 1/99% quantile range.
+    Those bounds are knowable at any prediction step from 2020-03 onwards
+    and do not change as more post-COVID data arrives.
+
+    Quantile bounds are computed from rows with index strictly less than
+    ``reference_end`` (default = ``COVID_START_DEFAULT`` = "2020-03-01").
+    Earlier versions of this function used every non-COVID row including
+    post-2020-12 data, which silently leaked future-quantile information
+    back into the COVID-row clip when applied to an X_full / y_full series
+    that extended past the prediction step's PIT cutoff. The new behavior
+    is PIT-trivially-safe because the reference distribution is fixed in
+    time and lives strictly before the COVID shock.
 
     Args:
         data: Wide-format DataFrame (DatetimeIndex, columns = series) or
-              a Series with DatetimeIndex.
+            a Series with DatetimeIndex.
         covid_start: First month of the COVID shock (inclusive).
         covid_end:   Last month of the COVID shock (inclusive).
         lower_percentile: Lower quantile for clipping (default 1%).
         upper_percentile: Upper quantile for clipping (default 99%).
+        reference_end: Strict upper bound on the reference window used
+            for quantile computation. Default = ``COVID_START_DEFAULT``,
+            which gives a pre-COVID reference window. Callers can pass
+            a per-step ``cutoff_date`` to use a tighter PIT window inside
+            a walk-forward backtest.
 
     Returns:
-        Copy of *data* with COVID-period values clipped per-column.
+        Copy of *data* with COVID-period values clipped per-column. When
+        no rows in *data* predate ``reference_end`` (e.g., the caller
+        passed a slice starting after 2020-03), *data* is returned
+        unchanged with a warning.
     """
     data = data.copy()
     covid_mask = (data.index >= pd.Timestamp(covid_start)) & \
@@ -728,19 +746,28 @@ def winsorize_covid_period(
     if not covid_mask.any():
         return data
 
+    ref_cutoff = pd.Timestamp(reference_end)
+    ref_mask = data.index < ref_cutoff
+    if not ref_mask.any():
+        # Defense: caller passed a window starting after the reference
+        # cutoff. Return data unchanged rather than silently producing
+        # NaN bounds.
+        return data
+    reference = data.loc[ref_mask]
+
     if isinstance(data, pd.DataFrame):
-        non_covid = data.loc[~covid_mask]
         # Vectorized: compute quantiles for all columns at once (returns Series)
-        lower_bounds = non_covid.quantile(lower_percentile)
-        upper_bounds = non_covid.quantile(upper_percentile)
-        # Clip all COVID rows against per-column bounds in one operation
+        lower_bounds = reference.quantile(lower_percentile)
+        upper_bounds = reference.quantile(upper_percentile)
+        # Clip all COVID rows against per-column bounds in one operation.
+        # NaN bounds (columns with all-NaN in the reference window) are
+        # treated as no-clip by pandas — desired behavior.
         data.loc[covid_mask] = data.loc[covid_mask].clip(
             lower=lower_bounds, upper=upper_bounds, axis=1
         )
     else:  # pd.Series
-        non_covid = data.loc[~covid_mask]
-        lower = non_covid.quantile(lower_percentile)
-        upper = non_covid.quantile(upper_percentile)
+        lower = reference.quantile(lower_percentile)
+        upper = reference.quantile(upper_percentile)
         data.loc[covid_mask] = data.loc[covid_mask].clip(
             lower=lower, upper=upper
         )

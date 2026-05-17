@@ -20,7 +20,11 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from experiments.sidecars.common import feature_audit_from_frame, write_sidecar_artifacts
+from experiments.sidecars.common import (
+    feature_audit_from_frame,
+    sidecar_branch_root,
+    write_sidecar_artifacts,
+)
 from experiments.sidecars.feature_matrix import (
     build_sidecar_design,
     rank_features_by_correlation,
@@ -36,8 +40,33 @@ except RuntimeError:
 
 
 DEFAULT_TARGET_PATH = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
-DEFAULT_OUTPUT_DIR = OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "direct_sa_residual"
 DEFAULT_MODEL_ID = "direct_sa_residual"
+DEFAULT_TARGET_TYPE = "sa"
+# Legacy output path (kept as a fallback when an explicit --output-dir isn't
+# given and target_type='nsa' — matches where the live NSA runner has been
+# writing). For SA we always land under sidecars/sa/.
+LEGACY_DEFAULT_OUTPUT_DIR = (
+    OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "direct_sa_residual"
+)
+
+
+def _resolve_output_dir(
+    explicit: Path | None,
+    target_type: str,
+    run_id: str,
+) -> Path:
+    """Resolve the artifact output dir.
+
+    SA always lands under ``sidecars/sa/<run_id>/direct_sa_residual/``.
+    NSA preserves the legacy flat path for backwards compatibility unless
+    an explicit dir is supplied.
+    """
+    if explicit is not None:
+        return explicit
+    target_type = str(target_type).strip().lower()
+    if target_type == "sa":
+        return sidecar_branch_root(OUTPUT_DIR, "sa") / run_id / "direct_sa_residual"
+    return LEGACY_DEFAULT_OUTPUT_DIR
 
 
 def _load_consensus_pit_frame() -> pd.DataFrame:
@@ -132,7 +161,7 @@ def _fit_predict(kind: str, X_train: np.ndarray, y_train: np.ndarray, X_pred: np
 def run_direct_sa_residual_sidecar(
     *,
     target_path: Path = DEFAULT_TARGET_PATH,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    output_dir: Path | None = None,
     start: str = "2000-01",
     min_train: int = 72,
     include_snapshots: bool = True,
@@ -140,10 +169,16 @@ def run_direct_sa_residual_sidecar(
     top_features: int = 60,
     model_kind: str = "ridge",
     model_id: str | None = None,
+    target_type: str = DEFAULT_TARGET_TYPE,
+    run_id: str = "local_sidecar_once",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if model_kind not in {"ridge", "elasticnet", "xgb", "lgbm"}:
         raise ValueError(f"Unsupported model_kind={model_kind!r}")
+    target_type = str(target_type).strip().lower()
+    if target_type not in {"nsa", "sa"}:
+        raise ValueError(f"target_type must be 'nsa' or 'sa'; got {target_type!r}")
     model_id = model_id or f"{DEFAULT_MODEL_ID}_{model_kind}"
+    output_dir = _resolve_output_dir(output_dir, target_type, run_id)
     design = build_sidecar_design(
         target_space="sa_revised",
         target_path=target_path,
@@ -252,7 +287,15 @@ def run_direct_sa_residual_sidecar(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-path", type=Path, default=DEFAULT_TARGET_PATH)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Explicit output dir. If omitted, falls back to "
+                             "sidecars/<target_type>/<run_id>/direct_sa_residual.")
+    parser.add_argument("--target-type", default=DEFAULT_TARGET_TYPE,
+                        choices=["nsa", "sa"],
+                        help="Branch subtree the artifact lands under "
+                             "(SA always under sidecars/sa/).")
+    parser.add_argument("--run-id", default="local_sidecar_once",
+                        help="Sidecar run-id directory under the branch subtree.")
     parser.add_argument("--start", default="2000-01")
     parser.add_argument("--min-train", type=int, default=72)
     parser.add_argument("--no-snapshots", action="store_true")
@@ -269,6 +312,8 @@ def main() -> None:
         max_snapshot_columns=args.max_snapshot_columns,
         top_features=args.top_features,
         model_kind=args.model_kind,
+        target_type=args.target_type,
+        run_id=args.run_id,
     )
     import json
 

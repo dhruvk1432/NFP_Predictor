@@ -1,0 +1,493 @@
+{
+  "model_id": "nsa_first_revised",
+  "run_date": "2026-05-16",
+  "backtest_months": 60,
+  "overall": {
+    "rmse": 258.78946467013003,
+    "mae": 190.28052108097484,
+    "bias": 73.80278815968359,
+    "dir_acc": 0.9827586206896551,
+    "accel_acc": 0.9473684210526315,
+    "coverage_50": 0.017241379310344827,
+    "coverage_80": 0.017241379310344827,
+    "coverage_95": 0.017241379310344827,
+    "trailing_12m_mae": 94.12642394893027,
+    "n_backtest": 58,
+    "std_ratio": 0.8973265242812922,
+    "diff_std_ratio": 0.895520870021924,
+    "corr_level": 0.974149596894123,
+    "corr_diff": 0.9745136255437259,
+    "diff_sign_accuracy": 0.9473684210526315,
+    "tail_mae": 342.42768093729563,
+    "extreme_hit_rate": 0.8333333333333334,
+    "strategy_counts": {
+      "base": 60
+    }
+  },
+  "per_month": [
+    {
+      "ds": "2021-06",
+      "actual": 1148.0,
+      "predicted": 622.070647724902,
+      "error": 525.929352275098,
+      "dir_correct": 1,
+      "accel_correct": null
+    },
+    {
+      "ds": "2021-07",
+      "actual": -133.0,
+      "predicted": -353.87462752260274,
+      "error": 220.87462752260274,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2021-08",
+      "actual": 312.0,
+      "predicted": 410.01752261797157,
+      "error": -98.01752261797157,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2021-09",
+      "actual": 654.0,
+      "predicted": 613.4970354965895,
+      "error": 40.50296450341045,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2021-10",
+      "actual": 1558.0,
+      "predicted": 809.0372700733814,
+      "error": 748.9627299266186,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2021-11",
+      "actual": 778.0,
+      "predicted": 431.88043894643295,
+      "error": 346.11956105356705,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2021-12",
+      "actual": 72.0,
+      "predicted": 295.6331435409649,
+      "error": -223.6331435409649,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-01",
+      "actual": -2824.0,
+      "predicted": -2165.438881233282,
+      "error": -658.5611187667182,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-02",
+      "actual": 1457.0,
+      "predicted": 849.802359394484,
+      "error": 607.197640605516,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-03",
+      "actual": 794.0,
+      "predicted": 705.8616774388394,
+      "error": 88.13832256116063,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-04",
+      "actual": 1071.0,
+      "predicted": 911.9716532581331,
+      "error": 159.02834674186693,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-05",
+      "actual": 809.0,
+      "predicted": 765.0958653710604,
+      "error": 43.90413462893957,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-06",
+      "actual": 944.0,
+      "predicted": 720.8451677517288,
+      "error": 223.1548322482712,
+      "dir_correct": 1,
+      "accel_correct": 0
+    },
+    {
+      "ds": "2022-07",
+      "actual": -385.0,
+      "predicted": -774.1457279302865,
+      "error": 389.1457279302865,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-08",
+      "actual": 309.0,
+      "predicted": 358.92827858164526,
+      "error": -49.92827858164526,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-09",
+      "actual": 431.0,
+      "predicted": 635.4659716448554,
+      "error": -204.46597164485536,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-10",
+      "actual": 1172.0,
+      "predicted": 565.6740431964209,
+      "error": 606.3259568035791,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-11",
+      "actual": 574.0,
+      "predicted": 344.0103374737921,
+      "error": 229.9896625262079,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2022-12",
+      "actual": -244.0,
+      "predicted": 156.87542032695634,
+      "error": -400.8754203269564,
+      "dir_correct": 0,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-01",
+      "actual": -2505.0,
+      "predicted": -2456.579879811834,
+      "error": -48.42012018816604,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-02",
+      "actual": 1119.0,
+      "predicted": 742.5930476950886,
+      "error": 376.40695230491144,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-03",
+      "actual": 520.0,
+      "predicted": 381.7247741231008,
+      "error": 138.27522587689919,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-04",
+      "actual": 892.0,
+      "predicted": 807.9367151559162,
+      "error": 84.0632848440838,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-05",
+      "actual": 920.0,
+      "predicted": 720.1303902968297,
+      "error": 199.86960970317034,
+      "dir_correct": 1,
+      "accel_correct": 0
+    },
+    {
+      "ds": "2023-06",
+      "actual": 697.0,
+      "predicted": 688.3769949320271,
+      "error": 8.62300506797294,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-07",
+      "actual": -819.0,
+      "predicted": -1022.3571847737688,
+      "error": 203.35718477376884,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-08",
+      "actual": 268.0,
+      "predicted": 282.10534285186293,
+      "error": -14.105342851862929,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-09",
+      "actual": 585.0,
+      "predicted": 595.3455864570299,
+      "error": -10.345586457029867,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-10",
+      "actual": 1066.0,
+      "predicted": 742.6046752348967,
+      "error": 323.3953247651033,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-11",
+      "actual": 477.0,
+      "predicted": 252.45759394320874,
+      "error": 224.54240605679126,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2023-12",
+      "actual": -167.0,
+      "predicted": -576.4682146358315,
+      "error": 409.4682146358315,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-01",
+      "actual": -2635.0,
+      "predicted": -2419.342357977333,
+      "error": -215.657642022667,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-02",
+      "actual": 1141.0,
+      "predicted": 794.9408640374568,
+      "error": 346.0591359625432,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-03",
+      "actual": 659.0,
+      "predicted": 485.39035833444325,
+      "error": 173.60964166555675,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-04",
+      "actual": 803.0,
+      "predicted": 938.1836689321265,
+      "error": -135.18366893212647,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-05",
+      "actual": 917.0,
+      "predicted": 769.8393348167217,
+      "error": 147.1606651832783,
+      "dir_correct": 1,
+      "accel_correct": 0
+    },
+    {
+      "ds": "2024-06",
+      "actual": 547.0,
+      "predicted": 553.617921876201,
+      "error": -6.617921876200967,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-07",
+      "actual": -915.0,
+      "predicted": -865.6173729444948,
+      "error": -49.38262705550517,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-08",
+      "actual": 263.0,
+      "predicted": 208.95933698954735,
+      "error": 54.04066301045265,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-09",
+      "actual": 460.0,
+      "predicted": 457.66248041827794,
+      "error": 2.337519581722063,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-10",
+      "actual": 826.0,
+      "predicted": 803.765095334071,
+      "error": 22.23490466592898,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-11",
+      "actual": 525.0,
+      "predicted": 332.74845909346226,
+      "error": 192.25154090653774,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2024-12",
+      "actual": -81.0,
+      "predicted": -251.3006692659954,
+      "error": 170.3006692659954,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-01",
+      "actual": -2852.0,
+      "predicted": -2635.4810656758855,
+      "error": -216.51893432411453,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-02",
+      "actual": 891.0,
+      "predicted": 772.9618340026927,
+      "error": 118.03816599730726,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-03",
+      "actual": 556.0,
+      "predicted": 707.7318625276141,
+      "error": -151.7318625276141,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-04",
+      "actual": 905.0,
+      "predicted": 863.6526344718131,
+      "error": 41.347365528186856,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-05",
+      "actual": 726.0,
+      "predicted": 669.2195925288826,
+      "error": 56.78040747111743,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-06",
+      "actual": 517.0,
+      "predicted": 568.0282436852369,
+      "error": -51.02824368523693,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-07",
+      "actual": -1066.0,
+      "predicted": -1084.895615706427,
+      "error": 18.895615706426952,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-08",
+      "actual": 200.0,
+      "predicted": 203.5840257591788,
+      "error": -3.584025759178786,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-09",
+      "actual": 317.0,
+      "predicted": 492.32694166790793,
+      "error": -175.32694166790793,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-10",
+      "actual": 679.0,
+      "predicted": 560.9153943216163,
+      "error": 118.0846056783837,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-11",
+      "actual": 241.0,
+      "predicted": 513.6849433546863,
+      "error": -272.6849433546863,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2025-12",
+      "actual": -192.0,
+      "predicted": -170.93838156516458,
+      "error": -21.061618434835424,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2026-01",
+      "actual": -2649.0,
+      "predicted": -2587.0984885821663,
+      "error": -61.90151141783372,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2026-02",
+      "actual": 563.0,
+      "predicted": 777.9785878396584,
+      "error": -214.97858783965842,
+      "dir_correct": 1,
+      "accel_correct": 1
+    },
+    {
+      "ds": "2026-03",
+      "actual": 571.0,
+      "predicted": 664.8432208437107,
+      "error": -93.8432208437107,
+      "dir_correct": 1,
+      "accel_correct": 1
+    }
+  ]
+}

@@ -260,6 +260,33 @@ class TestBatchLoadSource:
         data_cols = [c for c in wide.columns if c not in ['date', 'snapshot_date']]
         assert data_cols == ['feat_a']
 
+    def test_keeps_protected_consensus_features_even_if_not_selected(self, tmp_path):
+        """Static selected-feature caches must not drop protected consensus fields."""
+        month = pd.Timestamp('2020-06-01')
+        path = _snapshot_path(tmp_path, month)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({
+            'date': pd.date_range('2019-01-01', periods=3, freq='MS'),
+            'feat_a': [1.0, 2.0, 3.0],
+            'NFP_Consensus_Median': [100.0, 110.0, 120.0],
+            'NFP_Consensus_Median_lag_1m': [90.0, 100.0, 110.0],
+            'feat_c': [9.0, 9.0, 9.0],
+        })
+        df.to_parquet(path, index=False)
+
+        result = _batch_load_source(
+            'TestSource', tmp_path, [month],
+            allowed_features={'feat_a'}
+        )
+
+        wide = result['2020-06']
+        data_cols = [c for c in wide.columns if c not in ['date', 'snapshot_date']]
+        assert data_cols == [
+            'feat_a',
+            'NFP_Consensus_Median',
+            'NFP_Consensus_Median_lag_1m',
+        ]
+
     def test_empty_source_returns_empty_dict(self, tmp_path):
         """Source directory with no matching files returns empty dict."""
         months = [pd.Timestamp('2020-01-01')]

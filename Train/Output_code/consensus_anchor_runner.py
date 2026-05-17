@@ -33,6 +33,7 @@ because both consistently underperformed the Consensus baseline on the
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -71,6 +72,13 @@ except Exception:
 
 TARGET_PARQUET = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
 CONSENSUS_FEATURE_COL = "NFP_Consensus_Mean"
+ECONOMIST_PANEL_FORECAST_COLS = [
+    "NFP_Forecast_AIB",
+    "NFP_Forecast_CONTINUUM_ECON",
+    "NFP_Forecast_DANSKE_BK",
+    "NFP_Forecast_NATIONWIDE_INSUR",
+    "NFP_Forecast_Top4Mean",
+]
 
 # Minimum expanding-window history before producing a prediction
 MIN_HISTORY = 12
@@ -276,6 +284,88 @@ def _load_consensus_pit(
     return out
 
 
+def _load_economist_panel_pit(
+    target_type: str = "sa",
+    target_source: str = "revised",
+) -> pd.DataFrame:
+    """Load PIT economist panel forecasts from each monthly master snapshot.
+
+    ``NFP_Consensus_Mean`` is the broad analyst anchor. The curated
+    ``NFP_Forecast_*`` panel is smaller and spottier, but local replay shows
+    its simple cross-sectional mean is a strong final-level forecast when
+    available. Values are read from the target month's own PIT snapshot row,
+    so this has the same release cutoff discipline as ``_load_consensus_pit``.
+    """
+    base_dir = get_master_snapshots_dir(target_type, target_source)
+    snapshot_files = sorted(base_dir.glob("**/*.parquet"))
+    rows: List[Dict] = []
+    skipped_no_columns = 0
+
+    for snap_path in snapshot_files:
+        try:
+            obs_month = pd.to_datetime(snap_path.stem + "-01")
+        except (ValueError, TypeError):
+            continue
+
+        columns = ["date", *ECONOMIST_PANEL_FORECAST_COLS]
+        try:
+            snap = pd.read_parquet(snap_path, columns=columns)
+        except (KeyError, ValueError):
+            skipped_no_columns += 1
+            continue
+        except Exception as exc:
+            logger.warning("Failed to read economist panel from %s: %s", snap_path, exc)
+            continue
+
+        snap["date"] = pd.to_datetime(snap["date"], errors="coerce")
+        match = snap[snap["date"] == obs_month]
+        if match.empty:
+            continue
+
+        values = pd.to_numeric(
+            match[ECONOMIST_PANEL_FORECAST_COLS].iloc[0],
+            errors="coerce",
+        )
+        if not values.notna().any():
+            continue
+
+        row: Dict[str, object] = {
+            "ds": obs_month,
+            "panel_consensus_mean": float(values.mean()),
+            "panel_consensus_median": float(values.median()),
+            "panel_consensus_count": int(values.notna().sum()),
+            "panel_consensus_std": (
+                float(values.std()) if int(values.notna().sum()) > 1 else np.nan
+            ),
+        }
+        for col, val in values.items():
+            row[f"panel_{col}"] = float(val) if pd.notna(val) else np.nan
+        rows.append(row)
+
+    if not rows:
+        logger.warning(
+            "No economist panel forecasts found via master snapshots under %s "
+            "(%d snapshots lacked the panel columns)",
+            base_dir, skipped_no_columns,
+        )
+        return pd.DataFrame(columns=["ds"])
+
+    out = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
+    value_cols = [c for c in out.columns if c != "ds"]
+    out_indexed = out.set_index("ds")
+    out_indexed[value_cols] = winsorize_covid_period(out_indexed[value_cols])
+    out = out_indexed.reset_index()
+
+    logger.info(
+        "Economist panel PIT load: %d months (%s to %s), mean coverage %.1f forecasters",
+        len(out),
+        out["ds"].min().strftime("%Y-%m"),
+        out["ds"].max().strftime("%Y-%m"),
+        float(out["panel_consensus_count"].mean()),
+    )
+    return out
+
+
 def _load_model_backtest(path: Path, pred_name: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -303,6 +393,9 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
         output_base = OUTPUT_DIR
 
     consensus_monthly = _load_consensus_pit(target_type="sa", target_source="revised")
+    panel_monthly = _load_economist_panel_pit(target_type="sa", target_source="revised")
+    if not panel_monthly.empty:
+        consensus_monthly = consensus_monthly.merge(panel_monthly, on="ds", how="left")
     logger.info(
         "Consensus loaded PIT-correctly via master snapshots: %d months (%s to %s)",
         len(consensus_monthly),
@@ -429,6 +522,9 @@ def kalman_fusion(
     use_model: bool = True,
     use_nsa_accel: bool = True,
     nsa_weight_scale: float = 1.0,
+    use_panel_observation: bool = False,
+    panel_weight_scale: float = 1.0,
+    panel_max_precision_share: float = 0.65,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Kalman filter fusing consensus, model, and NSA acceleration predictions.
@@ -447,11 +543,18 @@ def kalman_fusion(
         use_model: Whether to include the SA blend champion channel.
         use_nsa_accel: Whether to include the NSA acceleration channel.
         nsa_weight_scale: Multiplier for NSA channel precision (>1 = more trust).
+        use_panel_observation: Whether to add the PIT economist panel mean as
+            another observation channel when present.
+        panel_weight_scale: Multiplier for the panel channel precision.
+        panel_max_precision_share: Maximum share of posterior precision the
+            panel channel may contribute at a step.
     """
     # Keep rows where consensus + model exist; actual can be NaN (OOS)
     keep_cols = ["ds", "actual", "consensus_pred", "champion_pred"]
     if "nsa_pred" in overlap_df.columns:
         keep_cols.append("nsa_pred")
+    panel_cols = [c for c in ("panel_consensus_mean", "panel_consensus_count") if c in overlap_df.columns]
+    keep_cols.extend(panel_cols)
     sidecar_cols = [c for c in overlap_df.columns if c.startswith("sidecar_")]
     keep_cols.extend(sidecar_cols)
     df = overlap_df[keep_cols].copy()
@@ -577,6 +680,43 @@ def kalman_fusion(
             else:
                 info_a = nsa_weight_scale / R_a
 
+        # Economist panel channel: a PIT cross-sectional economist mean read
+        # from the target month's master snapshot. Its measurement noise is
+        # estimated from prior panel misses only.
+        info_panel = 0.0
+        panel_obs = 0.0
+        if (
+            use_panel_observation
+            and "panel_consensus_mean" in df.columns
+            and pd.notna(row.get("panel_consensus_mean"))
+        ):
+            panel_obs = float(row["panel_consensus_mean"])
+            hist_panel = (
+                hist_valid[hist_valid["panel_consensus_mean"].notna()]
+                if "panel_consensus_mean" in hist_valid.columns
+                else pd.DataFrame()
+            )
+            hist_panel_clean = (
+                hist_panel[~is_covid_month(hist_panel["ds"])]
+                if not hist_panel.empty else hist_panel
+            )
+            if len(hist_panel_clean) >= 4:
+                recent_panel_err = (
+                    hist_panel_clean["actual"] - hist_panel_clean["panel_consensus_mean"]
+                ).values[-trailing_window:]
+                R_panel = float(np.var(recent_panel_err, ddof=1)) + 1e-6
+            else:
+                R_panel = max(R_c, R_m_step if use_model else R_c, R_a)
+            info_panel = max(float(panel_weight_scale), 0.0) / R_panel
+
+            base_info_for_panel = info_prior + info_c + info_m + info_a
+            cap_share_panel = max(0.0, min(0.95, float(panel_max_precision_share)))
+            if info_panel > 0 and cap_share_panel < 1.0:
+                cap_info = (
+                    cap_share_panel / max(1.0 - cap_share_panel, 1e-6)
+                ) * base_info_for_panel
+                info_panel = min(info_panel, cap_info)
+
         sidecar_terms: List[Tuple[float, float]] = []
         if sidecar_obs_cols and len(hist_valid) >= 6:
             for col in sidecar_obs_cols:
@@ -597,7 +737,7 @@ def kalman_fusion(
 
         sidecar_info_raw = float(sum(info for info, _ in sidecar_terms))
         sidecar_info = sidecar_info_raw
-        base_info = info_prior + info_c + info_m + info_a
+        base_info = info_prior + info_c + info_m + info_a + info_panel
         cap_share = sidecar_max_precision_share()
         if sidecar_info > 0 and cap_share < 1.0:
             cap_info = (cap_share / max(1.0 - cap_share, 1e-6)) * base_info
@@ -606,13 +746,14 @@ def kalman_fusion(
                 sidecar_terms = [(info * scale, obs) for info, obs in sidecar_terms]
                 sidecar_info = cap_info
 
-        total_info = info_prior + info_c + info_m + info_a + sidecar_info
+        total_info = info_prior + info_c + info_m + info_a + info_panel + sidecar_info
         P_post = 1.0 / total_info
         x_post = P_post * (
             info_prior * x_prior
             + info_c * row["consensus_pred"]
             + (info_m * row["champion_pred"] if use_model else 0.0)
             + (info_a * nsa_level_implied if info_a > 0 else 0.0)
+            + (info_panel * panel_obs if info_panel > 0 else 0.0)
             + sum(info * obs for info, obs in sidecar_terms)
         )
 
@@ -632,6 +773,13 @@ def kalman_fusion(
             "consensus_pred": row["consensus_pred"],
             "error": row["actual"] - pred if pd.notna(row["actual"]) else np.nan,
         }
+        if use_panel_observation and "panel_consensus_mean" in df.columns:
+            result_row.update({
+                "panel_consensus_mean": row.get("panel_consensus_mean"),
+                "panel_precision_share": (
+                    info_panel / total_info if total_info > 0 else 0.0
+                ),
+            })
         if sidecar_active:
             result_row.update({
                 "sidecar_precision_share": sidecar_info / total_info if total_info > 0 else 0.0,
@@ -701,27 +849,34 @@ def _walkforward_cv_score(
             history to switch off the init fallbacks.
 
     Returns:
-        Mean composite score over folds. If overlap_df is too small for nested
-        CV, falls back to a single full-fit score (the legacy behaviour).
+        Mean composite score over chronological validation folds. If the
+        requested ``min_train`` is too large for the available overlap window,
+        it is reduced to leave at least one future validation row per split.
+        This deliberately avoids the old full-window fallback, which tuned
+        Kalman params on the same rows later reported as backtest performance.
     """
     overlap_df = overlap_df.sort_values("ds").reset_index(drop=True)
     n = len(overlap_df)
 
-    # Need at least min_train + n_splits eval rows to run nested CV.
-    if n < min_train + n_splits * 3:
-        res_df = fold_runner(overlap_df, eval_end=n)
-        actual = res_df["actual"].values.astype(float)
-        pred = res_df["predicted"].values.astype(float)
-        mask = np.isfinite(actual) & np.isfinite(pred)
-        if mask.sum() == 0:
-            return float("inf")
-        return float(composite_objective_fn(actual[mask], pred[mask]))
+    if n <= MIN_HISTORY + 1:
+        return float("inf")
 
-    eval_size = (n - min_train) // n_splits
+    effective_splits = max(1, min(int(n_splits), n - MIN_HISTORY))
+    preferred_eval_size = 3 if n >= MIN_HISTORY + effective_splits * 3 else 1
+    effective_min_train = min(int(min_train), n - effective_splits * preferred_eval_size)
+    effective_min_train = max(MIN_HISTORY, effective_min_train)
+    if effective_min_train >= n:
+        effective_min_train = n - 1
+    eval_size = max(1, (n - effective_min_train) // effective_splits)
+
     fold_scores: List[float] = []
-    for k in range(n_splits):
-        eval_start = min_train + k * eval_size
-        eval_end = n if k == n_splits - 1 else min_train + (k + 1) * eval_size
+    for k in range(effective_splits):
+        eval_start = effective_min_train + k * eval_size
+        if eval_start >= n:
+            break
+        eval_end = n if k == effective_splits - 1 else min(
+            n, effective_min_train + (k + 1) * eval_size
+        )
         res_df = fold_runner(overlap_df, eval_end=eval_end)
         # Score ONLY on this fold's eval window (strictly future w.r.t. all
         # earlier folds; never overlaps with future folds either).
@@ -917,6 +1072,261 @@ def _tune_kalman(
     return result
 
 
+def _kalman_tune_mode() -> str:
+    mode = os.getenv("NFP_KALMAN_TUNE_MODE", "adaptive_grid").strip().lower()
+    if mode not in {"adaptive_grid", "optuna_cv"}:
+        return "adaptive_grid"
+    return mode
+
+
+def _load_nsa_adjustment_tuning_inputs(
+    output_base: Path,
+) -> Tuple[Optional[Dict[pd.Timestamp, float]], Optional[pd.DataFrame], Optional[Path]]:
+    """Load raw NSA predictions and adjustment history for final-layer tuning."""
+    from Train.sandbox.experiment_predicted_adjustment import load_adjustment_history
+
+    nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
+    if not nsa_raw_path.exists():
+        nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
+
+    if not nsa_raw_path.exists():
+        logger.warning(
+            "NSA raw backtest not found at %s; half_life_years will NOT be tuned",
+            nsa_raw_path,
+        )
+        return None, None, None
+
+    _nsa_raw_df = pd.read_csv(nsa_raw_path, parse_dates=["ds"])
+    _nsa_raw_df = _nsa_raw_df.dropna(subset=["predicted"])
+    nsa_raw_by_ds = dict(zip(
+        pd.to_datetime(_nsa_raw_df["ds"]).tolist(),
+        _nsa_raw_df["predicted"].astype(float).tolist(),
+    ))
+    try:
+        adj_history = load_adjustment_history()
+    except Exception as e:
+        logger.warning(
+            "Failed to load adjustment history; half_life_years will NOT be tuned: %s",
+            e,
+        )
+        adj_history = None
+    return nsa_raw_by_ds, adj_history, nsa_raw_path
+
+
+def _pit_adaptive_candidate_grid(
+    *,
+    has_nsa: bool,
+    has_panel: bool,
+    tune_adjustment: bool,
+) -> List[Dict[str, object]]:
+    """Small deterministic final-layer grid for prior-only PIT tuning.
+
+    This replaces post-hoc global Optuna for reported backtests. The grid is
+    intentionally compact: all candidates can be precomputed once, then each
+    month selects among them using only earlier realized months.
+    """
+    hls: List[Optional[float]]
+    if tune_adjustment:
+        hls = [1.0, 1.25, 1.5, 2.0, 3.0]
+    else:
+        hls = [None]
+    trailing_windows = [12, 14, 18, 23]
+    nsa_scales = [0.25, 0.4, 0.75, 1.0, 1.5] if has_nsa else [1.0]
+    panel_options: List[Tuple[bool, float]] = [(False, 0.0)]
+    if has_panel:
+        panel_options.extend([(True, 0.5), (True, 1.0)])
+
+    out: List[Dict[str, object]] = []
+    for hl in hls:
+        for tw in trailing_windows:
+            for nsa_ws in nsa_scales:
+                for use_panel, panel_ws in panel_options:
+                    out.append({
+                        "half_life_years": hl,
+                        "trailing_window": int(tw),
+                        "nsa_weight_scale": float(nsa_ws),
+                        "use_panel_observation": bool(use_panel),
+                        "panel_weight_scale": float(panel_ws),
+                    })
+    return out
+
+
+def _apply_adjustment_candidate(
+    overlap_df: pd.DataFrame,
+    *,
+    half_life_years: Optional[float],
+    pit_cache: Optional[Dict[pd.Timestamp, pd.DataFrame]],
+    nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]],
+) -> pd.DataFrame:
+    if half_life_years is None or pit_cache is None or nsa_raw_by_ds is None:
+        return overlap_df
+
+    modified = overlap_df.copy()
+    adj_vals = _compute_adjustment_series(
+        modified["ds"],
+        pit_cache,
+        float(half_life_years),
+    )
+    nsa_raw_vals = np.array([
+        nsa_raw_by_ds.get(pd.Timestamp(d), np.nan) for d in modified["ds"]
+    ], dtype=float)
+    champion_new = nsa_raw_vals + adj_vals
+    finite = np.isfinite(champion_new)
+    modified.loc[finite, "champion_pred"] = champion_new[finite]
+    if "nsa_pred" in modified.columns:
+        modified.loc[finite, "nsa_pred"] = champion_new[finite]
+    return modified
+
+
+def _score_candidate_history(
+    actual: np.ndarray,
+    pred: np.ndarray,
+    idx: np.ndarray,
+    objective: str,
+) -> float:
+    if idx.size == 0:
+        return float("inf")
+    a = np.asarray(actual[idx], dtype=float)
+    p = np.asarray(pred[idx], dtype=float)
+    mask = np.isfinite(a) & np.isfinite(p)
+    if mask.sum() == 0:
+        return float("inf")
+    a = a[mask]
+    p = p[mask]
+    mae = float(np.mean(np.abs(a - p)))
+    if objective == "mae":
+        return mae
+    rmse = float(np.sqrt(np.mean((a - p) ** 2)))
+    if objective == "rmse":
+        return rmse
+    if objective == "hybrid":
+        return mae + 0.15 * rmse
+    raise ValueError(f"Unknown PIT adaptive Kalman objective: {objective}")
+
+
+def pit_adaptive_kalman_fusion(
+    overlap_df: pd.DataFrame,
+    consensus_df: pd.DataFrame,
+    *,
+    adj_history: Optional[pd.DataFrame] = None,
+    nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]] = None,
+    min_history: int = 24,
+    selection_lookback: Optional[int] = None,
+    objective: str = "rmse",
+) -> Tuple[pd.DataFrame, Dict, Dict]:
+    """PIT-safe adaptive final-layer tuner.
+
+    For every row ``t``, this precomputes all candidate Kalman prediction
+    streams, then selects the candidate using only rows with known actuals
+    strictly before ``t``. Historical metrics therefore do not benefit from
+    future hyperparameter outcomes. The OOS/live row still uses all known
+    historical actuals, which is valid for a real forecast.
+    """
+    overlap_df = overlap_df.sort_values("ds").reset_index(drop=True)
+    has_nsa = "nsa_pred" in overlap_df.columns and overlap_df["nsa_pred"].notna().any()
+    has_panel = (
+        "panel_consensus_mean" in overlap_df.columns
+        and overlap_df["panel_consensus_mean"].notna().any()
+    )
+    tune_adjustment = adj_history is not None and nsa_raw_by_ds is not None
+    pit_cache: Optional[Dict[pd.Timestamp, pd.DataFrame]] = None
+    if tune_adjustment:
+        pit_cache = _build_pit_adjustment_cache(overlap_df["ds"], adj_history)
+
+    candidates = _pit_adaptive_candidate_grid(
+        has_nsa=has_nsa,
+        has_panel=has_panel,
+        tune_adjustment=tune_adjustment,
+    )
+    candidate_frames: List[pd.DataFrame] = []
+    candidate_preds: List[np.ndarray] = []
+    for candidate in candidates:
+        candidate_overlap = _apply_adjustment_candidate(
+            overlap_df,
+            half_life_years=candidate["half_life_years"],
+            pit_cache=pit_cache,
+            nsa_raw_by_ds=nsa_raw_by_ds,
+        )
+        res_df, _ = kalman_fusion(
+            candidate_overlap,
+            consensus_df,
+            trailing_window=int(candidate["trailing_window"]),
+            use_nsa_accel=has_nsa,
+            nsa_weight_scale=float(candidate["nsa_weight_scale"]),
+            use_panel_observation=bool(candidate["use_panel_observation"]),
+            panel_weight_scale=float(candidate["panel_weight_scale"]),
+        )
+        candidate_frames.append(res_df)
+        candidate_preds.append(res_df["predicted"].to_numpy(dtype=float))
+
+    actual = overlap_df["actual"].to_numpy(dtype=float)
+    default_idx = 0
+    for i, candidate in enumerate(candidates):
+        if (
+            (candidate["half_life_years"] in {None, 3.0})
+            and int(candidate["trailing_window"]) == 18
+            and abs(float(candidate["nsa_weight_scale"]) - 1.0) < 1e-12
+            and not bool(candidate["use_panel_observation"])
+        ):
+            default_idx = i
+            break
+
+    selected_rows: List[pd.Series] = []
+    selected_candidates: List[Dict[str, object]] = []
+    selected_scores: List[float] = []
+    for i in range(len(overlap_df)):
+        hist_idx = np.where(np.isfinite(actual[:i]))[0]
+        if hist_idx.size < int(min_history):
+            best_idx = default_idx
+            best_score = float("nan")
+        else:
+            score_idx = hist_idx[-int(selection_lookback):] if selection_lookback else hist_idx
+            scores = [
+                _score_candidate_history(actual, pred, score_idx, objective)
+                for pred in candidate_preds
+            ]
+            best_idx = int(np.argmin(scores))
+            best_score = float(scores[best_idx])
+
+        row = candidate_frames[best_idx].iloc[i].copy()
+        candidate = candidates[best_idx]
+        row["selected_half_life_years"] = candidate["half_life_years"]
+        row["selected_trailing_window"] = int(candidate["trailing_window"])
+        row["selected_nsa_weight_scale"] = float(candidate["nsa_weight_scale"])
+        row["selected_use_panel_observation"] = bool(candidate["use_panel_observation"])
+        row["selected_panel_weight_scale"] = float(candidate["panel_weight_scale"])
+        row["selection_history_n"] = int(hist_idx.size)
+        row["selection_score"] = best_score
+        selected_rows.append(row)
+        selected_candidates.append(candidate)
+        selected_scores.append(best_score)
+
+    out = pd.DataFrame(selected_rows).sort_values("ds").reset_index(drop=True)
+    metrics = full_metrics(
+        out["actual"].values,
+        out["predicted"].values,
+        "Kalman_Fusion_NSA" if has_nsa else "Kalman_Fusion",
+        ds=out["ds"],
+    )
+
+    live_params = selected_candidates[-1] if selected_candidates else {}
+    manifest = {
+        "mode": "adaptive_grid",
+        "pit_validation": (
+            "each row selects final-layer params using only earlier rows with actuals; "
+            "the OOS row uses all known historical actuals"
+        ),
+        "candidate_count": len(candidates),
+        "min_history": int(min_history),
+        "selection_lookback": selection_lookback,
+        "selection_objective": objective,
+        "live_params": live_params,
+        "has_panel_observation_candidates": bool(has_panel),
+        "tunes_adjustment_half_life": bool(tune_adjustment),
+    }
+    return out, metrics, manifest
+
+
 # ---------------------------------------------------------------------------
 # Comparison Visualization
 # ---------------------------------------------------------------------------
@@ -924,6 +1334,8 @@ def _tune_kalman(
 # Stable colors per forecast across the overlay + bar chart.
 _FORECAST_COLORS = {
     "Baseline_Consensus": "#DC2626",        # red
+    "Panel_Consensus_Mean": "#059669",      # green
+    "Panel_Kalman_Router": "#7C3AED",       # purple
     "Kalman_Fusion_NSA": "#2563EB",         # blue
     "Kalman_Fusion": "#2563EB",
     "Baseline_Champion": "#9CA3AF",         # gray
@@ -1069,6 +1481,8 @@ def write_comparison_visualization(
  <h2>Per-forecast diagnostics</h2>
  <div class="grid">
   <div><h3>Baseline Consensus</h3><img src="baseline_consensus/backtest_predictions.png"/></div>
+  <div><h3>Panel Consensus Mean</h3><img src="panel_consensus_mean/backtest_predictions.png"/></div>
+  <div><h3>Panel/Kalman Router</h3><img src="panel_kalman_router/backtest_predictions.png"/></div>
   <div><h3>Kalman Fusion (NSA)</h3><img src="kalman_fusion/backtest_predictions.png"/></div>
  </div>
 </body></html>
@@ -1088,6 +1502,8 @@ _MODEL_RMSE_PATHS: Dict[str, str] = {
     "SA":                                        "SA_prediction/summary_statistics.csv",
     "NSA_plus_adjustment":                       "NSA_plus_adjustment/summary_statistics.csv",
     "Consensus":                                 "consensus_anchor/baseline_consensus/summary_statistics.csv",
+    "consensus_anchor_panel_mean":               "consensus_anchor/panel_consensus_mean/summary_statistics.csv",
+    "consensus_anchor_panel_kalman_router":      "consensus_anchor/panel_kalman_router/summary_statistics.csv",
     "consensus_anchor_kalman_fusion":            "consensus_anchor/kalman_fusion/summary_statistics.csv",
 }
 
@@ -1109,6 +1525,118 @@ def _load_model_rmses(output_base: Path) -> Dict[str, float]:
         except Exception as exc:
             logger.warning("Could not read RMSE from %s: %s", path, exc)
     return out
+
+
+def _panel_router_candidate(
+    data: pd.DataFrame,
+    kind: str,
+    param: Optional[float] = None,
+) -> pd.Series:
+    """Candidate final forecasts for the PIT panel/Kalman router."""
+    panel = pd.to_numeric(data["panel_pred"], errors="coerce")
+    kalman = pd.to_numeric(data["kalman_pred"], errors="coerce")
+    if kind == "panel":
+        return panel
+    if kind == "kalman":
+        return kalman
+    if kind == "panel_missing_else_kalman":
+        raw_panel = pd.to_numeric(data["panel_consensus_mean"], errors="coerce")
+        return raw_panel.combine_first(kalman)
+    if kind == "blend":
+        weight = 0.5 if param is None else float(param)
+        return weight * panel + (1.0 - weight) * kalman
+    if kind == "gate":
+        threshold = 100.0 if param is None else float(param)
+        raw_panel = pd.to_numeric(data["panel_consensus_mean"], errors="coerce")
+        consensus = pd.to_numeric(data["consensus_pred"], errors="coerce")
+        pred = panel.copy()
+        use_kalman = raw_panel.isna() | ((kalman - consensus).abs() > threshold)
+        pred[use_kalman] = kalman[use_kalman]
+        return pred
+    raise ValueError(f"Unknown panel router candidate: {kind}")
+
+
+def _panel_router_score(actual: np.ndarray, pred: np.ndarray, objective: str) -> float:
+    mask = np.isfinite(actual) & np.isfinite(pred)
+    if mask.sum() == 0:
+        return float("inf")
+    a = actual[mask]
+    p = pred[mask]
+    if objective == "rmse":
+        return float(np.sqrt(np.mean((a - p) ** 2)))
+    if objective == "mae":
+        return float(np.mean(np.abs(a - p)))
+    if objective == "composite":
+        from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
+        dir_acc = float(np.mean(np.sign(a) == np.sign(p)))
+        accel_acc = float(compute_variance_kpis(a, p)["diff_sign_accuracy"])
+        mae = float(np.mean(np.abs(a - p)))
+        return mae - KALMAN_LAMBDA_ACCEL * accel_acc - KALMAN_LAMBDA_DIR * dir_acc
+    raise ValueError(f"Unknown panel router objective: {objective}")
+
+
+def build_panel_kalman_router(
+    panel_results: pd.DataFrame,
+    kalman_df: pd.DataFrame,
+    *,
+    min_history: int = 24,
+    objective: str = "mae",
+) -> Tuple[pd.DataFrame, Dict]:
+    """Walk-forward router between the PIT economist panel and Kalman.
+
+    For every month, the routing rule is selected using only earlier months
+    with actuals. This lets the final layer exploit the panel's lower level
+    error while falling back to Kalman when the disagreement pattern has
+    historically favored Kalman.
+    """
+    panel = panel_results.copy()
+    panel = panel.rename(columns={"predicted": "panel_pred"})
+    kalman = kalman_df[["ds", "predicted"]].rename(columns={"predicted": "kalman_pred"})
+    df = panel.merge(kalman, on="ds", how="inner").sort_values("ds").reset_index(drop=True)
+
+    candidates: List[Tuple[str, Optional[float]]] = [
+        ("panel", None),
+        ("kalman", None),
+        ("panel_missing_else_kalman", None),
+    ]
+    candidates.extend(("blend", float(w)) for w in np.linspace(0.35, 0.95, 13))
+    candidates.extend(("gate", float(t)) for t in [25, 50, 75, 100, 125, 150, 175, 200, 250, 300])
+
+    preds: List[float] = []
+    rules: List[str] = []
+    for i, row in df.iterrows():
+        hist = df.iloc[:i]
+        hist = hist[hist["actual"].notna()].copy()
+        if len(hist) < min_history:
+            pred = float(row["panel_pred"]) if pd.notna(row.get("panel_pred")) else float(row["kalman_pred"])
+            preds.append(pred)
+            rules.append("warmup_panel")
+            continue
+
+        actual = hist["actual"].to_numpy(dtype=float)
+        best: Optional[Tuple[float, str, Optional[float]]] = None
+        for kind, param in candidates:
+            cand = _panel_router_candidate(hist, kind, param).to_numpy(dtype=float)
+            score = _panel_router_score(actual, cand, objective)
+            if best is None or score < best[0]:
+                best = (score, kind, param)
+
+        assert best is not None
+        pred = float(_panel_router_candidate(row.to_frame().T, best[1], best[2]).iloc[0])
+        preds.append(pred)
+        rules.append(best[1] if best[2] is None else f"{best[1]}:{best[2]:.2f}")
+
+    out = df.copy()
+    out["predicted"] = preds
+    out["selected_rule"] = rules
+    out["error"] = np.where(out["actual"].notna(), out["actual"] - out["predicted"], np.nan)
+    metrics = full_metrics(
+        out["actual"].values,
+        out["predicted"].values,
+        "Panel_Kalman_Router",
+        ds=out["ds"],
+    )
+    return out, metrics
 
 
 def _quantile_ci_row(model_label: str, ds, pred: float, residuals: np.ndarray) -> Dict:
@@ -1139,6 +1667,8 @@ def _augment_predictions_csv(
     output_base: Path,
     cons_results: pd.DataFrame,
     kalman_df: pd.DataFrame,
+    panel_results: Optional[pd.DataFrame] = None,
+    panel_router_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Append Consensus + Kalman_Fusion rows to _output/Predictions/predictions.csv.
@@ -1173,6 +1703,8 @@ def _augment_predictions_csv(
         return df["error"].dropna().to_numpy()[-36:]
 
     variant_specs = [
+        ("consensus_anchor_panel_mean", panel_results),
+        ("consensus_anchor_panel_kalman_router", panel_router_df),
         ("consensus_anchor_kalman_fusion", kalman_df),
     ]
 
@@ -1343,6 +1875,52 @@ def run_consensus_anchor_pipeline(
         diagnostics_label="Baseline Consensus (Bloomberg/Reuters median)",
     )
 
+    panel_results: Optional[pd.DataFrame] = None
+    panel_metrics: Optional[Dict] = None
+    if "panel_consensus_mean" in overlap_with_oos.columns:
+        panel_keep_cols = [
+            "ds", "actual", "consensus_pred",
+            "panel_consensus_mean", "panel_consensus_median",
+            "panel_consensus_count", "panel_consensus_std",
+        ]
+        panel_keep_cols = [c for c in panel_keep_cols if c in overlap_with_oos.columns]
+        panel_results = overlap_with_oos[panel_keep_cols].copy()
+        panel_results["predicted"] = panel_results["panel_consensus_mean"].combine_first(
+            panel_results["consensus_pred"]
+        )
+        panel_results["error"] = np.where(
+            panel_results["actual"].notna(),
+            panel_results["actual"] - panel_results["predicted"],
+            np.nan,
+        )
+        panel_results = (
+            panel_results
+            .dropna(subset=["predicted"])
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        panel_eval = panel_results[panel_results["actual"].notna()].copy()
+        if not panel_eval.empty:
+            panel_metrics = full_metrics(
+                panel_eval["actual"].values,
+                panel_eval["predicted"].values,
+                "Panel_Consensus_Mean",
+                ds=panel_eval["ds"],
+            )
+            all_metrics.append(panel_metrics)
+            logger.info(
+                "  Panel mean: MAE=%.1f RMSE=%.1f AccelAcc=%.3f "
+                "(fallback to consensus when panel missing)",
+                panel_metrics["MAE"], panel_metrics["RMSE"],
+                panel_metrics["Acceleration_Accuracy"],
+            )
+            write_sandbox_output_bundle(
+                results_df=panel_results,
+                out_dir=out_dir / "panel_consensus_mean",
+                model_id="panel_consensus_mean",
+                diagnostics_label="PIT Economist Panel Mean",
+            )
+
     champ_ov = overlap_df[["ds", "actual", "champion_pred"]].dropna()
     champ_base = full_metrics(
         champ_ov["actual"].values,
@@ -1356,7 +1934,37 @@ def run_consensus_anchor_pipeline(
 
     # 3) Kalman Fusion (jointly tune Kalman params + adjustment half-life)
     logger.info("Running Kalman Fusion...")
+    kalman_df: Optional[pd.DataFrame] = None
+    kalman_metrics: Optional[Dict] = None
+    kalman_manifest: Dict[str, object] = {}
+    _nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]] = None
+    _adj_history: Optional[pd.DataFrame] = None
+    nsa_raw_path: Optional[Path] = None
     if tune:
+        tune_mode = _kalman_tune_mode()
+        _nsa_raw_by_ds, _adj_history, nsa_raw_path = _load_nsa_adjustment_tuning_inputs(output_base)
+
+        if tune_mode == "adaptive_grid":
+            logger.info(
+                "PIT-adaptive Kalman grid tuning enabled "
+                "(set NFP_KALMAN_TUNE_MODE=optuna_cv for the legacy CV tuner)"
+            )
+            kalman_df, kalman_metrics, kalman_manifest = pit_adaptive_kalman_fusion(
+                overlap_with_oos,
+                consensus_df,
+                adj_history=_adj_history,
+                nsa_raw_by_ds=_nsa_raw_by_ds,
+                min_history=24,
+                selection_lookback=None,
+                objective="rmse",
+            )
+            kalman_params = dict(kalman_manifest.get("live_params", {}))
+        else:
+            kalman_params = None
+    else:
+        kalman_params = {"trailing_window": 18}
+
+    if tune and kalman_df is None:
         # ── Joint-tune short-circuit ────────────────────────────────────────
         # If train_lightgbm_nfp ran with JOINT_OPTUNA=True it has already
         # chosen (half_life_years, trailing_window, nsa_weight_scale) via a
@@ -1364,7 +1972,6 @@ def run_consensus_anchor_pipeline(
         # _tune_kalman Optuna call entirely. The downstream HL-regen logic
         # below still runs.
         _joint_params_path = output_base / "consensus_anchor" / "kalman_fusion" / "joint_tuned_params.json"
-        kalman_params: Optional[Dict] = None
         if _joint_params_path.exists():
             try:
                 with open(_joint_params_path, "r") as _fp:
@@ -1388,32 +1995,6 @@ def run_consensus_anchor_pipeline(
                                _joint_params_path.name, e)
                 kalman_params = None
 
-        # Pull the raw NSA backtest + adjustment history so the tuner can
-        # rebuild champion_pred per Optuna trial with a candidate
-        # half_life_years (drives the adjustment toward the fusion objective).
-        from Train.sandbox.experiment_predicted_adjustment import load_adjustment_history
-        nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
-        if not nsa_raw_path.exists():
-            nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
-        _nsa_raw_by_ds: Optional[Dict[pd.Timestamp, float]] = None
-        _adj_history: Optional[pd.DataFrame] = None
-        if nsa_raw_path.exists():
-            _nsa_raw_df = pd.read_csv(nsa_raw_path, parse_dates=["ds"])
-            _nsa_raw_df = _nsa_raw_df.dropna(subset=["predicted"])
-            _nsa_raw_by_ds = dict(zip(
-                pd.to_datetime(_nsa_raw_df["ds"]).tolist(),
-                _nsa_raw_df["predicted"].astype(float).tolist(),
-            ))
-            try:
-                _adj_history = load_adjustment_history()
-            except Exception as e:
-                logger.warning("Failed to load adjustment history; "
-                               "half_life_years will NOT be tuned: %s", e)
-                _adj_history = None
-        else:
-            logger.warning("NSA raw backtest not found at %s; "
-                           "half_life_years will NOT be tuned", nsa_raw_path)
-
         if kalman_params is None:
             kalman_params = _tune_kalman(
                 overlap_df, consensus_df,
@@ -1423,39 +2004,13 @@ def run_consensus_anchor_pipeline(
                 tune_adjustment=(_adj_history is not None and _nsa_raw_by_ds is not None),
             )
 
-        # ── Half-life drift warning ──
-        # If the dynamic feature selection used a different half_life_years
-        # for its fusion-aligned selection target, log a WARNING. We do NOT
-        # force a re-run — the next reselection picks up the new value on
-        # its own, and a one-iteration lag is acceptable in steady state.
-        # Selection writes the value it used to dynamic_fs_selection_hl.json
-        # (see Train/train_lightgbm_nfp.py:_load_fusion_selection_target).
-        _hl_used_by_selection: Optional[float] = None
-        _hl_used_step: Optional[str] = None
-        _hl_meta_path = output_base / "consensus_anchor" / "dynamic_fs_selection_hl.json"
-        if _hl_meta_path.exists():
-            try:
-                with open(_hl_meta_path, "r") as f:
-                    _hl_meta = json.load(f)
-                _hl_used_by_selection = float(_hl_meta.get("half_life_years"))
-                _hl_used_step = str(_hl_meta.get("step_date", ""))
-            except Exception as e:
-                logger.warning("[DynFS] Could not read %s: %s", _hl_meta_path.name, e)
-
-        tuned_hl_for_drift = kalman_params.get("half_life_years")
-        if (
-            tuned_hl_for_drift is not None
-            and _hl_used_by_selection is not None
-            and abs(tuned_hl_for_drift - _hl_used_by_selection) > 1.0
-        ):
-            logger.warning(
-                "[DynFS] half_life_years drift Δ=%.2f "
-                "(selection used %.3f at step %s; Kalman tune now picked %.3f). "
-                "The next reselection will pick up the new value.",
-                tuned_hl_for_drift - _hl_used_by_selection,
-                _hl_used_by_selection, _hl_used_step or "n/a",
-                tuned_hl_for_drift,
-            )
+        # ── Half-life drift warning (retired 2026-05-15) ──
+        # Used to compare ``tuned_params.json`` HL against a value written
+        # by the FS-side fusion-aligned selection target
+        # (``dynamic_fs_selection_hl.json``). That selection variant was
+        # reverted, so the FS-side HL file is no longer produced and this
+        # consumer is gone. The iterative-fusion-tune orchestrator now
+        # compares the Kalman-tuned HL across consecutive passes instead.
 
         # If half_life_years was tuned, regenerate the NSA+adjustment CSV with
         # the tuned value so the final Kalman fusion (and downstream consumers
@@ -1489,22 +2044,25 @@ def run_consensus_anchor_pipeline(
                     "(%.3f): %s. Falling back to existing CSV (half_life=3.0).",
                     tuned_hl, e,
                 )
-    else:
-        kalman_params = {"trailing_window": 18}
 
     # Final run includes OOS future rows
-    has_nsa = "nsa_pred" in overlap_with_oos.columns and overlap_with_oos["nsa_pred"].notna().any()
-    kalman_df, kalman_metrics = kalman_fusion(
-        overlap_with_oos, consensus_df,
-        trailing_window=kalman_params["trailing_window"],
-        use_nsa_accel=has_nsa,
-        nsa_weight_scale=kalman_params.get("nsa_weight_scale", 1.0),
-    )
+    if kalman_df is None or kalman_metrics is None:
+        has_nsa = "nsa_pred" in overlap_with_oos.columns and overlap_with_oos["nsa_pred"].notna().any()
+        kalman_df, kalman_metrics = kalman_fusion(
+            overlap_with_oos, consensus_df,
+            trailing_window=kalman_params["trailing_window"],
+            use_nsa_accel=has_nsa,
+            nsa_weight_scale=kalman_params.get("nsa_weight_scale", 1.0),
+        )
+        kalman_manifest = {
+            "mode": "fixed_params",
+            "params": kalman_params,
+        }
     all_metrics.append(kalman_metrics)
     logger.info("  Kalman Fusion: MAE=%.1f RMSE=%.1f AccelAcc=%.3f (window=%d)",
                 kalman_metrics["MAE"], kalman_metrics["RMSE"],
                 kalman_metrics["Acceleration_Accuracy"],
-                kalman_params["trailing_window"])
+                int(kalman_params.get("trailing_window", 18)))
 
     # Log OOS predictions
     kalman_oos = kalman_df[kalman_df["actual"].isna()]
@@ -1523,6 +2081,41 @@ def run_consensus_anchor_pipeline(
     )
     with open(kalman_dir / "tuned_params.json", "w") as f:
         json.dump(kalman_params, f, indent=2)
+    with open(kalman_dir / "tuning_manifest.json", "w") as f:
+        json.dump(kalman_manifest, f, indent=2, default=str)
+
+    panel_router_df: Optional[pd.DataFrame] = None
+    panel_router_metrics: Optional[Dict] = None
+    if panel_results is not None and not panel_results.empty:
+        try:
+            panel_router_df, panel_router_metrics = build_panel_kalman_router(
+                panel_results,
+                kalman_df,
+                min_history=24,
+                objective="mae",
+            )
+            all_metrics.append(panel_router_metrics)
+            logger.info(
+                "  Panel/Kalman Router: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
+                panel_router_metrics["MAE"], panel_router_metrics["RMSE"],
+                panel_router_metrics["Acceleration_Accuracy"],
+            )
+            write_sandbox_output_bundle(
+                results_df=panel_router_df,
+                out_dir=out_dir / "panel_kalman_router",
+                model_id="panel_kalman_router",
+                diagnostics_label="PIT Panel/Kalman Router",
+            )
+            rule_counts = panel_router_df["selected_rule"].value_counts().to_dict()
+            with open(out_dir / "panel_kalman_router" / "router_manifest.json", "w") as f:
+                json.dump({
+                    "objective": "mae",
+                    "min_history": 24,
+                    "rule_counts": rule_counts,
+                    "pit_validation": "routing rule selected from prior actual months only",
+                }, f, indent=2)
+        except Exception as exc:
+            logger.warning("Panel/Kalman router failed: %s", exc)
 
     # AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11) because
     # both consistently underperformed the analyst Consensus baseline on the
@@ -1544,6 +2137,10 @@ def run_consensus_anchor_pipeline(
         cons_base["Forecast"]: cons_results,
         kalman_metrics["Forecast"]: kalman_df,
     }
+    if panel_results is not None and panel_metrics is not None:
+        forecast_dfs[panel_metrics["Forecast"]] = panel_results
+    if panel_router_df is not None and panel_router_metrics is not None:
+        forecast_dfs[panel_router_metrics["Forecast"]] = panel_router_df
     try:
         write_comparison_visualization(out_dir, forecast_dfs, metrics_df)
         logger.info("Wrote unified comparison visualization (overlay + bar + HTML)")
@@ -1558,6 +2155,8 @@ def run_consensus_anchor_pipeline(
             output_base=output_base,
             cons_results=cons_results,
             kalman_df=kalman_df,
+            panel_results=panel_results,
+            panel_router_df=panel_router_df,
         )
     except Exception as exc:
         logger.warning("Augmenting predictions.csv failed: %s", exc)
@@ -1567,7 +2166,12 @@ def run_consensus_anchor_pipeline(
 
     return {
         "kalman_fusion": kalman_metrics,
-        "baselines": {"consensus": cons_base, "champion": champ_base},
+        "baselines": {
+            "consensus": cons_base,
+            "champion": champ_base,
+            "panel_consensus_mean": panel_metrics,
+            "panel_kalman_router": panel_router_metrics,
+        },
     }
 
 

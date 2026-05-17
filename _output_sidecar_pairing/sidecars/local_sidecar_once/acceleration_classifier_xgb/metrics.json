@@ -1,0 +1,17 @@
+{
+  "acceleration_accuracy": 0.6825396825396826,
+  "bias": -25.251418945571732,
+  "direction_accuracy": 0.9206349206349206,
+  "mae": 132.70201167629824,
+  "mean_abs_suggested_nudge": 42.83785279809482,
+  "mean_confidence": 0.42128016456725104,
+  "model_kind": "xgb",
+  "n_predictions": 63,
+  "n_scored": 63,
+  "n_stress_panel": 10,
+  "promotion_gate_passed": false,
+  "rmse": 191.43814472006565,
+  "schema_version": "2026-05-16-sidecar-signal-v1",
+  "stress_panel_mae": 154.45975815653802,
+  "tail_mae": 255.6373914044637
+}

@@ -54,6 +54,7 @@ from utils.feature_generation_policy import (
     current_feature_policy_mode,
     feature_policy_schema_version,
     filter_wide_features,
+    is_protected_feature_name,
     write_feature_policy_report,
 )
 
@@ -1235,7 +1236,12 @@ def _batch_load_source(source_name: str, source_dir: Path,
         for raw_col in raw_feature_cols:
             raw_name = str(raw_col)
             sanitized_name = sanitize_feature_name(raw_name)
-            if raw_name in allowed_set or sanitized_name in allowed_set:
+            if (
+                raw_name in allowed_set
+                or sanitized_name in allowed_set
+                or is_protected_feature_name(raw_name)
+                or is_protected_feature_name(sanitized_name)
+            ):
                 sanitized_to_raw[sanitized_name].append(raw_col)
 
         if not sanitized_to_raw:

@@ -105,24 +105,31 @@ def test_sandbox_constant_matches_central():
 # --------------------------------------------------------------------------- #
 
 def test_winsorize_clips_extreme_consensus(covid_consensus_series):
-    """Apr 2020 consensus -14,448 must clip to within non-COVID 1st-pct bound."""
-    from utils.transforms import winsorize_covid_period
+    """Apr 2020 consensus -14,448 must clip to within the pre-COVID 1st-pct bound.
+
+    The PIT-safe contract for ``winsorize_covid_period`` is that quantile
+    bounds come from rows with index < ``reference_end`` (defaults to
+    2020-03-01), not from "every non-COVID row including post-2020 data".
+    This test pins that behavior.
+    """
+    from utils.transforms import COVID_START_DEFAULT, winsorize_covid_period
 
     s = winsorize_covid_period(covid_consensus_series)
 
-    non_covid = covid_consensus_series.drop(
-        pd.to_datetime(['2020-03-01', '2020-04-01', '2020-05-01']),
-    )
-    expected_floor = non_covid.quantile(0.01)
+    # Pre-COVID slice (strictly < 2020-03-01) is the reference window.
+    pre_covid = covid_consensus_series.loc[
+        covid_consensus_series.index < pd.Timestamp(COVID_START_DEFAULT)
+    ]
+    expected_floor = pre_covid.quantile(0.01)
 
-    # COVID values must be clipped to non-COVID 1st pct (extreme negative)
+    # COVID values must be clipped to the pre-COVID 1st pct (extreme negative)
     assert s.loc['2020-04-01'] == pytest.approx(expected_floor, rel=1e-6)
     assert s.loc['2020-05-01'] == pytest.approx(expected_floor, rel=1e-6)
     # March 2020 raw value -284 is below the 1st pct so also clips
     assert s.loc['2020-03-01'] == pytest.approx(expected_floor, rel=1e-6)
     # Non-COVID values untouched
     assert s.loc['2019-06-01'] == covid_consensus_series.loc['2019-06-01']
-    # The clipped Apr 2020 value must lie inside the non-COVID 50-250 range
+    # The clipped Apr 2020 value must lie inside the pre-COVID 50-250 range
     assert -100 < s.loc['2020-04-01'] < 300, (
         f"Apr 2020 consensus should clip to ~50-250 range, got {s.loc['2020-04-01']}"
     )

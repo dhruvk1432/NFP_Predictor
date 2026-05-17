@@ -1,0 +1,16 @@
+{
+  "acceleration_accuracy": 0.6349206349206349,
+  "bias": 0.2277717503415191,
+  "direction_accuracy": 0.9682539682539683,
+  "mae": 131.89632866542752,
+  "mean_abs_residual_pred": 50.731615861844034,
+  "model_kind": "ridge",
+  "n_predictions": 63,
+  "n_scored": 63,
+  "n_stress_panel": 10,
+  "promotion_gate_passed": false,
+  "rmse": 191.64166306545044,
+  "schema_version": "2026-05-16-sidecar-signal-v1",
+  "stress_panel_mae": 161.64852471726158,
+  "tail_mae": 199.6080412974214
+}

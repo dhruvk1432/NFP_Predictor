@@ -415,8 +415,11 @@ def load_target_data(
     df['y_mom'] = df['y'].diff()
 
     # ── P2-1: Winsorize COVID months at load time for all targets ──
-    # Applied BEFORE rolling stats so all downstream features see clipped values.
-    # This affects both variants: NSA/SA × revised.
+    # Applied BEFORE rolling stats so all downstream features see clipped
+    # values. winsorize_covid_period now uses a pre-COVID reference window
+    # (rows with index < 2020-03-01) to compute the 1/99% bounds, so this
+    # call is PIT-safe even though it runs over the full series at load
+    # time. Affects both variants: NSA/SA × revised.
     df_indexed = df.set_index('ds')
     df_indexed['y']     = winsorize_covid_period(df_indexed['y'])
     df_indexed['y_mom'] = winsorize_covid_period(df_indexed['y_mom'])
@@ -595,6 +598,8 @@ def build_revised_target(target_type: str = 'nsa') -> pd.DataFrame:
     df = df.sort_values('ds').reset_index(drop=True)
 
     # ── P2-1: Winsorize COVID months (same as load_target_data) ──
+    # PIT-safe via pre-COVID reference window (winsorize_covid_period
+    # defaults reference_end="2020-03-01"); see load_target_data comment.
     df_indexed = df.set_index('ds')
     df_indexed['y']     = winsorize_covid_period(df_indexed['y'])
     df_indexed['y_mom'] = winsorize_covid_period(df_indexed['y_mom'])

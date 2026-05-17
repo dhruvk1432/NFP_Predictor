@@ -1,0 +1,17 @@
+{
+  "mode": "adaptive_grid",
+  "pit_validation": "each row selects final-layer params using only earlier rows with actuals; the OOS row uses all known historical actuals",
+  "candidate_count": 300,
+  "min_history": 24,
+  "selection_lookback": null,
+  "selection_objective": "rmse",
+  "live_params": {
+    "half_life_years": 1.25,
+    "trailing_window": 18,
+    "nsa_weight_scale": 1.0,
+    "use_panel_observation": true,
+    "panel_weight_scale": 1.0
+  },
+  "has_panel_observation_candidates": true,
+  "tunes_adjustment_half_life": true
+}

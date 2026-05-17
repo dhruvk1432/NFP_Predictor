@@ -1,0 +1,23 @@
+{
+  "config": {
+    "include_snapshots": true,
+    "max_snapshot_columns": 80,
+    "min_train": 48,
+    "model_kind": "xgb",
+    "start": "2021-01",
+    "target_space": "sa_revised",
+    "top_features": 25
+  },
+  "data_paths": {
+    "target_path": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_sa_revised.parquet"
+  },
+  "environment": {
+    "NFP_SIDECAR_MODE": "off"
+  },
+  "model_id": "acceleration_classifier_xgb",
+  "n_predictions": 63,
+  "pit_validation": "trained_through < ds",
+  "repo_version": "3efaaa1",
+  "schema_version": "2026-05-16-sidecar-signal-v1",
+  "target_space": "sa_revised"
+}

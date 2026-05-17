@@ -1,0 +1,19 @@
+{
+  "acceleration_accuracy": 0.3968253968253968,
+  "bias": -6.410325206753417,
+  "covariance_type": "full",
+  "direction_accuracy": 0.9206349206349206,
+  "mae": 146.0368553221144,
+  "mean_abs_actual_accel": 144.38095238095238,
+  "mean_abs_predicted_accel": 2.400521873551101,
+  "min_train": 48,
+  "n_components": 2,
+  "n_predictions": 63,
+  "n_scored": 63,
+  "n_stress_panel": 10,
+  "promotion_gate_passed": false,
+  "rmse": 207.13137917875397,
+  "schema_version": "2026-05-16-sidecar-signal-v1",
+  "stress_panel_mae": 166.11765779874915,
+  "tail_mae": 238.2707922832137
+}

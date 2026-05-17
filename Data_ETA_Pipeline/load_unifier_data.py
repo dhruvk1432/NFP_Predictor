@@ -72,6 +72,23 @@ CONSENSUS_SERIES = {
 }
 
 
+def _missing_consensus_series_in_latest_snapshot(base_dir, nfp_release_map) -> set[str]:
+    """Return consensus series absent from the newest existing Unifier snapshot."""
+    expected = set(CONSENSUS_SERIES)
+    for obs_month in sorted(nfp_release_map.keys(), reverse=True):
+        snap_path = get_snapshot_path(base_dir, pd.Timestamp(obs_month))
+        if not snap_path.exists():
+            continue
+        try:
+            series = pd.read_parquet(snap_path, columns=["series_name"])["series_name"]
+        except Exception as e:
+            logger.warning(f"Could not inspect Unifier snapshot {snap_path}: {e}")
+            return expected
+        present = set(series.dropna().astype(str).unique())
+        return expected - present
+    return expected
+
+
 def calculate_series_lag(df, series_name):
     """
     Calculate the median lag for a series from observations with first_release_date.
@@ -352,9 +369,20 @@ def fetch_unifier_snapshots(start_date=START_DATE, end_date=END_DATE):
             existing_count += 1
 
     if existing_count == len(nfp_release_map):
-        print(f"✓ Unifier data already exists: {existing_count} monthly snapshots", flush=True)
-        logger.info(f"Unifier snapshots already exist, skipping")
-        return
+        missing_consensus = _missing_consensus_series_in_latest_snapshot(base_dir, nfp_release_map)
+        if not missing_consensus:
+            print(f"✓ Unifier data already exists: {existing_count} monthly snapshots", flush=True)
+            logger.info(f"Unifier snapshots already exist, skipping")
+            return
+        missing_msg = ", ".join(sorted(missing_consensus))
+        print(
+            f"Unifier snapshots exist but are missing consensus series: {missing_msg}. Refreshing.",
+            flush=True,
+        )
+        logger.warning(
+            "Unifier snapshots exist but are missing consensus series: %s. Refreshing.",
+            missing_msg,
+        )
 
     # Fetch all data for each series once
     logger.info("Starting Unifier data download")

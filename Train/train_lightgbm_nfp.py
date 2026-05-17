@@ -624,10 +624,8 @@ def _build_fusion_tuning_context(target_dates: pd.Series) -> Optional[Dict]:
       * Consensus PIT predictions + SA-revised actuals merged into a single
         ``consensus_df`` shaped for ``kalman_fusion``'s noise-prior init.
       * ``consensus_by_ds`` and ``sa_actuals_by_ds`` fast-lookup dicts.
-      * Per-``ds`` PIT-safe adjustment predictions, using the same
-        ``half_life_years`` that ``_load_fusion_selection_target`` reads (so
-        the selection target and the tuning objective agree on the adjustment
-        baseline).
+      * Per-``ds`` PIT-safe adjustment predictions at the currently tuned
+        ``half_life_years`` (read from ``tuned_params.json``, fallback 3.0).
 
     Returns ``None`` if any required input (consensus, SA actuals, adjustment
     history) cannot be loaded — the caller falls back to its non-fusion
@@ -734,162 +732,21 @@ def _load_fusion_selection_target(
     target_type: str,
     step_date: pd.Timestamp,
 ) -> Tuple[pd.Series, Optional[float]]:
-    """Build the fusion-aligned selection target for the NSA branch.
+    """Build the feature-selection target. Returns ``(y_sel, half_life_used)``.
 
-    Returns ``(y_sel, half_life_years_used)``.
-
-    For the NSA branch, the published forecast is produced by the Kalman
-    fusion of ``consensus + (NSA_LGBM_pred + adj_pred) + NSA_accel``. The
-    *model channel*'s actual target is ``SA_revised − adj_pred(ds)``
-    (because at fusion time ``adj_pred`` is added back). So if we want the
-    feature selection to prefer features that help the fusion (rather than
-    features that help stand-alone NSA prediction), the selection's notion
-    of ``y`` should be ``SA_revised − adj_pred``. The LightGBM model is
-    still trained on the original NSA y_mom — only the *selection*'s sense
-    of "good feature" shifts.
-
-    PIT-safe: for each ``ds`` the predicted adjustment is built from
-    history filtered by ``operational_available_date < ds``. SA_revised
-    rows with ``ds >= step_date`` never enter this construction because
-    ``X_train['ds'] < step_date`` is the caller's invariant.
-
-    The half-life is read from
-    ``_output/consensus_anchor/kalman_fusion/tuned_params.json`` if
-    present (the value the most recent Kalman tune chose); otherwise it
-    falls back to 3.0. The value used is logged and persisted to
-    ``_output/consensus_anchor/dynamic_fs_selection_hl.json`` so the
-    next Kalman re-tune can emit a drift warning.
-
-    Falls back to the legacy NSA-y_mom target (and returns
-    ``half_life_years_used=None``) when:
-      - target_type is not 'nsa'
-      - SA target / adjustment history loading fails
-      - the produced fusion target has zero finite rows
+    Currently always returns ``(NSA y_mom, None)``. An earlier variant tried
+    to swap in a fusion-aligned target ``SA_revised − adj_pred(HL)`` for the
+    NSA branch's selection stage, but that empirically collapsed the surviving
+    feature count from 80 to 17 and worsened fusion MAE 93.96 → 100.61
+    (revert 2026-05-15). It is kept as a function (not inlined) so a future
+    revival can plug back in without changing the calling site.
     """
     legacy_y_sel = pd.Series(
         y_train.values,
         index=pd.to_datetime(X_train['ds'].values),
         name='y_mom',
     ).dropna()
-
-    # FS-A REVERTED (2026-05-15): empirically the fusion-aligned target
-    # SA_revised − adj_pred(HL) collapsed feature count from 80→17 and bumped
-    # fusion MAE from 93.96→100.61 vs the simpler NSA y_mom target. The
-    # smaller residual signal causes SFS stopping (min 0.5% MAE improvement,
-    # patience=3) to terminate too early. Restored NSA y_mom as the selection
-    # target. Fusion-aligned construction below is kept as dead code for
-    # future revival (would require non-zero KALMAN_LAMBDA_* to give the
-    # objective curvature first).
     return legacy_y_sel, None
-
-    if str(target_type).lower() != 'nsa':
-        return legacy_y_sel, None
-
-    from Train.data_loader import load_target_data
-    from Train.sandbox.experiment_predicted_adjustment import (
-        load_adjustment_history,
-    )
-    from Train.Output_code.consensus_anchor_runner import (
-        _build_pit_adjustment_cache,
-        _compute_adjustment_series,
-    )
-
-    # ── half_life_years: read tuned value, fallback to 3.0 ──
-    hl_used = 3.0
-    tuned_path = OUTPUT_DIR / 'consensus_anchor' / 'kalman_fusion' / 'tuned_params.json'
-    if tuned_path.exists():
-        try:
-            import json as _json
-            with open(tuned_path, 'r') as f:
-                _tuned = _json.load(f)
-            if isinstance(_tuned, dict) and 'half_life_years' in _tuned:
-                hl_used = float(_tuned['half_life_years'])
-        except Exception as e:
-            logger.warning(
-                f"[DynFS] Could not read tuned half_life_years from "
-                f"{tuned_path} ({e}); using default 3.0"
-            )
-
-    # ── Load SA revised actuals and adjustment history ──
-    try:
-        sa_target = load_target_data(
-            target_type='sa', release_type='first', target_source='revised',
-        )
-        sa_y_mom_by_ds = pd.Series(
-            sa_target['y_mom'].astype(float).values,
-            index=pd.to_datetime(sa_target['ds'].values),
-        )
-        adj_history = load_adjustment_history()
-    except Exception as e:
-        logger.warning(
-            f"[DynFS] Could not load SA target / adjustment history for "
-            f"fusion-aligned selection target ({e}); falling back to NSA y_mom"
-        )
-        return legacy_y_sel, None
-
-    # ── Build PIT-filtered cache and compute per-ds adjustment values ──
-    train_dates = pd.to_datetime(X_train['ds'].values)
-    train_dates_series = pd.Series(train_dates)
-    pit_cache = _build_pit_adjustment_cache(train_dates_series, adj_history)
-    adj_values = _compute_adjustment_series(train_dates_series, pit_cache, hl_used)
-
-    # ── Assemble fusion target with row-level fallbacks ──
-    # If SA actual missing → drop row (matches existing dropna).
-    # If PIT history empty for a ds → fall back to NSA y_mom for that row.
-    out_dates: List[pd.Timestamp] = []
-    out_values: List[float] = []
-    n_pit_fallback = 0
-    y_train_arr = y_train.values
-    for i, ds in enumerate(train_dates):
-        sa_val = sa_y_mom_by_ds.get(ds, np.nan)
-        avail = pit_cache.get(ds)
-        if avail is None or avail.empty:
-            nsa_val = y_train_arr[i] if i < len(y_train_arr) else np.nan
-            if pd.isna(nsa_val):
-                continue
-            out_dates.append(ds)
-            out_values.append(float(nsa_val))
-            n_pit_fallback += 1
-            continue
-        if pd.isna(sa_val):
-            continue
-        out_dates.append(ds)
-        out_values.append(float(sa_val) - float(adj_values[i]))
-
-    if not out_dates:
-        logger.warning(
-            "[DynFS] Fusion-aligned target produced zero rows; "
-            "falling back to NSA y_mom"
-        )
-        return legacy_y_sel, None
-
-    fusion_y_sel = pd.Series(
-        out_values,
-        index=pd.DatetimeIndex(out_dates),
-        name='y_fusion',
-    )
-
-    # ── Persist the half-life used so the post-tune drift warning can read it ──
-    try:
-        hl_path = OUTPUT_DIR / 'consensus_anchor' / 'dynamic_fs_selection_hl.json'
-        hl_path.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json
-        with open(hl_path, 'w') as f:
-            _json.dump({
-                'half_life_years': hl_used,
-                'step_date': step_date.strftime('%Y-%m'),
-                'n_rows': len(fusion_y_sel),
-                'n_pit_fallback': n_pit_fallback,
-            }, f, indent=2)
-    except Exception as e:
-        logger.warning(f"[DynFS] Could not write {hl_path.name}: {e}")
-
-    logger.info(
-        f"[DynFS] Selection target = SA_revised − adj_pred "
-        f"(half_life_years={hl_used:.3f}, n={len(fusion_y_sel)}, "
-        f"NSA-fallback rows={n_pit_fallback})"
-    )
-    return fusion_y_sel, hl_used
 
 
 def _dynamic_reselection(
@@ -968,13 +825,9 @@ def _dynamic_reselection(
             logger.info(f"[{label}] Source {src_name}: {len(cols)} features")
 
     # ── Build date-indexed target for the selection engine ──
-    # For NSA branch, swap to the fusion-aligned target so every target-aware
-    # stage (Boruta, cluster, vintage, interaction rescue, SFS) is tilted
-    # toward "features whose information makes the fusion model channel
-    # close to SA_revised", rather than "features that just predict NSA".
-    # The trained LightGBM model still uses y_train (NSA y_mom); only the
-    # selection's notion of "good feature" shifts. See
-    # _load_fusion_selection_target for PIT details and the fallback path.
+    # Currently `_load_fusion_selection_target` returns NSA y_mom (the
+    # fusion-aligned `SA_revised − adj_pred(HL)` variant was reverted on
+    # 2026-05-15 — see that function's docstring for context).
     y_sel, _hl_used_for_selection = _load_fusion_selection_target(
         X_train, y_train, target_type, step_date,
     )
@@ -1932,17 +1785,24 @@ def run_expanding_window_backtest(
         logger.error("Failed to build training dataset")
         return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
 
-    X_full = attach_sidecar_features(X_full, output_dir=OUTPUT_DIR, logger=logger)
+    X_full = attach_sidecar_features(
+        X_full, output_dir=OUTPUT_DIR, target_type=target_type, logger=logger,
+    )
 
     # COVID-winsorize X_full and y_full ONCE upfront so training, prediction
     # (X_pred = X_full.iloc[[target_idx]]), AND the production model fit (which
     # also reuses X_full via train_and_evaluate) all see consistent winsorized
-    # values for Mar-May 2020. This closes the asymmetry where the prior
-    # per-step winsorize on X_train_valid only touched the training slice and
-    # left X_pred at COVID target months exposed to raw out-of-distribution
-    # feature values (e.g., NFP_Consensus_Mean = -14,448 at Apr 2020). The
-    # clipping bounds use full-history non-COVID quantiles, which are
-    # empirically stable across decades for NFP-related features.
+    # values for Mar-May 2020. This closes the asymmetry where a per-step
+    # winsorize on X_train_valid only touched the training slice and left
+    # X_pred at COVID target months exposed to raw out-of-distribution
+    # feature values (e.g., NFP_Consensus_Mean = -14,448 at Apr 2020).
+    #
+    # PIT-safe: winsorize_covid_period now sources its 1/99% clipping bounds
+    # from a pre-COVID reference window (rows with index < 2020-03-01),
+    # which is a fixed, time-invariant, trivially-PIT-correct distribution.
+    # Earlier implementations used every non-COVID row including post-2020
+    # data and silently leaked future quantile information into the COVID
+    # rows' clip.
     logger.info("Applying COVID winsorization to X_full and y_full upfront...")
     _x_indexed = X_full.set_index('ds')
     _numeric = _x_indexed.select_dtypes(include=[np.number]).columns
@@ -3703,9 +3563,9 @@ def validate_post_train_all_artifacts(
 def _read_half_life_json(path: Path) -> Optional[float]:
     """Read ``half_life_years`` from a JSON file. Returns None if missing or unreadable.
 
-    Used by the iterative fusion-tune orchestrator to compare HL state across
-    passes. The same JSON files are written by `_load_fusion_selection_target`
-    (dynamic_fs_selection_hl.json) and `_tune_kalman` (tuned_params.json).
+    Used by the iterative fusion-tune orchestrator to compare the Kalman
+    tune's HL across passes. The file is ``tuned_params.json`` written by
+    ``_tune_kalman``.
     """
     if not path.exists():
         return None
@@ -3831,17 +3691,23 @@ Examples:
 
     if args.iterate_fusion_tune:
         # =====================================================================
-        # ITERATIVE FUSION TUNING — joint NSA ↔ Kalman convergence
+        # ITERATIVE FUSION TUNING — Kalman half-life self-convergence
         # =====================================================================
-        # Runs --train-all up to N times as a subprocess. After each pass we
-        # compare the half-life that the dynamic FS USED in this pass (from
-        # dynamic_fs_selection_hl.json) against the half-life that Kalman
-        # PRODUCED at the end of this pass (from tuned_params.json). When
-        # |Δhl| < threshold, the system is internally consistent — FS picked
-        # features for a HL that Kalman now confirms, and we stop. Otherwise
-        # the next pass starts with the new HL and re-runs FS + NSA Optuna
-        # + backtest + Kalman tune against that HL. Each pass gets its own
-        # archive folder so all snapshots are preserved.
+        # Runs --train-all up to N times as a subprocess. Each pass clears
+        # the universe cache (forcing fresh feature selection), re-runs FS +
+        # NSA Optuna + backtest + Kalman tune, and writes a new
+        # tuned_params.json. We compare the Kalman-tuned half_life_years
+        # across consecutive passes: when |HL_new − HL_prior| < threshold the
+        # system has stabilized and we stop. Otherwise the next pass runs
+        # against the updated state (different Optuna trials, refreshed
+        # universe cache) until either convergence or max_passes is hit.
+        #
+        # Historical note: an earlier design also tracked a "HL used by FS"
+        # value written to dynamic_fs_selection_hl.json by a fusion-aligned
+        # selection target (SA_revised − adj_pred(HL)). That selection
+        # variant was reverted on 2026-05-15 (collapsed feature count,
+        # worsened MAE), so the FS-side HL signal no longer exists. The
+        # convergence test now compares Kalman-to-Kalman across passes.
         import subprocess as _sub
         import sys as _sys
 
@@ -3858,7 +3724,6 @@ Examples:
         converge_threshold = float(args.fusion_converge_threshold)
 
         tuned_hl_path = OUTPUT_DIR / "consensus_anchor" / "kalman_fusion" / "tuned_params.json"
-        fs_hl_path = OUTPUT_DIR / "consensus_anchor" / "dynamic_fs_selection_hl.json"
         iter_log_path = OUTPUT_DIR / "consensus_anchor" / "kalman_fusion" / "fusion_iteration_log.json"
         iter_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3873,13 +3738,11 @@ Examples:
 
         for pass_idx in range(1, max_passes + 1):
             hl_prior_tuned = _read_half_life_json(tuned_hl_path)
-            hl_prior_fs = _read_half_life_json(fs_hl_path)
 
             logger.info(f"\n{'-' * 70}")
             logger.info(f"PASS {pass_idx}/{max_passes}")
             logger.info(f"{'-' * 70}")
             logger.info(f"  HL prior (tuned_params.json): {hl_prior_tuned}")
-            logger.info(f"  HL prior (FS used last pass): {hl_prior_fs}")
 
             removed = _clear_universe_cache()
             logger.info(f"  Cleared {removed} universe cache files "
@@ -3898,8 +3761,6 @@ Examples:
                 passes.append({
                     "pass": pass_idx,
                     "hl_prior_tuned": hl_prior_tuned,
-                    "hl_prior_fs": hl_prior_fs,
-                    "hl_used_by_fs": _read_half_life_json(fs_hl_path),
                     "hl_new_tuned": _read_half_life_json(tuned_hl_path),
                     "delta": None,
                     "fusion_metrics": _read_kalman_fusion_metrics(),
@@ -3908,18 +3769,15 @@ Examples:
                 break
 
             hl_new_tuned = _read_half_life_json(tuned_hl_path)
-            hl_new_fs = _read_half_life_json(fs_hl_path)
             fusion_metrics = _read_kalman_fusion_metrics()
 
             delta: Optional[float] = None
-            if hl_new_fs is not None and hl_new_tuned is not None:
-                delta = float(abs(hl_new_tuned - hl_new_fs))
+            if hl_prior_tuned is not None and hl_new_tuned is not None:
+                delta = float(abs(hl_new_tuned - hl_prior_tuned))
 
             passes.append({
                 "pass": pass_idx,
                 "hl_prior_tuned": hl_prior_tuned,
-                "hl_prior_fs": hl_prior_fs,
-                "hl_used_by_fs": hl_new_fs,
                 "hl_new_tuned": hl_new_tuned,
                 "delta": delta,
                 "fusion_metrics": fusion_metrics,
@@ -3927,16 +3785,19 @@ Examples:
             })
 
             logger.info(f"\n  PASS {pass_idx} COMPLETE")
-            logger.info(f"    HL used by FS in this pass:   {hl_new_fs}")
+            logger.info(f"    HL prior:                     {hl_prior_tuned}")
             logger.info(f"    HL produced by Kalman tune:   {hl_new_tuned}")
-            logger.info(f"    Δ = |Kalman_new − FS_used|:   "
+            logger.info(f"    Δ = |HL_new − HL_prior|:      "
                         f"{delta if delta is not None else 'n/a'}")
             logger.info(f"    Fusion MAE / RMSE / AccelAcc: "
                         f"{fusion_metrics.get('MAE')} / "
                         f"{fusion_metrics.get('RMSE')} / "
                         f"{fusion_metrics.get('Acceleration_Accuracy')}")
 
-            if delta is not None and delta < converge_threshold:
+            # Pass 1 has no prior to compare against (the on-disk HL was
+            # written by an unrelated prior run). Require at least one
+            # full pass to establish a baseline.
+            if pass_idx >= 2 and delta is not None and delta < converge_threshold:
                 logger.info(f"  ★ CONVERGED — Δ {delta:.3f}y < {converge_threshold:.3f}y threshold")
                 converged = True
                 break

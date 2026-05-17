@@ -51,6 +51,8 @@ def test_sidecar_features_attach_when_explicitly_enabled(tmp_path, monkeypatch):
     sidecar_cols = [c for c in out.columns if c.startswith("sidecar_accel__")]
     assert "sidecar_accel__predicted_mom" in sidecar_cols
     assert out["sidecar_accel__predicted_mom"].tolist() == [1.0, 2.0, 3.0]
+    assert "sidecar_meta__predicted_accel_mean" in out.columns
+    assert out["sidecar_meta__accel_proba_up_mean"].tolist() == [0.7, 0.4, 0.8]
 
 
 def test_sidecar_gate_skips_non_passing_models(tmp_path, monkeypatch):
@@ -60,6 +62,22 @@ def test_sidecar_gate_skips_non_passing_models(tmp_path, monkeypatch):
 
     frame = load_sidecar_feature_frame(output_dir=tmp_path)
     assert list(frame.columns) == ["ds"]
+
+
+def test_sidecar_loader_never_attaches_actual_columns(tmp_path, monkeypatch):
+    model_dir = _write_sidecar(tmp_path)
+    pred_path = model_dir / "predictions.csv"
+    pred = pd.read_csv(pred_path)
+    pred["actual_mom"] = [100.0, 200.0, 300.0]
+    pred["actual_accel"] = [1.0, 2.0, 3.0]
+    pred["consensus_residual"] = [9.0, 9.0, 9.0]
+    pred.to_csv(pred_path, index=False)
+
+    monkeypatch.setenv("NFP_SIDECAR_RUN_ID", "run_a")
+    monkeypatch.setenv("NFP_SIDECAR_REQUIRE_PASSING_GATE", "0")
+    frame = load_sidecar_feature_frame(output_dir=tmp_path)
+
+    assert not any("actual" in c or "consensus_residual" in c for c in frame.columns)
 
 
 def test_kalman_off_ignores_sidecar_columns(monkeypatch):

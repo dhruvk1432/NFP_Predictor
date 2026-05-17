@@ -20,6 +20,27 @@ import pandas as pd
 
 
 SIDECAR_SCHEMA_VERSION = "2026-05-16-sidecar-signal-v1"
+VALID_TARGET_TYPES = ("nsa", "sa")
+
+
+def sidecar_branch_root(output_dir: Path, target_type: str) -> Path:
+    """Return the per-target-type sidecar branch directory.
+
+    Layout: ``<output_dir>/sidecars/<target_type>/``.
+
+    SA-branch sidecars (built for the SA challenger) must always land
+    under ``sidecars/sa/`` so they don't shadow the live NSA artifacts.
+    NSA sidecars may continue writing to the legacy flat layout for
+    compatibility, but new callers should pass target_type='nsa' to land
+    under ``sidecars/nsa/`` instead.
+    """
+    target_type = str(target_type).strip().lower()
+    if target_type not in VALID_TARGET_TYPES:
+        raise ValueError(
+            f"target_type must be one of {VALID_TARGET_TYPES}; got {target_type!r}"
+        )
+    return Path(output_dir) / "sidecars" / target_type
+
 REQUIRED_PREDICTION_COLUMNS = {
     "ds",
     "model_id",

@@ -1,0 +1,23 @@
+{
+  "config": {
+    "covariance_type": "full",
+    "include_snapshots": true,
+    "max_features": 20,
+    "max_snapshot_columns": 60,
+    "min_train": 48,
+    "n_components": 2,
+    "start": "2021-01"
+  },
+  "data_paths": {
+    "target_path": "/Users/dhruvkohli/Desktop/Github Repos/NFP_Predictor/data/NFP_target/y_sa_revised.parquet"
+  },
+  "environment": {
+    "NFP_SIDECAR_MODE": "off"
+  },
+  "model_id": "hmm_labor_regime",
+  "n_predictions": 63,
+  "pit_validation": "trained_through < ds",
+  "repo_version": "56e6256",
+  "schema_version": "2026-05-16-sidecar-signal-v1",
+  "target_space": "sa_revised"
+}

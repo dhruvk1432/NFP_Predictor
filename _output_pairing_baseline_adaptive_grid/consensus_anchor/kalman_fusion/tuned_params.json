@@ -1,0 +1,7 @@
+{
+  "half_life_years": 1.25,
+  "trailing_window": 18,
+  "nsa_weight_scale": 1.5,
+  "use_panel_observation": true,
+  "panel_weight_scale": 1.0
+}

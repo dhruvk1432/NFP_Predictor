@@ -209,6 +209,11 @@ def _is_exact_protected(feature_name: str) -> bool:
     )
 
 
+def is_protected_feature_name(feature_name: str) -> bool:
+    """Return whether a feature is a protected keep-through-generation signal."""
+    return _is_exact_protected(feature_name)
+
+
 def _has_exact_allowed_descendant(source_name: str, feature_name: str) -> bool:
     feature = str(feature_name)
     allowed = exact_allowed_features(source_name)

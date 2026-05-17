@@ -1,8 +1,15 @@
 # Environment files
 
 .env
+.env.*
 .env.local
 .env.*.local
+!.env.example
+!.env.template
+
+# Local assistant/tool settings
+.claude/settings.local.json
+.claude/*.local.json
 
 # Data folder
 data/
@@ -65,3 +72,9 @@ aws/.keys/
 aws/.state/
 aws/config.env
 aws/config.local.env
+
+# Private keys and credentials
+*.pem
+*.key
+id_rsa
+id_ed25519

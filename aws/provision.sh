@@ -159,7 +159,7 @@ PROVISION COMPLETE.
                      (or: aws/ssh.sh)
 
 NEXT STEPS:
-  1. aws/push_data.sh         # upload ./data to S3 (slow, ~69GB)
+  1. aws/push_data.sh         # upload train-only data to S3
   2. aws/push_env.sh          # copy .env to instance
   3. aws/push_code.sh         # rsync Train/, Data_ETA_Pipeline/, etc.
   4. aws/ssh.sh

@@ -18,6 +18,7 @@ from experiments.sidecars.common import REQUIRED_PREDICTION_COLUMNS  # noqa: E40
 from experiments.sidecars.economist_panel_sidecar import (  # noqa: E402
     PanelConfig,
     _compute_track_record,
+    _latest_available_forecasts,
     _pool_step,
     _shape_for_sidecar,
     _trained_through_for_step,
@@ -94,6 +95,106 @@ def test_track_record_pit_strict(synthetic_panel):
     assert 40 < bias_a < 60, f"ECON_A trailing bias {bias_a} should be ~50"
 
 
+def test_latest_available_forecasts_uses_last_submission_before_cutoff():
+    panel = pd.DataFrame([
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 100.0,
+            "first_release_date": pd.Timestamp("2022-05-20"),
+        },
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 130.0,
+            "first_release_date": pd.Timestamp("2022-06-01"),
+        },
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 999.0,
+            "first_release_date": pd.Timestamp("2022-06-10"),
+        },
+    ])
+    cutoff = pd.Timestamp("2022-06-03")
+
+    latest = _latest_available_forecasts(
+        panel[panel["first_release_date"] < cutoff]
+    )
+
+    assert len(latest) == 1
+    assert float(latest["forecast"].iloc[0]) == 130.0
+
+
+def test_track_record_scores_last_available_submission():
+    actuals = pd.Series(
+        [100.0],
+        index=[pd.Timestamp("2022-05-01")],
+        name="actual",
+    )
+    panel = pd.DataFrame([
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 100.0,
+            "first_release_date": pd.Timestamp("2022-05-20"),
+        },
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 130.0,
+            "first_release_date": pd.Timestamp("2022-06-01"),
+        },
+        {
+            "ds": pd.Timestamp("2022-05-01"),
+            "ident": "US_A",
+            "name": "ECON_A",
+            "forecast": 999.0,
+            "first_release_date": pd.Timestamp("2022-06-10"),
+        },
+    ])
+
+    track = _compute_track_record(
+        panel=panel,
+        actuals=actuals,
+        target_month=pd.Timestamp("2022-06-01"),
+        cutoff=pd.Timestamp("2022-06-03"),
+        track_window=1,
+    )
+
+    assert len(track) == 1
+    assert float(track["bias"].iloc[0]) == pytest.approx(30.0)
+    assert float(track["mae"].iloc[0]) == pytest.approx(30.0)
+
+
+def test_track_record_excludes_actuals_not_operationally_available(synthetic_panel):
+    panel, actuals = synthetic_panel
+    target = pd.Timestamp("2022-06-01")
+    cutoff = target + pd.DateOffset(days=5)
+    window_month = target - pd.DateOffset(months=1)
+    actuals = actuals.copy()
+    actuals.attrs["actual_available_date_by_ds"] = pd.Series(
+        [cutoff],
+        index=[window_month],
+        name="actual_available_date",
+    )
+
+    track = _compute_track_record(
+        panel=panel,
+        actuals=actuals,
+        target_month=target,
+        cutoff=cutoff,
+        track_window=1,
+    )
+
+    assert track.empty
+
+
 def test_pool_step_emits_all_variants(synthetic_panel):
     """_pool_step always emits all candidate keys (NaN if not computable)."""
     panel, actuals = synthetic_panel
@@ -113,7 +214,6 @@ def test_pool_step_emits_all_variants(synthetic_panel):
         "predicted_mom_trimmed10",
         "predicted_mom_top3_simple",
         "predicted_mom_top3_bc_simple",
-        "predicted_mom_legacy_top4_mean",
         "panel_n",
         "panel_n_calibrated",
         "panel_top3_size",

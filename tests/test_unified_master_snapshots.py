@@ -1,9 +1,10 @@
 """
-Tests for unified no-selection master snapshot generation.
+Tests for no-selection master snapshot generation.
 
 Covers:
 - _batch_load_source_all_features() keeps all columns (no filtering)
-- _run_unified_no_selection() produces parquets at all 2 branch paths (revised only)
+- _run_unified_no_selection() writes parquets directly to the canonical
+  sa/revised branch (nsa requests resolve to the same dir)
 - Marker JSON has "mode": "all_features"
 - CLI default is no-selection
 """
@@ -168,12 +169,13 @@ class TestBatchLoadSourceAllFeatures:
 class TestRunUnifiedNoSelection:
     """Tests for unified no-selection master snapshot generation."""
 
-    def test_produces_parquets_at_all_2_branch_paths(self, tmp_path, monkeypatch):
-        """Parquets should exist at nsa/revised and sa/revised."""
+    def test_produces_parquet_at_canonical_sa_branch_path(self, tmp_path, monkeypatch):
+        """Parquet should exist at the canonical sa/revised branch path."""
         import Data_ETA_Pipeline.create_master_snapshots as cms
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, 'MASTER_BASE', master_base)
+        monkeypatch.setattr('Train.config.MASTER_SNAPSHOTS_BASE', master_base)
         monkeypatch.setattr(cms, 'TARGET_COMBOS', [
             ('nsa', 'revised'),
             ('sa', 'revised'),
@@ -195,15 +197,18 @@ class TestRunUnifiedNoSelection:
         snapshot_pairs = [(month, pd.Timestamp('2020-06-05'))]
         cms._run_unified_no_selection(snapshot_pairs, skip_existing=False)
 
-        # Check all 2 branches have the parquet
-        for cat in ['nsa', 'sa']:
-            branch_path = master_base / cat / "revised" / "decades"
-            pq = _snapshot_path(branch_path, month)
-            assert pq.exists(), f"Missing parquet at {pq}"
-            loaded = pd.read_parquet(pq)
-            assert 'feat_x' in loaded.columns
-            assert 'date' in loaded.columns
-            assert 'snapshot_date' in loaded.columns
+        # Only sa/revised is written; nsa is resolved to sa by readers.
+        sa_pq = _snapshot_path(master_base / "sa" / "revised" / "decades", month)
+        assert sa_pq.exists(), f"Missing parquet at {sa_pq}"
+        loaded = pd.read_parquet(sa_pq)
+        assert 'feat_x' in loaded.columns
+        assert 'date' in loaded.columns
+        assert 'snapshot_date' in loaded.columns
+
+        nsa_pq = _snapshot_path(master_base / "nsa" / "revised" / "decades", month)
+        assert not nsa_pq.exists(), (
+            "nsa/revised should no longer be written; readers route to sa/revised"
+        )
 
     def test_writes_all_features_marker_json(self, tmp_path, monkeypatch):
         """Each branch should get a selected_features marker with mode=all_features."""
@@ -211,6 +216,7 @@ class TestRunUnifiedNoSelection:
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, 'MASTER_BASE', master_base)
+        monkeypatch.setattr('Train.config.MASTER_SNAPSHOTS_BASE', master_base)
         monkeypatch.setattr(cms, 'TARGET_COMBOS', [
             ('nsa', 'revised'), ('sa', 'revised'),
         ])
@@ -239,50 +245,14 @@ class TestRunUnifiedNoSelection:
             assert data["mode"] == "all_features"
             assert "generated_at" in data
 
-    def test_all_2_branches_are_identical_copies(self, tmp_path, monkeypatch):
-        """All 2 branch parquets should have identical content."""
-        import Data_ETA_Pipeline.create_master_snapshots as cms
-
-        master_base = tmp_path / "master_snapshots"
-        monkeypatch.setattr(cms, 'MASTER_BASE', master_base)
-        monkeypatch.setattr(cms, 'TARGET_COMBOS', [
-            ('nsa', 'revised'),
-            ('sa', 'revised'),
-        ])
-
-        source_dir = tmp_path / "src" / "decades"
-        month = pd.Timestamp('2020-03-01')
-        rng = np.random.RandomState(99)
-        path = _snapshot_path(source_dir, month)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({
-            'date': pd.date_range('2019-01-01', periods=6, freq='MS'),
-            'col_a': rng.randn(6),
-            'col_b': rng.randn(6),
-        }).to_parquet(path, index=False)
-        monkeypatch.setattr(cms, 'SOURCES', {'S': source_dir})
-
-        cms._run_unified_no_selection(
-            [(month, pd.Timestamp('2020-03-06'))],
-            skip_existing=False,
-        )
-
-        dfs = {}
-        for cat in ['nsa', 'sa']:
-            branch_dir = master_base / cat / "revised" / "decades"
-            pq = _snapshot_path(branch_dir, month)
-            dfs[f"{cat}/revised"] = pd.read_parquet(pq)
-
-        ref = dfs['nsa/revised']
-        pd.testing.assert_frame_equal(ref, dfs['sa/revised'], check_like=True)
-
     def test_skip_existing_respects_flag(self, tmp_path, monkeypatch):
         """When skip_existing=True, existing parquets should not be regenerated."""
         import Data_ETA_Pipeline.create_master_snapshots as cms
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, 'MASTER_BASE', master_base)
-        monkeypatch.setattr(cms, 'TARGET_COMBOS', [('nsa', 'revised')])
+        monkeypatch.setattr('Train.config.MASTER_SNAPSHOTS_BASE', master_base)
+        monkeypatch.setattr(cms, 'TARGET_COMBOS', [('sa', 'revised')])
 
         source_dir = tmp_path / "src" / "decades"
         month = pd.Timestamp('2020-01-01')
@@ -300,10 +270,10 @@ class TestRunUnifiedNoSelection:
             skip_existing=False,
         )
 
-        # Modify the unified parquet to detect if it gets re-generated
-        unified_dir = master_base / "_unified" / "decades"
-        unified_pq = _snapshot_path(unified_dir, month)
-        original_df = pd.read_parquet(unified_pq)
+        # Capture the canonical sa/revised parquet to detect regeneration.
+        sa_dir = master_base / "sa" / "revised" / "decades"
+        sa_pq = _snapshot_path(sa_dir, month)
+        original_df = pd.read_parquet(sa_pq)
 
         # Second run with skip_existing=True
         cms._run_unified_no_selection(
@@ -312,7 +282,7 @@ class TestRunUnifiedNoSelection:
         )
 
         # File should still exist (not regenerated)
-        loaded = pd.read_parquet(unified_pq)
+        loaded = pd.read_parquet(sa_pq)
         pd.testing.assert_frame_equal(original_df, loaded)
 
 

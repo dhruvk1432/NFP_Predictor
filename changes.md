@@ -8,6 +8,10 @@ This document inventories every code change between [b9832e3](.) and the current
 
 Recurring theme across the changes: a PIT-leakage audit (documented in [leakage.md](leakage.md)) closed 11 leakage issues in the ETL + Train pipeline, COVID handling was centralized and stratified through every stage, the consensus-anchor pipeline was simplified to Kalman-only with nested walk-forward CV, and the LightGBM training paths gained a full determinism block.
 
+2026-05-17 addition: `NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN=1` now emits an experiment-only `consensus_anchor/panel_replaces_consensus_kalman/` bundle during train-all. It uses a dynamic PIT rolling panel from full economist history with configurable default knobs (`8m/top8/80% coverage/median`, Kalman `trailing_window=18`, `nsa_weight_scale=0.40`) while preserving production defaults. The rolling panel is rebuilt with strict current-forecast and prior-actual cutoffs, writes `panel_replacement_pit_audit.csv`, and is listed under `experimental_outputs` in `main_models.json`.
+
+2026-05-17 PIT audit addition: snapshot-wise lags passed strict cutoff checks, but branch-target `nfp_nsa_*` lag/rolling features were not snapshot-derived and needed their own operational-availability mask. `Train/data_loader.py` now masks revised target `y`/`y_mom` unless `operational_available_date < cutoff_date` before lag construction in both batch training and prediction paths. `scripts/audit_current_pipeline_pit.py` writes current-pipeline PIT artifacts; the first audit found 2,157 selected NSA target-derived feature-month values changed from legacy non-null to PIT-missing, so local model/fusion artifacts from before this fix are stale.
+
 ---
 
 ## 1. `Data_ETA_Pipeline/`
@@ -156,7 +160,7 @@ with the comment "File is keyed by the OBSERVATION MONTH (matches every other so
 
 ### 2.1 [Train/Output_code/consensus_anchor_runner.py](Train/Output_code/consensus_anchor_runner.py) (largest change, ~770 lines diffed)
 
-Headline: this file went from "Kalman + AccelOverride + Kalman+AccelPostFilter" to "Kalman only", and the consensus loader / Optuna tuner / metric stratifier were all rewritten.
+Headline: this file went from "Kalman + AccelOverride + Kalman+AccelPostFilter" to a cleaner final layer centered on Kalman. A later 2026-05 update promoted the PIT Panel/Kalman Router as the second main output; the consensus loader / Optuna tuner / metric stratifier were all rewritten.
 
 #### 2.1.1 Removed approaches
 
@@ -164,7 +168,7 @@ Removed: `accel_override(...)`, `_tune_accel_override(...)`, and the inline Kalm
 
 > AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11) because both consistently underperformed the Consensus baseline on the 60-month backtest window.
 
-**Impact:** ~200 lines of dead inference code deleted. The output bundle contract simplifies to `baseline_consensus/`, `kalman_fusion/`, and `comparison_metrics.csv`. Downstream `predictions.csv` becomes idempotent across this trim — `_augment_predictions_csv` now drops any lingering `consensus_anchor_accel_override` / `consensus_anchor_kalman_accel_postfilter` rows from earlier runs.
+**Impact:** ~200 lines of dead inference code deleted. The output bundle contract now centers on `kalman_fusion/` and `panel_kalman_router/`, with `baseline_consensus/` and `panel_consensus_mean/` kept as diagnostics. Downstream `predictions.csv` remains idempotent across this trim — `_augment_predictions_csv` drops any lingering `consensus_anchor_accel_override` / `consensus_anchor_kalman_accel_postfilter` rows from earlier runs.
 
 #### 2.1.2 Consensus loader rewritten — `_latest_snapshot_path` → `_load_consensus_pit`
 
@@ -528,7 +532,32 @@ These three exist on disk but are not committed:
 | **Leakage closure** | 4 distinct PIT leaks closed in ETL (claims late-start, NOAA CPI deflator, NOAA weighted-state pre-coverage, NOAA snapshot filename mismatch); 4 in Train (consensus loader, Kalman init prior, Optuna meta-leak, NSA-acceleration same-day revision leak); plus 1 leak fix in the adjustment sandbox (Apr-2020 winsor artifact embedded in same-month means). All documented in [leakage.md](leakage.md). |
 | **COVID handling** | Centralized via `utils.transforms.{COVID_EXCLUDE_MONTHS,is_covid_month}`. Consumed by consensus loader (winsorize), Kalman noise estimator (filter), metrics (stratify), adjustment predictors (filter). Headline MAE/RMSE drops because Apr-2020 winsor artifacts are no longer counted at full magnitude. New stratified `NonCovid_*` / `CovidOnly_*` columns in every `summary_statistics.csv`. |
 | **Reproducibility** | Full LightGBM determinism block (`deterministic`, `force_col_wise`, plus all five secondary seeds) applied in `hyperparameter_tuning`, `reduce_features`, `short_pass_selection`, and the new `LightGBMAdjustmentPredictor`. Eliminates a known source of run-to-run variance. |
-| **Consensus-anchor pipeline** | Simplified from 4 forecasts to 2 (`Baseline_Consensus`, `Kalman_Fusion`). AccelOverride and Kalman+AccelPostFilter removed. Optuna now uses nested expanding-window CV (5 folds). |
+| **Consensus-anchor pipeline** | AccelOverride and Kalman+AccelPostFilter removed. The two main final outputs are now `Kalman_Fusion` and `Panel_Kalman_Router`, with Baseline Consensus and Panel Consensus Mean retained as diagnostics. Optuna uses nested expanding-window CV (5 folds) for Kalman. |
 | **Adjustment predictor** | Default production predictor swapped from `ExpWeightedMonthlyAvgPredictor` to `ExpWeightedMedianCovidExcludedPredictor` — median + COVID-clean history. New `LightGBMAdjustmentPredictor` available in the sandbox for further A/B testing. |
 | **Feature selection** | macOS `FS_LGBM_NJOBS` default 1 → 5 (~2× faster). Per-window replay mode (driven by `USE_PER_WINDOW_FEATURES=True` in `.env` + `Best_features_selected/` on disk) bypasses fresh reselection entirely in both backtest and production paths, while logging "(overriding ALL-FEATURES mode)" when both flags conflict. |
 | **Operational robustness** | NOAA FRED state-employment download now retries with exponential backoff and hard-fails if any state is missing — kills a silent N<51 weighted-aggregate bug. `rerun_post_train_adj_and_consensus.py` now refreshes `predictions.csv` for `NSA_plus_adjustment` so post-train iteration doesn't leave stale OOS rows. |
+
+---
+
+## 2026-05-17 PIT follow-up: final-layer operational actual availability
+
+The final Kalman/panel layer now treats revised actual history the same way the
+LightGBM branch-target lag path does: a prior actual is usable only when
+`actual_available_date < target_release_date`.
+
+Changed files:
+
+- [Train/Output_code/consensus_anchor_runner.py](Train/Output_code/consensus_anchor_runner.py): carries target release/actual availability dates into the merged final-layer frame; filters Kalman history, adaptive-grid selection, and panel-router rule scoring by strict operational availability; writes `history_available_n` and `latest_available_actual_ds` audit columns.
+- [experiments/sidecars/feature_matrix.py](experiments/sidecars/feature_matrix.py): builds sidecar target dynamics from availability-filtered revised target history instead of raw `.shift(1)` when metadata exists.
+- [experiments/sidecars/acceleration_classifier_sidecar.py](experiments/sidecars/acceleration_classifier_sidecar.py): uses the PIT-built `*_accel_lag1` feature for target momentum/acceleration composites instead of `actual_accel.shift(1)`.
+- [experiments/sidecars/economist_panel_sidecar.py](experiments/sidecars/economist_panel_sidecar.py): filters economist track records to actuals available before the target release cutoff.
+- [Train/Output_code/sa_consensus_anchor_runner.py](Train/Output_code/sa_consensus_anchor_runner.py): applies the same operational-availability history filter to the isolated SA challenger fusion.
+- [Train/training_dataset_cache.py](Train/training_dataset_cache.py): bumps cache schema to `2` so old pre-fix training matrices are not reused.
+- [scripts/audit_current_pipeline_pit.py](scripts/audit_current_pipeline_pit.py): expands the audit to operational Kalman history, sidecar target dynamics, and cache schema.
+
+Verification:
+
+- Focused PIT regression suite: 55 passed.
+- Current audit artifacts: `_output_pairing_baseline_pitfix/pit_audit_current_pipeline/`.
+- Non-destructive runtime Kalman validation: 59 rows, 0 operational-history violations.
+- Official model/fusion CSVs in `_output_pairing_baseline_pitfix` are still stale relative to this code and must be regenerated before their headline metrics are trusted.

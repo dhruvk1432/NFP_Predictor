@@ -152,9 +152,11 @@ claims, and FRED-employment spine, which is good. But the post-baseline sources
 are no longer invisible:
 
 - `NFP_Consensus_Mean` is a top-10 final NSA feature.
-- Individual economist features appear in dynamic-selection cohorts, including
-  `NFP_Forecast_CONTINUUM_ECON`, `NFP_Forecast_DANSKE_BK`, and top-4 panel
-  transforms.
+- Dynamic-economist-panel features (`NFP_Forecast_Dynamic_Top10_k12`,
+  `Top4_k12`, `RobustMedian`, `DispersionStd`) appear in dynamic-selection
+  cohorts. The earlier hardcoded 4-economist features were removed for
+  selection leakage; importance attribution should be re-run against the
+  current dynamic-only inventory.
 - Futures/market features appear in selected cohorts and final importance:
   Fed Funds, Treasury/Yield, NatGas, JPY/USD volatility, VIX/WTI in some
   cohorts, and `SP500_max_5d_drop_chg_3m_lag_3m`.
@@ -418,43 +420,43 @@ additions, they appear in selected cohorts and final feature importance.
 
 Current repo asset:
 
-- `Data_ETA_Pipeline/load_economist_panel.py`
-- Raw inputs under `economist_panel/`
-- Output snapshots under `Exogenous_data/exogenous_economist_data`
-- Diagnostics under `_output/economist_panel/`
+- `Data_ETA_Pipeline/inject_dynamic_economist_features.py`
+- Raw inputs under `economist_panel/by_economist/`
+- Dynamic features appended in-place into the master snapshots under
+  `data/master_snapshots/{nsa,sa}/revised/decades/`
 
-The current implementation is promising because it is deterministic and
-PIT-aware. It uses a hand-curated top-4 panel selected on shared historical
-accuracy, emits each economist's forecast as a feature, and emits a top-4
-equal-weight ensemble with release timing set to the latest constituent
-forecast. That is the right shape: individual forecasts can contain useful
-cross-sectional disagreement that the aggregate consensus loses.
+The current implementation uses PIT-safe dynamic top-N selection: at every
+target month it ranks the full 261-economist panel by trailing 12-month MAE
+on PIT-eligible filings (≥70 % coverage), and emits equal-weight Top4/Top10/
+Top15 ensembles plus dispersion/median diagnostics. An earlier hardcoded
+top-4 list (`load_economist_panel.py`) was removed for selection leakage —
+those 4 names were hand-picked off a future window, so any feature that
+depended on them carried look-ahead bias.
 
 Tests to run:
 
-- No economist features versus top-4 individual features.
-- Top-4 mean only versus individual top-4 plus mean.
-- All available economists with strong regularization versus hard top-4.
-- Rolling top-k economist selection using only historical data available before
-  each month.
-- Accuracy-weighted top-k ensemble versus equal-weight top-4.
-- Dispersion, range, and disagreement features if the panel has enough members.
-- Forecast-revision features if multiple forecast timestamps exist for the same
-  event month.
+- No economist features versus dynamic top-N.
+- Top-N variants (4/10/15) versus broad robust median / trimmed mean.
+- Accuracy-weighted top-k ensemble versus equal-weight.
+- Dispersion, range, and disagreement features as channel-uncertainty
+  signals.
+- Forecast-revision features if multiple forecast timestamps exist for the
+  same event month.
 
 Metrics to inspect:
 
 - Incremental MAE versus consensus and recoverable baseline.
 - Stress-panel performance.
-- Whether the economist features reduce consensus residual error.
+- Whether the dynamic features reduce consensus residual error.
 - Whether economist disagreement predicts channel uncertainty.
-- Feature-selection stability: do selected economist features persist or churn?
+- Feature-selection stability: do the dynamic features persist across
+  cohorts or churn?
 
 Failure modes:
 
-- Top-4 selection may be overfit to the 2022-2025 shared sample.
 - Individual forecasters may stop filing or file too late.
-- The ensemble may duplicate consensus unless individual disagreement is used.
+- The dynamic top-N may collapse onto consensus during low-dispersion
+  regimes.
 - If release timing is mishandled, the feature can become subtly leaky.
 
 #### Continuous Daily Futures Features

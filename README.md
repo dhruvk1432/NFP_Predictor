@@ -1,6 +1,6 @@
 # NFP Predictor
 
-An institutional-grade forecasting pipeline for the U.S. Non-Farm Payrolls (NFP) month-over-month (MoM) print. The production output is a **Kalman-filter fusion** of three channels — the Reuters/LSEG economists' consensus poll, an NSA LightGBM model run through a PIT-safe seasonal-adjustment overlay, and the NSA-implied acceleration signal — Optuna-tuned against a composite objective on a 5-fold nested expanding-window CV.
+An institutional-grade forecasting pipeline for the U.S. Non-Farm Payrolls (NFP) month-over-month (MoM) print. The final SA-revised outputs are a tuned **Kalman-filter fusion** and a **Panel/Kalman Router**. The Kalman model fuses the Reuters/LSEG consensus poll, an NSA LightGBM model run through a PIT-safe seasonal-adjustment overlay, and the NSA-implied acceleration signal; the router then tests whether the PIT economist panel, Kalman, or a conservative blend has been more reliable using only earlier realized months.
 
 The system is built around three strict invariants:
 
@@ -8,21 +8,22 @@ The system is built around three strict invariants:
 2. **Walk-forward only.** All metrics come from an expanding-window backtest — never K-fold CV, never random shuffles. The model is retrained from scratch each month using only data available before that month's NFP release.
 3. **Native NaN handling.** LightGBM's split-finding algorithm consumes NaN directly. The pipeline never forward-fills or imputes feature values (the staggered start dates — FRED 1948, ADP 2001, Prosper 2009, Futures 2002, Economist Panel 2022 — encode genuine information that imputation would destroy).
 
-> **Architectural note (2026-05):** A standalone SA LightGBM model is no longer trained. The canonical SA-revised forecast is produced by the Kalman fusion, not by a stand-alone SA LightGBM. `--train-all` now runs only the NSA branch; the SA branch was retired because (a) tuning compute is better directed at the fusion objective, and (b) the fusion already beats a stand-alone SA LightGBM on every error metric.
+> **Architectural note (2026-05):** A standalone SA LightGBM model is no longer trained. The canonical SA-revised forecast layer is now `consensus_anchor/`, whose two main models are `kalman_fusion/` and `panel_kalman_router/`. `--train-all` runs only the NSA branch, then always runs the consensus-anchor layer.
 
 ---
 
-## Headline results (production backtest — 58 OOS months, SA-revised target)
+## Headline results (representative PIT backtests — 58 OOS months, SA-revised target)
 
 | Forecast | MAE | RMSE | DirAcc | AccelAcc | STD Ratio | Diff STD Ratio | Role |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **Kalman Fusion (NSA)** | **92.7** | **130.9** | **96.6%** | **70.2%** | 0.81 | 0.71 | **Production** |
+| **Panel/Kalman Router** | **85.5** | **126.3** | **98.3%** | 68.4% | 0.90 | 0.47 | **Main final model** |
+| **Kalman Fusion (NSA)** | 95.5 | 133.6 | 96.6% | **71.9%** | 0.79 | 0.75 | **Main final model** |
 | Baseline Consensus | 101.3 | 144.0 | 96.6% | 66.7% | 0.82 | 0.41 | Anchor / benchmark |
-| Baseline Champion (NSA + Adj) | 191.7 | 249.1 | 81.0% | 64.9% | 1.46 | 2.39 | Diagnostic channel only |
+| Baseline Champion (NSA + Adj) | 182.7 | 234.5 | 84.5% | 68.4% | 1.30 | 2.04 | Diagnostic channel only |
 
-Kalman Fusion beats the consensus poll on **every** error metric (MAE −8.6, RMSE −13.1) while simultaneously lifting acceleration accuracy by **+3.5 percentage points** — the gain that matters most for catching turning points. The NSA + Adjustment "Champion" is not used as a stand-alone forecast (its raw level error is large); it is consumed only as the second Kalman observation channel and as the input to the NSA-acceleration channel.
+The numbers shown come from the local no-tune post-train smoke replay in `_output_pairing_baseline_pitfix/`. A fresh tuned `--train-all` writes the authoritative values to `_output/consensus_anchor/comparison_metrics.csv` and declares the final two-model lineup in `_output/consensus_anchor/main_models.json`.
 
-`AccelOverride` and `Kalman + AccelOverride post-filter` variants were removed on **2026-05-11** after consistently underperforming Consensus on the 60-month backtest window. The pipeline now emits exactly two anchored forecasts (Kalman Fusion + Baseline Consensus) plus the Baseline Champion as a diagnostic overlay.
+`AccelOverride` and `Kalman + AccelOverride post-filter` variants were removed on **2026-05-11** after consistently underperforming Consensus on the 60-month backtest window. Baseline Consensus, Panel Consensus Mean, and NSA+Adjustment remain diagnostics; the two main final forecasts are Kalman Fusion and Panel/Kalman Router.
 
 ---
 
@@ -45,7 +46,7 @@ Kalman Fusion beats the consensus poll on **every** error metric (MAE −8.6, RM
 7. [Feature selection engine](#7-feature-selection-engine)
 8. [Master snapshot aggregation](#8-master-snapshot-aggregation)
 9. [Training pipeline — deep dive](#9-training-pipeline--deep-dive)
-10. [The Kalman Fusion forecast (production)](#10-the-kalman-fusion-forecast-production)
+10. [Consensus-anchor final forecasts](#10-consensus-anchor-final-forecasts)
 11. [Iterative fusion tuning](#11-iterative-fusion-tuning)
 12. [Running the pipeline](#12-running-the-pipeline)
 13. [Configuration reference](#13-configuration-reference)
@@ -93,13 +94,14 @@ flowchart TD
 
     subgraph Phase4["Phase 4: Walk-forward NSA training"]
         FE[Feature engineering<br/>calendar + survey week + lags<br/>+ revision deltas + NSA accel]
-        DynFS[Dynamic feature reselection<br/>every 24 months<br/>2-pass per-source then global<br/>capped at 80 features]
+        DynFS[Dynamic feature reselection<br/>every 60 months by default<br/>2-pass per-source then global<br/>capped at 120 features]
         LGBM[Expanding-window LightGBM<br/>Optuna composite tuning<br/>scored against fusion CV<br/>variance enhancement stack]
     end
 
     subgraph Phase5["Phase 5: Post-training fusion"]
         ExpAdj[PIT-safe seasonal adjustment<br/>ExpWeightedMedian, COVID-excluded<br/>half-life tuned by fusion Optuna]
-        Kalman[Kalman fusion - production<br/>info-filter, 3 channels<br/>cons + champion + nsa accel<br/>adaptive trailing-window noise]
+        Kalman[Kalman fusion - main<br/>info-filter, 3 channels<br/>cons + champion + nsa accel<br/>adaptive trailing-window noise]
+        Router[Panel/Kalman Router - main<br/>PIT rule selection<br/>panel vs Kalman vs blend]
         Cons[Baseline consensus<br/>raw Reuters/LSEG poll]
     end
 
@@ -121,6 +123,9 @@ flowchart TD
     LGBM --> Kalman
     Unifier --> Cons
     Cons --> Kalman
+    Econ --> Router
+    Cons --> Router
+    Kalman --> Router
 ```
 
 The shape of each phase is:
@@ -129,7 +134,7 @@ The shape of each phase is:
 - **Phase 2 — Per-source PIT snapshots.** Each source writes one parquet per target month under `data/Exogenous_data/{source}/decades/{decade}s/{year}/{YYYY-MM}.parquet`, containing only rows with `release_date < nfp_release_date(target_month)`.
 - **Phase 3 — Master aggregation.** [`create_master_snapshots.py`](Data_ETA_Pipeline/create_master_snapshots.py) joins all source snapshots into a single wide-format parquet per target month, in "all-features" mode (selection deferred to walk-forward time).
 - **Phase 4 — NSA training.** [`train_lightgbm_nfp.py --train-all`](Train/train_lightgbm_nfp.py) walks forward one month at a time, re-running dynamic feature selection every 24 months, with Optuna re-tuning the LightGBM hyperparameters every 12 months against the *fusion-CV composite* (not against NSA's own y_mom).
-- **Phase 5 — Fusion.** [`consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py) runs the Kalman fusion against the SA-revised target, jointly tuning the adjustment half-life, the Kalman trailing window, and the NSA acceleration weight.
+- **Phase 5 — Final forecasts.** [`consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py) runs the tuned Kalman fusion against the SA-revised target, then builds the PIT Panel/Kalman Router as the second main final model.
 
 ---
 
@@ -162,7 +167,7 @@ Required entries in `.env` (see [settings.py](settings.py:59)):
 | `START_DATE` | Training start date (e.g. `1990-01-01`) |
 | `BACKTEST_MONTHS` | Walk-forward backtest length (e.g. `60`) |
 
-Optional: `END_DATE`, `OUTPUT_DIR` (default `_output`), `TEMP_DIR` (default `./_temp`), `MODEL_TYPE`, `TARGET_TYPE`, `DEBUG`, `REFRESH_CACHE`, `RESELECT_EVERY_N_MONTHS` (default `6`; the committed `.env` ships `24`), `USE_PER_WINDOW_FEATURES` (replay mode — see §9.4).
+Optional: `END_DATE`, `OUTPUT_DIR` (default `_output`), `TEMP_DIR` (default `./_temp`), `MODEL_TYPE`, `TARGET_TYPE`, `DEBUG`, `REFRESH_CACHE`, `RESELECT_EVERY_N_MONTHS` (default `60`), `DYNAMIC_FS_PASS2_MAX_FEATURES` (default `120`), `N_OPTUNA_TRIALS` (default `50`), `USE_PER_WINDOW_FEATURES` (replay mode — see §9.4).
 
 ### Smoke test
 
@@ -189,7 +194,7 @@ NFP_Predictor/
 │   ├── load_unifier_data.py             # LSEG / Unifier (ISM, retail, consensus poll, …)
 │   ├── load_prosper_data.py             # Prosper consumer surveys
 │   ├── load_futures_data.py             # 19 continuous-futures contracts (PIT month-end)
-│   ├── load_economist_panel.py          # Top-4 economist forecasts + ensemble mean
+│   ├── inject_dynamic_economist_features.py  # Dynamic top-N economist features (PIT, full 261-panel)
 │   ├── nfp_release_calendar.py          # BLS NFP release calendar (first-Friday rule)
 │   ├── feature_selection_engine.py      # 7-stage selection (Pre-screen → Dual → Boruta → Vintage → Cluster → Interaction → SFS)
 │   ├── create_master_snapshots.py       # Merges all source snapshots into master wide parquets
@@ -218,7 +223,7 @@ NFP_Predictor/
 │   ├── rerun_post_train_adj_and_consensus.py  # Re-run adjustment + fusion without retraining
 │   ├── sandbox/                         # Standalone experiments (see Train/sandbox/README.md)
 │   └── Output_code/
-│       ├── consensus_anchor_runner.py   # Kalman fusion + Optuna joint tune (production)
+│       ├── consensus_anchor_runner.py   # Kalman fusion + Panel/Kalman Router final layer
 │       ├── generate_output.py           # Orchestrator: NSA / NSA+Adj / Predictions / Archive
 │       ├── model_comparison.py          # Multi-variant scorecard (CSV + HTML)
 │       ├── metrics.py                   # RMSE, MAE, coverage, acceleration accuracy
@@ -274,7 +279,7 @@ NFP_Predictor/
 ├── _output/                             # Pipeline outputs (gitignored)
 │   ├── NSA_prediction/                  # NSA branch backtest, plots, SHAP
 │   ├── NSA_plus_adjustment/             # NSA + PIT-safe seasonal adjustment
-│   ├── consensus_anchor/                # PRODUCTION: Kalman fusion + baseline consensus
+│   ├── consensus_anchor/                # FINAL: Kalman fusion + Panel/Kalman Router
 │   ├── Predictions/                     # Forward predictions with CIs
 │   ├── models/lightgbm_nfp/             # Saved models + multi-variant scorecard
 │   ├── dynamic_selection/               # Per-window feature JSONs (24-month cohort)
@@ -539,44 +544,31 @@ A claim reported January 15th (after the January NFP release on January 10th) is
 
 ---
 
-### 6.8 Economist Panel
+### 6.8 Economist Panel (dynamic, PIT-safe)
 
-**File:** [`Data_ETA_Pipeline/load_economist_panel.py`](Data_ETA_Pipeline/load_economist_panel.py)
+**File:** [`Data_ETA_Pipeline/inject_dynamic_economist_features.py`](Data_ETA_Pipeline/inject_dynamic_economist_features.py)
 
-**Purpose.** A deterministic, hand-curated panel of the four economists who have historically been the most accurate forecasters of the SA first-release MoM. Their forecasts (and an equal-weight ensemble mean) enter the master snapshot as PIT-correct features.
+**Purpose.** Inject PIT-safe dynamic-best-economist features into the existing master snapshots, ranking the full 261-economist panel by trailing track record at every backtest step. A prior hand-curated 4-economist list was removed — post-hoc selection against a future window was selection leakage.
 
-**The 4 hardcoded panellists** (validated against `y_sa_revised.y_mom` on the 36 shared months Apr 2022 → Sep 2025):
+**Features written** (all prefixed `NFP_Forecast_Dynamic_`):
 
-```python
-TOP_4_ECONOMISTS = [
-    "CONTINUUM ECON",
-    "NATIONWIDE INSUR",
-    "DANSKE BK",
-    "AIB",
-]
-```
-
-The list is **deliberately deterministic** — not auto-ranked at every run. Re-ranking would produce a different feature set each month and prevent feature stability.
-
-**Per-economist feature.** `NFP_Forecast_<EconShortName>` — the economist's first-release-value forecast (thousands of SA MoM jobs), with `release_date = first_release_date`.
-
-**Ensemble feature.** `NFP_Forecast_Top4Mean` — equal-weight mean of the panellists who filed for that month (≥ 2 of 4). The ensemble's `release_date = MAX` of constituent `first_release_date`s, so the ensemble is only "known" after every available member has filed.
+- `Top10_k12` — primary auto-panel forecast (12-month track window, ≥70 % coverage filter, equal-weight mean of top-10 by trailing MAE among active forecasters).
+- `Top4_k12` / `Top15_k12` — narrower / wider variants.
+- `PanelN` / `NCalibrated` — counts of eligible / calibrated forecasters.
+- `DispersionStd` / `DispersionIqr` — cross-sectional uncertainty.
+- `Top10TrackMae` — mean trailing MAE across the selected top-10.
+- `RobustMedian` / `TrimmedMean10` — broad-pool fallbacks.
 
 **Data inputs (at project root).**
 
 ```
 economist_panel/by_economist/US_XXXXX.parquet
-economist_panel/contributors.parquet
 NFP_target/y_sa_revised.parquet
+NFP_target/y_sa_first_release.parquet
 ```
 
-**Outputs.**
-
-```
-_output/economist_panel/rankings_full.csv   # full per-economist × window RMSE/MAE table (transparency)
-_output/economist_panel/top_economists.csv  # 4 hardcoded picks + metrics
-DATA_PATH/Exogenous_data/exogenous_economist_data/decades/{decade}s/{year}/{YYYY-MM}.parquet
-```
+**Outputs.** Dynamic columns appended into every master snapshot at
+`data/master_snapshots/{nsa,sa}/revised/decades/{decade}s/{year}/{YYYY-MM}.parquet`.
 
 ---
 
@@ -787,9 +779,9 @@ FOR each target_month in [oldest_backtest_month .. latest]:
   1. EXPANDING WINDOW: X_train = all rows whose release_date < nfp_release_date(target_month)
   2. FEATURE ENGINEERING: calendar + survey-week + branch-target lags + revision deltas + NSA-accel
                           (parallelized via joblib)
-  3. DYNAMIC RESELECTION: every 24 months (RESELECT_EVERY_N_MONTHS):
+  3. DYNAMIC RESELECTION: every 60 months by default (RESELECT_EVERY_N_MONTHS):
        Pass 1 — per-source FS (stages 0,2,4,5), uniform weights, 2000-01-01 onward
-       Pass 2 — global cross-source reduction to ≤ 80 features
+       Pass 2 — global cross-source reduction to ≤ DYNAMIC_FS_PASS2_MAX_FEATURES features
   4. SHORT-PASS: top-60 features per step (LightGBM gain), branch-target features merged on top
   5. HYPERPARAMETER TUNING: Optuna every 12 months (TUNE_EVERY_N_MONTHS)
                             objective = fusion-CV composite (NSA_TUNE_USE_KALMAN_FUSION=True)
@@ -824,15 +816,15 @@ Master snapshots are built in "all-features" mode, so dynamic reselection at wal
 | Pass | Scope | Stages | Hard cap |
 |---|---|---|---|
 | Pass 1 | Per source (FRED Employment NSA/SA, FRED Exogenous, Unifier, ADP, NOAA, Prosper, Futures, EconomistPanel) | `(0, 2, 4, 5)` — light pre-funnel + Boruta + Cluster + Interaction | per-source quota |
-| Pass 2 | Cross-source union + target-derived + calendar + revision | `(0, 2, 4)` — global Pre-funnel + Boruta + Cluster (SFS reverted 2026-05-15) | `DYNAMIC_FS_PASS2_MAX_FEATURES = 80` |
+| Pass 2 | Cross-source union + target-derived + calendar + revision | `(0, 2, 4)` — global Pre-funnel + Boruta + Cluster (SFS reverted 2026-05-15) | `DYNAMIC_FS_PASS2_MAX_FEATURES` (default `120`) |
 
-**Reselection frequency.** Controlled by `RESELECT_EVERY_N_MONTHS` (`.env` ships `24`). At 24 months, a 60-month backtest gets ~3 reselection events plus the initial bootstrap.
+**Reselection frequency.** Controlled by `RESELECT_EVERY_N_MONTHS` (default `60`). With the default on a 60-month backtest, reselection happens at the initial bootstrap and then only when the cadence boundary is reached.
 
 **Sample weighting for reselection.** Equal weights (`RESELECTION_HALF_LIFE_MONTHS = 9999`) — empirically, recency-biased reselection (HL=36) caused massive feature churn (Jaccard 0.23 between consecutive reselections). Equal weights select features with **durable** long-term predictive power; the per-step short-pass handles short-term adaptation.
 
 **NaN evaluation window.** Features are judged on their NaN rate from `2010-01-01` onward (`DYNAMIC_FS_NAN_EVAL_START`). Pre-2010 NaN is tolerated since many sources didn't exist before then. Maximum acceptable NaN rate: 20% (`DYNAMIC_FS_NAN_MAX_RATE`).
 
-**Per-window cache.** Each reselection writes its survivors to `_output/dynamic_selection/{target}_{source}/{step_date}.json`. With `RESELECT_EVERY_N_MONTHS=24` and a 60-month backtest, this typically contains 4–5 JSONs:
+**Per-window cache.** Each reselection writes its survivors to `_output/dynamic_selection/{target}_{source}/{step_date}.json`. With `RESELECT_EVERY_N_MONTHS=60` and a 60-month backtest, this typically contains the initial bootstrap cohort plus any cadence-boundary cohorts:
 
 ```
 _output/dynamic_selection/nsa_revised/
@@ -975,7 +967,7 @@ with $\lambda_{\text{accel}} = \lambda_{\text{dir}} = 5.0$ (`KALMAN_LAMBDA_ACCEL
 
 This is the key insight: **NSA hyperparameters are chosen for how well they make the fusion forecast perform**, not for how well NSA fits its own y_mom. If the fusion is the deployed forecast, the fusion is the objective.
 
-**Optimisation.** TPE sampler (`seed=42`), `MedianPruner(n_startup_trials=10, n_warmup_steps=20)`, 25 trials, 300s timeout, re-tune every 12 months. After feature reselection, the previous best params are seeded as Trial 0 (warm start).
+**Optimisation.** TPE sampler (`seed=42`), `MedianPruner(n_startup_trials=10, n_warmup_steps=20)`, `N_OPTUNA_TRIALS` trials (default `50`), 300s timeout, re-tune every 12 months. After feature reselection, the previous best params are seeded as Trial 0 (warm start).
 
 ### 9.10 Variance enhancement stack
 
@@ -1083,24 +1075,31 @@ $$\text{score} = \text{MAE}_{\text{fusion}} - 5 \cdot \text{accel\_acc}_{\text{f
 
 ---
 
-## 10. The Kalman Fusion forecast (production)
+## 10. Consensus-anchor final forecasts
 
 **File:** [`Train/Output_code/consensus_anchor_runner.py`](Train/Output_code/consensus_anchor_runner.py)
 
-After the NSA branch finishes its walk-forward, the consensus-anchor runner fuses three signals into the production forecast against the **SA-revised** target.
+After the NSA branch finishes its walk-forward, the consensus-anchor runner builds the final **SA-revised** forecast layer. It emits two main forecasts:
+
+- **Kalman Fusion (NSA):** the existing information-filter model over consensus, NSA+adjustment, and NSA acceleration.
+- **Panel/Kalman Router:** a deterministic PIT rule layer that chooses the panel forecast, Kalman forecast, or a blend/gate rule based only on earlier realized misses.
+
+It can also emit a gated local experiment, **Panel-Replaces-Consensus Kalman**, when `NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN=1`. This is not a production default. It uses a dynamic rolling full-economist panel as the Kalman level anchor when available, and falls back to `NFP_Consensus_Mean` when the rolling panel is missing.
 
 ### 10.1 Inputs
 
 | Channel | Source | Role |
 |---|---|---|
 | `consensus_pred` | NFP_Consensus_Mean from master snapshots (PIT-loaded per target month) | Anchor / always-on observation |
+| `panel_consensus_mean` | Curated economist panel from master snapshots (PIT-loaded per target month) | Router candidate and diagnostic level anchor |
+| `panel_replacement_pred` | Full economist panel, selected dynamically and PIT-clean each month when the experiment flag is enabled | Optional experiment: replaces `consensus_pred` inside Kalman only when available |
 | `champion_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (fallback: SA blend sandbox) | Primary model channel |
 | `nsa_pred` | `_output/NSA_plus_adjustment/backtest_results.csv` (same series) | NSA-implied delta → level for the third Kalman channel |
 | `actual` | `data/NFP_target/y_sa_revised.parquet` | Ground truth (SA-revised MoM) |
 
 The "Champion" feeding the Kalman is the **NSA + Adjustment** trajectory — NSA's MoM prediction plus a PIT-safe seasonal-adjustment overlay computed by `ExpWeightedMedianCovidExcludedPredictor`. NSA + Adjustment outperforms the legacy SA-blend sandbox as a Kalman channel because its acceleration dynamics translate better to the SA target.
 
-### 10.2 The state-space model
+### 10.2 Kalman state-space model
 
 **State.** A scalar random walk:
 
@@ -1162,28 +1161,69 @@ The half-life is tuned **inside the Kalman objective** — for each trial, the c
 
 After the tune, if `tuned_hl` differs from the static default (3.0y), the runner regenerates `_output/NSA_plus_adjustment/backtest_results.csv` with the tuned HL and rebuilds the merged dataset, so the final fusion sees the optimal champion.
 
-**Half-life drift warning.** The runner reads `_output/consensus_anchor/dynamic_fs_selection_hl.json` — written by the dynamic FS path with the HL it used to construct its selection target — and warns when $|\text{HL}_{\text{tune}} - \text{HL}_{\text{selection}}| > 1.0$ year. This is the feedback signal consumed by `--iterate-fusion-tune` (see §11).
+### 10.5 Panel/Kalman Router
 
-### 10.5 The two surviving forecasts
+The router is not a separate feature selector and it does not retrain the main LightGBM model. It is a final-layer replay model over already PIT-safe forecast streams.
+
+For each target month `t`, `build_panel_kalman_router()` constructs a historical prefix `df.iloc[:i]`, drops rows without actuals, and scores a fixed candidate set on that prefix only:
+
+| Candidate | Meaning |
+|---|---|
+| `panel` | Use the PIT economist-panel cross-sectional mean |
+| `kalman` | Use the tuned Kalman fusion output |
+| `panel_missing_else_kalman` | Use panel when available, otherwise Kalman |
+| `blend:w` | Weighted panel/Kalman blend for `w` in 0.35..0.95 |
+| `gate:t` | Use panel unless the Kalman-consensus disagreement exceeds threshold `t` |
+| `trailing_edge:w:margin` | Use Kalman when its strict-PIT trailing `w`-month MAE has beaten the panel by more than `margin`; this can switch to Kalman even when the panel is live |
+
+The best rule is chosen by prior-month MAE after a 24-month warmup, then applied to month `t`. By default, rule scoring uses the latest 24 operationally available historical months (`NFP_PANEL_ROUTER_SELECTION_LOOKBACK=24`); set it to `0` to restore all-history scoring. This is why the router is PIT-safe: the target row's actual and all later actuals are unavailable to rule choice, and the trailing-edge candidates replay each historical row using only rows that were available before that historical row. During warmup it uses the panel if available and falls back to Kalman.
+
+The router writes a full bundle under `_output/consensus_anchor/panel_kalman_router/`, including `router_manifest.json` with rule counts and the PIT statement.
+
+### 10.6 Gated panel-replacement experiment
+
+Enable locally with:
+
+```bash
+NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN=1 python Train/train_lightgbm_nfp.py --train-all
+```
+
+Default parameters are fixed experiment knobs; the selected economist identities are recomputed dynamically each month:
+
+```text
+NFP_PANEL_REPLACE_WINDOW=8
+NFP_PANEL_REPLACE_TOP_N=8
+NFP_PANEL_REPLACE_MIN_COVERAGE=0.80
+NFP_PANEL_REPLACE_POOLING=median
+NFP_PANEL_REPLACE_TRAILING_WINDOW=18
+NFP_PANEL_REPLACE_NSA_WEIGHT_SCALE=0.40
+```
+
+For each target month, the rolling panel uses only economist forecasts whose `first_release_date` is before that month’s NFP release date. Economist ranking uses only prior target months whose revised actual has `operational_available_date` before the same cutoff. The output bundle writes `experiment_manifest.json` and `panel_replacement_pit_audit.csv` so the cutoff, selected economists, `trained_through`, and missing-panel fallback can be inspected.
+
+### 10.7 Main forecasts
 
 | Forecast | What it is | Status |
 |---|---|---|
-| **Kalman Fusion (NSA)** | Information-filter fuse of consensus + champion + NSA-implied delta | Production |
-| **Baseline Consensus** | Raw Reuters/LSEG mean poll | Reported alongside Kalman as the benchmark |
+| **Kalman Fusion (NSA)** | Information-filter fuse of consensus + champion + NSA-implied delta | Main final model |
+| **Panel/Kalman Router** | PIT walk-forward router over panel, Kalman, and blends | Main final model |
+| Panel-Replaces-Consensus Kalman | Optional rolling full-economist panel replaces consensus inside Kalman with consensus fallback | Gated experiment only |
+| Baseline Consensus | Raw Reuters/LSEG mean poll | Benchmark |
+| Panel Consensus Mean | Cross-sectional curated economist panel mean | Diagnostic candidate |
 | Baseline Champion (NSA + Adj) | The model's own backtest, untouched | Diagnostic only — large standalone MAE |
 
 `AccelOverride` and `Kalman + AccelPostFilter` were dropped on **2026-05-11** after consistently underperforming Consensus on the 60-month window.
 
-### 10.6 Outputs
+### 10.8 Outputs
 
 ```
 _output/consensus_anchor/
-├── merged_consensus_model.csv          # Merged inputs (cons + champion + nsa + actual)
-├── comparison_metrics.csv              # Full metric block for all three forecasts (all / non-COVID / COVID-only)
+├── main_models.json                    # Declares the two main final models
+├── merged_consensus_model.csv          # Merged inputs (cons + panel + champion + nsa + actual)
+├── comparison_metrics.csv              # Full metric block for forecasts and diagnostics
 ├── comparison_metrics.png              # Bar charts (MAE/RMSE + DirAcc/AccelAcc)
 ├── comparison_overlay.png              # Time-series overlay vs actual
 ├── comparison_scorecard.html           # Sortable HTML scorecard with embedded plots
-├── dynamic_fs_selection_hl.json        # HL that dynamic FS used (drift-warning input)
 │
 ├── baseline_consensus/                 # Raw consensus, full diagnostic bundle
 │   ├── backtest_results.csv
@@ -1193,7 +1233,25 @@ _output/consensus_anchor/
 │   ├── summary_table.png
 │   └── acf_*.csv / pacf_*.csv / acf_pacf_diagnostics.png
 │
-└── kalman_fusion/                      # PRODUCTION — same bundle + tuned_params + iteration log
+├── panel_consensus_mean/               # Panel-only diagnostic bundle
+│   └── (same bundle shape)
+│
+├── panel_kalman_router/                # MAIN — same bundle + router_manifest
+│   ├── backtest_results.csv
+│   ├── summary_statistics.csv
+│   ├── summary_metrics.json
+│   ├── router_manifest.json
+│   └── (acf/pacf/plots as above)
+│
+├── panel_replaces_consensus_kalman/    # Optional experiment when NFP_ENABLE...=1
+│   ├── backtest_results.csv
+│   ├── summary_statistics.csv
+│   ├── summary_metrics.json
+│   ├── experiment_manifest.json
+│   ├── panel_replacement_pit_audit.csv
+│   └── (acf/pacf/plots as above)
+│
+└── kalman_fusion/                      # MAIN — same bundle + tuned_params + iteration log
     ├── backtest_results.csv
     ├── summary_statistics.csv
     ├── summary_metrics.json
@@ -1212,10 +1270,10 @@ python Train/train_lightgbm_nfp.py --iterate-fusion-tune
 
 Runs `--train-all` repeatedly as a subprocess. After each pass the orchestrator compares:
 
-- **`HL_selection`** — the adjustment half-life that *dynamic FS* used inside its selection target on this pass.
-- **`HL_tune`** — the half-life that the post-training *Kalman tune* picked at the end of this pass.
+- **prior `HL_tune`** — the half-life from the previous completed pass.
+- **new `HL_tune`** — the half-life that the post-training Kalman tune picked at the end of the current pass.
 
-When $|HL_{\text{tune}} - HL_{\text{selection}}| < 0.25$ years the system is internally consistent — FS picked features for a half-life that Kalman now confirms, and the loop exits. Otherwise the next pass starts from the new HL, invalidates the universe cache (so dynamic FS reruns against the new selection target), and re-runs NSA Optuna + backtest + Kalman tune.
+When the absolute half-life change is below the threshold, the loop exits. Otherwise the next pass invalidates the universe cache and re-runs NSA Optuna, the walk-forward backtest, and the consensus-anchor final layer.
 
 ```
 --max-fusion-passes <int>        # default 3
@@ -1224,7 +1282,7 @@ When $|HL_{\text{tune}} - HL_{\text{selection}}| < 0.25$ years the system is int
 
 A log is written to `_output/consensus_anchor/kalman_fusion/fusion_iteration_log.json` so each pass and its fusion metrics are inspectable.
 
-**Why iterate?** Because the dynamic FS selection target is `SA_revised − adj_pred(HL)` — features are picked for how well they explain whatever residual structure remains after the SA-NSA adjustment is removed. If HL changes, the residual structure changes, and a different feature set might be optimal. The iterative loop chases a fixed point of (HL, features, hyperparameters).
+**Why iterate?** The adjustment half-life affects the NSA+Adjustment channel consumed by Kalman. If the final-layer tune moves that half-life, the next train-all pass should rebuild cached feature universes and training matrices against the current final-layer state instead of silently reusing stale artifacts.
 
 ---
 
@@ -1252,7 +1310,7 @@ python run_full_project.py --skip noaa,prosper       # skip specific sources
 python run_full_project.py --list-steps              # show all pipeline steps
 ```
 
-> Note: `run_full_project.py` currently wires the 6 long-standing sources (FRED Employment, FRED Exogenous, ADP, NOAA, Prosper, Unifier). The Futures and EconomistPanel loaders ([`load_futures_data.py`](Data_ETA_Pipeline/load_futures_data.py), [`load_economist_panel.py`](Data_ETA_Pipeline/load_economist_panel.py)) are run standalone before master-snapshot aggregation; their outputs land in `data/Exogenous_data/exogenous_futures_data/` and `data/Exogenous_data/exogenous_economist_data/`, which `create_master_snapshots.py` then picks up.
+> Note: `run_full_project.py` currently wires the 6 long-standing sources (FRED Employment, FRED Exogenous, ADP, NOAA, Prosper, Unifier). The Futures loader ([`load_futures_data.py`](Data_ETA_Pipeline/load_futures_data.py)) is run standalone before master-snapshot aggregation; its output lands in `data/Exogenous_data/exogenous_futures_data/`, which `create_master_snapshots.py` then picks up. Dynamic-economist-panel features are injected after master-snapshot creation via [`inject_dynamic_economist_features.py`](Data_ETA_Pipeline/inject_dynamic_economist_features.py).
 
 ### Direct training
 
@@ -1332,7 +1390,9 @@ A persistent EC2 toolkit is shipped under [`aws/`](aws/) — provision, push cod
 | `DELIM` | no | `.` | Separator used in series codes |
 | `DEBUG` | no | `False` | Verbose logging |
 | `REFRESH_CACHE` | no | `False` | Force cache refresh |
-| `RESELECT_EVERY_N_MONTHS` | no | `6` (committed `.env` ships `24`) | Dynamic FS frequency |
+| `RESELECT_EVERY_N_MONTHS` | no | `60` | Dynamic FS frequency |
+| `DYNAMIC_FS_PASS2_MAX_FEATURES` | no | `120` | Hard cap after dynamic FS Pass 2 |
+| `N_OPTUNA_TRIALS` | no | `50` | Optuna trials per tune |
 | `USE_PER_WINDOW_FEATURES` | no | `False` | Replay mode (re-use saved JSON cohort) |
 
 ### `Train/config.py` — training knobs
@@ -1347,12 +1407,12 @@ A persistent EC2 toolkit is shipped under [`aws/`](aws/) — provision, push cod
 | `NUM_BOOST_ROUND` | 1000 | Max boosting rounds |
 | `EARLY_STOPPING_ROUNDS` | 50 | Early-stopping patience |
 | `HALF_LIFE_MIN_MONTHS` / `MAX_MONTHS` | 12 / 120 | Optuna HL bounds |
-| `N_OPTUNA_TRIALS` | 25 | Trials per tune |
+| `N_OPTUNA_TRIALS` | `.env` default `50` | Trials per tune |
 | `OPTUNA_TIMEOUT` | 300 | Seconds per tune |
 | `TUNE_EVERY_N_MONTHS` | 12 | Re-tune cadence |
 | `CONFIDENCE_LEVELS` | [0.50, 0.80, 0.95] | Empirical interval levels |
 | `SHORTPASS_TOPK` | 60 | Top-K per step (`lgbm_gain`) |
-| `DYNAMIC_FS_PASS2_MAX_FEATURES` | 80 | Hard cap after Pass 2 global reduction |
+| `DYNAMIC_FS_PASS2_MAX_FEATURES` | `.env` default `120` | Hard cap after Pass 2 global reduction |
 | `RESELECTION_HALF_LIFE_MONTHS` | 9999 | Equal weights for reselection |
 | `RESELECTION_START_DATE` | `2000-01-01` | Earliest reselection step |
 | `RESELECTION_STAGES_PASS1` | `(0, 2, 4, 5)` | Per-source stages in dynamic FS |
@@ -1408,19 +1468,21 @@ _output/
 │   ├── summary_statistics.csv
 │   └── summary_table.png
 │
-├── consensus_anchor/                # PRODUCTION
-│   ├── kalman_fusion/               # ← the production forecast
+├── consensus_anchor/                # FINAL FORECAST LAYER
+│   ├── main_models.json             # Kalman + Panel/Kalman Router lineup
+│   ├── kalman_fusion/               # Main final forecast
+│   ├── panel_kalman_router/         # Main final forecast
 │   ├── baseline_consensus/
+│   ├── panel_consensus_mean/
 │   ├── merged_consensus_model.csv
 │   ├── comparison_metrics.csv
 │   ├── comparison_metrics.png
 │   ├── comparison_overlay.png
-│   ├── comparison_scorecard.html
-│   └── dynamic_fs_selection_hl.json
+│   └── comparison_scorecard.html
 │
 ├── Predictions/
 │   └── predictions.csv              # Forward predictions with 50/80/95% CIs,
-│                                    # augmented with the Kalman / Consensus OOS rows
+│                                    # augmented with final-layer OOS rows
 │
 ├── models/lightgbm_nfp/
 │   ├── nsa_first_revised/           # Saved model + metadata + metrics JSON

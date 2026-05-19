@@ -13,17 +13,18 @@ to a short key and stores the result under
 ``_output/cache/training_dataset/`` so subsequent runs skip the
 parallel-feature-engineering build entirely.
 
-The cache has no temporal semantics — it is purely an iteration-speedup
-mechanism. PIT correctness is unaffected because the cached artifact is
-what ``build_training_dataset`` would have returned today.
+The cache key includes ``SCHEMA_VERSION`` because feature-builder semantics
+can change without any upstream parquet mtime changing. Bump the version
+whenever generated feature values or PIT masking behavior changes.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import pandas as pd
 
@@ -37,7 +38,9 @@ from Train.config import (
 
 logger = setup_logger(__file__, TEMP_DIR)
 
-SCHEMA_VERSION = 1
+# v2: branch-target lag features mask revised targets by each snapshot's
+# operational cutoff before shift/rolling construction.
+SCHEMA_VERSION = 2
 
 CACHE_DIR = OUTPUT_DIR / "cache" / "training_dataset"
 
@@ -103,13 +106,48 @@ def compute_cache_key(
     return h.hexdigest()[:16]
 
 
+def _normalize_cache_read_root(raw: str) -> Optional[Path]:
+    """Resolve an env-provided cache root to its training_dataset directory."""
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if path.name == "training_dataset" and path.parent.name == "cache":
+        return path
+    return path / "cache" / "training_dataset"
+
+
+def _candidate_cache_dirs() -> Iterable[Path]:
+    """Primary output cache plus optional read-through roots from prior output dirs."""
+    seen: set[Path] = set()
+    primary = CACHE_DIR.resolve()
+    seen.add(primary)
+    yield CACHE_DIR
+
+    raw = os.getenv("NFP_TRAIN_DATASET_CACHE_READ_ROOTS", "").strip()
+    if not raw:
+        return
+    for token in raw.replace(os.pathsep, ",").split(","):
+        extra = _normalize_cache_read_root(token)
+        if extra is None:
+            continue
+        resolved = extra.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield extra
+
+
 def _paths_for(
     target_type: str,
     release_type: str,
     target_source: str,
     key: str,
+    cache_dir: Path = CACHE_DIR,
 ) -> Tuple[Path, Path]:
-    base = CACHE_DIR / f"{target_type}_{release_type}_{target_source}__{key}"
+    base = cache_dir / f"{target_type}_{release_type}_{target_source}__{key}"
     return base.with_suffix(".X.parquet"), base.with_suffix(".y.parquet")
 
 
@@ -125,8 +163,13 @@ def load_cached_dataset(
     key = compute_cache_key(
         target_df, target_type, release_type, target_source, start_date, end_date,
     )
-    x_path, y_path = _paths_for(target_type, release_type, target_source, key)
-    if not (x_path.exists() and y_path.exists()):
+    x_path = y_path = None
+    for cache_dir in _candidate_cache_dirs():
+        cand_x, cand_y = _paths_for(target_type, release_type, target_source, key, cache_dir)
+        if cand_x.exists() and cand_y.exists():
+            x_path, y_path = cand_x, cand_y
+            break
+    if x_path is None or y_path is None:
         return None
 
     try:
@@ -144,7 +187,7 @@ def load_cached_dataset(
     y.name = 'y_mom'
     logger.info(
         f"training_dataset_cache HIT [{target_type}/{release_type}/{target_source}] "
-        f"key={key} → {len(X)} rows × {len(X.columns)} cols"
+        f"key={key} source={x_path.parent} → {len(X)} rows × {len(X.columns)} cols"
     )
     return X, y
 

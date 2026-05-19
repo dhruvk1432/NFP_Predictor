@@ -169,10 +169,10 @@ class TestCleanFeaturesNaNPruning:
 
         X = sample_X_with_dates.copy()
         X["Treasury_10Y_close"] = np.nan
-        X["NFP_Forecast_AIB"] = np.nan
+        X["NFP_Forecast_Dynamic_Top10_k12"] = np.nan
         recent_idx = X.index[-60:]
         X.loc[recent_idx, "Treasury_10Y_close"] = np.arange(len(recent_idx))
-        X.loc[recent_idx, "NFP_Forecast_AIB"] = np.arange(len(recent_idx))
+        X.loc[recent_idx, "NFP_Forecast_Dynamic_Top10_k12"] = np.arange(len(recent_idx))
 
         result = clean_features(
             X,
@@ -183,7 +183,7 @@ class TestCleanFeaturesNaNPruning:
         )
 
         assert "Treasury_10Y_close" in result
-        assert "NFP_Forecast_AIB" in result
+        assert "NFP_Forecast_Dynamic_Top10_k12" in result
         assert "modern_bad" not in result
 
     def test_coverage_protection_does_not_keep_stale_source_features(
@@ -511,14 +511,14 @@ class TestClassifyColumnsBySource:
 
         cols = [
             'Treasury_10Y_close',
-            'NFP_Forecast_CONTINUUM_ECON',
+            'NFP_Forecast_Dynamic_Top10_k12',
             'sanagap_adj_lag1',
             'is_jan',
             'rev_master_mean',
         ]
         groups = _classify_columns_by_source(cols)
         assert groups['Futures'] == ['Treasury_10Y_close']
-        assert groups['EconomistPanel'] == ['NFP_Forecast_CONTINUUM_ECON']
+        assert groups['EconomistPanel'] == ['NFP_Forecast_Dynamic_Top10_k12']
         assert groups['SA_NSA_Gap'] == ['sanagap_adj_lag1']
         assert groups['DerivedControls'] == ['is_jan', 'rev_master_mean']
 
@@ -800,7 +800,7 @@ class TestBacktestAllFeaturesMode:
         last_reselection_date = pd.Timestamp('2020-01-01')
         target_month = pd.Timestamp('2020-07-15')
 
-        RESELECT_EVERY_N_MONTHS = 36
+        RESELECT_EVERY_N_MONTHS = 6
         _reselect_interval_days = RESELECT_EVERY_N_MONTHS * 30
 
         _trigger_reselection = (

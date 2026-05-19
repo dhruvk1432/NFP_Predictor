@@ -7,13 +7,14 @@ import pandas as pd
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from Train.config import MASTER_SNAPSHOTS_BASE, get_master_snapshots_dir  # noqa: E402
+
 DATA_START_FLOOR = pd.Timestamp("1990-01-01")
-MASTER_BASE = Path(__file__).resolve().parent.parent / "data" / "master_snapshots"
+MASTER_BASE = MASTER_SNAPSHOTS_BASE
 
 PATHS = [
-    MASTER_BASE / "_unified" / "decades",
-    MASTER_BASE / "nsa" / "revised" / "decades",
-    MASTER_BASE / "sa" / "revised" / "decades",
+    get_master_snapshots_dir("sa", "revised"),
 ]
 
 

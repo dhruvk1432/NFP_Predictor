@@ -43,7 +43,10 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from settings import (
     DATA_PATH, TEMP_DIR, OUTPUT_DIR, setup_logger, BACKTEST_MONTHS,
-    RESELECT_EVERY_N_MONTHS, USE_PER_WINDOW_FEATURES,
+    RESELECT_EVERY_N_MONTHS, RESELECTION_TRIGGER_MODE, USE_PER_WINDOW_FEATURES,
+    RESELECTION_EXCLUDE_ANCHOR,
+    PER_WINDOW_FEATURES_SOURCE_OUTPUT_DIR, PER_WINDOW_FEATURES_REPLAY_MODE,
+    PER_WINDOW_FEATURES_EXCLUDE_ANCHOR,
 )
 from Data_ETA_Pipeline.perf_stats import profiled, perf_phase, inc_counter, dump_perf_json, register_atexit_dump
 from experiments.sidecars.integration import attach_sidecar_features
@@ -83,6 +86,7 @@ def _process_single_month_task(
     release_type: str,
     target_source: str,
     target_lags_lookup: Dict[pd.Timestamp, Dict[str, float]],
+    use_snapshot_cache: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """
     Helper function to process the feature engineering for a single month in parallel.
@@ -121,8 +125,12 @@ def _process_single_month_task(
     features.update(target_lags_lookup.get(target_month, {}))
 
     # 3. Load pre-merged, pre-selected master snapshot (contains ALL sources)
-    snapshot_df = load_master_snapshot(snapshot_date, target_type=target_type,
-                                       target_source=target_source, use_cache=False)
+    snapshot_df = load_master_snapshot(
+        snapshot_date,
+        target_type=target_type,
+        target_source=target_source,
+        use_cache=use_snapshot_cache,
+    )
 
     if snapshot_df is None or snapshot_df.empty:
         return None, None
@@ -139,8 +147,12 @@ def _process_single_month_task(
         prev_month_target = target_month - pd.DateOffset(months=1)
         prev_snapshot_date = prev_month_target + pd.offsets.MonthEnd(0)
 
-        prev_snapshot = load_master_snapshot(prev_snapshot_date, target_type=target_type,
-                                             target_source=target_source, use_cache=False)
+        prev_snapshot = load_master_snapshot(
+            prev_snapshot_date,
+            target_type=target_type,
+            target_source=target_source,
+            use_cache=use_snapshot_cache,
+        )
 
         if prev_snapshot is not None and not prev_snapshot.empty:
             view_curr = pivot_snapshot_to_wide(snapshot_df, prev_month_target, cutoff_date=cutoff_date)
@@ -196,6 +208,32 @@ from Train.config import (
     SA_CALENDAR_FEATURES_KEEP,
     ENHANCEMENT_EXEMPT_TARGETS,
     RESELECTION_START_DATE,
+    HMM_RESELECTION_MIN_TRAIN_MONTHS, HMM_RESELECTION_N_COMPONENTS,
+    HMM_RESELECTION_COVARIANCE_TYPE, HMM_RESELECTION_MAX_FEATURES,
+    HMM_RESELECTION_MIN_FEATURES, HMM_RESELECTION_MIN_NON_NAN,
+    HMM_RESELECTION_MIN_GAP_MONTHS, HMM_RESELECTION_MAX_GAP_MONTHS,
+    HMM_RESELECTION_MIN_STATE_PROB, HMM_RESELECTION_TRANSITION_RISK_THRESHOLD,
+    HMM_RESELECTION_TRANSITION_JUMP, HMM_RESELECTION_ENTROPY_THRESHOLD,
+    HMM_RESELECTION_ENTROPY_JUMP, HMM_RESELECTION_SURPRISE_Q,
+    HMM_RESELECTION_FORCE_LABELS, HMM_RESELECTION_FORCE_RISK,
+    HMM_RESELECTION_MIN_PROB_MARGIN, HMM_RESELECTION_EMISSION_PROFILE,
+    HMM_RESELECTION_TRIGGER_SCORE_THRESHOLD, HMM_RESELECTION_SURPRISE_LOW_Q,
+    HMM_RESELECTION_SURPRISE_HIGH_Q, HMM_RESELECTION_SEVERE_SURPRISE_RATIO,
+    HMM_RESELECTION_DOWNSIDE_SURPRISE_RATIO,
+    HMM_RESELECTION_SEASONAL_PENALTY_SURPRISE_RATIO,
+    HMM_RESELECTION_MIN_STATE_SUPPORT_N, HMM_RESELECTION_MIN_STATE_SUPPORT_SHARE,
+    HMM_RESELECTION_MIN_EXPECTED_DURATION,
+    HMM_RESELECTION_EPISODE_SUPPRESSION_MONTHS,
+    HMM_RESELECTION_EPISODE_CLEAR_MONTHS, HMM_RESELECTION_RANDOM_STATE,
+    HMM_RESELECTION_N_ITER,
+    NFP_STICKY_FEATURE_SELECTION, NFP_STICKY_MARGIN_STABLE,
+    NFP_STICKY_MARGIN_UPWARD, NFP_STICKY_MARGIN_VOLATILE,
+    NFP_STICKY_MARGIN_DEFAULT, NFP_STICKY_STABLE_MAX_REPLACEMENT_SHARE,
+    NFP_STICKY_VOLATILE_MIN_REPLACEMENT_SHARE,
+    NFP_DYNAMIC_SELECTION_PROFILE, NFP_STABLE_CORE_MIN_PERSISTENCE,
+    NFP_FEATURE_REPLACEMENT_CAP_SHARE, NFP_FEATURE_CHALLENGER_SLOTS,
+    NFP_STABLE_CORE_SOURCE_DIRS, NFP_STABLE_GUARDRAIL_SOURCES,
+    NFP_STABLE_RANK_WEIGHT, NFP_STABLE_CORRELATION_WEIGHT,
 )
 
 from Train.branch_target_selection import (
@@ -203,6 +241,13 @@ from Train.branch_target_selection import (
     select_branch_target_features_for_step,
 )
 from Train.variance_metrics import compute_variance_kpis, composite_objective_score
+from Train.hmm_regime_reselection import (
+    HMMRegimeConfig,
+    HMMRegimeSnapshot,
+    StickySelectionConfig,
+    apply_sticky_feature_selection,
+    evaluate_hmm_reselection_trigger,
+)
 
 from Train.model import (
     get_lgbm_params,
@@ -245,6 +290,56 @@ def _feature_engineering_parallel_settings() -> Tuple[int, Optional[str]]:
         )
         backend = None
     return n_jobs, backend
+
+
+def _feature_engineering_use_snapshot_cache(n_jobs: int, backend: Optional[str]) -> bool:
+    """Use in-process master snapshot caching when it cannot duplicate memory across processes."""
+    raw = os.getenv("NFP_TRAIN_FEATURE_USE_SNAPSHOT_CACHE", "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw and raw != "auto":
+        logger.warning(
+            "Invalid NFP_TRAIN_FEATURE_USE_SNAPSHOT_CACHE=%r; using auto",
+            raw,
+        )
+    return n_jobs == 1 or backend == "threading"
+
+
+def _available_label_mask_for_cutoff(
+    ds_values: pd.Series,
+    target_df: pd.DataFrame,
+    cutoff_date: Optional[pd.Timestamp],
+    target_source: str,
+) -> pd.Series:
+    """Return rows whose revised target label was operationally available before cutoff."""
+    ds_series = ds_values if isinstance(ds_values, pd.Series) else pd.Series(ds_values)
+    mask = pd.Series(True, index=ds_series.index)
+    if (
+        str(target_source).lower() != "revised"
+        or target_df.empty
+        or "operational_available_date" not in target_df.columns
+    ):
+        return mask
+
+    cutoff = pd.to_datetime(cutoff_date, errors="coerce")
+    if pd.isna(cutoff):
+        return mask
+
+    lookup_df = target_df[["ds", "operational_available_date"]].copy()
+    lookup_df["ds"] = pd.to_datetime(
+        lookup_df["ds"], errors="coerce"
+    ).dt.to_period("M").dt.to_timestamp()
+    lookup_df["operational_available_date"] = pd.to_datetime(
+        lookup_df["operational_available_date"], errors="coerce"
+    )
+    lookup_df = lookup_df.dropna(subset=["ds"])
+    op_lookup = dict(zip(lookup_df["ds"], lookup_df["operational_available_date"]))
+
+    months = pd.to_datetime(ds_series, errors="coerce").dt.to_period("M").dt.to_timestamp()
+    available_at = pd.to_datetime(months.map(op_lookup), errors="coerce")
+    return available_at.notna() & (available_at < cutoff)
 
 
 def _coverage_protected_sources() -> set[str]:
@@ -517,9 +612,230 @@ def _classify_columns_by_source(
     return groups
 
 
+def _source_for_feature(feature: str) -> str:
+    groups = _classify_columns_by_source([feature])
+    for source_name, cols in groups.items():
+        if cols:
+            return source_name
+    return "Unknown"
+
+
+def _dynamic_selection_json_dirs(target_type: str, target_source: str) -> List[Path]:
+    rel = Path("dynamic_selection") / f"{target_type}_{target_source}"
+    roots: List[Path] = [OUTPUT_DIR]
+    for raw in NFP_STABLE_CORE_SOURCE_DIRS:
+        roots.append(Path(raw).expanduser())
+    dirs: List[Path] = []
+    for root in roots:
+        candidates = [root / rel, root]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir() and candidate not in dirs:
+                if list(candidate.glob("*.json")) or (candidate / rel.name).exists():
+                    dirs.append(candidate)
+    return dirs
+
+
+def _load_stable_core_seed_features(
+    *,
+    target_type: str,
+    target_source: str,
+    available_columns: set[str],
+    min_persistence: float,
+) -> List[str]:
+    """Load recurring dynamic-selection features as an optional stable-core seed."""
+    counts: Dict[str, int] = {}
+    total_files = 0
+    for json_dir in _dynamic_selection_json_dirs(target_type, target_source):
+        for path in sorted(json_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text())
+            except Exception:
+                continue
+            features = [
+                f for f in payload.get("features", [])
+                if isinstance(f, str) and f in available_columns
+            ]
+            if not features:
+                continue
+            total_files += 1
+            for feature in set(features):
+                counts[feature] = counts.get(feature, 0) + 1
+    if total_files <= 0:
+        return []
+    threshold = max(1, int(np.ceil(float(min_persistence) * total_files)))
+    return [
+        feature for feature, count in sorted(
+            counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if count >= threshold
+    ]
+
+
+def _apply_stable_source_guardrails(
+    *,
+    selected_features: List[str],
+    candidate_features: List[str],
+    incumbent_features: Optional[List[str]],
+    max_features: int,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Restore protected source families if a sticky/challenger pass drops them."""
+    guard_sources = set(NFP_STABLE_GUARDRAIL_SOURCES)
+    if not guard_sources:
+        return selected_features, {"guardrail_restored": []}
+
+    selected = list(selected_features[:max_features])
+    selected_set = set(selected)
+    pool = _merge_unique_feature_lists(incumbent_features or [], candidate_features)
+    restored: List[Dict[str, str]] = []
+
+    def _source_counts(features: List[str]) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for feature in features:
+            source = _source_for_feature(feature)
+            out[source] = out.get(source, 0) + 1
+        return out
+
+    for source in sorted(guard_sources):
+        source_pool = [f for f in pool if _source_for_feature(f) == source]
+        if not source_pool or any(_source_for_feature(f) == source for f in selected):
+            continue
+        add_feature = source_pool[0]
+        if add_feature in selected_set:
+            continue
+        if len(selected) < max_features:
+            selected.append(add_feature)
+            selected_set.add(add_feature)
+            restored.append({"source": source, "feature": add_feature})
+            continue
+
+        counts = _source_counts(selected)
+        replace_idx: Optional[int] = None
+        for idx in range(len(selected) - 1, -1, -1):
+            existing_source = _source_for_feature(selected[idx])
+            if existing_source not in guard_sources or counts.get(existing_source, 0) > 1:
+                replace_idx = idx
+                break
+        if replace_idx is None:
+            continue
+        selected_set.remove(selected[replace_idx])
+        selected[replace_idx] = add_feature
+        selected_set.add(add_feature)
+        restored.append({"source": source, "feature": add_feature})
+
+    return selected[:max_features], {"guardrail_restored": restored}
+
+
+def _per_window_selection_dir(target_type: str, target_source: str) -> Path:
+    """Return the directory used for per-window feature replay JSONs."""
+    if PER_WINDOW_FEATURES_SOURCE_OUTPUT_DIR:
+        source_root = Path(PER_WINDOW_FEATURES_SOURCE_OUTPUT_DIR)
+        if not source_root.is_absolute():
+            source_root = (Path(__file__).resolve().parent.parent / source_root).resolve()
+        candidates = [
+            source_root / "dynamic_selection" / f"{target_type}_{target_source}",
+            source_root / f"{target_type}_{target_source}",
+            source_root,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        # Return the canonical path so the caller logs a useful missing path.
+        return candidates[0]
+    return OUTPUT_DIR / "dynamic_selection" / f"{target_type}_{target_source}"
+
+
+def _months_between(later: pd.Timestamp, earlier: pd.Timestamp) -> int:
+    """Whole calendar-month count from ``earlier`` to ``later``."""
+    later = pd.Timestamp(later)
+    earlier = pd.Timestamp(earlier)
+    return (later.year - earlier.year) * 12 + (later.month - earlier.month)
+
+
+def _filter_per_window_sets_for_replay(
+    sets: List[Tuple[pd.Timestamp, List[str]]],
+    backtest_months: Optional[List[pd.Timestamp]],
+) -> List[Tuple[pd.Timestamp, List[str]]]:
+    """Optionally map source feature sets onto this run's replay schedule.
+
+    ``all`` preserves the source schedule. ``bootstrap`` uses only the first
+    available set. ``cadence`` activates the latest PIT-eligible source set at
+    this run's scheduled cadence months; this lets a slower-cadence experiment
+    reuse selections computed by a faster run without doing fresh selection.
+    """
+    if not sets:
+        return sets
+
+    mode = (PER_WINDOW_FEATURES_REPLAY_MODE or "all").strip().lower()
+    if mode in {"all", "source", "source_schedule"}:
+        return sets
+    if mode in {"bootstrap", "first", "single"}:
+        return [sets[0]]
+    if mode not in {"cadence", "scheduled"}:
+        logger.warning(
+            f"Unknown PER_WINDOW_FEATURES_REPLAY_MODE={PER_WINDOW_FEATURES_REPLAY_MODE!r}; "
+            "using source schedule."
+        )
+        return sets
+    if not backtest_months:
+        logger.warning(
+            "PER_WINDOW_FEATURES_REPLAY_MODE=cadence requested without "
+            "backtest_months; using source schedule."
+        )
+        return sets
+
+    months = [pd.Timestamp(m) for m in backtest_months]
+    anchor = months[-1]
+    start = pd.Timestamp(RESELECTION_START_DATE)
+    desired: List[pd.Timestamp] = [months[0]]
+
+    if RESELECT_EVERY_N_MONTHS > 0:
+        for month in months:
+            if month < start:
+                continue
+            if (PER_WINDOW_FEATURES_EXCLUDE_ANCHOR or RESELECTION_EXCLUDE_ANCHOR) and month == anchor:
+                continue
+            diff = _months_between(anchor, month)
+            if diff >= 0 and diff % RESELECT_EVERY_N_MONTHS == 0:
+                desired.append(month)
+
+    desired = sorted(set(desired))
+    mapped: List[Tuple[pd.Timestamp, List[str]]] = []
+    source_idx = 0
+    for activation_month in desired:
+        chosen: Optional[Tuple[pd.Timestamp, List[str]]] = None
+        while source_idx < len(sets) and sets[source_idx][0] <= activation_month:
+            chosen = sets[source_idx]
+            source_idx += 1
+        if chosen is None:
+            candidates = [s for s in sets if s[0] <= activation_month]
+            chosen = candidates[-1] if candidates else None
+        if chosen is None:
+            logger.warning(
+                "PER-WINDOW cadence replay: no PIT-eligible source feature set "
+                f"for activation {activation_month.strftime('%Y-%m')}; skipping."
+            )
+            continue
+        source_step, features = chosen
+        if mapped and mapped[-1][0] == activation_month:
+            mapped[-1] = (activation_month, features)
+        else:
+            mapped.append((activation_month, features))
+        logger.info(
+            "PER-WINDOW cadence replay: activation=%s uses source_step=%s "
+            "(%d features)",
+            activation_month.strftime("%Y-%m"),
+            source_step.strftime("%Y-%m"),
+            len(features),
+        )
+
+    return mapped or [sets[0]]
+
+
 def _load_per_window_feature_sets(
     target_type: str,
     target_source: str,
+    backtest_months: Optional[List[pd.Timestamp]] = None,
 ) -> List[Tuple[pd.Timestamp, List[str]]]:
     """Load saved per-window feature JSONs for replay mode.
 
@@ -532,7 +848,7 @@ def _load_per_window_feature_sets(
     prior dynamic-reselection backtest run without re-running the slow
     feature-selection stage.
     """
-    sel_dir = OUTPUT_DIR / "dynamic_selection" / f"{target_type}_{target_source}"
+    sel_dir = _per_window_selection_dir(target_type, target_source)
     if not sel_dir.exists():
         return []
 
@@ -542,8 +858,13 @@ def _load_per_window_feature_sets(
 
     mtimes = [(p, p.stat().st_mtime) for p in json_paths]
     latest_mtime = max(m for _, m in mtimes)
-    cohort_window_seconds = 6 * 3600
-    cohort = [p for p, m in mtimes if (latest_mtime - m) <= cohort_window_seconds]
+    if PER_WINDOW_FEATURES_SOURCE_OUTPUT_DIR:
+        # Explicit source replay is usually a long backtest whose JSONs are
+        # written hours apart. The source directory itself is the cohort.
+        cohort = [p for p, _ in mtimes]
+    else:
+        cohort_window_seconds = 6 * 3600
+        cohort = [p for p, m in mtimes if (latest_mtime - m) <= cohort_window_seconds]
 
     sets: List[Tuple[pd.Timestamp, List[str]]] = []
     for p in sorted(cohort):
@@ -575,7 +896,20 @@ def _load_per_window_feature_sets(
             f"for ALL backtest steps. Verify this is intentional."
         )
 
-    return sets
+    filtered = _filter_per_window_sets_for_replay(sets, backtest_months)
+    if filtered != sets:
+        logger.info(
+            "_load_per_window_feature_sets: replay source %s filtered %d → %d "
+            "sets using mode=%s, cadence=%s, exclude_anchor=%s",
+            sel_dir,
+            len(sets),
+            len(filtered),
+            PER_WINDOW_FEATURES_REPLAY_MODE,
+            RESELECT_EVERY_N_MONTHS,
+            PER_WINDOW_FEATURES_EXCLUDE_ANCHOR or RESELECTION_EXCLUDE_ANCHOR,
+        )
+
+    return filtered
 
 
 def _get_features_for_step(
@@ -755,7 +1089,10 @@ def _dynamic_reselection(
     step_date: pd.Timestamp,
     target_type: str,
     target_source: str,
-) -> List[str]:
+    incumbent_features: Optional[List[str]] = None,
+    hmm_regime_log: Optional[Dict[str, Any]] = None,
+    return_metadata: bool = False,
+) -> List[str] | Tuple[List[str], Dict[str, Any]]:
     """Two-pass recency-weighted dynamic feature re-selection.
 
     Called at the scheduled reselection months during the expanding-window
@@ -776,7 +1113,7 @@ def _dynamic_reselection(
     recency weights to ≤ ``DYNAMIC_FS_PASS2_MAX_FEATURES``.
 
     Returns:
-        List of selected feature names (≤ DYNAMIC_FS_PASS2_MAX_FEATURES).
+        Selected feature names (≤ DYNAMIC_FS_PASS2_MAX_FEATURES) and metadata.
         **Raises RuntimeError** if selection produces zero features.
     """
     from collections import defaultdict
@@ -1061,7 +1398,96 @@ def _dynamic_reselection(
         f"{total_pass1} → {len(pass2_survivors)} → {len(final_features)} features"
     )
 
-    return final_features
+    regime_label = None
+    if hmm_regime_log:
+        regime_label = hmm_regime_log.get("hmm_regime_label")
+    selection_profile = NFP_DYNAMIC_SELECTION_PROFILE
+    stable_profile_enabled = selection_profile in {"stable_core", "challenger"}
+    stable_core_seed: List[str] = []
+    if stable_profile_enabled:
+        stable_core_seed = _load_stable_core_seed_features(
+            target_type=target_type,
+            target_source=target_source,
+            available_columns=available_in_train,
+            min_persistence=NFP_STABLE_CORE_MIN_PERSISTENCE,
+        )
+        if stable_core_seed:
+            logger.info(
+                f"[{label}] Stable-core seed: {len(stable_core_seed)} recurring "
+                f"features from dynamic-selection artifacts "
+                f"(min_persistence={NFP_STABLE_CORE_MIN_PERSISTENCE:.2f})"
+            )
+    effective_incumbents = _merge_unique_feature_lists(
+        incumbent_features or [],
+        stable_core_seed,
+    )
+    sticky_enabled = bool(NFP_STICKY_FEATURE_SELECTION or stable_profile_enabled)
+    challenger_slots = (
+        int(NFP_FEATURE_CHALLENGER_SLOTS)
+        if selection_profile == "challenger" else 0
+    )
+    sticky_result = apply_sticky_feature_selection(
+        candidate_features=final_features,
+        incumbent_features=effective_incumbents,
+        X_train=X_train,
+        y_train=y_train,
+        regime_label=str(regime_label) if regime_label else None,
+        config=StickySelectionConfig(
+            enabled=sticky_enabled,
+            max_features=DYNAMIC_FS_PASS2_MAX_FEATURES,
+            margin_stable=NFP_STICKY_MARGIN_STABLE,
+            margin_upward=NFP_STICKY_MARGIN_UPWARD,
+            margin_volatile=NFP_STICKY_MARGIN_VOLATILE,
+            margin_default=NFP_STICKY_MARGIN_DEFAULT,
+            stable_max_replacement_share=NFP_STICKY_STABLE_MAX_REPLACEMENT_SHARE,
+            volatile_min_replacement_share=NFP_STICKY_VOLATILE_MIN_REPLACEMENT_SHARE,
+            replacement_cap_share=(
+                NFP_FEATURE_REPLACEMENT_CAP_SHARE
+                if stable_profile_enabled else None
+            ),
+            challenger_slots=challenger_slots,
+            rank_weight=(
+                NFP_STABLE_RANK_WEIGHT if stable_profile_enabled else 0.05
+            ),
+            correlation_weight=(
+                NFP_STABLE_CORRELATION_WEIGHT if stable_profile_enabled else 1.0
+            ),
+        ),
+    )
+    selected_features = sticky_result.features
+    guardrail_meta: Dict[str, Any] = {"guardrail_restored": []}
+    if stable_profile_enabled:
+        selected_features, guardrail_meta = _apply_stable_source_guardrails(
+            selected_features=selected_features,
+            candidate_features=final_features,
+            incumbent_features=effective_incumbents,
+            max_features=DYNAMIC_FS_PASS2_MAX_FEATURES,
+        )
+    if sticky_result.enabled and effective_incumbents:
+        logger.info(
+            f"[{label}] Sticky reselection profile={selection_profile}: "
+            f"regime={sticky_result.regime_label or 'unknown'} "
+            f"margin={sticky_result.margin:.3f} replacements={sticky_result.replacements} "
+            f"jaccard={sticky_result.jaccard_vs_previous}"
+        )
+    if guardrail_meta.get("guardrail_restored"):
+        logger.info(
+            f"[{label}] Stable source guardrails restored "
+            f"{len(guardrail_meta['guardrail_restored'])} source families"
+        )
+
+    meta = {
+        "pass1_survivors": int(total_pass1),
+        "pass2_survivors": int(len(pass2_survivors)),
+        "pre_sticky_features": int(len(final_features)),
+        "dynamic_selection_profile": selection_profile,
+        "stable_core_seed_count": int(len(stable_core_seed)),
+        **sticky_result.to_log_dict(),
+        **guardrail_meta,
+    }
+    if return_metadata:
+        return selected_features, meta
+    return selected_features
 
 
 def _merge_unique_feature_lists(*groups: List[str]) -> List[str]:
@@ -1577,12 +2003,6 @@ def build_training_dataset(
         target_type, release_type=release_type, target_source=target_source
     )
 
-    # Pre-compute branch-target lagged features vectorized (shift/rolling)
-    # instead of per-worker filtering. Produces O(1) worker lookups.
-    target_prefix = f"nfp_{target_type}"
-    logger.info(f"Pre-computing vectorized lagged target features ({target_prefix})...")
-    target_lags_lookup = batch_lagged_target_features(branch_target_full, prefix=target_prefix)
-
     # Filter target data by date range
     filtered_df = target_df.copy()
     if start_date:
@@ -1606,6 +2026,20 @@ def build_training_dataset(
             target_ref.loc[valid_mask, 'release_date'],
         ))
 
+    # Pre-compute branch-target lagged features. For revised targets, pass the
+    # prediction cutoff map so lag/rolling features exclude target values whose
+    # operational_available_date is not strictly before the target release.
+    target_prefix = f"nfp_{target_type}"
+    logger.info(f"Pre-computing PIT lagged target features ({target_prefix})...")
+    target_lags_lookup = batch_lagged_target_features(
+        branch_target_full,
+        prefix=target_prefix,
+        cutoff_dates=release_date_map,
+    )
+
+    n_jobs, backend = _feature_engineering_parallel_settings()
+    use_snapshot_cache = _feature_engineering_use_snapshot_cache(n_jobs, backend)
+
     # Prepare arguments for parallel execution (vectorized — no iterrows)
     target_months = filtered_df['ds'].values
     target_values = filtered_df['y_mom'].values
@@ -1618,19 +2052,22 @@ def build_training_dataset(
             tm + pd.offsets.MonthEnd(0),
             target_type, release_type, target_source,
             target_lags_lookup,
+            use_snapshot_cache,
         ))
 
-    n_jobs, backend = _feature_engineering_parallel_settings()
     backend_msg = f" with {backend} backend" if backend else ""
+    cache_msg = "enabled" if use_snapshot_cache else "disabled"
     if n_jobs == 1:
         logger.info(
-            f"Starting sequential feature engineering for {len(tasks)} months"
+            f"Starting sequential feature engineering for {len(tasks)} months "
+            f"(snapshot cache {cache_msg})"
         )
         results = [_process_single_month_task(*args) for args in tasks]
     else:
         logger.info(
             f"Starting parallel feature engineering for {len(tasks)} months "
-            f"with n_jobs={n_jobs}{backend_msg}..."
+            f"with n_jobs={n_jobs}{backend_msg} "
+            f"(snapshot cache {cache_msg})..."
         )
         parallel_kwargs = {"n_jobs": n_jobs, "verbose": 5}
         if backend:
@@ -1855,6 +2292,58 @@ def run_expanding_window_backtest(
     tuned_params = None  # Cached tuned hyperparameters
     _warm_start_params = None  # Previous best params for Optuna warm-start after reselection
 
+    # ── Reselection trigger mode ──
+    # "hmm" uses the PIT regime trigger plus optional max-gap fallback; "hybrid" also
+    # honors the legacy anchored cadence; "cadence" is the old fixed schedule.
+    _reselection_trigger_mode = (RESELECTION_TRIGGER_MODE or "hmm").strip().lower()
+    if _reselection_trigger_mode not in {"hmm", "hybrid", "cadence"}:
+        logger.warning(
+            f"Unknown RESELECTION_TRIGGER_MODE={RESELECTION_TRIGGER_MODE!r}; "
+            "falling back to 'cadence'."
+        )
+        _reselection_trigger_mode = "cadence"
+    _hmm_trigger_config: Optional[HMMRegimeConfig] = None
+    if _reselection_trigger_mode in {"hmm", "hybrid"}:
+        _hmm_trigger_config = HMMRegimeConfig(
+            min_train_months=HMM_RESELECTION_MIN_TRAIN_MONTHS,
+            n_components=HMM_RESELECTION_N_COMPONENTS,
+            covariance_type=HMM_RESELECTION_COVARIANCE_TYPE,
+            max_features=HMM_RESELECTION_MAX_FEATURES,
+            min_features=HMM_RESELECTION_MIN_FEATURES,
+            min_non_nan=HMM_RESELECTION_MIN_NON_NAN,
+            min_gap_months=HMM_RESELECTION_MIN_GAP_MONTHS,
+            max_gap_months=HMM_RESELECTION_MAX_GAP_MONTHS,
+            min_state_prob=HMM_RESELECTION_MIN_STATE_PROB,
+            transition_risk_threshold=HMM_RESELECTION_TRANSITION_RISK_THRESHOLD,
+            transition_jump=HMM_RESELECTION_TRANSITION_JUMP,
+            entropy_threshold=HMM_RESELECTION_ENTROPY_THRESHOLD,
+            entropy_jump=HMM_RESELECTION_ENTROPY_JUMP,
+            surprise_quantile=HMM_RESELECTION_SURPRISE_Q,
+            force_reselect_labels=tuple(HMM_RESELECTION_FORCE_LABELS),
+            force_reselect_risk=HMM_RESELECTION_FORCE_RISK,
+            min_prob_margin=HMM_RESELECTION_MIN_PROB_MARGIN,
+            emission_profile=HMM_RESELECTION_EMISSION_PROFILE,
+            trigger_score_threshold=HMM_RESELECTION_TRIGGER_SCORE_THRESHOLD,
+            surprise_low_quantile=HMM_RESELECTION_SURPRISE_LOW_Q,
+            surprise_high_quantile=HMM_RESELECTION_SURPRISE_HIGH_Q,
+            severe_surprise_ratio=HMM_RESELECTION_SEVERE_SURPRISE_RATIO,
+            downside_surprise_ratio=HMM_RESELECTION_DOWNSIDE_SURPRISE_RATIO,
+            seasonal_penalty_surprise_ratio=HMM_RESELECTION_SEASONAL_PENALTY_SURPRISE_RATIO,
+            min_state_support_n=HMM_RESELECTION_MIN_STATE_SUPPORT_N,
+            min_state_support_share=HMM_RESELECTION_MIN_STATE_SUPPORT_SHARE,
+            min_expected_duration=HMM_RESELECTION_MIN_EXPECTED_DURATION,
+            episode_suppression_months=HMM_RESELECTION_EPISODE_SUPPRESSION_MONTHS,
+            episode_clear_months=HMM_RESELECTION_EPISODE_CLEAR_MONTHS,
+            random_state=HMM_RESELECTION_RANDOM_STATE,
+            n_iter=HMM_RESELECTION_N_ITER,
+        )
+    logger.info(
+        f"[{model_id}] Reselection trigger mode={_reselection_trigger_mode} "
+        f"(fixed cadence={RESELECT_EVERY_N_MONTHS}mo, "
+        f"HMM max_gap={HMM_RESELECTION_MAX_GAP_MONTHS}mo, "
+        f"exclude_anchor={RESELECTION_EXCLUDE_ANCHOR})"
+    )
+
     # ── Fusion-CV tuning context (NSA branch only) ──
     # Built once per train_and_evaluate. Each tune call reuses this same
     # context — consensus PIT / SA actuals / adjustment history don't
@@ -1901,6 +2390,8 @@ def run_expanding_window_backtest(
     dynamic_features: Optional[List[str]] = None   # None = not yet selected
     last_reselection_date: Optional[pd.Timestamp] = None
     _dynamic_selection_logs: List[Dict] = []  # JSON logs per reselection window
+    _hmm_previous_snapshot: Optional[HMMRegimeSnapshot] = None
+    _hmm_regime_logs: List[Dict] = []
 
     def _months_since(later: pd.Timestamp, earlier: pd.Timestamp) -> int:
         """Whole calendar-month count from ``earlier`` to ``later`` (signed).
@@ -1922,6 +2413,7 @@ def run_expanding_window_backtest(
         not _all_features_mode
         and master_snapshot_base_features
         and RESELECT_EVERY_N_MONTHS == 0
+        and _reselection_trigger_mode == "cadence"
     )
     if _frozen_features_mode:
         dynamic_features = list(master_snapshot_base_features)
@@ -1939,11 +2431,15 @@ def run_expanding_window_backtest(
     _per_window_features_sets: List[Tuple[pd.Timestamp, List[str]]] = []
     _per_window_mode = USE_PER_WINDOW_FEATURES
     if _per_window_mode:
-        _per_window_features_sets = _load_per_window_feature_sets(target_type, target_source)
+        _per_window_features_sets = _load_per_window_feature_sets(
+            target_type,
+            target_source,
+            backtest_months=backtest_months,
+        )
         if not _per_window_features_sets:
             logger.warning(
                 f"[{model_id}] PER-WINDOW mode requested but no JSONs found at "
-                f"{OUTPUT_DIR / 'dynamic_selection' / f'{target_type}_{target_source}'}. "
+                f"{_per_window_selection_dir(target_type, target_source)}. "
                 f"Falling back to frozen-features mode."
             )
             _per_window_mode = False
@@ -1977,8 +2473,20 @@ def run_expanding_window_backtest(
             continue
 
         with perf_phase("train.backtest.step.split_mask", step=i):
-            # EXPANDING WINDOW: Training data is everything BEFORE the target month
-            train_mask = X_full['ds'] < target_month
+            # EXPANDING WINDOW: Training data is every operationally available
+            # label before the target release. For revised targets, ds < target
+            # is not sufficient because the prior month's revision can be
+            # published at the same timestamp as the current target release.
+            cutoff_for_training = target_release_date_map.get(target_month, target_month)
+            train_mask = (
+                (X_full['ds'] < target_month)
+                & _available_label_mask_for_cutoff(
+                    X_full['ds'],
+                    target_df,
+                    cutoff_for_training,
+                    target_source,
+                )
+            )
             train_idx = X_full[train_mask].index.tolist()
 
             if len(train_idx) < 24:  # Need at least 2 years of training data
@@ -2047,20 +2555,13 @@ def run_expanding_window_backtest(
                     tuned_params = None
                 dynamic_features = list(new_features)
 
-        # ── Dynamic re-selection (anchored on the latest backtest month) ──
-        # The reselection schedule is anchored on the LAST backtest month
-        # (the prediction we care about most) and extends backward through
-        # history at N-month intervals: {anchor, anchor-N, anchor-2N, ...}.
-        # This makes the live prediction month itself a reselection step,
-        # so features are freshly selected and re-tuned for the target we
-        # are actually about to predict, instead of using a feature set that
-        # was last refreshed at an arbitrary point N months earlier.
-        #
-        # In all-features mode: mandatory bootstrap on step 0 (so the model
-        # has features at all); subsequent reselections fire only when
-        # target_month is on the schedule AND >= RESELECTION_START_DATE.
-        # In legacy mode: optional, triggered only when RESELECT_EVERY_N_MONTHS > 0.
-        # Per-window replay mode short-circuits this entirely — the user-curated
+        # ── Dynamic re-selection trigger ──
+        # Bootstrap still happens the first time a dynamic feature list is
+        # needed. After that, the trigger can be:
+        #   cadence: legacy anchored RESELECT_EVERY_N_MONTHS schedule.
+        #   hmm: PIT HMM macro-regime shift detector with optional max-gap fallback.
+        #   hybrid: either trigger may fire.
+        # Per-window replay mode short-circuits this entirely; the saved JSON
         # schedule from disk is authoritative.
         _reselection_start = pd.Timestamp(RESELECTION_START_DATE)
         _reselection_anchor = backtest_months[-1]
@@ -2069,28 +2570,67 @@ def run_expanding_window_backtest(
             """True iff ``month`` lies on {anchor - k*N : k=0,1,2,...}."""
             if RESELECT_EVERY_N_MONTHS <= 0:
                 return False
+            if RESELECTION_EXCLUDE_ANCHOR and month == _reselection_anchor:
+                return False
             diff = _months_since(_reselection_anchor, month)
             return diff >= 0 and diff % RESELECT_EVERY_N_MONTHS == 0
 
         _trigger_reselection = False
+        _trigger_reasons: List[str] = []
+        _hmm_decision_log: Optional[Dict] = None
+        _cadence_due = (
+            target_month >= _reselection_start
+            and _is_scheduled_reselection_month(target_month)
+        )
+
+        if (
+            not _per_window_mode
+            and _hmm_trigger_config is not None
+            and dynamic_features is not None
+            and target_month >= _reselection_start
+        ):
+            _hmm_decision = evaluate_hmm_reselection_trigger(
+                X_train=X_train_valid,
+                y_train=y_train_valid,
+                step_date=target_month,
+                cleaned_features=cleaned_features,
+                previous_snapshot=_hmm_previous_snapshot,
+                last_reselection_date=last_reselection_date,
+                config=_hmm_trigger_config,
+                X_current=X_full.iloc[[target_idx]],
+            )
+            _hmm_decision_log = {
+                "step_index": i,
+                "target_type": target_type,
+                "target_source": target_source,
+                **_hmm_decision.to_log_dict(),
+            }
+            _hmm_regime_logs.append(_hmm_decision_log)
+            if _hmm_decision.snapshot is not None:
+                _hmm_previous_snapshot = _hmm_decision.snapshot
+            logger.info(
+                f"[Step {i}] HMM regime trigger: "
+                f"{_hmm_decision.reason}, reselect={_hmm_decision.should_reselect}"
+            )
+
         if _per_window_mode:
             _trigger_reselection = False
-        elif _all_features_mode:
-            _trigger_reselection = (
-                dynamic_features is None  # First step — bootstrap select
-                or (
-                    target_month >= _reselection_start
-                    and _is_scheduled_reselection_month(target_month)
-                )
-            )
-        elif RESELECT_EVERY_N_MONTHS > 0:
-            _trigger_reselection = (
-                last_reselection_date is None
-                or (
-                    target_month >= _reselection_start
-                    and _is_scheduled_reselection_month(target_month)
-                )
-            )
+        else:
+            if not _frozen_features_mode and (dynamic_features is None or last_reselection_date is None):
+                _trigger_reselection = True
+                _trigger_reasons.append("bootstrap")
+
+            if _reselection_trigger_mode in {"cadence", "hybrid"} and _cadence_due:
+                _trigger_reselection = True
+                _trigger_reasons.append("anchored_cadence")
+
+            if (
+                _reselection_trigger_mode in {"hmm", "hybrid"}
+                and _hmm_decision_log is not None
+                and bool(_hmm_decision_log.get("hmm_should_reselect", False))
+            ):
+                _trigger_reselection = True
+                _trigger_reasons.append(str(_hmm_decision_log.get("hmm_trigger_reason", "hmm_shift")))
 
         if _trigger_reselection:
             with perf_phase("train.backtest.step.dynamic_reselection", step=i):
@@ -2100,19 +2640,26 @@ def run_expanding_window_backtest(
                     step_date=target_month,
                     target_type=target_type,
                     target_source=target_source,
+                    incumbent_features=dynamic_features,
+                    hmm_regime_log=_hmm_decision_log,
+                    return_metadata=True,
                 )
                 # _dynamic_reselection raises RuntimeError on failure in all-features mode
-                dynamic_features = _dyn_result
+                dynamic_features, _dyn_meta = _dyn_result
                 last_reselection_date = target_month
-                _next_scheduled = target_month + pd.DateOffset(months=RESELECT_EVERY_N_MONTHS)
-                _next_str = (
-                    _next_scheduled.strftime('%Y-%m')
-                    if _next_scheduled <= _reselection_anchor
-                    else f"none — {target_month.strftime('%Y-%m')} is the anchor"
-                )
+                if _reselection_trigger_mode in {"cadence", "hybrid"} and RESELECT_EVERY_N_MONTHS > 0:
+                    _next_scheduled = target_month + pd.DateOffset(months=RESELECT_EVERY_N_MONTHS)
+                    _next_str = (
+                        _next_scheduled.strftime('%Y-%m')
+                        if _next_scheduled <= _reselection_anchor
+                        else f"none — {target_month.strftime('%Y-%m')} is the anchor"
+                    )
+                else:
+                    _next_str = "HMM-gated"
                 logger.info(
                     f"[Step {i}] Dynamic re-selection: {len(dynamic_features)} features "
                     f"(anchor={_reselection_anchor.strftime('%Y-%m')}, "
+                    f"trigger={';'.join(_trigger_reasons) or 'unspecified'}, "
                     f"next scheduled re-selection: {_next_str})"
                 )
 
@@ -2122,9 +2669,14 @@ def run_expanding_window_backtest(
                     "target_source": target_source,
                     "step_date": target_month.strftime('%Y-%m'),
                     "step_index": i,
+                    "trigger_mode": _reselection_trigger_mode,
+                    "trigger_reason": ";".join(_trigger_reasons) or "unspecified",
                     "n_features": len(dynamic_features),
                     "features": dynamic_features,
+                    "selection_meta": _dyn_meta,
                 }
+                if _hmm_decision_log is not None:
+                    _sel_log["hmm_regime"] = _hmm_decision_log
                 _dynamic_selection_logs.append(_sel_log)
                 _sel_log_dir = OUTPUT_DIR / "dynamic_selection" / f"{target_type}_{target_source}"
                 _sel_log_dir.mkdir(parents=True, exist_ok=True)
@@ -2808,6 +3360,29 @@ def run_expanding_window_backtest(
             _json.dump(stability_data, _f, indent=2)
         logger.info(f"Saved stability report to {stability_path}")
 
+    if _hmm_regime_logs:
+        import json as _json
+        regime_dir = OUTPUT_DIR / "models" / "lightgbm_nfp" / model_id
+        regime_dir.mkdir(parents=True, exist_ok=True)
+        regime_json_path = regime_dir / "hmm_regime_reselection.json"
+        regime_csv_path = regime_dir / "hmm_regime_reselection.csv"
+        regime_payload = {
+            "trigger_mode": _reselection_trigger_mode,
+            "config": (
+                _hmm_trigger_config.__dict__
+                if _hmm_trigger_config is not None
+                else None
+            ),
+            "events": _hmm_regime_logs,
+        }
+        with open(regime_json_path, 'w') as _f:
+            _json.dump(regime_payload, _f, indent=2)
+        pd.DataFrame(_hmm_regime_logs).drop(
+            columns=["hmm_features", "hmm_state_stats"],
+            errors="ignore",
+        ).to_csv(regime_csv_path, index=False)
+        logger.info(f"Saved HMM regime reselection audit to {regime_json_path}")
+
     return results_df, X_full, y_full
 
 
@@ -2881,8 +3456,23 @@ def train_and_evaluate(
     logger.info(f"TRAINING FINAL PRODUCTION MODEL [{model_id.upper()}]")
     logger.info("=" * 60)
 
-    # Filter out NaN targets for final model training
+    # Filter out NaN targets and any revised labels not yet operationally
+    # available for final model training.
     valid_mask = ~y_full.isna()
+    if target_source == 'revised' and 'operational_available_date' in target_df.columns:
+        label_available_now = _available_label_mask_for_cutoff(
+            X_full['ds'],
+            target_df,
+            pd.Timestamp.now(),
+            target_source,
+        )
+        excluded_unavailable = int((valid_mask & ~label_available_now).sum())
+        if excluded_unavailable:
+            logger.info(
+                f"Excluding {excluded_unavailable} non-NaN revised labels whose "
+                "operational_available_date is not before now."
+            )
+        valid_mask = valid_mask & label_available_now
     X_full_valid = X_full[valid_mask].copy()
     y_full_valid = y_full[valid_mask].copy()
 
@@ -2919,7 +3509,16 @@ def train_and_evaluate(
     _prod_per_window_sets: List[Tuple[pd.Timestamp, List[str]]] = []
     _prod_per_window_mode = USE_PER_WINDOW_FEATURES
     if _prod_per_window_mode:
-        _prod_per_window_sets = _load_per_window_feature_sets(target_type, target_source)
+        _prod_backtest_months = (
+            pd.to_datetime(backtest_results["ds"]).tolist()
+            if "ds" in backtest_results.columns
+            else None
+        )
+        _prod_per_window_sets = _load_per_window_feature_sets(
+            target_type,
+            target_source,
+            backtest_months=_prod_backtest_months,
+        )
         if not _prod_per_window_sets:
             logger.warning(
                 f"[{model_id}] PER-WINDOW mode requested for production but no "
@@ -3374,7 +3973,10 @@ def predict_nfp_mom(
 
     # Add branch-target lagged features
     target_lag_features = get_lagged_target_features(
-        target_full, target_month, f'nfp_{target_type}'
+        target_full,
+        target_month,
+        f'nfp_{target_type}',
+        cutoff_date=cutoff_date,
     )
     for k, v in target_lag_features.items():
         features[k] = v
@@ -3449,11 +4051,10 @@ def get_latest_prediction(
 
 # `--train-all` runs ONLY the NSA branch.
 # The SA branch has been retired from the published pipeline as of 2026-05:
-# the canonical SA-revised forecast is produced by the Kalman fusion of
-# (consensus, NSA + predicted adjustment, NSA acceleration), not by a
-# stand-alone SA LightGBM. Tuning is therefore directed at the fusion
-# objective; running an SA LightGBM model in --train-all would burn compute
-# on a branch no one publishes.
+# the canonical SA-revised forecast layer is consensus_anchor/ (Kalman Fusion
+# plus Panel/Kalman Router), not a stand-alone SA LightGBM. Tuning is therefore
+# directed at the final fusion objective; running an SA LightGBM model in
+# --train-all would burn compute on a branch no one publishes.
 ALL_COMBOS = [
     ('nsa', 'first', 'revised'),
 ]
@@ -3470,14 +4071,14 @@ def validate_post_train_all_artifacts(
     Validate that train-all produced complete production artifacts.
 
     Required artifacts:
-      1) 2 model files + 2 metadata files
-      2) 2 per-model metrics JSON files
+      1) NSA model file + metadata file
+      2) NSA per-model metrics JSON file
       3) model_comparison.csv/html
       4) revised output bundles under OUTPUT_DIR (_output/)
 
     Optional artifacts (post-training pipeline):
       5) sandbox predicted adjustment + SA blend walk-forward
-      6) consensus anchor (baseline consensus + Kalman fusion)
+      6) consensus anchor diagnostics
     """
     if output_root is None:
         output_root = OUTPUT_DIR
@@ -3526,14 +4127,25 @@ def validate_post_train_all_artifacts(
     optional.append(("sandbox::sa_blend_walkforward",
                      output_root / "sandbox" / "sa_blend_walkforward" / "backtest_results.csv"))
 
-    # Consensus anchor: Baseline_Consensus + Kalman_Fusion are the production
-    # artifact set. AccelOverride and Kalman+AccelPostFilter were dropped
+    # Consensus anchor: Kalman_Fusion and Panel_Kalman_Router are the two main
+    # final SA-revised forecast artifacts. Baseline_Consensus and panel mean are
+    # diagnostics; AccelOverride and Kalman+AccelPostFilter were dropped
     # 2026-05-11 (both underperformed Consensus on the backtest window).
     consensus_dir = output_root / "consensus_anchor"
+    required.append(("consensus_anchor::main_models",
+                     consensus_dir / "main_models.json"))
     required.append(("consensus_anchor::baseline_consensus",
                      consensus_dir / "baseline_consensus" / "backtest_results.csv"))
     required.append(("consensus_anchor::kalman_fusion",
                      consensus_dir / "kalman_fusion" / "backtest_results.csv"))
+    required.append(("consensus_anchor::kalman_fusion_metrics",
+                     consensus_dir / "kalman_fusion" / "summary_statistics.csv"))
+    required.append(("consensus_anchor::panel_kalman_router",
+                     consensus_dir / "panel_kalman_router" / "backtest_results.csv"))
+    required.append(("consensus_anchor::panel_kalman_router_metrics",
+                     consensus_dir / "panel_kalman_router" / "summary_statistics.csv"))
+    required.append(("consensus_anchor::panel_kalman_router_manifest",
+                     consensus_dir / "panel_kalman_router" / "router_manifest.json"))
     required.append(("consensus_anchor::comparison_metrics",
                      consensus_dir / "comparison_metrics.csv"))
     required.append(("consensus_anchor::comparison_overlay",
@@ -3542,6 +4154,20 @@ def validate_post_train_all_artifacts(
                      consensus_dir / "comparison_metrics.png"))
     required.append(("consensus_anchor::comparison_scorecard",
                      consensus_dir / "comparison_scorecard.html"))
+
+    panel_replace_enabled = str(
+        os.getenv("NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN", "")
+    ).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+    if panel_replace_enabled:
+        panel_replace_dir = consensus_dir / "panel_replaces_consensus_kalman"
+        required.append(("consensus_anchor::panel_replaces_consensus_kalman",
+                         panel_replace_dir / "backtest_results.csv"))
+        required.append(("consensus_anchor::panel_replaces_consensus_kalman_metrics",
+                         panel_replace_dir / "summary_statistics.csv"))
+        required.append(("consensus_anchor::panel_replaces_consensus_kalman_manifest",
+                         panel_replace_dir / "experiment_manifest.json"))
+        required.append(("consensus_anchor::panel_replaces_consensus_kalman_pit_audit",
+                         panel_replace_dir / "panel_replacement_pit_audit.csv"))
 
     for label, path in required:
         if not path.exists():
@@ -4005,10 +4631,9 @@ Examples:
         # Kalman fusion is the canonical replacement.
         logger.info("\n[Post-2] SA blend walk-forward — SKIPPED (SA LightGBM retired)")
 
-        # Step 3: Consensus anchor (Kalman fusion + AccelOverride with Optuna)
+        # Step 3: Consensus anchor (Kalman fusion + Panel/Kalman Router)
         # Required artifact: failing this step fails the whole pipeline, since the
-        # 4-way scorecard (baseline_consensus, kalman_fusion, accel_override,
-        # kalman_accel_postfilter) is part of the production output set.
+        # Kalman fusion and Panel/Kalman Router are the two final model outputs.
         from Train.Output_code.consensus_anchor_runner import run_consensus_anchor_pipeline
         logger.info("\n[Post-3] Consensus anchor integration...")
         run_consensus_anchor_pipeline(
@@ -4020,7 +4645,7 @@ Examples:
         logger.info("  Consensus anchor integration complete")
 
         # Step 4: Archive the full final state (deferred from generate_all_output
-        # so the snapshot includes the consensus anchor 4-way scorecard).
+        # so the snapshot includes the consensus anchor final-forecast scorecard).
         from Train.Output_code.generate_output import archive_outputs
         logger.info("\n[Post-4] Archiving final outputs...")
         archive_outputs(OUTPUT_DIR)
@@ -4077,8 +4702,8 @@ Examples:
                 logger.warning(f"Single-branch output generation failed: {e}")
 
             # If training NSA (default), generate the combined output using SA
-            # actuals from the target file (SA LightGBM is retired — fusion is
-            # the canonical SA-revised forecast).
+            # actuals from the target file. SA LightGBM is retired; final
+            # SA-revised outputs come from the consensus-anchor layer.
             if args.target == 'nsa':
                 from Train.Output_code.generate_output import generate_all_output
                 from Train.data_loader import load_target_data

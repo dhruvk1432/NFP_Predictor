@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Sync ./data/<subdir>/ -> s3://<bucket>/data/<subdir>/ for each subdir
-# that the training pipeline actually reads.
+# Sync ./data/<subdir>/ -> s3://<bucket>/data/<subdir>/ for the minimal
+# train-only dataset. Current train-all reads PIT master snapshots plus the
+# revised NSA/SA target parquets; raw/prepared ETL inputs are not required.
 #
 # Whitelist (per Train/config.py):
-#   - master_snapshots/  (~50G) — the wide-format monthly snapshots
-#   - fred_data/         (~124M) — FRED employment series used for features
+#   - master_snapshots/  (~17G) — the wide-format monthly PIT snapshots
 #   - NFP_target/        (~152K) — y_nsa_revised / y_sa_revised target series
 #
-# Skipped (used only by Data_ETA_Pipeline/, not by training):
-#   - Exogenous_data/, fred_data_prepared_nsa/, fred_data_prepared_sa/
+# Skipped (used only by Data_ETA_Pipeline/ or legacy experiments, not current
+# train-all from existing snapshots):
+#   - fred_data/, Exogenous_data/, fred_data_prepared_nsa/,
+#     fred_data_prepared_sa/
 #
 # To sync everything (for full ETL on AWS), set PUSH_DATA_ALL=1 in env.
 #
@@ -31,10 +33,10 @@ PUSH_DATA_ALL="${PUSH_DATA_ALL:-0}"
 if [[ "${PUSH_DATA_ALL}" == "1" ]]; then
   SUBDIRS=(master_snapshots fred_data NFP_target \
            Exogenous_data fred_data_prepared_nsa fred_data_prepared_sa)
-  log "PUSH_DATA_ALL=1, syncing every data/ subdir (~69GB)."
+  log "PUSH_DATA_ALL=1, syncing every data/ subdir for ETL-capable AWS."
 else
-  SUBDIRS=(master_snapshots fred_data NFP_target)
-  log "Syncing training-only whitelist (~50GB). Set PUSH_DATA_ALL=1 to push everything."
+  SUBDIRS=(master_snapshots NFP_target)
+  log "Syncing train-only whitelist. Set PUSH_DATA_ALL=1 to push ETL inputs too."
 fi
 
 for sub in "${SUBDIRS[@]}"; do
@@ -46,6 +48,7 @@ for sub in "${SUBDIRS[@]}"; do
   fi
   log "  ${sub}: $(du -sh "${SRC}" 2>/dev/null | cut -f1) -> ${DST}"
   aws_ s3 sync "${SRC}" "${DST}" \
+    --delete \
     --exclude "*.tmp" --exclude "*.DS_Store" --exclude "__pycache__/*"
 done
 

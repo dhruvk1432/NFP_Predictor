@@ -19,7 +19,11 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from experiments.sidecars.common import feature_audit_from_frame, write_sidecar_artifacts
+from experiments.sidecars.common import (
+    feature_audit_from_frame,
+    sidecar_branch_root,
+    write_sidecar_artifacts,
+)
 from experiments.sidecars.feature_matrix import (
     build_sidecar_design,
     rank_features_by_correlation,
@@ -34,9 +38,39 @@ except RuntimeError:
     OUTPUT_DIR = Path("_output")
 
 
-DEFAULT_TARGET_PATH = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
-DEFAULT_OUTPUT_DIR = OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "acceleration_classifier"
+DEFAULT_TARGET_TYPE = "sa"
 DEFAULT_MODEL_ID = "acceleration_classifier"
+# Legacy flat fallback for NSA when no explicit --output-dir is given.
+LEGACY_DEFAULT_OUTPUT_DIR = (
+    OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "acceleration_classifier"
+)
+
+
+def _default_target_path(target_type: str) -> Path:
+    if target_type == "nsa":
+        return DATA_PATH / "NFP_target" / "y_nsa_revised.parquet"
+    return DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
+
+
+def _default_target_space(target_type: str) -> str:
+    return "nsa_revised" if target_type == "nsa" else "sa_revised"
+
+
+def _resolve_output_dir(explicit: Path | None, target_type: str, run_id: str) -> Path:
+    """SA always lands under sidecars/sa/<run_id>/acceleration_classifier/.
+    NSA keeps the legacy flat path unless an explicit dir is supplied.
+    """
+    if explicit is not None:
+        return explicit
+    target_type = str(target_type).strip().lower()
+    if target_type == "sa":
+        return sidecar_branch_root(OUTPUT_DIR, "sa") / run_id / "acceleration_classifier"
+    return LEGACY_DEFAULT_OUTPUT_DIR
+
+
+# Back-compat aliases (some external scripts import these names).
+DEFAULT_TARGET_PATH = _default_target_path(DEFAULT_TARGET_TYPE)
+DEFAULT_OUTPUT_DIR = LEGACY_DEFAULT_OUTPUT_DIR
 
 
 def _optional_model(kind: str) -> Any | None:
@@ -149,26 +183,37 @@ def _add_composites(design: pd.DataFrame) -> pd.DataFrame:
         z = (z - z.expanding(min_periods=12).mean()) / z.expanding(min_periods=12).std().replace(0.0, np.nan)
         out[f"composite_{name}_mean_z"] = z.mean(axis=1)
         out[f"composite_{name}_dispersion"] = z.std(axis=1)
-    if {"prev_mom", "actual_accel"}.issubset(out.columns):
-        out["composite_target_mom_accel_interaction"] = out["prev_mom"] * out["actual_accel"].shift(1)
+    accel_lag1_cols = [c for c in out.columns if c.endswith("_accel_lag1")]
+    if "prev_mom" in out.columns and accel_lag1_cols:
+        # Use the target-dynamics helper's PIT-built acceleration lag. A raw
+        # actual_accel.shift(1) can leak a same-day previous revised actual.
+        out["composite_target_mom_accel_interaction"] = out["prev_mom"] * out[accel_lag1_cols[0]]
     return out
 
 
 def run_acceleration_classifier_sidecar(
     *,
-    target_path: Path = DEFAULT_TARGET_PATH,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    target_path: Path | None = None,
+    output_dir: Path | None = None,
     start: str = "2000-01",
     min_train: int = 72,
-    target_space: str = "sa_revised",
+    target_space: str | None = None,
     include_snapshots: bool = True,
     max_snapshot_columns: int = 250,
     top_features: int = 50,
     model_kind: str = "ensemble",
     model_id: str | None = None,
+    target_type: str = DEFAULT_TARGET_TYPE,
+    run_id: str = "local_sidecar_once",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if model_kind not in {"logistic", "xgb", "lgbm", "ensemble"}:
         raise ValueError(f"Unsupported model_kind={model_kind!r}")
+    target_type = str(target_type).strip().lower()
+    if target_type not in {"nsa", "sa"}:
+        raise ValueError(f"target_type must be 'nsa' or 'sa'; got {target_type!r}")
+    target_path = target_path or _default_target_path(target_type)
+    target_space = target_space or _default_target_space(target_type)
+    output_dir = _resolve_output_dir(output_dir, target_type, run_id)
     model_id = model_id or f"{DEFAULT_MODEL_ID}_{model_kind}"
     design = build_sidecar_design(
         target_space=target_space,
@@ -278,11 +323,22 @@ def run_acceleration_classifier_sidecar(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target-path", type=Path, default=DEFAULT_TARGET_PATH)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--target-path", type=Path, default=None,
+                        help="Explicit target parquet; if omitted, picks "
+                             "y_<target_type>_revised.parquet by --target-type.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Explicit output dir. SA falls back to "
+                             "sidecars/sa/<run_id>/acceleration_classifier; "
+                             "NSA falls back to the legacy flat path.")
+    parser.add_argument("--target-type", default=DEFAULT_TARGET_TYPE,
+                        choices=["nsa", "sa"],
+                        help="Branch subtree the artifact lands under.")
+    parser.add_argument("--run-id", default="local_sidecar_once",
+                        help="Sidecar run-id directory under the branch subtree.")
     parser.add_argument("--start", default="2000-01")
     parser.add_argument("--min-train", type=int, default=72)
-    parser.add_argument("--target-space", choices=["sa_revised", "nsa_revised"], default="sa_revised")
+    parser.add_argument("--target-space", choices=["sa_revised", "nsa_revised"], default=None,
+                        help="Target space override; defaults from --target-type.")
     parser.add_argument("--no-snapshots", action="store_true")
     parser.add_argument("--max-snapshot-columns", type=int, default=250)
     parser.add_argument("--top-features", type=int, default=50)
@@ -298,6 +354,8 @@ def main() -> None:
         max_snapshot_columns=args.max_snapshot_columns,
         top_features=args.top_features,
         model_kind=args.model_kind,
+        target_type=args.target_type,
+        run_id=args.run_id,
     )
     import json
 

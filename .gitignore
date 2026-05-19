@@ -10,6 +10,7 @@
 # Local assistant/tool settings
 .claude/settings.local.json
 .claude/*.local.json
+.claude/agent-memory/
 
 # Data folder
 data/
@@ -60,7 +61,7 @@ dist/
 *.egg-info/
 
 # Model outputs and training artifacts
-_output/
+_output*/
 *.ckpt
 *.pkl
 

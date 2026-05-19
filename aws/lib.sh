@@ -109,6 +109,16 @@ require_running() {
 preflight() {
   need aws
   need jq
-  aws_ sts get-caller-identity >/dev/null 2>&1 \
-    || die "AWS CLI profile '${AWS_PROFILE}' is not configured. See aws/README.md."
+  local sts_err
+  sts_err="$(mktemp)"
+  if ! aws_ sts get-caller-identity >/dev/null 2>"${sts_err}"; then
+    local msg
+    msg="$(tr '\n' ' ' < "${sts_err}")"
+    rm -f "${sts_err}"
+    if aws configure list-profiles 2>/dev/null | grep -qx "${AWS_PROFILE}"; then
+      die "AWS CLI profile '${AWS_PROFILE}' exists, but STS validation failed: ${msg}"
+    fi
+    die "AWS CLI profile '${AWS_PROFILE}' is not configured. See aws/README.md. AWS CLI said: ${msg}"
+  fi
+  rm -f "${sts_err}"
 }

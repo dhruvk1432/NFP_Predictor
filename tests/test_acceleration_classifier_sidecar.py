@@ -1,7 +1,34 @@
 import numpy as np
 import pandas as pd
 
-from experiments.sidecars.acceleration_classifier_sidecar import run_acceleration_classifier_sidecar
+from experiments.sidecars.acceleration_classifier_sidecar import (
+    _add_composites,
+    run_acceleration_classifier_sidecar,
+)
+from experiments.sidecars.feature_matrix import add_target_dynamics
+
+
+def test_sidecar_target_dynamics_exclude_same_day_revised_actuals():
+    dates = pd.date_range("2021-01-01", periods=4, freq="MS")
+    target = pd.DataFrame({
+        "ds": dates,
+        "y_mom": [10.0, 20.0, 30.0, 40.0],
+        "release_date": dates + pd.DateOffset(months=1, days=4),
+        "operational_available_date": dates + pd.DateOffset(months=2, days=4),
+    })
+
+    out = add_target_dynamics(target, prefix="sa")
+
+    mar = out[out["ds"] == pd.Timestamp("2021-03-01")].iloc[0]
+    apr = out[out["ds"] == pd.Timestamp("2021-04-01")].iloc[0]
+    assert mar["prev_mom"] == 10.0
+    assert mar["actual_accel"] == 20.0
+    assert apr["prev_mom"] == 20.0
+    assert apr["sa_mom_lag1"] == 20.0
+
+    with_composites = _add_composites(out)
+    apr_comp = with_composites[with_composites["ds"] == pd.Timestamp("2021-04-01")].iloc[0]
+    assert apr_comp["composite_target_mom_accel_interaction"] == apr["prev_mom"] * apr["sa_accel_lag1"]
 
 
 def test_acceleration_classifier_sidecar_writes_contract(tmp_path):

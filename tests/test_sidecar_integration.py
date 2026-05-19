@@ -125,3 +125,30 @@ def test_kalman_sidecar_fusion_is_precision_capped(monkeypatch):
 
     assert "sidecar_precision_share" in fused.columns
     assert fused["sidecar_precision_share"].max() <= 0.1500001
+
+
+def test_kalman_hmm_metadata_is_joined_and_can_inflate_noise(monkeypatch):
+    ds = pd.date_range("2020-01-01", periods=30, freq="MS")
+    actual = np.linspace(-30, 30, len(ds))
+    overlap = pd.DataFrame(
+        {
+            "ds": ds,
+            "actual": actual,
+            "consensus_pred": actual + 1.0,
+            "champion_pred": actual - 10.0,
+            "hmm_regime_label": ["stable"] * 20 + ["volatile_down"] * 10,
+            "hmm_transition_risk": [0.1] * 20 + [0.7] * 10,
+            "hmm_surprise": [0.0] * 30,
+            "hmm_reselected_this_month": [False] * 29 + [True],
+            "hmm_trigger_class": ["no_shift"] * 29 + ["risk_jump"],
+            "hmm_force_override": [False] * 29 + [True],
+        }
+    )
+
+    monkeypatch.setenv("NFP_KALMAN_HMM_REGIME_NOISE", "1")
+    fused, _ = kalman_fusion(overlap, overlap, trailing_window=6, use_model=True, use_nsa_accel=False)
+
+    assert "hmm_regime_label" in fused.columns
+    assert "hmm_model_R_multiplier" in fused.columns
+    assert fused["hmm_model_R_multiplier"].iloc[-1] > 1.0
+    assert fused["hmm_process_Q_multiplier"].iloc[-1] == 5.0

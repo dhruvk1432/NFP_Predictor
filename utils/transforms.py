@@ -740,6 +740,15 @@ def winsorize_covid_period(
         unchanged with a warning.
     """
     data = data.copy()
+    # Quantile clipping can produce fractional bounds even for integer-valued
+    # feature columns. Promote numeric inputs up front so newer pandas versions
+    # do not reject assigning clipped float values back into int blocks.
+    if isinstance(data, pd.DataFrame):
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            data[numeric_cols] = data[numeric_cols].astype("float64")
+    elif pd.api.types.is_numeric_dtype(data.dtype):
+        data = data.astype("float64")
     covid_mask = (data.index >= pd.Timestamp(covid_start)) & \
                  (data.index <= pd.Timestamp(covid_end))
 

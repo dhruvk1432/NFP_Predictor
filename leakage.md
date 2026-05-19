@@ -3,7 +3,7 @@
 **Original audit scope (Issues 1-7):** All files in `Data_ETA_Pipeline/` that ingest raw
 data and produce per-month snapshots used downstream by `Train/`.
 
-**Extended audit scope (Issues 8-12, added 2026-05-11):** All files in `Train/` that consume
+**Extended audit scope (Issues 8-14, added 2026-05-11 and 2026-05-17):** All files in `Train/` that consume
 the snapshots, train the model, run the backtest, and produce final outputs. This covers the
 training pipeline (`train_lightgbm_nfp.py`, `model.py`, `data_loader.py`,
 `feature_engineering.py`, `revision_features.py`, `hyperparameter_tuning.py`,
@@ -64,15 +64,19 @@ For each source we verified:
 | 11 | **FIXED** | ~~LOW~~ | `Train/Output_code/consensus_anchor_runner.py` | ~~Kalman noise initialization (`R_c_init`, `Q_init`) uses the last 60 entries of the FULL consensus history~~ — restricted to `consensus_df[ds < first_backtest_ds]`. Init noise prior cannot peek into months that will later be evaluated. |
 | 12 | **CLOSED** | **NOTE** | `Train/sandbox/experiment_predicted_adjustment.py` + `Train/Output_code/generate_output.py` | Sandbox `evaluate_models` selects "best" predictor by full-backtest composite — but production `_generate_adjustment_folder` hard-codes `ExpWeightedMedianCovidExcludedPredictor(half_life_years=3.0)`, so the sandbox selection is informational only. Not a leak in the production pipeline. |
 | 13 | **FIXED** | **HIGH** | `utils/transforms.py`, `Train/train_lightgbm_nfp.py`, `Train/Output_code/{consensus_anchor_runner,metrics}.py`, `Train/sandbox/experiment_predicted_adjustment.py` | COVID winsorization was applied inconsistently: training X_train was winsorized per-step but X_pred at COVID target months was raw; consensus values were raw downstream of the model in the consensus_anchor stage; all sandbox adjustment predictors except the production default fitted on artificial winsorized adjustment values; metrics CSVs had no COVID stratification. **Six fixes applied (2026-05-11):** (1) centralized COVID constants in `utils/transforms`, (2) winsorize X_full once upfront in `run_expanding_window_backtest` (closes train/predict asymmetry + fixes production model), (3) winsorize consensus in `_load_consensus_pit` (Apr 2020 −14,448 → −525), (4) exclude COVID rows from Kalman R_c/R_m/Q noise estimation, (5) stratified `NonCovid_*`/`CovidOnly_*` columns in `compute_metrics` + `full_metrics`, (6) COVID-aware base class for `AdjustmentPredictor` (all 8 sandbox predictors honor `exclude_covid=True` by default). 11 unit tests in `tests/test_covid_winsorization.py` verify each fix. |
+| 14 | **FIXED** | **HIGH** | `Train/data_loader.py`, `Train/train_lightgbm_nfp.py` | Branch-target `nfp_nsa_*` lag/rolling features were computed from the revised target table with observation-month `.shift()` only. These are not master-snapshot features. For strict release-time replay, M-1 revised target values released on the same NFP release date as month M must be unavailable. Fixed by masking revised target `y`/`y_mom` unless `operational_available_date < cutoff_date` before lag/rolling construction, in both backtest batch and prediction paths. Audit found 2,157 selected feature-month values changed from legacy non-null to PIT-missing. |
 
-**All 13 issues are now closed.** Issues 1, 2, 4-PopB, 5, 6 fixed in code (ETL stage).
+**All 14 issues are now closed.** Issues 1, 2, 4-PopB, 5, 6 fixed in code (ETL stage).
 Issues 3, 4-PopA accepted as designed. Issues 7, 12 verified empirically/by code-path
 tracing as not-a-leak. Issues 8, 9, 10, 11 fixed in code (Train/ stage; 2026-05-11).
 Issue 13 (COVID winsorization consistency) fixed in code with 11 unit tests (2026-05-11).
-The post-train consensus_anchor stage must be re-run to regenerate
-`_output/consensus_anchor/` artifacts (Issues 8, 9, 11, 13), and the full backtest
-must be re-run to incorporate the upfront X_full winsorization (Issue 13) and the
-strict NSA-acceleration cutoff (Issue 10). Issues 1 (CPI leak), 2 (NOAA filename),
+Issue 14 (branch-target revised lag availability) fixed in code with unit tests and
+`scripts/audit_current_pipeline_pit.py` artifacts (2026-05-17). The post-train
+consensus_anchor stage must be re-run to regenerate `_output/consensus_anchor/`
+artifacts (Issues 8, 9, 11, 13), and the full backtest must be re-run to incorporate
+the upfront X_full winsorization (Issue 13), the strict NSA-acceleration cutoff
+(Issue 10), and strict branch-target revised lag masking (Issue 14). Issues 1
+(CPI leak), 2 (NOAA filename),
 4-Population-B (FRED Exogenous shutdown-era backfill), 5 (NOAA pre-coverage fallback),
 and 6 (ADP validation log) were fixed in code. Issue 3 (Prosper) was accepted because
 the Unifier API does not carry a publication timestamp. Issue 4-Population-A was
@@ -1333,7 +1337,8 @@ step. The downstream `nsa_actual_accel` feature value changes accordingly.
 python Train/train_lightgbm_nfp.py --train --target sa --release first
 python -m Train.rerun_post_train_adj_and_consensus
 ```
-NSA branch is unaffected and does not need regeneration.
+Issue 10 itself does not affect the NSA branch; Issue 14 is separate and does require
+rerunning NSA artifacts.
 
 The original analysis follows for historical reference.
 
@@ -1680,8 +1685,12 @@ The hyperparameter selection IS PIT-correct at the per-fold level — the Optuna
 ### V12 — `clean_features` post-2010 NaN-rate evaluation respects the training window
 [train_lightgbm_nfp.py:283-291](Train/train_lightgbm_nfp.py#L283-L291) — `modern_mask = X['ds'] >= eval_ts` and `nan_rates = X_modern.isna().sum() / n_modern`. The function is called inside the backtest loop with `X_train_valid` (data strictly < target_month), so the post-2010 evaluation window is `[2010-01-01, target_month)` — strictly historical relative to the prediction.
 
-### V13 — Branch-target lagged features are vectorized with shift/rolling (PIT-safe)
-[data_loader.py:683-771](Train/data_loader.py#L683-L771) — `_build_lagged_target_feature_frame` uses `mom.shift(1)`, `mom.rolling(N, min_periods=N).mean().shift(1)`, etc. Every operation is strictly backward-looking; the `.shift(1)` after `.rolling()` ensures the rolling stat at month t uses [t-N, t-1] (no t itself). Same-month seasonal features at lines 760-764 use `month_groups.shift(1)` over groupby-month, also strictly prior-year.
+### V13 — Snapshot lags are PIT-safe; branch-target revised lags also require availability masking
+[data_loader.py:683-771](Train/data_loader.py#L683-L771) — `_build_lagged_target_feature_frame` uses `mom.shift(1)`, `mom.rolling(N, min_periods=N).mean().shift(1)`, etc. The lag math is backward-looking in observation-month order; the `.shift(1)` after `.rolling()` ensures the rolling stat at month t uses [t-N, t-1] (no t itself). Same-month seasonal features at lines 760-764 use `month_groups.shift(1)` over groupby-month, also strictly prior-year.
+
+This is sufficient for features already inside the master snapshot, because the snapshot itself has already been filtered with strict `release_date < cutoff`. It is not sufficient for the branch-target `nfp_nsa_*` features injected from `data/NFP_target/y_nsa_revised.parquet`: those values are revised target actuals, not snapshot rows, and the prior month's revised value is often released on the same NFP release date as the current target.
+
+**Status:** fixed 2026-05-17. `get_lagged_target_features(..., cutoff_date=...)` now masks revised target `y` and `y_mom` unless `operational_available_date < cutoff_date` before calling `_build_lagged_target_feature_frame`; `batch_lagged_target_features(..., cutoff_dates=...)` uses the same per-month cutoff map during training; and `predict_nfp_mom` passes the live cutoff date for inference. Audit artifacts live under `_output_pairing_baseline_pitfix/pit_audit_current_pipeline/`.
 
 ### V14 — Production model uses `target_month=X.max()` as weight anchor
 [train_lightgbm_nfp.py:2324](Train/train_lightgbm_nfp.py#L2324) — `final_target_month = pd.to_datetime(X_full_valid['ds'].max())`. Production model trains on all historical valid data with weights anchored to the latest available month. Distances are non-negative (V9), and the model is then used to predict future months whose `ds > final_target_month` — no leakage, just decayed weighting toward recent regimes.
@@ -1712,7 +1721,7 @@ The hyperparameter selection IS PIT-correct at the per-fold level — the Optuna
 
 ---
 
-# RECOMMENDED REMEDIATION ORDER (Train/ pipeline, Issues 8-12)
+# RECOMMENDED REMEDIATION ORDER (Train/ pipeline, Issues 8-14)
 
 1. ~~**Issue 8 (consensus PIT filter).**~~ **DONE 2026-05-11** — replaced `_load_consensus`
    with `_load_consensus_pit` that reads `NFP_Consensus_Mean` directly from the
@@ -1741,6 +1750,10 @@ The hyperparameter selection IS PIT-correct at the per-fold level — the Optuna
 
 5. **Issue 12.** Already closed (verified non-leak in production).
 
+6. ~~**Issue 14 (branch-target revised target lags).**~~ **DONE 2026-05-17** — NSA
+   branch-target lag/rolling features now mask revised target values by
+   `operational_available_date < cutoff_date` before shift/rolling construction.
+
 **Action required for the fixes to take effect on disk:**
 
 - **Issues 8, 9, 11:** post-train consensus_anchor only — re-run
@@ -1749,11 +1762,14 @@ The hyperparameter selection IS PIT-correct at the per-fold level — the Optuna
   plus `comparison_metrics.csv`. Fast (~minutes).
 - **Issue 10:** the SA branch's training features change; re-run
   `python Train/train_lightgbm_nfp.py --train --target sa --release first` (or the full
-  `--train-all`), then `python -m Train.rerun_post_train_adj_and_consensus`. NSA branch
-  is unaffected and does NOT need regeneration.
+  `--train-all`), then `python -m Train.rerun_post_train_adj_and_consensus`. Issue 10
+  itself does not affect the NSA branch; Issue 14 below does.
+- **Issue 14:** the NSA branch's target-derived lag features change; re-run
+  `python Train/train_lightgbm_nfp.py --train-all`, then the consensus-anchor post-train
+  stage. Existing local NSA and final-layer metrics from before 2026-05-17 are stale.
 
-No on-disk parquet artifacts under `data/` need regeneration for Issues 8-12 — these
-issues are all in the training/post-train consumption layer, not the ETL layer.
+No on-disk parquet artifacts under `data/` need regeneration for Issues 8-14 —
+these issues are all in the training/post-train consumption layer, not the ETL layer.
 
 ---
 
@@ -1836,6 +1852,132 @@ After regen, expect:
   `comparison_metrics.csv` row.
 - The model's predictions at COVID target months now use winsorized inputs (by design;
   the training distribution and prediction distribution now match).
+
+---
+
+## ISSUE 14 — FIXED 2026-05-17: Branch-target revised lags needed operational availability cutoffs
+
+**Status:** FIXED 2026-05-17. The lag formulas themselves were backward-looking, and
+master-snapshot-derived lags remain PIT-safe by snapshot construction. The leak was in
+a different path: branch-target `nfp_nsa_*` features injected directly from
+`data/NFP_target/y_nsa_revised.parquet` before the master snapshot is joined.
+
+For a month M prediction made at the M NFP release, the M-1 revised value is often
+released in that same report. A simple observation-month `.shift(1)` therefore treated
+same-day M-1 revised values as known before the M release, which is not strict PIT.
+
+### Fixes applied
+
+| # | File | Change |
+|---|---|---|
+| 1 | [Train/data_loader.py](Train/data_loader.py) | Added `_mask_unavailable_revised_targets()` and `cutoff_date` support in `get_lagged_target_features()`. Revised target `y` and `y_mom` are blanked unless `operational_available_date < cutoff_date` before shift/rolling features are built. |
+| 2 | [Train/data_loader.py](Train/data_loader.py) | Added `cutoff_dates` support to `batch_lagged_target_features()` so the training batch path uses the same per-month strict cutoff as prediction. |
+| 3 | [Train/train_lightgbm_nfp.py](Train/train_lightgbm_nfp.py) | `build_training_dataset()` now builds `release_date_map` before branch-target lag precomputation and passes it into `batch_lagged_target_features()`. |
+| 4 | [Train/train_lightgbm_nfp.py](Train/train_lightgbm_nfp.py) | `predict_nfp_mom()` now passes the live prediction `cutoff_date` into `get_lagged_target_features()`. |
+| 5 | [scripts/audit_current_pipeline_pit.py](scripts/audit_current_pipeline_pit.py) | Added a reproducible current-pipeline PIT audit for NSA branch-target lags, rolling panel replacement, Kalman history use, snapshot cutoffs, and stale artifacts. |
+
+### Audit result
+
+`scripts/audit_current_pipeline_pit.py --output-base _output_pairing_baseline_pitfix`
+wrote `_output_pairing_baseline_pitfix/pit_audit_current_pipeline/` and found:
+
+- `snapshot_cutoffs`: PASS, 24 latest master snapshots, 0 cutoff violations.
+- `nsa_branch_target_lags`: PASS_AFTER_CODE_FIX, 2,157 selected feature-month values
+  changed from legacy non-null to PIT-missing.
+- Changed selected NSA target-derived features:
+  `nfp_nsa_accel_rolling_3m`, `nfp_nsa_accel_vol_3m`,
+  `nfp_nsa_mom_abs_lag1`, `nfp_nsa_mom_abs_rolling_6m`,
+  `nfp_nsa_mom_vol_3m`.
+- `panel_replacement`: PASS, 0 trained-through leaks and 0 forecast-release leaks.
+- `kalman_fusion`: PASS, 0 history order violations.
+- `artifact_staleness`: STALE_ARTIFACTS, because the latest local model/fusion files
+  predate this code fix and must be rerun before their metrics are trusted.
+
+### Unit tests
+
+`tests/test_data_loader.py` includes:
+
+- `test_revised_lag_excludes_same_day_available_value`
+- `test_batch_revised_lags_respect_cutoff_map`
+
+Both verify that same-day operational availability is excluded under strict
+`operational_available_date < cutoff_date`.
+
+### Required regeneration
+
+```
+python Train/train_lightgbm_nfp.py --train-all
+```
+
+The output root should then be audited again with:
+
+```
+python scripts/audit_current_pipeline_pit.py --output-base <new_output_root>
+```
+
+---
+
+## ISSUE 15 — FIXED 2026-05-17: Final-layer Kalman/router and sidecar target dynamics needed operational actual availability
+
+**Status:** FIXED 2026-05-17. A second same-day revised-actual issue existed outside
+the LightGBM feature matrix. The post-train Kalman fusion, adaptive Kalman grid, and
+Panel/Kalman Router used chronological prior actual rows (`ds < current ds`) for
+noise estimation, state resets, and router rule scoring. For revised NFP targets,
+the immediately prior month's revised actual is commonly operationally available on
+the same release date as the current forecast, so chronology alone is not strict PIT.
+
+Sidecar target-dynamics helpers had the same issue when they used `shift(1)` on the
+revised target table to build `prev_mom`, target lags, and acceleration labels.
+
+### Fixes applied
+
+| # | File | Change |
+|---|---|---|
+| 1 | [Train/Output_code/consensus_anchor_runner.py](Train/Output_code/consensus_anchor_runner.py) | `build_merged_dataset()` now carries `target_release_date` and `actual_available_date` from the SA revised target parquet into the final-layer dataset. |
+| 2 | [Train/Output_code/consensus_anchor_runner.py](Train/Output_code/consensus_anchor_runner.py) | `kalman_fusion()` now filters history to `actual_available_date < target_release_date`, resets state only to actuals known before the current release, and scales random-walk process noise by the month gap from the latest known actual. |
+| 3 | [Train/Output_code/consensus_anchor_runner.py](Train/Output_code/consensus_anchor_runner.py) | `pit_adaptive_kalman_fusion()` and `build_panel_kalman_router()` now score candidate params/rules only on prior operationally available actuals. |
+| 4 | [experiments/sidecars/feature_matrix.py](experiments/sidecars/feature_matrix.py) | Sidecar target dynamics use a PIT history window when release and operational availability columns exist; plain shift is retained only for synthetic/legacy frames without availability metadata. |
+| 5 | [experiments/sidecars/economist_panel_sidecar.py](experiments/sidecars/economist_panel_sidecar.py) | Economist sidecar track records now use actuals whose `operational_available_date` is strictly before the target release cutoff. |
+| 6 | [experiments/sidecars/acceleration_classifier_sidecar.py](experiments/sidecars/acceleration_classifier_sidecar.py) | Acceleration-classifier composite features use PIT-built `*_accel_lag1` rather than `actual_accel.shift(1)`. |
+| 7 | [Train/Output_code/sa_consensus_anchor_runner.py](Train/Output_code/sa_consensus_anchor_runner.py) | Isolated SA challenger fusion now uses the same operational-availability filter for R/Q/state updates. |
+| 8 | [Train/training_dataset_cache.py](Train/training_dataset_cache.py) | Training dataset cache schema bumped to `2` so old cached matrices from pre-fix target-lag semantics are not reused. |
+| 9 | [scripts/audit_current_pipeline_pit.py](scripts/audit_current_pipeline_pit.py) | Audit now checks operational-history fields, cache schema version, and sidecar target-dynamics line coverage. |
+
+### Audit result
+
+The refreshed audit report lives under
+`_output_pairing_baseline_pitfix/pit_audit_current_pipeline/`.
+
+- Static line audit: PASS, 14 PIT checks.
+- NSA branch-target lags: PASS_AFTER_CODE_FIX, same 2,157 selected feature-month
+  values corrected to PIT-missing.
+- Panel replacement: PASS, 0 trained-through leaks and 0 forecast-release leaks.
+- Training dataset cache schema: PASS, `SCHEMA_VERSION=2`.
+- Snapshot cutoffs: PASS, 24 latest snapshots checked.
+- Existing official Kalman CSVs: `MISSING_OPERATIONAL_FIELDS` / stale, because they
+  predate this fix and do not yet contain `target_release_date`,
+  `actual_available_date`, or `history_available_n`.
+- Runtime non-destructive Kalman check:
+  `_output_pairing_baseline_pitfix/pit_audit_current_pipeline/kalman_fusion_runtime_pit_validation.csv`
+  has 59 rows and 0 operational-history violations.
+
+### Unit tests
+
+Added regression tests for:
+
+- Kalman fusion excluding same-day prior revised actuals.
+- Adaptive Kalman grid selection excluding same-day prior revised actuals.
+- Panel/Kalman Router excluding same-day prior revised actuals.
+- Sidecar target dynamics excluding same-day revised target shifts.
+- Economist panel sidecar track records excluding actuals not operationally available.
+
+Focused command:
+
+```
+FRED_API_KEY=dummy DATA_PATH=data START_DATE=1990-01-01 BACKTEST_MONTHS=60 UNIFIER_USER=dummy UNIFIER_TOKEN=dummy pytest tests/test_consensus_panel_anchor.py tests/test_kalman_optuna_pit.py tests/test_acceleration_classifier_sidecar.py tests/test_economist_panel_sidecar.py tests/test_data_loader.py tests/test_sidecar_integration.py
+```
+
+Result: 55 passed.
 
 ---
 

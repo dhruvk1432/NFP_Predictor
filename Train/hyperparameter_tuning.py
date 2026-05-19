@@ -37,6 +37,7 @@ from Train.config import (
     TUNING_LAMBDA_ACCEL,
     TUNING_LAMBDA_DIR,
     LGBM_DETERMINISM,
+    lgbm_n_jobs,
 )
 from Train.variance_metrics import (
     compute_variance_kpis,
@@ -265,7 +266,7 @@ def tune_hyperparameters(
             'metric': 'mae',
             'boosting_type': 'gbdt',
             'verbosity': -1,
-            'n_jobs': -1,
+            'n_jobs': lgbm_n_jobs(),
             **LGBM_DETERMINISM,
             'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.15, log=True),
             'num_leaves': trial.suggest_int('num_leaves', 15, 127),
@@ -477,7 +478,7 @@ def tune_hyperparameters(
         'metric': 'mae',
         'boosting_type': 'gbdt',
         'verbosity': -1,
-        'n_jobs': -1,
+        'n_jobs': lgbm_n_jobs(),
         **LGBM_DETERMINISM,
     }
     best_params.update(best.params)

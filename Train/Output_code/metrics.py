@@ -5,9 +5,123 @@ Backtest summary statistics computation.
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Optional
 from Train.variance_metrics import compute_variance_kpis
 from utils.transforms import is_covid_month
+
+
+CONSENSUS_MEAN_REF_COLS = (
+    "consensus_pred",
+    "consensus_mean_pred",
+    "Consensus_Mean",
+    "NFP_Consensus_Mean",
+)
+CONSENSUS_MEDIAN_REF_COLS = (
+    "consensus_median_pred",
+    "Consensus_Median",
+    "NFP_Consensus_Median",
+)
+
+
+def _first_existing_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _reference_hit_block(
+    df: pd.DataFrame,
+    *,
+    pred_col: str,
+    ref_col: str,
+    label: str,
+    prefix: str = "",
+) -> Dict[str, float]:
+    """Consensus-relative hit-rate metrics for one reference forecast.
+
+    A "hit" means the model forecast is strictly closer to actual than the
+    reference forecast for the same month. Ties are counted separately.
+    """
+    keys = (
+        f"{prefix}HitRate_vs_{label}",
+        f"{prefix}TieRate_vs_{label}",
+        f"{prefix}LossRate_vs_{label}",
+        f"{prefix}MeanAbsErrorDelta_vs_{label}",
+        f"{prefix}HitWins_vs_{label}",
+        f"{prefix}HitLosses_vs_{label}",
+        f"{prefix}HitTies_vs_{label}",
+        f"{prefix}HitN_vs_{label}",
+    )
+    if df.empty or pred_col not in df.columns or ref_col not in df.columns:
+        return {k: float("nan") for k in keys}
+
+    work = df[["actual", pred_col, ref_col]].copy()
+    work["actual"] = pd.to_numeric(work["actual"], errors="coerce")
+    work[pred_col] = pd.to_numeric(work[pred_col], errors="coerce")
+    work[ref_col] = pd.to_numeric(work[ref_col], errors="coerce")
+    work = work.dropna()
+    if work.empty:
+        return {k: float("nan") for k in keys}
+
+    model_abs = (work[pred_col] - work["actual"]).abs()
+    ref_abs = (work[ref_col] - work["actual"]).abs()
+    wins = model_abs < ref_abs
+    ties = model_abs == ref_abs
+    losses = model_abs > ref_abs
+    n = int(len(work))
+    return {
+        f"{prefix}HitRate_vs_{label}": float(wins.mean()),
+        f"{prefix}TieRate_vs_{label}": float(ties.mean()),
+        f"{prefix}LossRate_vs_{label}": float(losses.mean()),
+        f"{prefix}MeanAbsErrorDelta_vs_{label}": float((ref_abs - model_abs).mean()),
+        f"{prefix}HitWins_vs_{label}": int(wins.sum()),
+        f"{prefix}HitLosses_vs_{label}": int(losses.sum()),
+        f"{prefix}HitTies_vs_{label}": int(ties.sum()),
+        f"{prefix}HitN_vs_{label}": n,
+    }
+
+
+def add_consensus_hit_rate_metrics(
+    metrics: Dict[str, float],
+    results_df: pd.DataFrame,
+    *,
+    pred_col: str = "predicted",
+    exclude_covid_for_hitrate: bool = True,
+) -> Dict[str, float]:
+    """Attach hit-rate metrics versus consensus mean/median references.
+
+    The non-COVID block excludes only ``utils.transforms.COVID_EXCLUDE_MONTHS``.
+    Missing reference columns are tolerated so older artifacts remain readable.
+    """
+    if results_df.empty or "actual" not in results_df.columns or pred_col not in results_df.columns:
+        return metrics
+
+    refs = {
+        "ConsensusMean": _first_existing_col(results_df, CONSENSUS_MEAN_REF_COLS),
+        "ConsensusMedian": _first_existing_col(results_df, CONSENSUS_MEDIAN_REF_COLS),
+    }
+    for label, ref_col in refs.items():
+        if ref_col is None:
+            continue
+        metrics.update(_reference_hit_block(
+            results_df,
+            pred_col=pred_col,
+            ref_col=ref_col,
+            label=label,
+            prefix="",
+        ))
+        if exclude_covid_for_hitrate and "ds" in results_df.columns:
+            ds = pd.to_datetime(results_df["ds"], errors="coerce")
+            non_covid = results_df[~is_covid_month(ds)].copy()
+            metrics.update(_reference_hit_block(
+                non_covid,
+                pred_col=pred_col,
+                ref_col=ref_col,
+                label=f"{label}_NonCovid",
+                prefix="",
+            ))
+    return metrics
 
 
 def _metric_block(df: pd.DataFrame, prefix: str = "") -> Dict[str, float]:
@@ -98,6 +212,7 @@ def compute_metrics(results_df: pd.DataFrame) -> Dict[str, float]:
     out["N"] = int(len(backtest))
     out["N_NonCovid"] = int((~covid_mask).sum())
     out["N_Covid"] = int(covid_mask.sum())
+    out = add_consensus_hit_rate_metrics(out, backtest)
     return out
 
 

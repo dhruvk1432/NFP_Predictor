@@ -18,7 +18,11 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from experiments.sidecars.common import feature_audit_from_frame, write_sidecar_artifacts
+from experiments.sidecars.common import (
+    feature_audit_from_frame,
+    sidecar_branch_root,
+    write_sidecar_artifacts,
+)
 from experiments.sidecars.feature_matrix import (
     build_sidecar_design,
     select_numeric_feature_cols,
@@ -32,9 +36,34 @@ except RuntimeError:
     OUTPUT_DIR = Path("_output")
 
 
-DEFAULT_TARGET_PATH = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
-DEFAULT_OUTPUT_DIR = OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "hmm_labor_regime"
+DEFAULT_TARGET_TYPE = "sa"
 DEFAULT_MODEL_ID = "hmm_labor_regime"
+LEGACY_DEFAULT_OUTPUT_DIR = (
+    OUTPUT_DIR / "sidecars" / "local_sidecar_once" / "hmm_labor_regime"
+)
+
+
+def _default_target_path(target_type: str) -> Path:
+    if target_type == "nsa":
+        return DATA_PATH / "NFP_target" / "y_nsa_revised.parquet"
+    return DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
+
+
+def _default_target_space(target_type: str) -> str:
+    return "nsa_revised" if target_type == "nsa" else "sa_revised"
+
+
+def _resolve_output_dir(explicit: Path | None, target_type: str, run_id: str) -> Path:
+    if explicit is not None:
+        return explicit
+    target_type = str(target_type).strip().lower()
+    if target_type == "sa":
+        return sidecar_branch_root(OUTPUT_DIR, "sa") / run_id / "hmm_labor_regime"
+    return LEGACY_DEFAULT_OUTPUT_DIR
+
+
+DEFAULT_TARGET_PATH = _default_target_path(DEFAULT_TARGET_TYPE)
+DEFAULT_OUTPUT_DIR = LEGACY_DEFAULT_OUTPUT_DIR
 
 
 def _state_mean_acceleration(train: pd.DataFrame, states: np.ndarray) -> dict[int, float]:
@@ -78,18 +107,26 @@ def _select_step_features(
 
 def run_hmm_acceleration_sidecar(
     *,
-    target_path: Path = DEFAULT_TARGET_PATH,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    target_path: Path | None = None,
+    output_dir: Path | None = None,
     start: str = "2000-01",
     min_train: int = 72,
     n_components: int = 2,
     covariance_type: str = "full",
-    target_space: str = "sa_revised",
+    target_space: str | None = None,
     include_snapshots: bool = True,
     max_snapshot_columns: int = 160,
     max_features: int = 30,
     model_id: str = DEFAULT_MODEL_ID,
+    target_type: str = DEFAULT_TARGET_TYPE,
+    run_id: str = "local_sidecar_once",
 ) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    target_type = str(target_type).strip().lower()
+    if target_type not in {"nsa", "sa"}:
+        raise ValueError(f"target_type must be 'nsa' or 'sa'; got {target_type!r}")
+    target_path = target_path or _default_target_path(target_type)
+    target_space = target_space or _default_target_space(target_type)
+    output_dir = _resolve_output_dir(output_dir, target_type, run_id)
     design = build_sidecar_design(
         target_space=target_space,
         target_path=target_path,
@@ -214,11 +251,13 @@ def run_hmm_acceleration_sidecar(
 def run_hmm_grid(
     *,
     output_dir: Path,
-    target_path: Path = DEFAULT_TARGET_PATH,
-    target_space: str = "sa_revised",
+    target_path: Path | None = None,
+    target_space: str | None = None,
     start: str = "2000-01",
     min_train: int = 72,
     include_snapshots: bool = True,
+    target_type: str = DEFAULT_TARGET_TYPE,
+    run_id: str = "local_sidecar_once",
 ) -> pd.DataFrame:
     rows = []
     for n_components in (2, 3, 4):
@@ -235,6 +274,8 @@ def run_hmm_grid(
                     target_space=target_space,
                     include_snapshots=include_snapshots,
                     model_id=model_id,
+                    target_type=target_type,
+                    run_id=run_id,
                 )
                 rows.append({"model_id": model_id, **metrics})
             except Exception as exc:
@@ -250,13 +291,22 @@ def run_hmm_grid(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target-path", type=Path, default=DEFAULT_TARGET_PATH)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--target-path", type=Path, default=None,
+                        help="Explicit target parquet; defaults from --target-type.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Explicit output dir; SA falls back to "
+                             "sidecars/sa/<run_id>/hmm_labor_regime.")
+    parser.add_argument("--target-type", default=DEFAULT_TARGET_TYPE,
+                        choices=["nsa", "sa"],
+                        help="Branch subtree the artifact lands under.")
+    parser.add_argument("--run-id", default="local_sidecar_once",
+                        help="Sidecar run-id directory under the branch subtree.")
     parser.add_argument("--start", default="2000-01")
     parser.add_argument("--min-train", type=int, default=72)
     parser.add_argument("--n-components", type=int, default=2)
     parser.add_argument("--covariance-type", choices=["diag", "full"], default="full")
-    parser.add_argument("--target-space", default="sa_revised", choices=["sa_revised", "nsa_revised"])
+    parser.add_argument("--target-space", default=None, choices=["sa_revised", "nsa_revised"],
+                        help="Target space override; defaults from --target-type.")
     parser.add_argument("--no-snapshots", action="store_true")
     parser.add_argument("--max-snapshot-columns", type=int, default=160)
     parser.add_argument("--max-features", type=int, default=30)
@@ -264,12 +314,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.grid:
         report = run_hmm_grid(
-            output_dir=args.output_dir,
+            output_dir=args.output_dir if args.output_dir is not None
+                       else _resolve_output_dir(None, args.target_type, args.run_id),
             target_path=args.target_path,
             target_space=args.target_space,
             start=args.start,
             min_train=args.min_train,
             include_snapshots=not args.no_snapshots,
+            target_type=args.target_type,
+            run_id=args.run_id,
         )
         print(report.to_string(index=False))
     else:
@@ -284,6 +337,8 @@ def main() -> None:
             include_snapshots=not args.no_snapshots,
             max_snapshot_columns=args.max_snapshot_columns,
             max_features=args.max_features,
+            target_type=args.target_type,
+            run_id=args.run_id,
         )
         import json
 

@@ -1,28 +1,37 @@
 """
 Post-training consensus-anchor integration.
 
-Runs after the main train-all pipeline to produce a consensus-anchored
-forecast via Kalman Filter Fusion (consensus + model signals fused via a
-state-space random walk with adaptive trailing-window noise estimation).
+Runs after the main train-all pipeline to produce the final SA-revised
+forecast layer. The two first-class outputs are:
 
-Optuna with nested expanding-window CV tunes `trailing_window` and
-`nsa_weight_scale` to maintain strict PIT safety.
+  - Kalman Fusion: consensus + NSA+adjustment + NSA acceleration signals fused
+    through a random-walk information filter with adaptive measurement noise.
+  - Panel/Kalman Router: a PIT walk-forward rule layer that chooses between the
+    PIT economist-panel forecast, the Kalman forecast, and conservative blends
+    using only earlier months with actuals.
+  - Optional experiment: Panel-Replaces-Consensus Kalman, enabled only by
+    ``NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN=1``. This swaps the consensus
+    level observation for a PIT rolling economist panel when available, then
+    falls back to consensus when the rolling panel is missing.
+
+Optuna with nested expanding-window CV tunes the Kalman parameters while the
+router stays deterministic and PIT-selected from prior realized misses.
 
 The merged consensus+model dataset is built on-the-fly from:
   - Master snapshots         (NFP_Consensus_Mean, PIT-correct per target month)
-  - SA blend champion        (_output/sandbox/sa_blend_walkforward/backtest_results.csv)
-  - SA revised challenger    (_output/SA_prediction/backtest_results.csv)
+  - Economist panel features (PIT target-month snapshot row)
   - NSA + adjustment         (_output/NSA_plus_adjustment/backtest_results.csv)
+  - NSA raw predictions      (_output/NSA_prediction/backtest_results.csv)
 
 Outputs:
   _output/consensus_anchor/
+  ├── main_models.json
   ├── merged_consensus_model.csv
-  ├── baseline_consensus/        (raw analyst median, for benchmarking)
-  ├── kalman_fusion/
-  │   ├── backtest_results.csv
-  │   ├── summary_statistics.csv
-  │   ├── backtest_predictions.png
-  │   └── summary_table.png
+  ├── baseline_consensus/        (raw analyst consensus mean, benchmark)
+  ├── panel_consensus_mean/      (panel-only diagnostic)
+  ├── kalman_fusion/             (main output)
+  ├── panel_kalman_router/       (main output)
+  ├── panel_replaces_consensus_kalman/ (optional gated experiment)
   └── comparison_metrics.csv
 
 Note: AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11)
@@ -46,6 +55,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 from settings import OUTPUT_DIR, TEMP_DIR, DATA_PATH, setup_logger
 from Train.config import N_OPTUNA_TRIALS, OPTUNA_TIMEOUT, get_master_snapshots_dir
 from Train.variance_metrics import compute_variance_kpis
+from Train.Output_code.metrics import add_consensus_hit_rate_metrics
 from Train.sandbox.output_utils import write_sandbox_output_bundle
 from utils.transforms import (
     winsorize_covid_period,
@@ -72,16 +82,166 @@ except Exception:
 
 TARGET_PARQUET = DATA_PATH / "NFP_target" / "y_sa_revised.parquet"
 CONSENSUS_FEATURE_COL = "NFP_Consensus_Mean"
-ECONOMIST_PANEL_FORECAST_COLS = [
-    "NFP_Forecast_AIB",
-    "NFP_Forecast_CONTINUUM_ECON",
-    "NFP_Forecast_DANSKE_BK",
-    "NFP_Forecast_NATIONWIDE_INSUR",
-    "NFP_Forecast_Top4Mean",
+CONSENSUS_MEDIAN_FEATURE_COL = "NFP_Consensus_Median"
+# Hardcoded 4-economist + Top4Mean entries were removed: they were hand-picked
+# off a future window (selection leakage). With this list empty, the panel
+# loader below falls back to the PIT-safe dynamic panel aggregate columns under
+# NFP_Forecast_Dynamic_*.
+ECONOMIST_PANEL_FORECAST_COLS: List[str] = []
+DYNAMIC_PANEL_PRIMARY_COL = "NFP_Forecast_Dynamic_Top10_k12"
+DYNAMIC_PANEL_FORECAST_COLS: List[str] = [
+    "NFP_Forecast_Dynamic_Top10_k12",
+    "NFP_Forecast_Dynamic_Top4_k12",
+    "NFP_Forecast_Dynamic_Top15_k12",
+    "NFP_Forecast_Dynamic_RobustMedian",
+    "NFP_Forecast_Dynamic_TrimmedMean10",
 ]
+DYNAMIC_PANEL_META_COLS: List[str] = [
+    "NFP_Forecast_Dynamic_PanelN",
+    "NFP_Forecast_Dynamic_NCalibrated",
+    "NFP_Forecast_Dynamic_DispersionStd",
+    "NFP_Forecast_Dynamic_DispersionIqr",
+    "NFP_Forecast_Dynamic_Top10TrackMae",
+]
+
+PANEL_REPLACES_CONSENSUS_ENV = "NFP_ENABLE_PANEL_REPLACES_CONSENSUS_KALMAN"
+PANEL_ROUTER_SELECTION_LOOKBACK_ENV = "NFP_PANEL_ROUTER_SELECTION_LOOKBACK"
+PANEL_ROUTER_OBJECTIVE_ENV = "NFP_ROUTER_OBJECTIVE"
+PANEL_ROUTER_LEARNED_ENV = "NFP_ENABLE_LEARNED_FINAL_ROUTER"
+PANEL_REPLACES_CONSENSUS_DIR = "panel_replaces_consensus_kalman"
+PANEL_REPLACES_CONSENSUS_MODEL = "consensus_anchor_panel_replaces_consensus_kalman_experiment"
+PANEL_REPLACES_CONSENSUS_FORECAST = "Panel_Replaces_Consensus_Kalman"
+
+DEFAULT_PANEL_REPLACEMENT_CONFIG: Dict[str, object] = {
+    # Experiment defaults only. Economist identities are selected dynamically
+    # each target month from PIT trailing track records, never fixed here.
+    "track_window": 8,
+    "top_n": 8,
+    "min_coverage_pct": 0.80,
+    "pooling": "median",
+    "skip_covid_track_record": False,
+    "trailing_window": 18,
+    "nsa_weight_scale": 0.40,
+}
+
+PANEL_ROUTER_TRAILING_EDGE_WINDOWS = (6, 8, 12, 18, 24, 36)
+PANEL_ROUTER_TRAILING_EDGE_MARGINS = (-50, -25, -10, 0, 10, 25, 50)
+PANEL_ROUTER_MIN_LOCAL_HISTORY = 6
+PANEL_ROUTER_SUPPORTED_OBJECTIVES = {
+    "mae", "rmse", "composite", "mae_hit", "rmse_hit", "composite_non_covid",
+}
+HMM_REGIME_METADATA_COLS = (
+    "hmm_regime_label",
+    "hmm_transition_risk",
+    "hmm_surprise",
+    "hmm_should_reselect",
+    "hmm_trigger_class",
+    "hmm_force_override",
+)
 
 # Minimum expanding-window history before producing a prediction
 MIN_HISTORY = 12
+
+PIT_DATE_COLS = ("target_release_date", "actual_available_date")
+
+
+def _row_prediction_cutoff(row: "pd.Series") -> pd.Timestamp:
+    """Operational cutoff for a forecast row.
+
+    The target parquet carries the NFP release date for the row's target
+    month. Final-layer history must be known strictly before that date.
+    Older synthetic tests/artifacts do not have the column, so the fallback is
+    a conservative month-start timestamp that preserves legacy chronology-only
+    behavior for those frames.
+    """
+    cutoff = row.get("target_release_date", pd.NaT)
+    if pd.notna(cutoff):
+        return pd.Timestamp(cutoff)
+    return pd.Timestamp(row["ds"])
+
+
+def _actual_history_available_before(
+    hist: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    current_ds: pd.Timestamp,
+) -> pd.DataFrame:
+    """Rows with actuals operationally available before the current forecast."""
+    if hist.empty or "actual" not in hist.columns:
+        return hist.iloc[0:0].copy()
+    out = hist[hist["actual"].notna()].copy()
+    if out.empty:
+        return out
+    if "ds" in out.columns:
+        out = out[pd.to_datetime(out["ds"]) < pd.Timestamp(current_ds)]
+    if "actual_available_date" in out.columns and pd.notna(cutoff):
+        avail = pd.to_datetime(out["actual_available_date"], errors="coerce")
+        out = out[avail.notna() & (avail < pd.Timestamp(cutoff))]
+    return out
+
+
+def _panel_router_selection_lookback(default: int = 24) -> Optional[int]:
+    """Recent strict-history window used to pick the router rule.
+
+    ``0`` or a negative value restores the old all-history scoring behavior.
+    The default is intentionally modest because the panel/Kalman edge changes
+    over time as panel coverage and the model-side signal quality drift.
+    """
+    raw = str(os.getenv(PANEL_ROUTER_SELECTION_LOOKBACK_ENV, str(default))).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %d",
+            PANEL_ROUTER_SELECTION_LOOKBACK_ENV,
+            raw,
+            default,
+        )
+        value = int(default)
+    return None if value <= 0 else value
+
+
+def _panel_router_objective(default: str = "mae_hit") -> str:
+    raw = str(os.getenv(PANEL_ROUTER_OBJECTIVE_ENV, default)).strip().lower()
+    if raw not in PANEL_ROUTER_SUPPORTED_OBJECTIVES:
+        logger.warning(
+            "Invalid %s=%r; using %s",
+            PANEL_ROUTER_OBJECTIVE_ENV,
+            raw,
+            default,
+        )
+        return default
+    return raw
+
+
+def _learned_panel_router_enabled() -> bool:
+    return _env_bool(PANEL_ROUTER_LEARNED_ENV, default=False)
+
+
+def _available_actual_indices_before(df: pd.DataFrame, row_idx: int) -> np.ndarray:
+    if row_idx <= 0:
+        return np.array([], dtype=int)
+    row = df.iloc[row_idx]
+    hist = df.iloc[:row_idx]
+    hist_valid = _actual_history_available_before(
+        hist,
+        _row_prediction_cutoff(row),
+        pd.Timestamp(row["ds"]),
+    )
+    return hist_valid.index.to_numpy(dtype=int)
+
+
+def _latest_available_actual_row(hist_valid: pd.DataFrame) -> Optional[pd.Series]:
+    if hist_valid.empty:
+        return None
+    return hist_valid.sort_values("ds").iloc[-1]
+
+
+def _month_gap(later, earlier) -> int:
+    if pd.isna(later) or pd.isna(earlier):
+        return 1
+    later_p = pd.Timestamp(later).to_period("M")
+    earlier_p = pd.Timestamp(earlier).to_period("M")
+    return max(1, (later_p.year - earlier_p.year) * 12 + (later_p.month - earlier_p.month))
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +355,513 @@ def full_metrics(
     return out
 
 
+def _eval_exclude_covid_hitrate() -> bool:
+    return _env_bool("NFP_EVAL_EXCLUDE_COVID_HITRATE", default=True)
+
+
+def _metrics_with_consensus_hits(metrics: Dict, results_df: pd.DataFrame) -> Dict:
+    """Attach consensus-relative hit rates when reference columns are present."""
+    return add_consensus_hit_rate_metrics(
+        metrics,
+        results_df,
+        exclude_covid_for_hitrate=_eval_exclude_covid_hitrate(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gated PIT rolling-panel replacement experiment
+# ---------------------------------------------------------------------------
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+def panel_replaces_consensus_enabled() -> bool:
+    """Whether to emit the local Panel-Replaces-Consensus Kalman experiment."""
+    return _env_bool(PANEL_REPLACES_CONSENSUS_ENV, default=False)
+
+
+def kalman_hmm_regime_noise_enabled() -> bool:
+    return _env_bool("NFP_KALMAN_HMM_REGIME_NOISE", default=False)
+
+
+def _hmm_regime_alpha(label: object) -> float:
+    regime = str(label or "").strip().lower()
+    return {
+        "stable": 0.25,
+        "upward": 0.50,
+        "recovery": 0.50,
+        "volatile_up": 0.75,
+        "volatile_down": 1.00,
+        "crash": 1.50,
+    }.get(regime, 0.50)
+
+
+def _hmm_reset_multiplier(label: object, risk: float, reselected: bool) -> float:
+    if not reselected:
+        return 1.0
+    regime = str(label or "").strip().lower()
+    if regime in {"crash", "volatile_down"} or risk >= 0.60:
+        return 5.0
+    return 2.0
+
+
+def _panel_replacement_config() -> Dict[str, object]:
+    cfg = dict(DEFAULT_PANEL_REPLACEMENT_CONFIG)
+    cfg["track_window"] = int(os.getenv("NFP_PANEL_REPLACE_WINDOW", cfg["track_window"]))
+    cfg["top_n"] = int(os.getenv("NFP_PANEL_REPLACE_TOP_N", cfg["top_n"]))
+    cfg["min_coverage_pct"] = float(
+        os.getenv("NFP_PANEL_REPLACE_MIN_COVERAGE", cfg["min_coverage_pct"])
+    )
+    cfg["pooling"] = str(os.getenv("NFP_PANEL_REPLACE_POOLING", cfg["pooling"]))
+    cfg["skip_covid_track_record"] = _env_bool(
+        "NFP_PANEL_REPLACE_SKIP_COVID_TRACK",
+        bool(cfg["skip_covid_track_record"]),
+    )
+    cfg["trailing_window"] = int(
+        os.getenv("NFP_PANEL_REPLACE_TRAILING_WINDOW", cfg["trailing_window"])
+    )
+    cfg["nsa_weight_scale"] = float(
+        os.getenv("NFP_PANEL_REPLACE_NSA_WEIGHT_SCALE", cfg["nsa_weight_scale"])
+    )
+    if cfg["pooling"] not in {
+        "equal_mean", "median", "trimmed_mean", "bias_corrected_mean",
+        "inv_mae_weighted_mean", "inv_rmse_weighted_mean",
+    }:
+        raise ValueError(f"Unsupported NFP_PANEL_REPLACE_POOLING={cfg['pooling']!r}")
+    return cfg
+
+
+def _load_sa_actuals_with_availability() -> pd.DataFrame:
+    target = pd.read_parquet(TARGET_PARQUET)
+    required = {"ds", "y_mom", "operational_available_date"}
+    missing = required.difference(target.columns)
+    if missing:
+        raise RuntimeError(
+            f"{TARGET_PARQUET} missing required columns for PIT panel ranking: "
+            f"{sorted(missing)}"
+        )
+    out = target[["ds", "y_mom", "operational_available_date"]].copy()
+    out["ds"] = pd.to_datetime(out["ds"]).dt.to_period("M").dt.to_timestamp()
+    out["actual"] = pd.to_numeric(out["y_mom"], errors="coerce")
+    out["actual_available_date"] = pd.to_datetime(
+        out["operational_available_date"],
+        errors="coerce",
+    )
+    return (
+        out[["ds", "actual", "actual_available_date"]]
+        .drop_duplicates("ds")
+        .sort_values("ds")
+        .reset_index(drop=True)
+    )
+
+
+def _compute_panel_track_record_pit(
+    panel: pd.DataFrame,
+    actuals: pd.DataFrame,
+    target_month: pd.Timestamp,
+    cutoff: pd.Timestamp,
+    track_window: int,
+    *,
+    skip_covid: bool = False,
+) -> Tuple[pd.DataFrame, pd.Timestamp, int]:
+    """Rank economists using only prior actuals operationally known at cutoff."""
+    window_end = target_month - pd.DateOffset(months=1)
+    window_start = target_month - pd.DateOffset(months=int(track_window))
+    window_months = pd.date_range(window_start, window_end, freq="MS")
+    if skip_covid:
+        window_months = window_months[~window_months.isin(COVID_EXCLUDE_MONTHS)]
+
+    actual_window = actuals[
+        actuals["ds"].isin(window_months)
+        & actuals["actual"].notna()
+        & actuals["actual_available_date"].notna()
+        & (actuals["actual_available_date"] < cutoff)
+    ][["ds", "actual"]].copy()
+    n_scorable = int(actual_window["ds"].nunique())
+    empty_cols = [
+        "ident", "name", "mae", "rmse", "bias", "n", "coverage",
+        "n_scorable_months", "trained_through",
+    ]
+    if n_scorable == 0:
+        return pd.DataFrame(columns=empty_cols), target_month - pd.DateOffset(months=1), 0
+
+    hist = panel[
+        panel["ds"].isin(actual_window["ds"])
+        & (panel["first_release_date"] < cutoff)
+    ][["ds", "ident", "name", "forecast"]].copy()
+    if hist.empty:
+        return pd.DataFrame(columns=empty_cols), pd.Timestamp(actual_window["ds"].max()), n_scorable
+
+    hist = hist.merge(actual_window, on="ds", how="inner").dropna(subset=["forecast", "actual"])
+    if hist.empty:
+        return pd.DataFrame(columns=empty_cols), pd.Timestamp(actual_window["ds"].max()), n_scorable
+
+    hist["err"] = hist["forecast"].astype(float) - hist["actual"].astype(float)
+    track = (
+        hist.groupby(["ident", "name"], as_index=False)
+        .agg(
+            mae=("err", lambda s: float(np.mean(np.abs(s)))),
+            rmse=("err", lambda s: float(np.sqrt(np.mean(np.square(s))))),
+            bias=("err", lambda s: float(np.mean(s))),
+            n=("err", "size"),
+        )
+    )
+    track["n"] = track["n"].astype(int)
+    track["coverage"] = track["n"].astype(float) / float(n_scorable)
+    track["n_scorable_months"] = int(n_scorable)
+    track["trained_through"] = pd.Timestamp(actual_window["ds"].max())
+    return track, pd.Timestamp(actual_window["ds"].max()), n_scorable
+
+
+def _pool_panel_replacement(selected: pd.DataFrame, pooling: str) -> float:
+    if selected.empty:
+        return float("nan")
+    raw = selected["forecast"].astype(float).to_numpy()
+    if pooling == "equal_mean":
+        return float(np.mean(raw))
+    if pooling == "median":
+        return float(np.median(raw))
+    if pooling == "trimmed_mean":
+        if raw.size >= 10:
+            lo, hi = np.percentile(raw, [10, 90])
+            raw = raw[(raw >= lo) & (raw <= hi)]
+        return float(np.mean(raw))
+    if pooling == "bias_corrected_mean":
+        return float(np.mean(raw - selected["bias"].astype(float).to_numpy()))
+    if pooling in {"inv_mae_weighted_mean", "inv_rmse_weighted_mean"}:
+        err_col = "mae" if pooling == "inv_mae_weighted_mean" else "rmse"
+        denom = np.maximum(selected[err_col].astype(float).to_numpy(), 1.0) ** 2
+        weights = 1.0 / denom
+        weights = weights / weights.sum()
+        return float(np.sum(weights * raw))
+    raise ValueError(f"Unknown panel replacement pooling={pooling!r}")
+
+
+def _build_rolling_panel_replacement(
+    *,
+    panel: pd.DataFrame,
+    actuals: pd.DataFrame,
+    release_map: pd.Series,
+    target_months: List[pd.Timestamp],
+    config: Dict[str, object],
+) -> pd.DataFrame:
+    """Build the gated rolling panel used to replace consensus in one experiment."""
+    rows: List[Dict[str, object]] = []
+    actual_lookup = actuals.set_index("ds")["actual"]
+    track_window = int(config["track_window"])
+    top_n = int(config["top_n"])
+    min_coverage = float(config["min_coverage_pct"])
+    pooling = str(config["pooling"])
+    skip_covid = bool(config.get("skip_covid_track_record", False))
+
+    for raw_month in sorted(pd.to_datetime(pd.Series(target_months)).dropna().unique()):
+        target_month = pd.Timestamp(raw_month).to_period("M").to_timestamp()
+        cutoff = release_map.get(target_month)
+        if pd.isna(cutoff):
+            rows.append({
+                "ds": target_month,
+                "actual": actual_lookup.get(target_month, np.nan),
+                "panel_replacement_pred": np.nan,
+                "panel_replacement_size": 0,
+                "panel_replacement_eligible_count": 0,
+                "panel_replacement_calibrated_count": 0,
+                "panel_replacement_n_scorable_months": 0,
+                "panel_replacement_trained_through": pd.NaT,
+                "panel_replacement_latest_forecast_release": pd.NaT,
+                "panel_replacement_selected_names": "",
+                "panel_replacement_selected_idents": "",
+                "panel_replacement_selected_mean_mae": np.nan,
+                "panel_replacement_selected_mean_rmse": np.nan,
+                "panel_replacement_selected_mean_coverage": np.nan,
+                "panel_replacement_dispersion_std": np.nan,
+                "panel_replacement_missing_reason": "missing_target_release_date",
+                "panel_replacement_target_release_date": pd.NaT,
+            })
+            continue
+        cutoff = pd.Timestamp(cutoff)
+        eligible = panel[
+            (panel["ds"] == target_month)
+            & (panel["first_release_date"] < cutoff)
+        ][["ident", "name", "forecast", "first_release_date"]].copy()
+
+        track, trained_through, n_scorable = _compute_panel_track_record_pit(
+            panel,
+            actuals,
+            target_month,
+            cutoff,
+            track_window,
+            skip_covid=skip_covid,
+        )
+        active_track = track[track["ident"].isin(eligible["ident"])] if not track.empty else track
+        if not active_track.empty:
+            calibrated = active_track[active_track["coverage"] >= min_coverage].copy()
+            ranked = (
+                calibrated
+                .sort_values(
+                    ["mae", "rmse", "coverage", "n", "ident"],
+                    ascending=[True, True, False, False, True],
+                )
+                .head(top_n)
+                .reset_index(drop=True)
+            )
+            selected = ranked.merge(
+                eligible[["ident", "forecast", "first_release_date"]],
+                on="ident",
+                how="left",
+                validate="one_to_one",
+            )
+        else:
+            calibrated = active_track
+            selected = pd.DataFrame()
+
+        pred = _pool_panel_replacement(selected, pooling) if not selected.empty else float("nan")
+        selected_raw = (
+            selected["forecast"].astype(float).to_numpy()
+            if not selected.empty else np.array([])
+        )
+        if eligible.empty:
+            missing_reason = "no_current_forecasts_before_release"
+        elif calibrated.empty:
+            missing_reason = "no_active_forecasters_pass_coverage"
+        elif selected.empty or not np.isfinite(pred):
+            missing_reason = "pooling_no_prediction"
+        else:
+            missing_reason = ""
+
+        rows.append({
+            "ds": target_month,
+            "actual": actual_lookup.get(target_month, np.nan),
+            "panel_replacement_pred": pred,
+            "panel_replacement_size": int(len(selected)),
+            "panel_replacement_eligible_count": int(len(eligible)),
+            "panel_replacement_calibrated_count": int(len(calibrated)),
+            "panel_replacement_n_scorable_months": int(n_scorable),
+            "panel_replacement_trained_through": pd.Timestamp(trained_through),
+            "panel_replacement_latest_forecast_release": (
+                pd.to_datetime(selected["first_release_date"]).max()
+                if not selected.empty else pd.NaT
+            ),
+            "panel_replacement_selected_names": (
+                "|".join(selected["name"].astype(str).tolist()) if not selected.empty else ""
+            ),
+            "panel_replacement_selected_idents": (
+                "|".join(selected["ident"].astype(str).tolist()) if not selected.empty else ""
+            ),
+            "panel_replacement_selected_mean_mae": (
+                float(selected["mae"].mean()) if not selected.empty else np.nan
+            ),
+            "panel_replacement_selected_mean_rmse": (
+                float(selected["rmse"].mean()) if not selected.empty else np.nan
+            ),
+            "panel_replacement_selected_mean_coverage": (
+                float(selected["coverage"].mean()) if not selected.empty else np.nan
+            ),
+            "panel_replacement_dispersion_std": (
+                float(np.std(selected_raw, ddof=1)) if selected_raw.size > 1
+                else 0.0 if selected_raw.size == 1 else np.nan
+            ),
+            "panel_replacement_missing_reason": missing_reason,
+            "panel_replacement_target_release_date": cutoff,
+        })
+
+    out = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
+    _validate_rolling_panel_replacement(out)
+    return out
+
+
+def _validate_rolling_panel_replacement(panel_df: pd.DataFrame) -> None:
+    if panel_df.empty:
+        return
+    tmp = panel_df.copy()
+    tmp["ds"] = pd.to_datetime(tmp["ds"])
+    tmp["panel_replacement_trained_through"] = pd.to_datetime(
+        tmp["panel_replacement_trained_through"],
+        errors="coerce",
+    )
+    trained_leak = tmp[
+        tmp["panel_replacement_trained_through"].notna()
+        & (tmp["panel_replacement_trained_through"] >= tmp["ds"])
+    ]
+    if not trained_leak.empty:
+        raise RuntimeError(
+            "Panel-replacement PIT validation failed: trained_through >= ds for "
+            f"{trained_leak[['ds', 'panel_replacement_trained_through']].head().to_dict('records')}"
+        )
+
+    tmp["panel_replacement_latest_forecast_release"] = pd.to_datetime(
+        tmp["panel_replacement_latest_forecast_release"],
+        errors="coerce",
+    )
+    tmp["panel_replacement_target_release_date"] = pd.to_datetime(
+        tmp["panel_replacement_target_release_date"],
+        errors="coerce",
+    )
+    release_leak = tmp[
+        tmp["panel_replacement_latest_forecast_release"].notna()
+        & tmp["panel_replacement_target_release_date"].notna()
+        & (
+            tmp["panel_replacement_latest_forecast_release"]
+            >= tmp["panel_replacement_target_release_date"]
+        )
+    ]
+    if not release_leak.empty:
+        raise RuntimeError(
+            "Panel-replacement PIT validation failed: selected forecast released "
+            "after cutoff for "
+            f"{release_leak[['ds', 'panel_replacement_latest_forecast_release', 'panel_replacement_target_release_date']].head().to_dict('records')}"
+        )
+
+
+def _attach_rolling_panel_replacement(
+    merged: pd.DataFrame,
+    *,
+    config: Dict[str, object],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    """Attach the full-panel rolling replacement signal to merged train-all data."""
+    from experiments.sidecars.economist_panel_sidecar import (
+        _load_full_panel,
+        _load_nfp_release_map,
+    )
+
+    panel = _load_full_panel()
+    release_map = _load_nfp_release_map()
+    actuals = _load_sa_actuals_with_availability()
+    target_months = pd.to_datetime(merged["ds"]).dropna().dt.to_period("M").dt.to_timestamp()
+    target_month_list = list(target_months.drop_duplicates())
+    panel_df = _build_rolling_panel_replacement(
+        panel=panel,
+        actuals=actuals,
+        release_map=release_map,
+        target_months=target_month_list,
+        config=config,
+    )
+
+    drop_cols = [
+        c for c in merged.columns
+        if c.startswith("panel_replacement_")
+    ]
+    merged_clean = merged.drop(columns=drop_cols, errors="ignore")
+    attached = merged_clean.merge(
+        panel_df.drop(columns=["actual"], errors="ignore"),
+        on="ds",
+        how="left",
+    )
+    manifest = {
+        "enabled_by": PANEL_REPLACES_CONSENSUS_ENV,
+        "config": dict(config),
+        "panel_rows": int(len(panel_df)),
+        "panel_available_rows": int(panel_df["panel_replacement_pred"].notna().sum()),
+        "panel_missing_rows": int(panel_df["panel_replacement_pred"].isna().sum()),
+        "missing_reasons": (
+            panel_df["panel_replacement_missing_reason"]
+            .replace("", "available")
+            .value_counts(dropna=False)
+            .to_dict()
+        ),
+        "pit_validation": (
+            "current-month forecasts require first_release_date < target NFP "
+            "release_date; economist ranking uses only prior actuals with "
+            "operational_available_date < target release_date; trained_through < ds"
+        ),
+    }
+    logger.info(
+        "Panel replacement attached: %d available / %d rows (%s)",
+        manifest["panel_available_rows"],
+        manifest["panel_rows"],
+        dict(manifest["missing_reasons"]),
+    )
+    return attached, panel_df, manifest
+
+
+def build_panel_replaces_consensus_kalman(
+    overlap_with_oos: pd.DataFrame,
+    consensus_df: pd.DataFrame,
+    *,
+    config: Optional[Dict[str, object]] = None,
+) -> Tuple[pd.DataFrame, Dict, Dict[str, object]]:
+    """Run the gated experiment where PIT rolling panel replaces consensus.
+
+    Missing rolling-panel months fall back to the original consensus anchor.
+    This preserves production-safe behavior for recent months where local panel
+    collection was historically spotty.
+    """
+    if config is None:
+        config = _panel_replacement_config()
+    if "panel_replacement_pred" not in overlap_with_oos.columns:
+        raise RuntimeError("panel_replacement_pred missing; attach rolling panel first")
+
+    modified = overlap_with_oos.copy()
+    modified["consensus_original"] = modified["consensus_pred"]
+    modified["anchor_source"] = np.where(
+        modified["panel_replacement_pred"].notna(),
+        "rolling_panel",
+        "consensus_fallback",
+    )
+    modified["consensus_pred"] = modified["panel_replacement_pred"].combine_first(
+        modified["consensus_pred"]
+    )
+    has_nsa = "nsa_pred" in modified.columns and modified["nsa_pred"].notna().any()
+    res_df, metrics = kalman_fusion(
+        modified,
+        consensus_df,
+        trailing_window=int(config["trailing_window"]),
+        use_nsa_accel=has_nsa,
+        nsa_weight_scale=float(config["nsa_weight_scale"]),
+        use_panel_observation=False,
+    )
+    metrics["Forecast"] = PANEL_REPLACES_CONSENSUS_FORECAST
+
+    audit_cols = [
+        "ds", "consensus_original", "panel_replacement_pred", "anchor_source",
+        "panel_replacement_size", "panel_replacement_eligible_count",
+        "panel_replacement_calibrated_count",
+        "panel_replacement_n_scorable_months",
+        "panel_replacement_trained_through",
+        "panel_replacement_latest_forecast_release",
+        "panel_replacement_target_release_date",
+        "panel_replacement_selected_names",
+        "panel_replacement_selected_idents",
+        "panel_replacement_selected_mean_mae",
+        "panel_replacement_selected_mean_rmse",
+        "panel_replacement_selected_mean_coverage",
+        "panel_replacement_dispersion_std",
+        "panel_replacement_missing_reason",
+    ]
+    audit_cols = [c for c in audit_cols if c in modified.columns]
+    res_df = res_df.merge(modified[audit_cols], on="ds", how="left")
+    if "consensus_original" in res_df.columns:
+        res_df["consensus_pred"] = res_df["consensus_original"].combine_first(
+            res_df["consensus_pred"]
+        )
+        metrics = _metrics_with_consensus_hits(metrics, res_df)
+
+    manifest = {
+        "enabled_by": PANEL_REPLACES_CONSENSUS_ENV,
+        "model_id": PANEL_REPLACES_CONSENSUS_MODEL,
+        "forecast": PANEL_REPLACES_CONSENSUS_FORECAST,
+        "artifact_dir": f"consensus_anchor/{PANEL_REPLACES_CONSENSUS_DIR}",
+        "config": dict(config),
+        "kalman_params": {
+            "trailing_window": int(config["trailing_window"]),
+            "nsa_weight_scale": float(config["nsa_weight_scale"]),
+            "use_nsa_accel": bool(has_nsa),
+            "use_panel_observation": False,
+        },
+        "anchor_source_counts": res_df["anchor_source"].value_counts(dropna=False).to_dict(),
+        "pit_validation": (
+            "Panel values are built before fusion with current forecasts released "
+            "before the target NFP release and prior ranking actuals only. "
+            "Kalman/router history requires actual_available_date < target_release_date, "
+            "so same-day prior revised actuals are excluded."
+        ),
+    }
+    return res_df, metrics, manifest
+
+
 # ---------------------------------------------------------------------------
 # Data Loading (reuses logic from build_consensus_anchor_merged_variants.py)
 # ---------------------------------------------------------------------------
@@ -203,12 +870,12 @@ def _load_consensus_pit(
     target_type: str = "sa",
     target_source: str = "revised",
 ) -> pd.DataFrame:
-    """Load NFP_Consensus_Mean per ds via the master-snapshot infrastructure.
+    """Load PIT consensus mean/median per ds via master snapshots.
 
     For each target month M, the master snapshot at M was built at ETL time with the
     strict filter ``release_date < M's NFP release date``, so any column value at row
-    ``ds=M`` is PIT-correct by construction. We extract ``NFP_Consensus_Mean`` at
-    that row.
+    ``ds=M`` is PIT-correct by construction. We extract ``NFP_Consensus_Mean`` and,
+    when present, ``NFP_Consensus_Median`` at that row.
 
     Replaces the prior "read latest Unifier snapshot + groupby('value','last')"
     approach, which carried no PIT enforcement and was vulnerable to silent leak if
@@ -234,11 +901,17 @@ def _load_consensus_pit(
             continue
 
         try:
-            snap = pd.read_parquet(snap_path, columns=["date", CONSENSUS_FEATURE_COL])
+            snap = pd.read_parquet(
+                snap_path,
+                columns=["date", CONSENSUS_FEATURE_COL, CONSENSUS_MEDIAN_FEATURE_COL],
+            )
         except (KeyError, ValueError):
-            # NFP_Consensus_Mean was not selected into this snapshot.
-            skipped_no_column += 1
-            continue
+            try:
+                snap = pd.read_parquet(snap_path, columns=["date", CONSENSUS_FEATURE_COL])
+            except (KeyError, ValueError):
+                # NFP_Consensus_Mean was not selected into this snapshot.
+                skipped_no_column += 1
+                continue
         except Exception as exc:
             logger.warning("Failed to read consensus from %s: %s", snap_path, exc)
             continue
@@ -252,7 +925,12 @@ def _load_consensus_pit(
         if pd.isna(val):
             continue
 
-        rows.append({"ds": obs_month, "consensus_pred": float(val)})
+        row = {"ds": obs_month, "consensus_pred": float(val)}
+        if CONSENSUS_MEDIAN_FEATURE_COL in match.columns:
+            median_val = match[CONSENSUS_MEDIAN_FEATURE_COL].iloc[0]
+            if pd.notna(median_val):
+                row["consensus_median_pred"] = float(median_val)
+        rows.append(row)
 
     if not rows:
         raise RuntimeError(
@@ -276,9 +954,11 @@ def _load_consensus_pit(
     # the Consensus baseline's MAE in comparison_metrics.csv and leaking into
     # Kalman R_c estimation as a regime-shift bias.
     out_indexed = out.set_index("ds")
-    out_indexed["consensus_pred"] = winsorize_covid_period(
-        out_indexed[["consensus_pred"]]
-    )["consensus_pred"]
+    value_cols = [
+        c for c in ("consensus_pred", "consensus_median_pred")
+        if c in out_indexed.columns
+    ]
+    out_indexed[value_cols] = winsorize_covid_period(out_indexed[value_cols])
     out = out_indexed.reset_index()
 
     return out
@@ -300,6 +980,12 @@ def _load_economist_panel_pit(
     snapshot_files = sorted(base_dir.glob("**/*.parquet"))
     rows: List[Dict] = []
     skipped_no_columns = 0
+    use_dynamic_panel = len(ECONOMIST_PANEL_FORECAST_COLS) == 0
+    requested_cols = (
+        DYNAMIC_PANEL_FORECAST_COLS + DYNAMIC_PANEL_META_COLS
+        if use_dynamic_panel
+        else ECONOMIST_PANEL_FORECAST_COLS
+    )
 
     for snap_path in snapshot_files:
         try:
@@ -307,7 +993,7 @@ def _load_economist_panel_pit(
         except (ValueError, TypeError):
             continue
 
-        columns = ["date", *ECONOMIST_PANEL_FORECAST_COLS]
+        columns = ["date", *requested_cols]
         try:
             snap = pd.read_parquet(snap_path, columns=columns)
         except (KeyError, ValueError):
@@ -322,24 +1008,65 @@ def _load_economist_panel_pit(
         if match.empty:
             continue
 
-        values = pd.to_numeric(
-            match[ECONOMIST_PANEL_FORECAST_COLS].iloc[0],
-            errors="coerce",
-        )
-        if not values.notna().any():
-            continue
+        if use_dynamic_panel:
+            values = pd.to_numeric(
+                match[DYNAMIC_PANEL_FORECAST_COLS].iloc[0],
+                errors="coerce",
+            )
+            if not values.notna().any():
+                continue
 
-        row: Dict[str, object] = {
-            "ds": obs_month,
-            "panel_consensus_mean": float(values.mean()),
-            "panel_consensus_median": float(values.median()),
-            "panel_consensus_count": int(values.notna().sum()),
-            "panel_consensus_std": (
-                float(values.std()) if int(values.notna().sum()) > 1 else np.nan
-            ),
-        }
-        for col, val in values.items():
-            row[f"panel_{col}"] = float(val) if pd.notna(val) else np.nan
+            primary = values.get(DYNAMIC_PANEL_PRIMARY_COL, np.nan)
+            if pd.isna(primary):
+                primary = values.dropna().iloc[0] if values.notna().any() else np.nan
+            if pd.isna(primary):
+                continue
+
+            median = values.get("NFP_Forecast_Dynamic_RobustMedian", np.nan)
+            if pd.isna(median):
+                median = values.median()
+
+            meta = pd.to_numeric(
+                match[[c for c in DYNAMIC_PANEL_META_COLS if c in match.columns]].iloc[0],
+                errors="coerce",
+            )
+            count = meta.get("NFP_Forecast_Dynamic_NCalibrated", np.nan)
+            if pd.isna(count):
+                count = meta.get("NFP_Forecast_Dynamic_PanelN", values.notna().sum())
+            dispersion = meta.get("NFP_Forecast_Dynamic_DispersionStd", np.nan)
+
+            row = {
+                "ds": obs_month,
+                "panel_consensus_mean": float(primary),
+                "panel_consensus_median": float(median) if pd.notna(median) else np.nan,
+                "panel_consensus_count": int(count) if pd.notna(count) else int(values.notna().sum()),
+                "panel_consensus_std": float(dispersion) if pd.notna(dispersion) else np.nan,
+                "panel_source": "dynamic_panel_aggregates",
+            }
+            for col, val in values.items():
+                row[f"panel_{col}"] = float(val) if pd.notna(val) else np.nan
+            for col, val in meta.items():
+                row[f"panel_{col}"] = float(val) if pd.notna(val) else np.nan
+        else:
+            values = pd.to_numeric(
+                match[ECONOMIST_PANEL_FORECAST_COLS].iloc[0],
+                errors="coerce",
+            )
+            if not values.notna().any():
+                continue
+
+            row = {
+                "ds": obs_month,
+                "panel_consensus_mean": float(values.mean()),
+                "panel_consensus_median": float(values.median()),
+                "panel_consensus_count": int(values.notna().sum()),
+                "panel_consensus_std": (
+                    float(values.std()) if int(values.notna().sum()) > 1 else np.nan
+                ),
+                "panel_source": "fixed_economist_columns",
+            }
+            for col, val in values.items():
+                row[f"panel_{col}"] = float(val) if pd.notna(val) else np.nan
         rows.append(row)
 
     if not rows:
@@ -351,7 +1078,10 @@ def _load_economist_panel_pit(
         return pd.DataFrame(columns=["ds"])
 
     out = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
-    value_cols = [c for c in out.columns if c != "ds"]
+    value_cols = [
+        c for c in out.columns
+        if c != "ds" and pd.api.types.is_numeric_dtype(out[c])
+    ]
     out_indexed = out.set_index("ds")
     out_indexed[value_cols] = winsorize_covid_period(out_indexed[value_cols])
     out = out_indexed.reset_index()
@@ -377,6 +1107,36 @@ def _load_model_backtest(path: Path, pred_name: str) -> pd.DataFrame:
     out["predicted"] = pd.to_numeric(out["predicted"], errors="coerce")
     out = out.dropna(subset=["ds"]).sort_values("ds")
     out = out.rename(columns={"actual": f"actual_{pred_name}", "predicted": pred_name})
+    return out
+
+
+def _load_hmm_regime_metadata(output_base: Path) -> pd.DataFrame:
+    path = output_base / "models" / "lightgbm_nfp" / "nsa_first_revised" / "hmm_regime_reselection.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["ds"])
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        logger.warning("Could not read HMM regime metadata at %s: %s", path, exc)
+        return pd.DataFrame(columns=["ds"])
+    if "step_date" not in df.columns:
+        return pd.DataFrame(columns=["ds"])
+    df["ds"] = pd.to_datetime(df["step_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    rename = {
+        "hmm_should_reselect": "hmm_reselected_this_month",
+    }
+    keep = ["ds"]
+    for col in HMM_REGIME_METADATA_COLS:
+        if col in df.columns:
+            keep.append(col)
+    out = df[keep].rename(columns=rename).dropna(subset=["ds"]).copy()
+    for col in ("hmm_transition_risk", "hmm_surprise"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ("hmm_reselected_this_month", "hmm_force_override"):
+        if col in out.columns:
+            out[col] = out[col].astype(bool)
+    logger.info("Loaded HMM regime metadata: %d months", len(out))
     return out
 
 
@@ -460,7 +1220,8 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
         merged["nsa_pred"] = np.nan
         logger.warning("NSA+adjustment not found")
 
-    # NSA Raw predictions for AccelOverride direction voting
+    # NSA raw predictions are retained for diagnostics and sidecar/router
+    # experiments; the production Kalman channel uses NSA+adjustment above.
     nsa_raw_path = output_base / "NSA_prediction" / "backtest_results.csv"
     if not nsa_raw_path.exists():
         nsa_raw_path = output_base / "NSA_prediction_revised" / "backtest_results.csv"
@@ -470,13 +1231,38 @@ def build_merged_dataset(output_base: Optional[Path] = None) -> pd.DataFrame:
         logger.info("Loaded NSA raw: %d months", merged["nsa_raw_pred"].notna().sum())
     else:
         merged["nsa_raw_pred"] = np.nan
-        logger.warning("NSA raw not found; AccelOverride will use fewer signals")
+        logger.warning("NSA raw not found; diagnostics will use fewer signals")
 
-    # Backfill actuals from target parquet for full consensus history
+    hmm_meta = _load_hmm_regime_metadata(output_base)
+    if not hmm_meta.empty:
+        merged = merged.merge(hmm_meta, on="ds", how="left")
+
+    # Backfill actuals and operational availability from the target parquet.
+    # The dates are required by the final Kalman/router layer: a prior revised
+    # actual is usable only when actual_available_date < current target release.
     if TARGET_PARQUET.exists():
-        target = pd.read_parquet(TARGET_PARQUET, columns=["ds", "y_mom"])
-        target["ds"] = pd.to_datetime(target["ds"])
+        target_raw = pd.read_parquet(TARGET_PARQUET)
+        keep = ["ds", "y_mom"]
+        for col in ("release_date", "operational_available_date"):
+            if col in target_raw.columns:
+                keep.append(col)
+        target = target_raw[keep].copy()
+        target["ds"] = pd.to_datetime(target["ds"]).dt.to_period("M").dt.to_timestamp()
         target = target.rename(columns={"y_mom": "actual_from_target"})
+        if "release_date" in target.columns:
+            target["target_release_date"] = pd.to_datetime(
+                target["release_date"],
+                errors="coerce",
+            )
+        if "operational_available_date" in target.columns:
+            target["actual_available_date"] = pd.to_datetime(
+                target["operational_available_date"],
+                errors="coerce",
+            )
+        target = target.drop(
+            columns=["release_date", "operational_available_date"],
+            errors="ignore",
+        )
         merged = merged.merge(target, on="ds", how="left")
         merged["actual"] = merged["actual"].combine_first(merged["actual_from_target"])
         merged = merged.drop(columns=["actual_from_target"])
@@ -551,10 +1337,22 @@ def kalman_fusion(
     """
     # Keep rows where consensus + model exist; actual can be NaN (OOS)
     keep_cols = ["ds", "actual", "consensus_pred", "champion_pred"]
+    if "consensus_median_pred" in overlap_df.columns:
+        keep_cols.append("consensus_median_pred")
+    keep_cols.extend([c for c in PIT_DATE_COLS if c in overlap_df.columns])
     if "nsa_pred" in overlap_df.columns:
         keep_cols.append("nsa_pred")
     panel_cols = [c for c in ("panel_consensus_mean", "panel_consensus_count") if c in overlap_df.columns]
     keep_cols.extend(panel_cols)
+    hmm_cols = [c for c in (
+        "hmm_regime_label",
+        "hmm_transition_risk",
+        "hmm_surprise",
+        "hmm_reselected_this_month",
+        "hmm_trigger_class",
+        "hmm_force_override",
+    ) if c in overlap_df.columns]
+    keep_cols.extend(hmm_cols)
     sidecar_cols = [c for c in overlap_df.columns if c.startswith("sidecar_")]
     keep_cols.extend(sidecar_cols)
     df = overlap_df[keep_cols].copy()
@@ -570,11 +1368,13 @@ def kalman_fusion(
     # evaluated. Once `len(hist_valid) >= 6` inside the loop the per-step path takes
     # over and these inits no longer matter.
     first_backtest_ds = df.iloc[0]["ds"] if not df.empty else pd.Timestamp.max
-    prior_cons = consensus_df[
-        consensus_df["consensus_pred"].notna()
-        & consensus_df["actual"].notna()
-        & (consensus_df["ds"] < first_backtest_ds)
-    ]
+    first_cutoff = _row_prediction_cutoff(df.iloc[0]) if not df.empty else pd.Timestamp.max
+    prior_cons = consensus_df[consensus_df["consensus_pred"].notna()].copy()
+    prior_cons = _actual_history_available_before(
+        prior_cons,
+        first_cutoff,
+        pd.Timestamp(first_backtest_ds),
+    )
     prior_cons_err = (prior_cons["actual"] - prior_cons["consensus_pred"]).values
     R_c_init = float(np.var(prior_cons_err[-60:], ddof=1)) if len(prior_cons_err) >= 2 else 1.0
     prior_actuals = prior_cons["actual"].dropna().values[-60:]
@@ -591,12 +1391,30 @@ def kalman_fusion(
     Q = Q_init
     R_a = R_c_init * 2.0  # NSA channel default
 
+    last_state_actual_ds: Optional[pd.Timestamp] = None
+    hmm_noise_active = kalman_hmm_regime_noise_enabled()
     results = []
     for i in range(len(df)):
         row = df.iloc[i]
-        # Use only historical rows with known actuals for noise estimation
+        current_ds = pd.Timestamp(row["ds"])
+        current_cutoff = _row_prediction_cutoff(row)
+        # Use only historical rows whose actuals were operationally known
+        # before the target release cutoff. The previous month's revised
+        # actual is often released on the same date as the current target, so
+        # chronological df.iloc[:i] alone is not strict enough.
         hist = df.iloc[:i]
-        hist_valid = hist[hist["actual"].notna()]
+        hist_valid = _actual_history_available_before(hist, current_cutoff, current_ds)
+        latest_actual_row = _latest_available_actual_row(hist_valid)
+        if latest_actual_row is not None:
+            latest_actual_ds = pd.Timestamp(latest_actual_row["ds"])
+            if last_state_actual_ds is None or latest_actual_ds > last_state_actual_ds:
+                x_hat = float(latest_actual_row["actual"])
+                P = 1e-6
+                last_state_actual_ds = latest_actual_ds
+        state_gap_months = (
+            _month_gap(current_ds, last_state_actual_ds)
+            if last_state_actual_ds is not None else 1
+        )
 
         # COVID-clean view for variance computation: Mar/Apr/May 2020 are
         # winsorized (Fix 3) so values are flat and constant — including them
@@ -625,8 +1443,27 @@ def kalman_fusion(
         # else: keep R_c, R_m, Q at the most recent estimates (or inits)
 
         router_risk, router_confidence = sidecar_router_values(row)
-        Q_step = Q * (1.0 + 0.75 * router_risk)
+        Q_step = Q * float(state_gap_months) * (1.0 + 0.75 * router_risk)
         R_m_step = R_m
+        hmm_transition_risk = (
+            float(row.get("hmm_transition_risk"))
+            if pd.notna(row.get("hmm_transition_risk", np.nan))
+            else 0.0
+        )
+        hmm_reselected_raw = row.get("hmm_reselected_this_month", False)
+        hmm_reselected = bool(hmm_reselected_raw) if pd.notna(hmm_reselected_raw) else False
+        hmm_q_multiplier = 1.0
+        hmm_r_multiplier = 1.0
+        if hmm_noise_active:
+            alpha = _hmm_regime_alpha(row.get("hmm_regime_label"))
+            hmm_r_multiplier = 1.0 + alpha * max(0.0, hmm_transition_risk)
+            hmm_q_multiplier = _hmm_reset_multiplier(
+                row.get("hmm_regime_label"),
+                hmm_transition_risk,
+                hmm_reselected,
+            )
+            Q_step *= hmm_q_multiplier
+            R_m_step *= hmm_r_multiplier
         if router_confidence > 0 and use_model and len(hist_valid) >= 1:
             prev_actual = float(hist_valid["actual"].iloc[-1])
             champion_delta = float(row["champion_pred"]) - prev_actual
@@ -759,9 +1596,20 @@ def kalman_fusion(
 
         pred = x_post
 
-        if pd.notna(row["actual"]):
+        row_actual_available_now = (
+            pd.notna(row["actual"])
+            and (
+                "actual_available_date" not in df.columns
+                or (
+                    pd.notna(row.get("actual_available_date"))
+                    and pd.Timestamp(row["actual_available_date"]) < current_cutoff
+                )
+            )
+        )
+        if row_actual_available_now:
             x_hat = row["actual"]
             P = 1e-6
+            last_state_actual_ds = current_ds
         else:
             x_hat = x_post
             P = P_post
@@ -769,10 +1617,30 @@ def kalman_fusion(
         result_row = {
             "ds": row["ds"],
             "actual": row["actual"],
+            "target_release_date": row.get("target_release_date", pd.NaT),
+            "actual_available_date": row.get("actual_available_date", pd.NaT),
+            "history_available_n": int(len(hist_valid)),
+            "latest_available_actual_ds": (
+                pd.Timestamp(latest_actual_row["ds"]) if latest_actual_row is not None else pd.NaT
+            ),
+            "state_gap_months": int(state_gap_months),
             "predicted": pred,
             "consensus_pred": row["consensus_pred"],
             "error": row["actual"] - pred if pd.notna(row["actual"]) else np.nan,
         }
+        if "consensus_median_pred" in df.columns:
+            result_row["consensus_median_pred"] = row.get("consensus_median_pred")
+        if hmm_cols:
+            result_row.update({
+                "hmm_regime_label": row.get("hmm_regime_label"),
+                "hmm_transition_risk": row.get("hmm_transition_risk"),
+                "hmm_surprise": row.get("hmm_surprise"),
+                "hmm_reselected_this_month": row.get("hmm_reselected_this_month"),
+                "hmm_trigger_class": row.get("hmm_trigger_class"),
+                "hmm_force_override": row.get("hmm_force_override"),
+                "hmm_model_R_multiplier": hmm_r_multiplier,
+                "hmm_process_Q_multiplier": hmm_q_multiplier,
+            })
         if use_panel_observation and "panel_consensus_mean" in df.columns:
             result_row.update({
                 "panel_consensus_mean": row.get("panel_consensus_mean"),
@@ -796,6 +1664,7 @@ def kalman_fusion(
         res_df["actual"].values, res_df["predicted"].values, label,
         ds=res_df["ds"],
     )
+    metrics = _metrics_with_consensus_hits(metrics, res_df)
     return res_df, metrics
 
 
@@ -1275,7 +2144,7 @@ def pit_adaptive_kalman_fusion(
     selected_candidates: List[Dict[str, object]] = []
     selected_scores: List[float] = []
     for i in range(len(overlap_df)):
-        hist_idx = np.where(np.isfinite(actual[:i]))[0]
+        hist_idx = _available_actual_indices_before(overlap_df, i)
         if hist_idx.size < int(min_history):
             best_idx = default_idx
             best_score = float("nan")
@@ -1308,6 +2177,7 @@ def pit_adaptive_kalman_fusion(
         "Kalman_Fusion_NSA" if has_nsa else "Kalman_Fusion",
         ds=out["ds"],
     )
+    metrics = _metrics_with_consensus_hits(metrics, out)
 
     live_params = selected_candidates[-1] if selected_candidates else {}
     manifest = {
@@ -1336,6 +2206,7 @@ _FORECAST_COLORS = {
     "Baseline_Consensus": "#DC2626",        # red
     "Panel_Consensus_Mean": "#059669",      # green
     "Panel_Kalman_Router": "#7C3AED",       # purple
+    PANEL_REPLACES_CONSENSUS_FORECAST: "#EA580C",  # orange
     "Kalman_Fusion_NSA": "#2563EB",         # blue
     "Kalman_Fusion": "#2563EB",
     "Baseline_Champion": "#9CA3AF",         # gray
@@ -1356,7 +2227,7 @@ def write_comparison_visualization(
     metrics_df: pd.DataFrame,
 ) -> None:
     """
-    Produce a unified comparison view across all 4 consensus-anchor forecasts:
+    Produce a unified comparison view across consensus-anchor forecasts:
       - comparison_overlay.png  (actual vs each forecast, full backtest)
       - comparison_metrics.png  (MAE / RMSE / DirAcc / AccelAcc bar chart)
       - comparison_scorecard.html  (sortable metrics table + image grid)
@@ -1390,7 +2261,7 @@ def write_comparison_visualization(
                 color=_color_for(label), linewidth=1.4, marker="s", markersize=2.5,
                 alpha=0.9, label=label)
 
-    ax.set_title("Consensus Anchor: 4-Way Forecast Comparison (SA Revised MoM)",
+    ax.set_title("Consensus Anchor: Forecast Comparison (SA Revised MoM)",
                  fontweight="bold")
     ax.set_xlabel("Date")
     ax.set_ylabel("NFP MoM Change (thousands)")
@@ -1456,6 +2327,12 @@ def write_comparison_visualization(
         metrics_df.round(3)
         .to_html(index=False, classes="metrics", border=0)
     )
+    experiment_html = ""
+    if PANEL_REPLACES_CONSENSUS_FORECAST in forecast_dfs:
+        experiment_html = (
+            "  <div><h3>Panel-Replaces-Consensus Kalman</h3>"
+            f"<img src=\"{PANEL_REPLACES_CONSENSUS_DIR}/backtest_predictions.png\"/></div>\n"
+        )
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Consensus Anchor Scorecard</title>
 <style>
@@ -1471,7 +2348,7 @@ def write_comparison_visualization(
  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
 </style></head>
 <body>
- <h1>Consensus Anchor — 4-Way Forecast Scorecard</h1>
+ <h1>Consensus Anchor — Forecast Scorecard</h1>
  <p>Sorted by MAE. Backtest period: {len(actual_series) if actual_series is not None else "?"} months.</p>
  {table_html}
  <h2>Forecast overlay</h2>
@@ -1484,6 +2361,7 @@ def write_comparison_visualization(
   <div><h3>Panel Consensus Mean</h3><img src="panel_consensus_mean/backtest_predictions.png"/></div>
   <div><h3>Panel/Kalman Router</h3><img src="panel_kalman_router/backtest_predictions.png"/></div>
   <div><h3>Kalman Fusion (NSA)</h3><img src="kalman_fusion/backtest_predictions.png"/></div>
+{experiment_html.rstrip()}
  </div>
 </body></html>
 """
@@ -1505,6 +2383,7 @@ _MODEL_RMSE_PATHS: Dict[str, str] = {
     "consensus_anchor_panel_mean":               "consensus_anchor/panel_consensus_mean/summary_statistics.csv",
     "consensus_anchor_panel_kalman_router":      "consensus_anchor/panel_kalman_router/summary_statistics.csv",
     "consensus_anchor_kalman_fusion":            "consensus_anchor/kalman_fusion/summary_statistics.csv",
+    PANEL_REPLACES_CONSENSUS_MODEL:              f"consensus_anchor/{PANEL_REPLACES_CONSENSUS_DIR}/summary_statistics.csv",
 }
 
 
@@ -1537,6 +2416,14 @@ def _panel_router_candidate(
     kalman = pd.to_numeric(data["kalman_pred"], errors="coerce")
     if kind == "panel":
         return panel
+    if kind == "panel_median":
+        raw_panel_median = pd.to_numeric(data.get("panel_consensus_median"), errors="coerce")
+        return raw_panel_median.combine_first(panel)
+    if kind == "consensus":
+        return pd.to_numeric(data["consensus_pred"], errors="coerce")
+    if kind == "consensus_median":
+        median = pd.to_numeric(data.get("consensus_median_pred"), errors="coerce")
+        return median.combine_first(pd.to_numeric(data["consensus_pred"], errors="coerce"))
     if kind == "kalman":
         return kalman
     if kind == "panel_missing_else_kalman":
@@ -1545,6 +2432,10 @@ def _panel_router_candidate(
     if kind == "blend":
         weight = 0.5 if param is None else float(param)
         return weight * panel + (1.0 - weight) * kalman
+    if kind == "panel_consensus_blend":
+        weight = 0.5 if param is None else float(param)
+        consensus = pd.to_numeric(data["consensus_pred"], errors="coerce")
+        return weight * panel + (1.0 - weight) * consensus
     if kind == "gate":
         threshold = 100.0 if param is None else float(param)
         raw_panel = pd.to_numeric(data["panel_consensus_mean"], errors="coerce")
@@ -1556,16 +2447,252 @@ def _panel_router_candidate(
     raise ValueError(f"Unknown panel router candidate: {kind}")
 
 
-def _panel_router_score(actual: np.ndarray, pred: np.ndarray, objective: str) -> float:
+def _panel_router_static_candidates(data: pd.DataFrame) -> Dict[str, pd.Series]:
+    """Static router candidates that do not depend on realized errors."""
+    candidates: Dict[str, pd.Series] = {
+        "panel": _panel_router_candidate(data, "panel"),
+        "kalman": _panel_router_candidate(data, "kalman"),
+        "consensus": _panel_router_candidate(data, "consensus"),
+        "panel_missing_else_kalman": _panel_router_candidate(
+            data, "panel_missing_else_kalman",
+        ),
+    }
+    if "consensus_median_pred" in data.columns:
+        candidates["consensus_median"] = _panel_router_candidate(data, "consensus_median")
+    if "panel_consensus_median" in data.columns:
+        candidates["panel_median"] = _panel_router_candidate(data, "panel_median")
+    for weight in np.linspace(0.35, 0.95, 13):
+        candidates[f"blend:{weight:.2f}"] = _panel_router_candidate(
+            data, "blend", float(weight),
+        )
+    for weight in np.linspace(0.35, 0.95, 13):
+        candidates[f"panel_consensus_blend:{weight:.2f}"] = _panel_router_candidate(
+            data, "panel_consensus_blend", float(weight),
+        )
+    for threshold in [25, 50, 75, 100, 125, 150, 175, 200, 250, 300]:
+        candidates[f"gate:{threshold:.2f}"] = _panel_router_candidate(
+            data, "gate", float(threshold),
+        )
+    return candidates
+
+
+def _panel_router_trailing_edge_candidate(
+    data: pd.DataFrame,
+    *,
+    lookback: Optional[int],
+    margin: float,
+    min_local_history: int = PANEL_ROUTER_MIN_LOCAL_HISTORY,
+) -> pd.Series:
+    """Replay a recent-performance gate without current-row leakage.
+
+    For each row, use Kalman only if its trailing strict-PIT MAE beat the panel
+    by more than ``margin``. Positive margins require a Kalman edge; negative
+    margins allow Kalman when the panel's recent advantage is small. Missing
+    live panel rows still fall back to Kalman.
+    """
+    panel = pd.to_numeric(data["panel_pred"], errors="coerce")
+    kalman = pd.to_numeric(data["kalman_pred"], errors="coerce")
+    consensus = pd.to_numeric(data["consensus_pred"], errors="coerce")
+    raw_panel = pd.to_numeric(data["panel_consensus_mean"], errors="coerce")
+
+    preds: List[float] = []
+    for row_pos, (_, row) in enumerate(data.iterrows()):
+        use_kalman = bool(pd.isna(raw_panel.iloc[row_pos]) or pd.isna(panel.iloc[row_pos]))
+        if not use_kalman:
+            hist = _actual_history_available_before(
+                data.iloc[:row_pos],
+                _row_prediction_cutoff(row),
+                pd.Timestamp(row["ds"]),
+            )
+            hist = hist.dropna(subset=["actual", "panel_pred", "kalman_pred"])
+            if lookback is not None:
+                hist = hist.tail(int(lookback))
+            if len(hist) >= int(min_local_history):
+                panel_mae = float(np.mean(np.abs(hist["actual"] - hist["panel_pred"])))
+                kalman_mae = float(np.mean(np.abs(hist["actual"] - hist["kalman_pred"])))
+                use_kalman = bool((panel_mae - kalman_mae) > float(margin))
+
+        pred = kalman.iloc[row_pos] if use_kalman else panel.iloc[row_pos]
+        if pd.isna(pred):
+            pred = kalman.iloc[row_pos] if pd.notna(kalman.iloc[row_pos]) else consensus.iloc[row_pos]
+        preds.append(float(pred) if pd.notna(pred) else np.nan)
+    return pd.Series(preds, index=data.index)
+
+
+def _router_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
+    panel = pd.to_numeric(data["panel_pred"], errors="coerce")
+    kalman = pd.to_numeric(data["kalman_pred"], errors="coerce")
+    consensus = pd.to_numeric(data["consensus_pred"], errors="coerce")
+    panel_count = (
+        pd.to_numeric(data["panel_consensus_count"], errors="coerce")
+        if "panel_consensus_count" in data.columns else pd.Series(np.nan, index=data.index)
+    )
+    panel_disp = (
+        pd.to_numeric(data["panel_consensus_std"], errors="coerce")
+        if "panel_consensus_std" in data.columns else pd.Series(np.nan, index=data.index)
+    )
+    out = pd.DataFrame({
+        "abs_panel_kalman_gap": (panel - kalman).abs(),
+        "abs_panel_consensus_gap": (panel - consensus).abs(),
+        "abs_kalman_consensus_gap": (kalman - consensus).abs(),
+        "panel_count": panel_count,
+        "panel_dispersion": panel_disp,
+        "panel_missing": panel.isna().astype(float),
+    }, index=data.index)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _panel_router_learned_edge_candidate(
+    data: pd.DataFrame,
+    *,
+    min_history: int = 36,
+    threshold: float = 0.58,
+) -> pd.Series:
+    """Expanding-window learned router candidate.
+
+    The target is whether Kalman beat the panel on prior months. Each target
+    row trains only on rows whose actuals were operationally available before
+    that target's release cutoff.
+    """
+    panel = pd.to_numeric(data["panel_pred"], errors="coerce")
+    kalman = pd.to_numeric(data["kalman_pred"], errors="coerce")
+    consensus = pd.to_numeric(data["consensus_pred"], errors="coerce")
+    raw_panel = pd.to_numeric(data["panel_consensus_mean"], errors="coerce")
+    features = _router_feature_frame(data)
+    preds: List[float] = []
+
+    try:
+        from sklearn.impute import SimpleImputer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+    except Exception:
+        logger.warning("sklearn unavailable; learned panel router candidate falls back to panel")
+        return panel.combine_first(kalman).combine_first(consensus)
+
+    for row_pos, (_, row) in enumerate(data.iterrows()):
+        use_kalman = bool(pd.isna(raw_panel.iloc[row_pos]) or pd.isna(panel.iloc[row_pos]))
+        if not use_kalman:
+            hist = _actual_history_available_before(
+                data.iloc[:row_pos],
+                _row_prediction_cutoff(row),
+                pd.Timestamp(row["ds"]),
+            )
+            hist = hist.dropna(subset=["actual", "panel_pred", "kalman_pred"])
+            if len(hist) >= int(min_history):
+                hist_idx = hist.index
+                y = (
+                    (hist["actual"] - hist["kalman_pred"]).abs()
+                    < (hist["actual"] - hist["panel_pred"]).abs()
+                ).astype(int)
+                if y.nunique() >= 2:
+                    model = make_pipeline(
+                        SimpleImputer(strategy="median"),
+                        StandardScaler(),
+                        LogisticRegression(C=0.5, max_iter=200, random_state=42),
+                    )
+                    model.fit(features.loc[hist_idx], y)
+                    p_kalman = float(model.predict_proba(features.iloc[[row_pos]])[0, 1])
+                    use_kalman = p_kalman >= float(threshold)
+
+        pred = kalman.iloc[row_pos] if use_kalman else panel.iloc[row_pos]
+        if pd.isna(pred):
+            pred = kalman.iloc[row_pos] if pd.notna(kalman.iloc[row_pos]) else consensus.iloc[row_pos]
+        preds.append(float(pred) if pd.notna(pred) else np.nan)
+    return pd.Series(preds, index=data.index)
+
+
+def _panel_router_candidate_matrix(data: pd.DataFrame) -> pd.DataFrame:
+    """All router candidates, including PIT-replayed recent-edge gates."""
+    candidates = _panel_router_static_candidates(data)
+    for lookback in PANEL_ROUTER_TRAILING_EDGE_WINDOWS:
+        for margin in PANEL_ROUTER_TRAILING_EDGE_MARGINS:
+            name = f"trailing_edge:w{lookback}:margin{margin:+.0f}"
+            candidates[name] = _panel_router_trailing_edge_candidate(
+                data,
+                lookback=int(lookback),
+                margin=float(margin),
+            )
+    if _learned_panel_router_enabled():
+        candidates["learned_consensus_edge"] = _panel_router_learned_edge_candidate(data)
+    return pd.DataFrame(candidates, index=data.index)
+
+
+def _panel_router_source(row: pd.Series) -> str:
+    pred = row.get("predicted")
+    if pd.isna(pred):
+        return "missing"
+    for source, col in (
+        ("kalman", "kalman_pred"),
+        ("panel", "panel_pred"),
+        ("panel_median", "panel_consensus_median"),
+        ("consensus", "consensus_pred"),
+        ("consensus_median", "consensus_median_pred"),
+    ):
+        val = row.get(col)
+        if pd.notna(val) and abs(float(pred) - float(val)) < 1e-8:
+            return source
+    return "blend"
+
+
+def _panel_router_score(
+    actual: np.ndarray,
+    pred: np.ndarray,
+    objective: str,
+    *,
+    ds: Optional[np.ndarray] = None,
+    consensus: Optional[np.ndarray] = None,
+) -> float:
     mask = np.isfinite(actual) & np.isfinite(pred)
+    if consensus is not None:
+        consensus = np.asarray(consensus, dtype=float)
+        mask = mask & np.isfinite(consensus)
     if mask.sum() == 0:
         return float("inf")
     a = actual[mask]
     p = pred[mask]
+    c = np.asarray(consensus, dtype=float)[mask] if consensus is not None else None
+    ds_masked = pd.to_datetime(pd.Series(ds[mask])) if ds is not None else None
     if objective == "rmse":
         return float(np.sqrt(np.mean((a - p) ** 2)))
     if objective == "mae":
         return float(np.mean(np.abs(a - p)))
+    if objective in {"mae_hit", "rmse_hit", "composite_non_covid"}:
+        model_abs = np.abs(a - p)
+        base = (
+            float(np.sqrt(np.mean((a - p) ** 2)))
+            if objective == "rmse_hit"
+            else float(np.mean(model_abs))
+        )
+        if c is None:
+            return base
+        ref_abs = np.abs(a - c)
+        if objective == "composite_non_covid" and ds_masked is not None:
+            keep = ~is_covid_month(ds_masked).to_numpy()
+            if keep.any():
+                a_eval = a[keep]
+                p_eval = p[keep]
+                model_abs = model_abs[keep]
+                ref_abs = ref_abs[keep]
+            else:
+                a_eval = a
+                p_eval = p
+        else:
+            a_eval = a
+            p_eval = p
+        wins = model_abs < ref_abs
+        losses = model_abs > ref_abs
+        hit_rate = float(np.mean(wins)) if wins.size else 0.0
+        loss_rate = float(np.mean(losses)) if losses.size else 0.0
+        mean_edge = float(np.mean(ref_abs - model_abs)) if model_abs.size else 0.0
+        if objective == "mae_hit":
+            return float(base + 25.0 * loss_rate - 10.0 * hit_rate - 0.15 * mean_edge)
+        if objective == "rmse_hit":
+            return float(base + 40.0 * loss_rate - 15.0 * hit_rate - 0.10 * mean_edge)
+        accel_acc = float(compute_variance_kpis(a_eval, p_eval)["diff_sign_accuracy"])
+        rmse = float(np.sqrt(np.mean((a_eval - p_eval) ** 2))) if a_eval.size else base
+        mae = float(np.mean(np.abs(a_eval - p_eval))) if a_eval.size else base
+        return float(0.55 * mae + 0.35 * rmse + 30.0 * loss_rate - 20.0 * hit_rate - 15.0 * accel_acc)
     if objective == "composite":
         from Train.config import KALMAN_LAMBDA_ACCEL, KALMAN_LAMBDA_DIR
         dir_acc = float(np.mean(np.sign(a) == np.sign(p)))
@@ -1581,6 +2708,7 @@ def build_panel_kalman_router(
     *,
     min_history: int = 24,
     objective: str = "mae",
+    selection_lookback: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, Dict]:
     """Walk-forward router between the PIT economist panel and Kalman.
 
@@ -1591,51 +2719,122 @@ def build_panel_kalman_router(
     """
     panel = panel_results.copy()
     panel = panel.rename(columns={"predicted": "panel_pred"})
-    kalman = kalman_df[["ds", "predicted"]].rename(columns={"predicted": "kalman_pred"})
+    kalman_cols = ["ds", "predicted"]
+    kalman_cols.extend([c for c in PIT_DATE_COLS if c in kalman_df.columns and c not in panel.columns])
+    kalman_cols.extend([c for c in kalman_df.columns if c.startswith("hmm_")])
+    kalman = kalman_df[kalman_cols].rename(columns={"predicted": "kalman_pred"})
     df = panel.merge(kalman, on="ds", how="inner").sort_values("ds").reset_index(drop=True)
-
-    candidates: List[Tuple[str, Optional[float]]] = [
-        ("panel", None),
-        ("kalman", None),
-        ("panel_missing_else_kalman", None),
-    ]
-    candidates.extend(("blend", float(w)) for w in np.linspace(0.35, 0.95, 13))
-    candidates.extend(("gate", float(t)) for t in [25, 50, 75, 100, 125, 150, 175, 200, 250, 300])
+    if selection_lookback is None:
+        selection_lookback = _panel_router_selection_lookback()
+    objective = (objective or _panel_router_objective()).strip().lower()
+    if objective not in PANEL_ROUTER_SUPPORTED_OBJECTIVES:
+        raise ValueError(f"Unsupported panel router objective={objective!r}")
+    candidate_matrix = _panel_router_candidate_matrix(df)
 
     preds: List[float] = []
     rules: List[str] = []
+    selection_scores: List[float] = []
+    history_counts: List[int] = []
+    scored_history_counts: List[int] = []
+    latest_history_ds: List[pd.Timestamp] = []
     for i, row in df.iterrows():
         hist = df.iloc[:i]
-        hist = hist[hist["actual"].notna()].copy()
-        if len(hist) < min_history:
+        hist = _actual_history_available_before(
+            hist,
+            _row_prediction_cutoff(row),
+            pd.Timestamp(row["ds"]),
+        )
+        history_counts.append(int(len(hist)))
+        latest_history_ds.append(hist["ds"].max() if not hist.empty else pd.NaT)
+        score_hist = hist.tail(int(selection_lookback)) if selection_lookback else hist
+        scored_history_counts.append(int(len(score_hist)))
+        if len(hist) < min_history or len(score_hist) < min_history:
             pred = float(row["panel_pred"]) if pd.notna(row.get("panel_pred")) else float(row["kalman_pred"])
             preds.append(pred)
             rules.append("warmup_panel")
+            selection_scores.append(float("nan"))
             continue
 
-        actual = hist["actual"].to_numpy(dtype=float)
-        best: Optional[Tuple[float, str, Optional[float]]] = None
-        for kind, param in candidates:
-            cand = _panel_router_candidate(hist, kind, param).to_numpy(dtype=float)
-            score = _panel_router_score(actual, cand, objective)
-            if best is None or score < best[0]:
-                best = (score, kind, param)
+        actual = score_hist["actual"].to_numpy(dtype=float)
+        score_ds = pd.to_datetime(score_hist["ds"]).to_numpy()
+        consensus = pd.to_numeric(score_hist["consensus_pred"], errors="coerce").to_numpy(dtype=float)
+        best: Optional[Tuple[float, float, str]] = None
+        for name in candidate_matrix.columns:
+            cand = candidate_matrix.loc[score_hist.index, name].to_numpy(dtype=float)
+            score = _panel_router_score(
+                actual,
+                cand,
+                objective,
+                ds=score_ds,
+                consensus=consensus,
+            )
+            kalman_score_share = float(np.nanmean(
+                np.isclose(
+                    cand,
+                    pd.to_numeric(score_hist["kalman_pred"], errors="coerce").to_numpy(dtype=float),
+                    atol=1e-8,
+                )
+            ))
+            if (
+                best is None
+                or score < best[0] - 1e-9
+                or (abs(score - best[0]) <= 1e-9 and kalman_score_share > best[1])
+            ):
+                best = (score, kalman_score_share, name)
 
         assert best is not None
-        pred = float(_panel_router_candidate(row.to_frame().T, best[1], best[2]).iloc[0])
+        pred_value = candidate_matrix.loc[i, best[2]]
+        if pd.isna(pred_value):
+            pred_value = (
+                row["kalman_pred"]
+                if pd.notna(row.get("kalman_pred"))
+                else row.get("consensus_pred")
+            )
+        pred = float(pred_value)
         preds.append(pred)
-        rules.append(best[1] if best[2] is None else f"{best[1]}:{best[2]:.2f}")
+        rules.append(best[2])
+        selection_scores.append(float(best[0]))
 
     out = df.copy()
     out["predicted"] = preds
     out["selected_rule"] = rules
+    out["selected_source"] = out.apply(_panel_router_source, axis=1)
+    out["router_selection_score"] = selection_scores
+    out["router_history_available_n"] = history_counts
+    out["router_scored_history_n"] = scored_history_counts
+    out["router_latest_available_actual_ds"] = latest_history_ds
+    out["router_selection_lookback"] = int(selection_lookback) if selection_lookback else 0
     out["error"] = np.where(out["actual"].notna(), out["actual"] - out["predicted"], np.nan)
+    out["panel_abs_error"] = np.where(
+        out["actual"].notna(),
+        np.abs(out["actual"] - out["panel_pred"]),
+        np.nan,
+    )
+    out["kalman_abs_error"] = np.where(
+        out["actual"].notna(),
+        np.abs(out["actual"] - out["kalman_pred"]),
+        np.nan,
+    )
+    out["router_abs_error"] = np.where(out["actual"].notna(), np.abs(out["error"]), np.nan)
+    out["kalman_beats_panel"] = np.where(
+        out["actual"].notna() & out["panel_abs_error"].notna() & out["kalman_abs_error"].notna(),
+        out["kalman_abs_error"] < out["panel_abs_error"],
+        np.nan,
+    )
     metrics = full_metrics(
         out["actual"].values,
         out["predicted"].values,
         "Panel_Kalman_Router",
         ds=out["ds"],
     )
+    metrics = _metrics_with_consensus_hits(metrics, out)
+    metrics["Router_Kalman_Count"] = int((out["selected_source"] == "kalman").sum())
+    metrics["Router_Live_Panel_Kalman_Count"] = int(
+        ((out["selected_source"] == "kalman") & out["panel_consensus_mean"].notna()).sum()
+    )
+    metrics["Router_Selection_Lookback"] = int(selection_lookback) if selection_lookback else 0
+    metrics["Router_Objective"] = objective
+    out.attrs["candidate_count"] = int(candidate_matrix.shape[1])
     return out, metrics
 
 
@@ -1669,14 +2868,16 @@ def _augment_predictions_csv(
     kalman_df: pd.DataFrame,
     panel_results: Optional[pd.DataFrame] = None,
     panel_router_df: Optional[pd.DataFrame] = None,
+    panel_replacement_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
-    Append Consensus + Kalman_Fusion rows to _output/Predictions/predictions.csv.
+    Append Consensus + final consensus-anchor rows to _output/Predictions/predictions.csv.
 
     For each OOS month (actual is NaN) in the consensus-anchor result frames,
-    add two rows:
-      - Consensus  (the analyst median we are anchoring to)
+    add rows for the benchmark consensus, the diagnostic panel mean, and the
+    two main final models:
       - consensus_anchor_kalman_fusion
+      - consensus_anchor_panel_kalman_router
 
     AccelOverride and Kalman+AccelPostFilter were dropped (2026-05-11) because
     both consistently underperformed the Consensus baseline.
@@ -1707,6 +2908,8 @@ def _augment_predictions_csv(
         ("consensus_anchor_panel_kalman_router", panel_router_df),
         ("consensus_anchor_kalman_fusion", kalman_df),
     ]
+    if panel_replacement_df is not None and not panel_replacement_df.empty:
+        variant_specs.append((PANEL_REPLACES_CONSENSUS_MODEL, panel_replacement_df))
 
     # Restrict to the next-to-release month only. predictions.csv is the
     # next-NFP forecast bundle, not a multi-month forward strip — the base
@@ -1721,7 +2924,7 @@ def _augment_predictions_csv(
             return True
         return pd.Timestamp(row_ds) == target_ds
 
-    # Consensus row (the analyst median anchor). No CI — it's a single number.
+    # Consensus row (the analyst consensus anchor). No CI — it's a single number.
     cons_oos = cons_results[cons_results["actual"].isna()].copy().sort_values("ds")
     if target_ds is None and not cons_oos.empty:
         target_ds = pd.Timestamp(cons_oos.iloc[0]["ds"])
@@ -1737,7 +2940,7 @@ def _augment_predictions_csv(
             "lower_95": np.nan, "upper_95": np.nan,
         })
         logger.info(
-            "  Consensus %s -> %.0f (analyst median anchor)",
+                "  Consensus %s -> %.0f (analyst consensus anchor)",
             pd.Timestamp(row["ds"]).strftime("%Y-%m"), float(row["predicted"]),
         )
 
@@ -1797,6 +3000,7 @@ def run_consensus_anchor_pipeline(
     tune: bool = True,
     n_trials: int = N_OPTUNA_TRIALS,
     timeout: int = OPTUNA_TIMEOUT,
+    require_panel_router: bool = True,
 ) -> Dict[str, Dict]:
     """
     Run the full consensus-anchor post-training pipeline.
@@ -1806,6 +3010,9 @@ def run_consensus_anchor_pipeline(
         tune: Enable Optuna hyperparameter tuning.
         n_trials: Number of Optuna trials per approach.
         timeout: Optuna timeout in seconds per approach.
+        require_panel_router: If True, fail the post-train stage when the
+            Panel/Kalman Router cannot be built. This is the train-all default
+            because the router is now a first-class final forecast.
 
     Returns:
         Dict mapping approach names to their metrics dicts.
@@ -1823,6 +3030,27 @@ def run_consensus_anchor_pipeline(
     # 1) Build merged dataset
     logger.info("Building merged consensus+model dataset...")
     merged = build_merged_dataset(output_base=output_base)
+    panel_replacement_df: Optional[pd.DataFrame] = None
+    panel_replacement_manifest: Optional[Dict[str, object]] = None
+    panel_replacement_config: Optional[Dict[str, object]] = None
+    panel_replacement_enabled = panel_replaces_consensus_enabled()
+    if panel_replacement_enabled:
+        panel_replacement_config = _panel_replacement_config()
+        logger.info(
+            "Gated Panel-Replaces-Consensus Kalman experiment enabled via %s "
+            "(window=%s top_n=%s coverage=%.2f pooling=%s tw=%s nsa_ws=%.2f)",
+            PANEL_REPLACES_CONSENSUS_ENV,
+            panel_replacement_config["track_window"],
+            panel_replacement_config["top_n"],
+            float(panel_replacement_config["min_coverage_pct"]),
+            panel_replacement_config["pooling"],
+            panel_replacement_config["trailing_window"],
+            float(panel_replacement_config["nsa_weight_scale"]),
+        )
+        merged, panel_replacement_df, panel_replacement_manifest = _attach_rolling_panel_replacement(
+            merged,
+            config=panel_replacement_config,
+        )
     consensus_df, overlap_df, overlap_with_oos = split_datasets(merged)
 
     n_oos = int(overlap_with_oos["actual"].isna().sum())
@@ -1853,16 +3081,20 @@ def run_consensus_anchor_pipeline(
         "Baseline_Consensus",
         ds=overlap_df["ds"],
     )
-    all_metrics.append(cons_base)
     logger.info("  Consensus: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
                 cons_base["MAE"], cons_base["RMSE"], cons_base["Acceleration_Accuracy"])
 
     # Write a full diagnostics bundle for the consensus baseline so it has the
     # same plot/CSV/ACF artifacts as the three model approaches.
-    cons_results = overlap_with_oos[["ds", "actual", "consensus_pred"]].copy()
+    cons_keep_cols = ["ds", "actual", "consensus_pred"]
+    if "consensus_median_pred" in overlap_with_oos.columns:
+        cons_keep_cols.append("consensus_median_pred")
+    cons_results = overlap_with_oos[cons_keep_cols].copy()
     cons_results = cons_results.dropna(subset=["consensus_pred"]).sort_values("ds").reset_index(drop=True)
     cons_results = cons_results.rename(columns={"consensus_pred": "predicted"})
     cons_results["consensus_pred"] = cons_results["predicted"]
+    cons_base = _metrics_with_consensus_hits(cons_base, cons_results)
+    all_metrics.append(cons_base)
     cons_results["error"] = np.where(
         cons_results["actual"].notna(),
         cons_results["actual"] - cons_results["predicted"],
@@ -1872,7 +3104,7 @@ def run_consensus_anchor_pipeline(
         results_df=cons_results,
         out_dir=out_dir / "baseline_consensus",
         model_id="baseline_consensus",
-        diagnostics_label="Baseline Consensus (Bloomberg/Reuters median)",
+        diagnostics_label="Baseline Consensus (Bloomberg/Reuters mean)",
     )
 
     panel_results: Optional[pd.DataFrame] = None
@@ -1882,7 +3114,10 @@ def run_consensus_anchor_pipeline(
             "ds", "actual", "consensus_pred",
             "panel_consensus_mean", "panel_consensus_median",
             "panel_consensus_count", "panel_consensus_std",
+            "target_release_date", "actual_available_date",
         ]
+        if "consensus_median_pred" in overlap_with_oos.columns:
+            panel_keep_cols.append("consensus_median_pred")
         panel_keep_cols = [c for c in panel_keep_cols if c in overlap_with_oos.columns]
         panel_results = overlap_with_oos[panel_keep_cols].copy()
         panel_results["predicted"] = panel_results["panel_consensus_mean"].combine_first(
@@ -1907,6 +3142,7 @@ def run_consensus_anchor_pipeline(
                 "Panel_Consensus_Mean",
                 ds=panel_eval["ds"],
             )
+            panel_metrics = _metrics_with_consensus_hits(panel_metrics, panel_eval)
             all_metrics.append(panel_metrics)
             logger.info(
                 "  Panel mean: MAE=%.1f RMSE=%.1f AccelAcc=%.3f "
@@ -1920,13 +3156,26 @@ def run_consensus_anchor_pipeline(
                 model_id="panel_consensus_mean",
                 diagnostics_label="PIT Economist Panel Mean",
             )
+    elif require_panel_router:
+        raise RuntimeError(
+            "Panel/Kalman Router is required, but no PIT economist panel columns "
+            "were found in merged_consensus_model. Rebuild master snapshots with "
+            "the Economist Panel source before running train-all."
+        )
 
-    champ_ov = overlap_df[["ds", "actual", "champion_pred"]].dropna()
+    champ_cols = ["ds", "actual", "champion_pred", "consensus_pred"]
+    if "consensus_median_pred" in overlap_df.columns:
+        champ_cols.append("consensus_median_pred")
+    champ_ov = overlap_df[champ_cols].dropna(subset=["actual", "champion_pred"])
     champ_base = full_metrics(
         champ_ov["actual"].values,
         champ_ov["champion_pred"].values,
         "Baseline_Champion",
         ds=champ_ov["ds"],
+    )
+    champ_base = _metrics_with_consensus_hits(
+        champ_base,
+        champ_ov.rename(columns={"champion_pred": "predicted"}),
     )
     all_metrics.append(champ_base)
     logger.info("  Champion:  MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
@@ -2037,6 +3286,11 @@ def run_consensus_anchor_pipeline(
                 # Rebuild merged dataset so the rest of the pipeline reads
                 # the freshly-tuned champion.
                 merged = build_merged_dataset(output_base=output_base)
+                if panel_replacement_enabled:
+                    merged, panel_replacement_df, panel_replacement_manifest = _attach_rolling_panel_replacement(
+                        merged,
+                        config=panel_replacement_config or _panel_replacement_config(),
+                    )
                 consensus_df, overlap_df, overlap_with_oos = split_datasets(merged)
             except Exception as e:
                 logger.warning(
@@ -2088,17 +3342,24 @@ def run_consensus_anchor_pipeline(
     panel_router_metrics: Optional[Dict] = None
     if panel_results is not None and not panel_results.empty:
         try:
+            panel_router_selection_lookback = _panel_router_selection_lookback()
+            panel_router_objective = _panel_router_objective()
             panel_router_df, panel_router_metrics = build_panel_kalman_router(
                 panel_results,
                 kalman_df,
                 min_history=24,
-                objective="mae",
+                objective=panel_router_objective,
+                selection_lookback=panel_router_selection_lookback,
             )
             all_metrics.append(panel_router_metrics)
             logger.info(
-                "  Panel/Kalman Router: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
+                "  Panel/Kalman Router: MAE=%.1f RMSE=%.1f AccelAcc=%.3f "
+                "(objective=%s, selection_lookback=%s, live_panel_kalman=%d)",
                 panel_router_metrics["MAE"], panel_router_metrics["RMSE"],
                 panel_router_metrics["Acceleration_Accuracy"],
+                panel_router_objective,
+                panel_router_selection_lookback or "all",
+                int(panel_router_metrics.get("Router_Live_Panel_Kalman_Count", 0)),
             )
             write_sandbox_output_bundle(
                 results_df=panel_router_df,
@@ -2107,24 +3368,165 @@ def run_consensus_anchor_pipeline(
                 diagnostics_label="PIT Panel/Kalman Router",
             )
             rule_counts = panel_router_df["selected_rule"].value_counts().to_dict()
+            source_counts = panel_router_df["selected_source"].value_counts(dropna=False).to_dict()
             with open(out_dir / "panel_kalman_router" / "router_manifest.json", "w") as f:
                 json.dump({
-                    "objective": "mae",
+                    "objective": panel_router_objective,
                     "min_history": 24,
+                    "selection_lookback": panel_router_selection_lookback or "all",
+                    "selection_lookback_env": PANEL_ROUTER_SELECTION_LOOKBACK_ENV,
+                    "objective_env": PANEL_ROUTER_OBJECTIVE_ENV,
+                    "learned_router_enabled": _learned_panel_router_enabled(),
+                    "candidate_count": int(panel_router_df.attrs.get("candidate_count", 0)),
                     "rule_counts": rule_counts,
+                    "source_counts": source_counts,
+                    "live_panel_kalman_count": int(
+                        ((panel_router_df["selected_source"] == "kalman")
+                         & panel_router_df["panel_consensus_mean"].notna()).sum()
+                    ),
                     "pit_validation": "routing rule selected from prior actual months only",
                 }, f, indent=2)
         except Exception as exc:
+            if require_panel_router:
+                raise RuntimeError("Required Panel/Kalman router failed") from exc
             logger.warning("Panel/Kalman router failed: %s", exc)
+    elif require_panel_router:
+        raise RuntimeError(
+            "Panel/Kalman Router is required, but the PIT economist panel "
+            "diagnostic frame is empty."
+        )
+
+    panel_replace_kalman_df: Optional[pd.DataFrame] = None
+    panel_replace_kalman_metrics: Optional[Dict] = None
+    panel_replace_kalman_manifest: Optional[Dict[str, object]] = None
+    if panel_replacement_enabled:
+        try:
+            panel_replace_kalman_df, panel_replace_kalman_metrics, panel_replace_kalman_manifest = (
+                build_panel_replaces_consensus_kalman(
+                    overlap_with_oos,
+                    consensus_df,
+                    config=panel_replacement_config or _panel_replacement_config(),
+                )
+            )
+            all_metrics.append(panel_replace_kalman_metrics)
+            logger.info(
+                "  Panel-Replaces-Consensus Kalman: MAE=%.1f RMSE=%.1f AccelAcc=%.3f",
+                panel_replace_kalman_metrics["MAE"],
+                panel_replace_kalman_metrics["RMSE"],
+                panel_replace_kalman_metrics["Acceleration_Accuracy"],
+            )
+            panel_replace_dir = out_dir / PANEL_REPLACES_CONSENSUS_DIR
+            write_sandbox_output_bundle(
+                results_df=panel_replace_kalman_df,
+                out_dir=panel_replace_dir,
+                model_id=PANEL_REPLACES_CONSENSUS_DIR,
+                diagnostics_label="PIT Rolling Panel-Replaces-Consensus Kalman",
+            )
+            if panel_replacement_df is not None:
+                panel_replacement_df.to_csv(
+                    panel_replace_dir / "panel_replacement_pit_audit.csv",
+                    index=False,
+                )
+            manifest_payload = {
+                "rolling_panel": panel_replacement_manifest,
+                "kalman_experiment": panel_replace_kalman_manifest,
+            }
+            with open(panel_replace_dir / "experiment_manifest.json", "w") as f:
+                json.dump(manifest_payload, f, indent=2, default=str)
+        except Exception as exc:
+            raise RuntimeError("Panel-Replaces-Consensus Kalman experiment failed") from exc
 
     # AccelOverride and Kalman+AccelPostFilter were removed (2026-05-11) because
     # both consistently underperformed the analyst Consensus baseline on the
-    # 60-month backtest window. The Kalman_Fusion variant is the sole anchored
-    # forecast we now emit alongside the raw Consensus baseline.
+    # 60-month backtest window. Kalman_Fusion and Panel_Kalman_Router are the
+    # two main final forecasts; raw Consensus and panel mean remain diagnostics.
 
     # 4) Comparison metrics CSV
     metrics_df = pd.DataFrame(all_metrics).sort_values("MAE").reset_index(drop=True)
     metrics_df.to_csv(out_dir / "comparison_metrics.csv", index=False)
+
+    def _metric_snapshot(metrics: Optional[Dict]) -> Optional[Dict]:
+        if metrics is None:
+            return None
+        keep = [
+            "Forecast", "N", "MAE", "RMSE", "Directional_Accuracy",
+            "Acceleration_Accuracy", "Tail_MAE", "Extreme_Hit_Rate",
+            "NonCovid_MAE", "NonCovid_RMSE",
+            "HitRate_vs_ConsensusMean_NonCovid",
+            "HitRate_vs_ConsensusMedian_NonCovid",
+            "MeanAbsErrorDelta_vs_ConsensusMean_NonCovid",
+            "Router_Objective",
+        ]
+        return {k: metrics.get(k) for k in keep if k in metrics}
+
+    main_models_manifest = {
+        "main_models": [
+            {
+                "model_id": "consensus_anchor_kalman_fusion",
+                "forecast": kalman_metrics.get("Forecast"),
+                "artifact_dir": "consensus_anchor/kalman_fusion",
+                "role": "existing Kalman fusion final forecast",
+                "metrics": _metric_snapshot(kalman_metrics),
+            },
+            {
+                "model_id": "consensus_anchor_panel_kalman_router",
+                "forecast": (
+                    panel_router_metrics.get("Forecast")
+                    if panel_router_metrics is not None else None
+                ),
+                "artifact_dir": "consensus_anchor/panel_kalman_router",
+                "role": "PIT walk-forward router over economist panel and Kalman",
+                "metrics": _metric_snapshot(panel_router_metrics),
+            },
+        ],
+        "experimental_outputs": (
+            [
+                {
+                    "model_id": PANEL_REPLACES_CONSENSUS_MODEL,
+                    "forecast": (
+                        panel_replace_kalman_metrics.get("Forecast")
+                        if panel_replace_kalman_metrics is not None else None
+                    ),
+                    "artifact_dir": f"consensus_anchor/{PANEL_REPLACES_CONSENSUS_DIR}",
+                    "role": (
+                        "gated experiment: PIT rolling economist panel replaces "
+                        "the consensus level observation, with consensus fallback "
+                        "when panel is missing"
+                    ),
+                    "enabled_by": PANEL_REPLACES_CONSENSUS_ENV,
+                    "metrics": _metric_snapshot(panel_replace_kalman_metrics),
+                }
+            ]
+            if panel_replace_kalman_metrics is not None else []
+        ),
+        "diagnostic_outputs": [
+            "consensus_anchor/baseline_consensus",
+            "consensus_anchor/panel_consensus_mean",
+            "NSA_plus_adjustment",
+        ],
+        "pit_validation": {
+            "kalman": (
+                "measurement noise and router sidecar effects are estimated "
+                "inside the monthly loop from df.iloc[:i] historical actuals only"
+            ),
+            "panel_router": (
+                "for each target month, selected_rule is chosen by scoring "
+                "candidate rules only on earlier rows with actuals"
+            ),
+            "panel_data": (
+                "economist panel values are read from each target month's PIT "
+                "master snapshot row"
+            ),
+            "panel_replaces_consensus_experiment": (
+                "when enabled, the rolling full-economist panel is selected "
+                "per month from current forecasts released before that month "
+                "NFP release and ranked using only prior actuals available "
+                "before the same cutoff"
+            ),
+        },
+    }
+    with open(out_dir / "main_models.json", "w") as f:
+        json.dump(main_models_manifest, f, indent=2, default=str)
 
     logger.info("\nComparison (sorted by MAE):")
     for _, row in metrics_df.iterrows():
@@ -2141,6 +3543,8 @@ def run_consensus_anchor_pipeline(
         forecast_dfs[panel_metrics["Forecast"]] = panel_results
     if panel_router_df is not None and panel_router_metrics is not None:
         forecast_dfs[panel_router_metrics["Forecast"]] = panel_router_df
+    if panel_replace_kalman_df is not None and panel_replace_kalman_metrics is not None:
+        forecast_dfs[panel_replace_kalman_metrics["Forecast"]] = panel_replace_kalman_df
     try:
         write_comparison_visualization(out_dir, forecast_dfs, metrics_df)
         logger.info("Wrote unified comparison visualization (overlay + bar + HTML)")
@@ -2157,6 +3561,7 @@ def run_consensus_anchor_pipeline(
             kalman_df=kalman_df,
             panel_results=panel_results,
             panel_router_df=panel_router_df,
+            panel_replacement_df=panel_replace_kalman_df,
         )
     except Exception as exc:
         logger.warning("Augmenting predictions.csv failed: %s", exc)

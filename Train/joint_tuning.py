@@ -82,6 +82,7 @@ from Train.config import (
     NUM_BOOST_ROUND,
     N_OPTUNA_TRIALS,
     OPTUNA_TIMEOUT,
+    lgbm_n_jobs,
 )
 
 logger = setup_logger(__file__, TEMP_DIR)
@@ -388,7 +389,7 @@ def tune_full_pipeline_joint(
             'metric': 'mae',
             'boosting_type': 'gbdt',
             'verbosity': -1,
-            'n_jobs': -1,
+            'n_jobs': lgbm_n_jobs(),
             **LGBM_DETERMINISM,
             'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.15, log=True),
             'num_leaves': trial.suggest_int('num_leaves', 15, 127),
@@ -524,7 +525,7 @@ def tune_full_pipeline_joint(
         'metric': 'mae',
         'boosting_type': 'gbdt',
         'verbosity': -1,
-        'n_jobs': -1,
+        'n_jobs': lgbm_n_jobs(),
         **LGBM_DETERMINISM,
         'learning_rate': best_params['learning_rate'],
         'num_leaves': best_params['num_leaves'],

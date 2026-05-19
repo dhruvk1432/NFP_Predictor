@@ -45,6 +45,7 @@ from Data_ETA_Pipeline.perf_stats import (
 from Data_ETA_Pipeline.feature_selection_engine import (
     load_snapshot_wide, _classify_series, run_full_source_pipeline, MIN_VALID_OBS
 )
+from Train.config import get_master_snapshots_dir
 from Train.data_loader import load_target_data, sanitize_feature_name
 from Train.feature_engineering_sa_nsa_gap import (
     FEATURE_COLS as SA_NSA_GAP_FEATURE_COLS,
@@ -105,12 +106,11 @@ SOURCES = {
     'NOAA': DATA_PATH / "Exogenous_data" / "exogenous_noaa_snapshots" / "decades",
     'Prosper': DATA_PATH / "Exogenous_data" / "prosper" / "decades",
     'Futures': DATA_PATH / "Exogenous_data" / "exogenous_futures_data" / "decades",
-    'EconomistPanel': DATA_PATH / "Exogenous_data" / "exogenous_economist_data" / "decades",
 }
 
 # Ordered by typical execution time (longest to shortest) to optimize ProcessPool scheduling
 SOURCE_EXEC_ORDER = ['FRED_Employment_NSA', 'FRED_Employment_SA', 'FRED_Exogenous',
-                     'Unifier', 'Prosper', 'NOAA', 'ADP', 'Futures', 'EconomistPanel']
+                     'Unifier', 'Prosper', 'NOAA', 'ADP', 'Futures']
 
 # All 4 combinations of target category and target source
 TARGET_COMBOS = [
@@ -1031,14 +1031,14 @@ def _run_unified_no_selection(
     """Generate master snapshots containing ALL source features (no selection).
 
     Loads all 7 sources (including both NSA *and* SA employment) and merges
-    them into a single wide-format parquet per month.  The identical parquet
-    is then copied to all 4 branch paths so that the training pipeline's
-    ``get_master_snapshot_path()`` contract is satisfied.
+    them into a single wide-format parquet per month written directly to
+    ``data/master_snapshots/sa/revised/decades/``. Readers asking for either
+    ``target_type='sa'`` or ``target_type='nsa'`` are routed to this same
+    location by ``Train.config.get_master_snapshots_dir``.
 
     After generation, writes an ``all_features`` marker JSON for each branch.
     """
     import gc
-    import shutil
 
     # Apply optional date bounds
     pairs = list(snapshot_pairs)
@@ -1053,11 +1053,14 @@ def _run_unified_no_selection(
         logger.info("No snapshot months to process.")
         return
 
-    # ── Unified output dir (canonical copy) ──
-    unified_dir = MASTER_BASE / "_unified" / "decades"
-    unified_dir.mkdir(parents=True, exist_ok=True)
+    # ── Canonical output dir ──
+    # All branches resolve to the same location via get_master_snapshots_dir;
+    # writes land in the single canonical store. Skipped-on-crash recovery is
+    # handled by the progress file + skip_existing flag.
+    canonical_branch_dir = get_master_snapshots_dir("sa", "revised")
+    canonical_branch_dir.mkdir(parents=True, exist_ok=True)
 
-    # Progress tracking (reuse existing helpers with a synthetic branch key)
+    # Progress tracking (key kept stable for resume continuity).
     progress_key_cat, progress_key_src = "_unified", "all"
     completed_months = _load_progress(progress_key_cat, progress_key_src)
 
@@ -1067,7 +1070,7 @@ def _run_unified_no_selection(
         mk = obs.strftime('%Y-%m')
         if mk in completed_months:
             continue
-        if skip_existing and _snapshot_path(unified_dir, obs).exists():
+        if skip_existing and _snapshot_path(canonical_branch_dir, obs).exists():
             completed_months.add(mk)
             continue
         pending_pairs.append((obs, snap))
@@ -1117,7 +1120,7 @@ def _run_unified_no_selection(
                     master['date'] = pd.to_datetime(master['date'])
                     master = _augment_with_sa_nsa_gap(master, snap_date)
                     master['snapshot_date'] = snap_date
-                    save_path = _snapshot_path(unified_dir, obs_month)
+                    save_path = _snapshot_path(canonical_branch_dir, obs_month)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     master.to_parquet(save_path, index=False)
                     return month_key, master.shape[1], None
@@ -1147,25 +1150,6 @@ def _run_unified_no_selection(
             gc.collect()
 
     _clear_progress(progress_key_cat, progress_key_src)
-
-    # ── Copy unified parquets to all 4 branch paths ──
-    branch_dirs: dict[str, Path] = {}
-    for target_cat, target_source in TARGET_COMBOS:
-        branch_dir = MASTER_BASE / target_cat / target_source / "decades"
-        branch_dir.mkdir(parents=True, exist_ok=True)
-        branch_dirs[f"{target_cat}/{target_source}"] = branch_dir
-
-    # Walk unified dir and copy each parquet
-    unified_parquets = sorted(unified_dir.rglob("*.parquet"))
-    logger.info(f"[no-selection] Copying {len(unified_parquets)} parquets to 4 branch paths...")
-    for src_path in unified_parquets:
-        rel = src_path.relative_to(unified_dir)
-        for branch_label, branch_dir in branch_dirs.items():
-            dst = branch_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dst)
-
-    logger.info(f"[no-selection] Copied to branches: {list(branch_dirs.keys())}")
 
     # ── Write all_features marker JSON for each branch ──
     marker = {
@@ -1512,7 +1496,7 @@ def _run_skip_fs_branch(
     This path is used only in the fast skip-FS mode and parallelized across branches.
     """
     label = f"{target_cat.upper()}/{target_source}"
-    target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
+    target_master_dir = get_master_snapshots_dir(target_cat, target_source)
     static_feature_set = set(static_features)
 
     completed_months = _load_progress(target_cat, target_source)
@@ -1861,7 +1845,7 @@ def create_master_snapshots(
         )
         logger.info(f"========== COMMENCING BRANCH: {label} ==========")
         logger.info(f"[{label}] Feature-selection target mode: {branch_selection_mode}")
-        target_master_dir = MASTER_BASE / target_cat / target_source / "decades"
+        target_master_dir = get_master_snapshots_dir(target_cat, target_source)
 
         # 1. Build feature sets for this branch.
         all_branch_months = [obs for obs, _ in snapshot_pairs]

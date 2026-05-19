@@ -28,15 +28,24 @@ from typing import Dict, List, Set
 
 import pyarrow.parquet as pq
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from Train.config import get_master_snapshots_dir  # noqa: E402
 
+
+# Both branches share the same on-disk snapshots dir (resolved via
+# get_master_snapshots_dir); only the per-branch selected-features marker file
+# differs. The script keeps a per-branch entry so each marker can be honoured.
 BRANCH_CONFIG = {
     "nsa_revised": {
         "features_json": "selected_features_nsa_revised.json",
-        "snapshots_dir": "nsa/revised/decades",
+        "target_type": "nsa",
+        "target_source": "revised",
     },
     "sa_revised": {
         "features_json": "selected_features_sa_revised.json",
-        "snapshots_dir": "sa/revised/decades",
+        "target_type": "sa",
+        "target_source": "revised",
     },
 }
 
@@ -163,9 +172,11 @@ def main() -> int:
     parser.add_argument(
         "--branches",
         nargs="*",
-        default=list(BRANCH_CONFIG.keys()),
+        default=["sa_revised"],
         choices=list(BRANCH_CONFIG.keys()),
-        help="Subset of branches to process.",
+        help="Subset of branches to process. Default is sa_revised only; both "
+             "branches resolve to the same on-disk dir, so processing both "
+             "would re-prune the same files.",
     )
     parser.add_argument(
         "--dry-run",
@@ -186,7 +197,7 @@ def main() -> int:
         cfg = BRANCH_CONFIG[branch]
         selected_set = _load_selected_features(master_snapshots_dir, cfg["features_json"])
         selected_by_branch[branch] = selected_set
-        branch_dir = master_snapshots_dir / cfg["snapshots_dir"]
+        branch_dir = get_master_snapshots_dir(cfg["target_type"], cfg["target_source"])
         branch_files = _collect_branch_files(branch_dir)
         files_to_process.extend((branch, p) for p in branch_files)
         print(

@@ -13,10 +13,12 @@ try:
     from settings import DATA_PATH
     from Train.config import get_master_snapshots_dir
 except RuntimeError:
+    # Sidecar tests sometimes run before settings/env is fully initialised.
+    # Mirror the canonical resolver: any target_type → sa/revised/decades.
     DATA_PATH = Path("data")
 
     def get_master_snapshots_dir(target_type: str, target_source: str = "revised") -> Path:
-        return DATA_PATH / "master_snapshots" / target_type / target_source / "decades"
+        return DATA_PATH / "master_snapshots" / "sa" / "revised" / "decades"
 
 
 BLOCK_PREFIXES: dict[str, tuple[str, ...]] = {
@@ -78,10 +80,20 @@ def load_target(target_space: str = "sa_revised", target_path: Path | None = Non
         keep.append("y")
     if "release_date" in out.columns:
         keep.append("release_date")
+    if "operational_available_date" in out.columns:
+        keep.append("operational_available_date")
     return out[keep].dropna(subset=["ds"]).sort_values("ds").reset_index(drop=True)
 
 
 def add_target_dynamics(target: pd.DataFrame, prefix: str = "target") -> pd.DataFrame:
+    target = target.copy().sort_values("ds").reset_index(drop=True)
+    has_availability = {
+        "release_date",
+        "operational_available_date",
+    }.issubset(target.columns)
+    if has_availability:
+        return _add_target_dynamics_pit(target, prefix=prefix)
+
     df = target[["ds", "y_mom"]].copy().sort_values("ds").reset_index(drop=True)
     df["actual_mom"] = df["y_mom"]
     df["prev_mom"] = df["y_mom"].shift(1)
@@ -97,6 +109,79 @@ def add_target_dynamics(target: pd.DataFrame, prefix: str = "target") -> pd.Data
         std = df[f"{prefix}_mom_std_{window}m"].replace(0.0, np.nan)
         df[f"{prefix}_mom_z_{window}m"] = (shifted - mean) / std
     df[f"{prefix}_mom_vs_12m_trend"] = df[f"{prefix}_mom_lag1"] - df[f"{prefix}_mom_mean_12m"]
+    return df
+
+
+def _history_values_before(row: pd.Series, target: pd.DataFrame) -> np.ndarray:
+    cutoff = pd.Timestamp(row["release_date"])
+    current_ds = pd.Timestamp(row["ds"])
+    hist = target[
+        (pd.to_datetime(target["ds"]) < current_ds)
+        & pd.to_numeric(target["y_mom"], errors="coerce").notna()
+    ].copy()
+    avail = pd.to_datetime(hist["operational_available_date"], errors="coerce")
+    hist = hist[avail.notna() & (avail < cutoff)]
+    return hist.sort_values("ds")["y_mom"].astype(float).to_numpy()
+
+
+def _add_target_dynamics_pit(target: pd.DataFrame, prefix: str = "target") -> pd.DataFrame:
+    """Target dynamics using only actuals available before each row's release.
+
+    Revised NFP actuals for the immediately previous month are commonly
+    published on the same date as the current target release, so a plain
+    ``shift(1)`` would leak same-day information into sidecar features.
+    """
+    keep_cols = ["ds", "y_mom", "release_date", "operational_available_date"]
+    if "y" in target.columns:
+        keep_cols.insert(2, "y")
+    df = target[keep_cols].copy().sort_values("ds").reset_index(drop=True)
+    df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce")
+    df["operational_available_date"] = pd.to_datetime(
+        df["operational_available_date"],
+        errors="coerce",
+    )
+    df["actual_mom"] = pd.to_numeric(df["y_mom"], errors="coerce")
+
+    for col in ["prev_mom", "actual_accel"]:
+        df[col] = np.nan
+    for lag in (1, 2, 3, 6, 12):
+        df[f"{prefix}_mom_lag{lag}"] = np.nan
+        df[f"{prefix}_accel_lag{lag}"] = np.nan
+    for window in (3, 6, 12):
+        df[f"{prefix}_mom_mean_{window}m"] = np.nan
+        df[f"{prefix}_mom_std_{window}m"] = np.nan
+        df[f"{prefix}_mom_z_{window}m"] = np.nan
+    df[f"{prefix}_mom_vs_12m_trend"] = np.nan
+
+    for idx, row in df.iterrows():
+        if pd.isna(row["release_date"]):
+            continue
+        values = _history_values_before(row, df)
+        if values.size:
+            df.at[idx, "prev_mom"] = float(values[-1])
+            if pd.notna(row["actual_mom"]):
+                df.at[idx, "actual_accel"] = float(row["actual_mom"]) - float(values[-1])
+        diffs = np.diff(values) if values.size >= 2 else np.array([])
+        for lag in (1, 2, 3, 6, 12):
+            if values.size >= lag:
+                df.at[idx, f"{prefix}_mom_lag{lag}"] = float(values[-lag])
+            if diffs.size >= lag:
+                df.at[idx, f"{prefix}_accel_lag{lag}"] = float(diffs[-lag])
+        for window in (3, 6, 12):
+            min_periods = max(2, window // 2)
+            recent = values[-window:]
+            if recent.size >= min_periods:
+                mean = float(np.mean(recent))
+                std = float(np.std(recent, ddof=1)) if recent.size >= 2 else np.nan
+                df.at[idx, f"{prefix}_mom_mean_{window}m"] = mean
+                df.at[idx, f"{prefix}_mom_std_{window}m"] = std
+                if np.isfinite(std) and std > 0 and values.size:
+                    df.at[idx, f"{prefix}_mom_z_{window}m"] = (float(values[-1]) - mean) / std
+        if pd.notna(df.at[idx, f"{prefix}_mom_lag1"]) and pd.notna(df.at[idx, f"{prefix}_mom_mean_12m"]):
+            df.at[idx, f"{prefix}_mom_vs_12m_trend"] = (
+                float(df.at[idx, f"{prefix}_mom_lag1"])
+                - float(df.at[idx, f"{prefix}_mom_mean_12m"])
+            )
     return df
 
 

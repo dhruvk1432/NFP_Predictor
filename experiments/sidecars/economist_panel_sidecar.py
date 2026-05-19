@@ -1,14 +1,10 @@
 """Economist panel sidecar — automatic forecaster selection + per-economist
 transformations + multi-variant pooling, exploiting the FULL 261-economist
-panel (not the hardcoded Top-4).
+panel.
 
-The legacy ``load_economist_panel.py`` ETL hardcodes 4 names (CONTINUUM ECON,
-NATIONWIDE INSUR, DANSKE BK, AIB) picked off a single 36-month window. That
-selection is brittle: the best-window-3y leader (UBS, RMSE 55.6) isn't in
-the legacy list at all, and forecasters' relative skill rotates as regimes
-shift. This sidecar instead pulls every available forecaster's raw history,
-ranks them by **PIT-safe trailing track record** at each backtest step, and
-applies per-economist bias correction before pooling.
+Pulls every available forecaster's raw history, ranks them by **PIT-safe
+trailing track record** at each backtest step, and applies per-economist
+bias correction before pooling.
 
 For each backtest target month M:
   1. Load every economist's raw forecast for M where
@@ -40,7 +36,6 @@ For each backtest target month M:
          - ``..._trimmed10``: 10/90 trimmed mean of all eligible
          - ``..._topN_simple``: equal-weight mean of top-N (untransformed)
          - ``..._topN_bc_simple``: equal-weight mean of top-N (bias-corrected)
-         - ``..._legacy_top4_mean``: hardcoded Top-4 mean (legacy A/B)
        - Diagnostic in ``regime_*`` columns:
          - ``regime_panel_n``: count of eligible forecasters
          - ``regime_panel_n_calibrated``: count with track record
@@ -146,12 +141,6 @@ class PanelConfig:
     # it over-shoots actuals. Flag retained for regime changes.
     apply_bias_correction: bool = False
 
-    legacy_top4: Tuple[str, ...] = (
-        "CONTINUUM ECON",
-        "NATIONWIDE INSUR",
-        "DANSKE BK",
-        "AIB",
-    )
     run_id: str = "economist_panel_v1"
 
 
@@ -161,10 +150,31 @@ class PanelConfig:
 
 def _load_target_actuals() -> pd.Series:
     """Return ``y_sa_revised.y_mom`` indexed by target month (ds)."""
-    df = pd.read_parquet(NFP_TARGET_PATH)[["ds", "y_mom"]]
+    raw = pd.read_parquet(NFP_TARGET_PATH)
+    keep = ["ds", "y_mom"]
+    if "operational_available_date" in raw.columns:
+        keep.append("operational_available_date")
+    df = raw[keep].copy()
     df["ds"] = pd.to_datetime(df["ds"]).dt.to_period("M").dt.to_timestamp()
     df = df.dropna(subset=["y_mom"]).sort_values("ds").drop_duplicates("ds")
-    return pd.Series(df["y_mom"].to_numpy(dtype=float), index=df["ds"], name="actual")
+    actuals = pd.Series(df["y_mom"].to_numpy(dtype=float), index=df["ds"], name="actual")
+    if "operational_available_date" in df.columns:
+        avail = pd.Series(
+            pd.to_datetime(df["operational_available_date"], errors="coerce").to_numpy(),
+            index=df["ds"],
+            name="actual_available_date",
+        )
+        actuals.attrs["actual_available_date_by_ds"] = avail
+    return actuals
+
+
+def _actual_availability_series(actuals: pd.Series) -> Optional[pd.Series]:
+    avail = actuals.attrs.get("actual_available_date_by_ds")
+    if avail is None:
+        return None
+    avail = pd.Series(avail).copy()
+    avail.index = pd.to_datetime(avail.index).to_period("M").to_timestamp()
+    return pd.to_datetime(avail, errors="coerce")
 
 
 def _load_nfp_release_map() -> pd.Series:
@@ -197,13 +207,13 @@ def _load_nfp_release_map() -> pd.Series:
                     f"monotone rows:\n{bad.to_string()}"
                 )
             return pd.Series(df["release_date"].to_numpy(), index=df["ds"])
-    # Fallback: conservative under-bound — strictly earlier than any
-    # plausible BLS release (which is the first Friday of M+1, i.e.,
-    # earliest day 1, latest ~day 8). Using day 1 of M+1 ensures the
-    # fallback never admits a forecast that may not have been public.
+    # Fallback: strictly conservative under-bound — last day of M itself,
+    # which is always before the BLS release of M (which happens on the
+    # first Friday of M+1, earliest day 1). This guarantees no forecast
+    # filed between day 1..8 of M+1 (potentially after release) is admitted.
     df = pd.read_parquet(NFP_TARGET_PATH)[["ds"]].copy()
     df["ds"] = pd.to_datetime(df["ds"]).dt.to_period("M").dt.to_timestamp()
-    df["release_date"] = df["ds"] + pd.DateOffset(months=1) + pd.DateOffset(days=1)
+    df["release_date"] = df["ds"] + pd.offsets.MonthEnd(0)
     df = df.drop_duplicates("ds").sort_values("ds")
     return pd.Series(df["release_date"].to_numpy(), index=df["ds"])
 
@@ -239,12 +249,6 @@ def _load_full_panel() -> pd.DataFrame:
         p["ds"] = pd.to_datetime(p["timestamp"]).dt.to_period("M").dt.to_timestamp()
         p["first_release_date"] = pd.to_datetime(p["first_release_date"])
         p["forecast"] = pd.to_numeric(p["first_release_value"], errors="coerce")
-        # If a forecaster filed multiple times for the same month, keep the
-        # first publication (the PIT-honest one); later filings are revisions.
-        p = (
-            p.sort_values(["ds", "first_release_date"])
-             .drop_duplicates(subset=["ident", "ds"], keep="first")
-        )
         rows.append(p[["ds", "ident", "name", "forecast", "first_release_date"]])
     if not rows:
         raise RuntimeError("No usable economist parquets found.")
@@ -257,6 +261,23 @@ def _load_full_panel() -> pd.DataFrame:
         panel["ds"].max().strftime("%Y-%m"),
     )
     return panel
+
+
+def _latest_available_forecasts(panel: pd.DataFrame) -> pd.DataFrame:
+    """Keep the last economist forecast available for each target month.
+
+    Reuters/LSEG economist forecasts are not revised economic observations;
+    multiple rows for one economist/month represent successive forecast
+    submissions. The PIT-safe value at a cutoff is therefore the last
+    submission available before that cutoff.
+    """
+    if panel.empty:
+        return panel.copy()
+    return (
+        panel.sort_values(["ident", "ds", "first_release_date"], kind="mergesort")
+        .drop_duplicates(subset=["ident", "ds"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +313,12 @@ def _compute_track_record(
     window_months = pd.date_range(window_start, window_end, freq="MS")
     if skip_covid:
         window_months = window_months[~window_months.isin(COVID_EXCLUDE_MONTHS)]
+    avail = _actual_availability_series(actuals)
+    if avail is not None:
+        window_months = pd.DatetimeIndex([
+            m for m in window_months
+            if m in actuals.index and m in avail.index and pd.notna(avail.loc[m]) and avail.loc[m] < cutoff
+        ])
     n_window_months = int(len(window_months))
     if n_window_months == 0:
         return pd.DataFrame(
@@ -303,6 +330,7 @@ def _compute_track_record(
         panel["ds"].isin(window_months)
         & (panel["first_release_date"] < cutoff)
     ].copy()
+    eligible_history = _latest_available_forecasts(eligible_history)
     if eligible_history.empty:
         return pd.DataFrame(
             columns=["ident", "name", "mae", "rmse", "bias", "n",
@@ -310,6 +338,12 @@ def _compute_track_record(
         )
 
     eligible_history["actual"] = eligible_history["ds"].map(actuals)
+    if avail is not None:
+        eligible_history["actual_available_date"] = eligible_history["ds"].map(avail)
+        eligible_history = eligible_history[
+            eligible_history["actual_available_date"].notna()
+            & (eligible_history["actual_available_date"] < cutoff)
+        ]
     eligible_history = eligible_history.dropna(subset=["actual", "forecast"])
     if eligible_history.empty:
         return pd.DataFrame(
@@ -357,8 +391,7 @@ def _pool_step(
 
     The variant whose ``N == cfg.primary_top_n`` drives the primary
     ``predicted_mom`` channel. Auxiliary broad-panel variants
-    (``robust_median``, ``trimmed10``, ``legacy_top4_mean``) are always
-    emitted.
+    (``robust_median``, ``trimmed10``) are always emitted.
     """
     # Initialize all expected output keys to NaN so the caller can rely on
     # a consistent column set regardless of which branches fire.
@@ -366,7 +399,6 @@ def _pool_step(
         "predicted_mom": np.nan,
         "predicted_mom_robust_median": np.nan,
         "predicted_mom_trimmed10": np.nan,
-        "predicted_mom_legacy_top4_mean": np.nan,
         "panel_n": int(len(eligible)),
         "panel_n_calibrated": 0,
         "panel_dispersion_std": np.nan,
@@ -399,14 +431,6 @@ def _pool_step(
         )
     else:
         out["predicted_mom_trimmed10"] = float(np.mean(forecasts))
-
-    # Legacy Top-4 reference (same names as the hardcoded ETL).
-    top4_names = {n.upper() for n in cfg.legacy_top4}
-    legacy = eligible[
-        eligible["name"].str.upper().isin(top4_names)
-    ]["forecast"].astype(float)
-    if not legacy.empty:
-        out["predicted_mom_legacy_top4_mean"] = float(legacy.mean())
 
     # Auto-selection: rank only forecasters who actually filed this
     # month AND have a sufficient track record.
@@ -498,6 +522,12 @@ def _trained_through_for_step(
         return target_month - pd.DateOffset(months=1)
     candidates = eligible_history["ds"].drop_duplicates().sort_values()
     with_actuals = candidates[candidates.isin(actuals.index)]
+    avail = _actual_availability_series(actuals)
+    if avail is not None and not with_actuals.empty:
+        with_actuals = pd.DatetimeIndex([
+            m for m in with_actuals
+            if m in avail.index and pd.notna(avail.loc[m]) and avail.loc[m] < cutoff
+        ])
     if with_actuals.empty:
         return target_month - pd.DateOffset(months=1)
     return pd.Timestamp(with_actuals.iloc[-1])
@@ -551,9 +581,12 @@ def run_backtest(cfg: PanelConfig) -> Tuple[pd.DataFrame, Dict[str, str]]:
     rows: List[Dict] = []
     for target_month in target_months:
         cutoff = release_map.loc[target_month]
-        eligible = panel[
-            (panel["ds"] == target_month) & (panel["first_release_date"] < cutoff)
-        ][["ident", "name", "forecast"]].copy()
+        eligible = _latest_available_forecasts(
+            panel[
+                (panel["ds"] == target_month)
+                & (panel["first_release_date"] < cutoff)
+            ][["ds", "ident", "name", "forecast", "first_release_date"]].copy()
+        )[["ident", "name", "forecast"]]
 
         track = _compute_track_record(
             panel,
@@ -586,7 +619,6 @@ def run_backtest(cfg: PanelConfig) -> Tuple[pd.DataFrame, Dict[str, str]]:
         "predicted_mom",
         "predicted_mom_robust_median",
         "predicted_mom_trimmed10",
-        "predicted_mom_legacy_top4_mean",
     ]
     for n in cfg.top_n_variants:
         log_cols.append(f"predicted_mom_top{n}_simple")
@@ -625,16 +657,20 @@ def _shape_for_sidecar(preds: pd.DataFrame) -> pd.DataFrame:
       router meta-feature builder).
     """
     out = preds.copy()
-    # confidence = inverse of normalized cross-sectional dispersion (clipped).
+    out = out.sort_values("ds").reset_index(drop=True)
+    # confidence = inverse of dispersion normalized by an EXPANDING median
+    # of past dispersion only — PIT-safe (no future months contribute to the
+    # row's normalizer or its imputation).
     disp = out["panel_dispersion_std"].astype(float)
-    disp = disp.fillna(disp.median() if disp.notna().any() else 1.0)
-    norm = float(disp.median()) if disp.median() > 0 else 1.0
-    confidence = 1.0 / (1.0 + disp / max(norm, 1.0))
+    expanding_median = disp.shift(1).expanding(min_periods=1).median()
+    disp_filled = disp.where(disp.notna(), expanding_median).fillna(1.0)
+    norm = expanding_median.fillna(disp_filled.iloc[0] if len(disp_filled) else 1.0)
+    norm = norm.where(norm > 0, 1.0)
+    confidence = 1.0 / (1.0 + disp_filled / norm)
     out["confidence"] = confidence.clip(0.0, 1.0)
     out["uncertainty"] = (1.0 - out["confidence"]).clip(0.0, 1.0)
 
     # predicted_accel = diff of consecutive predicted_mom.
-    out = out.sort_values("ds").reset_index(drop=True)
     out["predicted_accel"] = out["predicted_mom"].diff()
     out["predicted_accel_sign"] = np.sign(out["predicted_accel"]).fillna(0.0)
     out["predicted_accel_proba_up"] = np.where(out["predicted_accel_sign"] > 0, 1.0, 0.0)
@@ -642,7 +678,6 @@ def _shape_for_sidecar(preds: pd.DataFrame) -> pd.DataFrame:
     rename_to_nudge = {
         "predicted_mom_robust_median": "suggested_nudge_robust_median",
         "predicted_mom_trimmed10": "suggested_nudge_trimmed10",
-        "predicted_mom_legacy_top4_mean": "suggested_nudge_legacy_top4_mean",
     }
     rename_to_regime = {
         "panel_n": "regime_panel_n",
@@ -689,7 +724,6 @@ def write_artifacts(
             "track_record_window": cfg.track_record_window,
             "skip_covid_in_track_record": cfg.skip_covid_in_track_record,
             "apply_bias_correction": cfg.apply_bias_correction,
-            "legacy_top4": list(cfg.legacy_top4),
             "backtest_months": cfg.backtest_months,
         },
         data_paths=data_paths,

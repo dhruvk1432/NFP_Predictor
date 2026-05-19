@@ -79,3 +79,72 @@ def test_pit_adaptive_kalman_selects_params_from_prior_rows_only(monkeypatch):
     # If the current row's realized error leaked into selection, any non-12
     # candidate would be preferred because tw=12 intentionally fails at row 31.
     assert row_31["predicted"] == 1000.0
+
+
+def test_pit_adaptive_kalman_selection_excludes_same_day_revised_actuals(monkeypatch):
+    import Train.Output_code.consensus_anchor_runner as runner
+
+    n = 35
+    ds = pd.date_range("2022-01-01", periods=n, freq="MS")
+    overlap = pd.DataFrame({
+        "ds": ds,
+        "actual": np.zeros(n, dtype=float),
+        "target_release_date": ds + pd.DateOffset(months=1, days=4),
+        "actual_available_date": ds + pd.DateOffset(months=2, days=4),
+        "consensus_pred": np.zeros(n, dtype=float),
+        "champion_pred": np.zeros(n, dtype=float),
+    })
+
+    def fake_kalman_fusion(overlap_df, consensus_df, trailing_window=18, **kwargs):
+        res = overlap_df[[
+            "ds", "actual", "target_release_date", "actual_available_date", "consensus_pred",
+        ]].copy()
+        res["predicted"] = 0.0
+        res["error"] = 0.0
+        metrics = runner.full_metrics(
+            res["actual"].values,
+            res["predicted"].values,
+            "Kalman_Fusion",
+            ds=res["ds"],
+        )
+        return res, metrics
+
+    monkeypatch.setattr(runner, "kalman_fusion", fake_kalman_fusion)
+
+    tuned, _, _ = runner.pit_adaptive_kalman_fusion(
+        overlap,
+        overlap,
+        min_history=1,
+        objective="mae",
+    )
+
+    # At row 31 (index 30), month 30's previous actual is released on the same
+    # date as row 31's target release. Strict PIT excludes it, leaving 29
+    # available historical actuals rather than 30 chronological prior rows.
+    assert tuned.iloc[30]["selection_history_n"] == 29
+
+
+def test_revised_training_label_mask_excludes_same_day_available_label():
+    from Train.train_lightgbm_nfp import _available_label_mask_for_cutoff
+
+    ds = pd.date_range("2020-01-01", periods=5, freq="MS")
+    target = pd.DataFrame({
+        "ds": ds,
+        "y_mom": [10.0, 20.0, 30.0, 40.0, 50.0],
+        "operational_available_date": [
+            pd.Timestamp("2020-02-07"),
+            pd.Timestamp("2020-03-06"),
+            pd.Timestamp("2020-04-03"),
+            pd.Timestamp("2020-05-08"),
+            pd.Timestamp("2020-06-05"),
+        ],
+    })
+
+    mask = _available_label_mask_for_cutoff(
+        pd.Series(ds),
+        target,
+        pd.Timestamp("2020-05-08"),
+        target_source="revised",
+    )
+
+    assert mask.tolist() == [True, True, True, False, False]

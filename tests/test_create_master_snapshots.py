@@ -49,10 +49,12 @@ from Train.data_loader import sanitize_feature_name
 
 @pytest.fixture
 def source_cache_dir(tmp_path, monkeypatch):
-    """Redirect cache root to tmp_path so cache files don't pollute real data."""
+    """Redirect cache + snapshot roots to tmp_path so test artifacts don't
+    pollute real data."""
     monkeypatch.setattr(
         'Data_ETA_Pipeline.create_master_snapshots.MASTER_BASE', tmp_path
     )
+    monkeypatch.setattr('Train.config.MASTER_SNAPSHOTS_BASE', tmp_path)
     return tmp_path
 
 
@@ -555,6 +557,7 @@ class TestRegimeSelection:
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr("Train.config.MASTER_SNAPSHOTS_BASE", master_base)
         monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "revised")])
         monkeypatch.setattr(cms, "SOURCES", {"ADP": tmp_path / "mock_sources" / "adp" / "decades"})
         monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
@@ -704,6 +707,7 @@ class TestSkipFeatureSelectionFastPath:
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr("Train.config.MASTER_SNAPSHOTS_BASE", master_base)
         monkeypatch.setattr(cms, "START_DATE", "2020-01-01")
         monkeypatch.setattr(cms, "END_DATE", "2020-01-01")
         monkeypatch.setattr(
@@ -746,6 +750,7 @@ class TestSkipFeatureSelectionFastPath:
         target_snap = pd.Timestamp("2020-01-10")
 
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr("Train.config.MASTER_SNAPSHOTS_BASE", master_base)
         monkeypatch.setattr(cms, "TARGET_COMBOS", [("nsa", "revised")])
         monkeypatch.setattr(cms, "SOURCES", {"ADP": source_dir})
         monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
@@ -861,6 +866,7 @@ class TestSingleAsOfSelection:
 
         master_base = tmp_path / "master_snapshots"
         monkeypatch.setattr(cms, "MASTER_BASE", master_base)
+        monkeypatch.setattr("Train.config.MASTER_SNAPSHOTS_BASE", master_base)
         monkeypatch.setattr(cms, "SOURCES", {"ADP": tmp_path / "mock_sources" / "adp" / "decades"})
         monkeypatch.setattr(cms, "SOURCE_EXEC_ORDER", ["ADP"])
         monkeypatch.setattr(cms, "START_DATE", "2020-01-01")

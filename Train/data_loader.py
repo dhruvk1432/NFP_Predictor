@@ -778,22 +778,54 @@ def _build_lagged_target_feature_frame(
     return result
 
 
+def _mask_unavailable_revised_targets(
+    target_df: pd.DataFrame,
+    cutoff_date: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    """Blank revised target values not operationally known before cutoff_date."""
+    if (
+        cutoff_date is None
+        or target_df.empty
+        or "operational_available_date" not in target_df.columns
+    ):
+        return target_df
+
+    cutoff = pd.to_datetime(cutoff_date, errors="coerce")
+    if pd.isna(cutoff):
+        return target_df
+
+    out = target_df.copy()
+    op = pd.to_datetime(out["operational_available_date"], errors="coerce")
+    unavailable = op.isna() | (op >= cutoff)
+    for col in ("y", "y_mom"):
+        if col in out.columns:
+            out.loc[unavailable, col] = np.nan
+    return out
+
+
 def get_lagged_target_features(
     target_df: pd.DataFrame,
     target_month: pd.Timestamp,
-    prefix: str = 'nfp'
+    prefix: str = 'nfp',
+    cutoff_date: Optional[pd.Timestamp] = None,
 ) -> Dict[str, float]:
     """
     Get lagged target features for a specific prediction month.
 
-    CRITICAL: Only use data from BEFORE target_month to avoid look-ahead bias.
-    The target is released in the following month, so for month M prediction,
-    we only know NFP values through month M-1.
+    CRITICAL: Only use data from BEFORE target_month and, for revised targets,
+    only rows whose operational availability is strictly before cutoff_date.
+    For month M prediction at the M NFP release, the M-1 revised value is
+    usually released in that same report, so strict pre-release replay must
+    not treat it as available.
 
     Args:
         target_df: DataFrame with target values
         target_month: Month we're predicting
         prefix: Prefix for feature names ('nfp_nsa' or 'nfp_sa')
+        cutoff_date: Optional prediction-time availability cutoff. When
+            provided with revised target data carrying operational_available_date,
+            target values with operational_available_date >= cutoff_date are
+            blanked before shift/rolling feature construction.
 
     Returns:
         Dictionary of lagged features
@@ -803,12 +835,13 @@ def get_lagged_target_features(
 
     target_month = pd.Timestamp(target_month).replace(day=1)
 
+    working_df = _mask_unavailable_revised_targets(target_df, cutoff_date)
+
     # Ensure target_month exists in the index so we can retrieve a PIT row even
     # for future months that are not yet present in target_df.
-    working_df = target_df
-    if not (target_df['ds'] == target_month).any():
+    if not (working_df['ds'] == target_month).any():
         extra_row = pd.DataFrame({'ds': [target_month], 'y': [np.nan], 'y_mom': [np.nan]})
-        working_df = pd.concat([target_df, extra_row], ignore_index=True)
+        working_df = pd.concat([working_df, extra_row], ignore_index=True)
 
     feature_frame = _build_lagged_target_feature_frame(working_df, prefix)
     if target_month not in feature_frame.index:
@@ -827,6 +860,7 @@ def get_lagged_target_features(
 def batch_lagged_target_features(
     target_df: pd.DataFrame,
     prefix: str = 'nfp',
+    cutoff_dates: Optional[Dict[pd.Timestamp, pd.Timestamp]] = None,
 ) -> Dict[pd.Timestamp, Dict[str, float]]:
     """
     Vectorized batch computation of lagged target features for ALL months at once.
@@ -841,10 +875,29 @@ def batch_lagged_target_features(
     Args:
         target_df: DataFrame with ds, y, y_mom columns
         prefix: Feature name prefix ('nfp_nsa' or 'nfp_sa')
+        cutoff_dates: Optional target_month -> cutoff_date map. When provided,
+            each row is generated with the same strict operational availability
+            filter used by get_lagged_target_features().
 
     Returns:
         Dict mapping target_month -> {feature_name: value} (NaN features omitted)
     """
+    if cutoff_dates and "operational_available_date" in target_df.columns:
+        lookup: Dict[pd.Timestamp, Dict[str, float]] = {}
+        cutoff_lookup = {
+            pd.Timestamp(k).to_period("M").to_timestamp(): pd.Timestamp(v)
+            for k, v in cutoff_dates.items()
+            if pd.notna(v)
+        }
+        for ts in pd.to_datetime(target_df["ds"]).dt.to_period("M").dt.to_timestamp():
+            lookup[pd.Timestamp(ts)] = get_lagged_target_features(
+                target_df,
+                pd.Timestamp(ts),
+                prefix=prefix,
+                cutoff_date=cutoff_lookup.get(pd.Timestamp(ts)),
+            )
+        return lookup
+
     result = _build_lagged_target_feature_frame(target_df, prefix)
 
     # Convert to dict-of-dicts, dropping NaN values per row

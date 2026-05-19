@@ -26,18 +26,15 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from settings import DATA_PATH, OUTPUT_DIR, MODEL_TYPE, RESELECT_EVERY_N_MONTHS
-
-
-def _env_int(name: str, default: int) -> int:
-    """Read an integer from env (e.g. for grid_search.py per-cell overrides)."""
-    v = os.getenv(name, "").strip()
-    if not v:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
+from settings import (
+    DATA_PATH,
+    DYNAMIC_FS_PASS2_MAX_FEATURES,
+    MODEL_TYPE,
+    N_OPTUNA_TRIALS,
+    OUTPUT_DIR,
+    RESELECT_EVERY_N_MONTHS,
+    RESELECTION_TRIGGER_MODE,
+)
 
 
 # =============================================================================
@@ -74,24 +71,40 @@ operational_available_date to have passed (enforced at inference)."""
 # =============================================================================
 
 MASTER_SNAPSHOTS_BASE = DATA_PATH / "master_snapshots"
-"""Base directory for feature-selected master snapshots ({nsa,sa}/revised/decades/)."""
+"""Base directory for feature-selected master snapshots (sa/revised/decades/)."""
 
 FRED_SNAPSHOTS_DIR = DATA_PATH / "fred_data" / "decades"
 """Directory containing raw FRED data snapshots (still needed for build_revised_target)."""
 
 
+# Single canonical branch on disk. Master snapshots are a feature-superset
+# (NSA + SA employment + every exogenous source) written directly to
+# sa/revised/. The resolver routes any target_type to that location. The
+# target_type argument still drives downstream concerns (which y_* parquet to
+# join, which output paths to write) — only the feature snapshot location is
+# shared.
+_CANONICAL_SNAPSHOT_BRANCH = 'sa'
+_CANONICAL_SNAPSHOT_SOURCE = 'revised'
+
+
 def get_master_snapshots_dir(target_type: str, target_source: str = 'revised') -> Path:
     """
-    Get the decades directory for master snapshots of a specific target configuration.
+    Get the decades directory for master snapshots.
 
     Args:
-        target_type: 'nsa' or 'sa'
-        target_source: 'revised'
+        target_type: 'nsa' or 'sa' (kept for API compatibility; both resolve
+            to the same on-disk location).
+        target_source: 'revised' (kept for API compatibility).
 
     Returns:
         Path to the decades directory containing master snapshots.
     """
-    return MASTER_SNAPSHOTS_BASE / target_type / target_source / "decades"
+    return (
+        MASTER_SNAPSHOTS_BASE
+        / _CANONICAL_SNAPSHOT_BRANCH
+        / _CANONICAL_SNAPSHOT_SOURCE
+        / "decades"
+    )
 
 NFP_TARGET_DIR = DATA_PATH / "NFP_target"
 """Directory containing the target parquet files for both first and revised NFP prints."""
@@ -252,6 +265,55 @@ LGBM_DETERMINISM = {
     'force_col_wise': True,
 }
 
+
+def lgbm_n_jobs(default: int = -1) -> int:
+    """LightGBM thread cap, overridable for parallel AWS experiment grids."""
+    raw = (
+        os.getenv("NFP_LGBM_N_JOBS", "")
+        or os.getenv("NFP_TRAIN_LGBM_N_JOBS", "")
+    ).strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on", "y", "t"}
+
+
+def _env_csv_tuple(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return tuple(default)
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 DEFAULT_LGBM_PARAMS = {
     'objective': 'regression',
     'metric': 'mae',
@@ -264,7 +326,7 @@ DEFAULT_LGBM_PARAMS = {
     'bagging_fraction': 0.8,
     'bagging_freq': 5,
     'verbose': -1,
-    'n_jobs': -1,
+    'n_jobs': lgbm_n_jobs(),
     **LGBM_DETERMINISM,
 }
 
@@ -288,8 +350,7 @@ EARLY_STOPPING_ROUNDS = 50
 HALF_LIFE_MIN_MONTHS = 12
 HALF_LIFE_MAX_MONTHS = 120
 
-# Optuna hyperparameter tuning
-N_OPTUNA_TRIALS = _env_int("N_OPTUNA_TRIALS", 25)   # Reverted 2026-05-15 from 50 → 25 (Step 4 regression). Grid search overrides via env.
+# Optuna hyperparameter tuning.  N_OPTUNA_TRIALS is loaded from .env via settings.py.
 OPTUNA_TIMEOUT = 300        # Max seconds per tuning run
 TUNE_EVERY_N_MONTHS = 12   # Re-tune hyperparameters every N months in backtest
 
@@ -391,8 +452,8 @@ DYNAMIC_FS_STAGES_PASS1 = (0, 1, 2, 4, 5, 6)
 DYNAMIC_FS_STAGES_PASS2 = (0, 1, 2, 4)
 
 # Hard cap on total features after the global pass-2 reduction (exogenous +
-# target-derived + calendar + revision all counted together).
-DYNAMIC_FS_PASS2_MAX_FEATURES = _env_int("DYNAMIC_FS_PASS2_MAX_FEATURES", 80)  # Reverted 2026-05-15 from 120 → 80 (Step 4 regression: cap=120 made NSA noisier; nsa_weight_scale collapsed 0.55→0.12). Grid overrides via env.
+# target-derived + calendar + revision all counted together). Loaded from .env
+# via settings.py so grid runs and local experiments can override it.
 
 # Boruta iterations for dynamic re-selection (lower than offline for speed).
 DYNAMIC_FS_BORUTA_RUNS = 50
@@ -419,6 +480,94 @@ RESELECTION_STAGES_PASS1 = (0, 2, 4, 5)  # Lighter: Pre-funnel + Boruta + Cluste
 # weights (λ_accel = λ_dir = 0). Stage 6 stays off until those issues are
 # addressed (small positive lambdas + a re-tuned SFS stopping rule).
 RESELECTION_STAGES_PASS2 = (0, 2, 4)  # Global: Pre-funnel + Boruta + Cluster (SFS reverted 2026-05-15)
+
+# HMM-gated reselection trigger. ``RESELECTION_TRIGGER_MODE`` is loaded from
+# settings.py and accepts:
+#   - "hmm": trigger from PIT HMM regime shifts, with optional max-gap fallback.
+#   - "hybrid": trigger from either HMM shifts or the old anchored cadence.
+#   - "cadence": legacy fixed anchored cadence only.
+HMM_RESELECTION_MIN_TRAIN_MONTHS = _env_int("HMM_RESELECTION_MIN_TRAIN_MONTHS", 96)
+HMM_RESELECTION_N_COMPONENTS = _env_int("HMM_RESELECTION_N_COMPONENTS", 3)
+HMM_RESELECTION_COVARIANCE_TYPE = os.getenv("HMM_RESELECTION_COVARIANCE_TYPE", "diag").strip() or "diag"
+HMM_RESELECTION_MAX_FEATURES = _env_int("HMM_RESELECTION_MAX_FEATURES", 32)
+HMM_RESELECTION_MIN_FEATURES = _env_int("HMM_RESELECTION_MIN_FEATURES", 4)
+HMM_RESELECTION_MIN_NON_NAN = _env_int("HMM_RESELECTION_MIN_NON_NAN", 72)
+HMM_RESELECTION_MIN_GAP_MONTHS = _env_int("HMM_RESELECTION_MIN_GAP_MONTHS", 9)
+HMM_RESELECTION_MAX_GAP_MONTHS = _env_int(
+    "HMM_RESELECTION_MAX_GAP_MONTHS",
+    0,
+)
+HMM_RESELECTION_MIN_STATE_PROB = _env_float("HMM_RESELECTION_MIN_STATE_PROB", 0.55)
+HMM_RESELECTION_TRANSITION_RISK_THRESHOLD = _env_float(
+    "HMM_RESELECTION_TRANSITION_RISK_THRESHOLD",
+    0.35,
+)
+HMM_RESELECTION_TRANSITION_JUMP = _env_float("HMM_RESELECTION_TRANSITION_JUMP", 0.15)
+HMM_RESELECTION_ENTROPY_THRESHOLD = _env_float("HMM_RESELECTION_ENTROPY_THRESHOLD", 0.70)
+HMM_RESELECTION_ENTROPY_JUMP = _env_float("HMM_RESELECTION_ENTROPY_JUMP", 0.18)
+HMM_RESELECTION_SURPRISE_Q = _env_float("HMM_RESELECTION_SURPRISE_Q", 0.95)
+HMM_RESELECTION_FORCE_LABELS = _env_csv_tuple(
+    "HMM_RESELECTION_FORCE_LABELS",
+    ("crash", "volatile_down"),
+)
+HMM_RESELECTION_FORCE_RISK = _env_float("HMM_RESELECTION_FORCE_RISK", 0.60)
+HMM_RESELECTION_MIN_PROB_MARGIN = _env_float("HMM_RESELECTION_MIN_PROB_MARGIN", 0.20)
+HMM_RESELECTION_EMISSION_PROFILE = (
+    os.getenv("HMM_RESELECTION_EMISSION_PROFILE", "seasonal_resid").strip()
+    or "seasonal_resid"
+)
+HMM_RESELECTION_TRIGGER_SCORE_THRESHOLD = _env_float("HMM_RESELECTION_TRIGGER_SCORE_THRESHOLD", 2.0)
+HMM_RESELECTION_SURPRISE_LOW_Q = _env_float("HMM_RESELECTION_SURPRISE_LOW_Q", 0.90)
+HMM_RESELECTION_SURPRISE_HIGH_Q = _env_float("HMM_RESELECTION_SURPRISE_HIGH_Q", 0.975)
+HMM_RESELECTION_SEVERE_SURPRISE_RATIO = _env_float("HMM_RESELECTION_SEVERE_SURPRISE_RATIO", 2.0)
+HMM_RESELECTION_DOWNSIDE_SURPRISE_RATIO = _env_float("HMM_RESELECTION_DOWNSIDE_SURPRISE_RATIO", 1.05)
+HMM_RESELECTION_SEASONAL_PENALTY_SURPRISE_RATIO = _env_float(
+    "HMM_RESELECTION_SEASONAL_PENALTY_SURPRISE_RATIO",
+    1.50,
+)
+HMM_RESELECTION_MIN_STATE_SUPPORT_N = _env_int("HMM_RESELECTION_MIN_STATE_SUPPORT_N", 12)
+HMM_RESELECTION_MIN_STATE_SUPPORT_SHARE = _env_float("HMM_RESELECTION_MIN_STATE_SUPPORT_SHARE", 0.05)
+HMM_RESELECTION_MIN_EXPECTED_DURATION = _env_float("HMM_RESELECTION_MIN_EXPECTED_DURATION", 2.0)
+HMM_RESELECTION_EPISODE_SUPPRESSION_MONTHS = _env_int("HMM_RESELECTION_EPISODE_SUPPRESSION_MONTHS", 6)
+HMM_RESELECTION_EPISODE_CLEAR_MONTHS = _env_int("HMM_RESELECTION_EPISODE_CLEAR_MONTHS", 3)
+HMM_RESELECTION_RANDOM_STATE = _env_int("HMM_RESELECTION_RANDOM_STATE", 42)
+HMM_RESELECTION_N_ITER = _env_int("HMM_RESELECTION_N_ITER", 200)
+
+# Sticky reselection dampens churn by preserving incumbent features unless new
+# candidates beat them by a regime-specific margin.
+NFP_STICKY_FEATURE_SELECTION = _env_bool("NFP_STICKY_FEATURE_SELECTION", False)
+NFP_STICKY_MARGIN_STABLE = _env_float("NFP_STICKY_MARGIN_STABLE", 0.20)
+NFP_STICKY_MARGIN_UPWARD = _env_float("NFP_STICKY_MARGIN_UPWARD", 0.15)
+NFP_STICKY_MARGIN_VOLATILE = _env_float("NFP_STICKY_MARGIN_VOLATILE", 0.05)
+NFP_STICKY_MARGIN_DEFAULT = _env_float("NFP_STICKY_MARGIN_DEFAULT", 0.10)
+NFP_STICKY_STABLE_MAX_REPLACEMENT_SHARE = _env_float(
+    "NFP_STICKY_STABLE_MAX_REPLACEMENT_SHARE",
+    0.20,
+)
+NFP_STICKY_VOLATILE_MIN_REPLACEMENT_SHARE = _env_float(
+    "NFP_STICKY_VOLATILE_MIN_REPLACEMENT_SHARE",
+    0.10,
+)
+
+# Gated stable-selection profiles. Defaults preserve the legacy reselection
+# behavior; set ``NFP_DYNAMIC_SELECTION_PROFILE=stable_core`` or ``challenger``
+# for local experiments that damp feature churn.
+NFP_DYNAMIC_SELECTION_PROFILE = (
+    os.getenv("NFP_DYNAMIC_SELECTION_PROFILE", "legacy").strip().lower()
+    or "legacy"
+)
+if NFP_DYNAMIC_SELECTION_PROFILE not in {"legacy", "stable_core", "challenger"}:
+    NFP_DYNAMIC_SELECTION_PROFILE = "legacy"
+NFP_STABLE_CORE_MIN_PERSISTENCE = _env_float("NFP_STABLE_CORE_MIN_PERSISTENCE", 0.50)
+NFP_FEATURE_REPLACEMENT_CAP_SHARE = _env_float("NFP_FEATURE_REPLACEMENT_CAP_SHARE", 0.15)
+NFP_FEATURE_CHALLENGER_SLOTS = _env_int("NFP_FEATURE_CHALLENGER_SLOTS", 20)
+NFP_STABLE_CORE_SOURCE_DIRS = _env_csv_tuple("NFP_STABLE_CORE_SOURCE_DIRS", ())
+NFP_STABLE_GUARDRAIL_SOURCES = _env_csv_tuple(
+    "NFP_STABLE_GUARDRAIL_SOURCES",
+    ("EconomistPanel", "Futures", "Unifier", "SA_NSA_Gap", "DerivedControls"),
+)
+NFP_STABLE_RANK_WEIGHT = _env_float("NFP_STABLE_RANK_WEIGHT", 1.0)
+NFP_STABLE_CORRELATION_WEIGHT = _env_float("NFP_STABLE_CORRELATION_WEIGHT", 0.25)
 
 # =============================================================================
 # TIER-A UNIVERSE DISTILLATION (Hierarchical reselection — see faster.md)

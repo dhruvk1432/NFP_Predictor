@@ -60,7 +60,7 @@ Everything is wired together by [`lib.sh`](lib.sh) — shared helpers for `aws` 
 # 1. Provision (creates bucket, IAM, key pair, SG, EC2 instance)
 ./aws/provision.sh
 
-# 2. Upload data to S3 (slow: ~50 GB whitelist, or 69 GB with PUSH_DATA_ALL=1)
+# 2. Upload train-only data to S3 (~17 GB snapshots + tiny target files)
 ./aws/push_data.sh
 #   PUSH_DATA_ALL=1 ./aws/push_data.sh    # if you also want raw ETL inputs
 
@@ -112,7 +112,7 @@ The on-instance wrapper then runs the training, syncs `_output/` to S3 (even if 
 - **Key rotation.** The private key is saved once to `aws/.keys/<KEY_NAME>.pem` (mode 600). Back it up to your password manager — `provision.sh` will refuse to re-create it if the AWS-side key pair exists but the local file doesn't, to avoid an unrecoverable mismatch.
 - **SSH ingress.** `SSH_INGRESS_CIDR=auto` (the default) detects your current public IP via `checkip.amazonaws.com` and locks the SG to `<your-ip>/32`. If you change networks, re-run `provision.sh` — it will idempotently authorize the new CIDR.
 - **`push_code.sh` deliberately excludes `.env`.** Use `push_env.sh` instead so you don't accidentally clobber the instance's `.env` with a local one (or commit it to S3 via a stray sync).
-- **Data sync whitelist.** `push_data.sh` ships the *training-only* subset by default: `master_snapshots/`, `fred_data/`, `NFP_target/`. The full ETL inputs (`Exogenous_data/`, `fred_data_prepared_{nsa,sa}/`) are only needed if you plan to re-run the data pipeline on AWS — set `PUSH_DATA_ALL=1` to include them.
+- **Data sync whitelist.** `push_data.sh` ships the *training-only* subset by default: `master_snapshots/` and `NFP_target/`. The full ETL inputs (`fred_data/`, `Exogenous_data/`, `fred_data_prepared_{nsa,sa}/`) are only needed if you plan to rebuild targets or master snapshots on AWS — set `PUSH_DATA_ALL=1` to include them.
 - **Re-running cleanly.** `provision.sh`, `bootstrap.sh`, and `push_data.sh` are all idempotent. Failures mid-flow are recoverable without state surgery.
 
 ## Configuration (`config.env`)

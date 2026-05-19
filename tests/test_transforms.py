@@ -236,6 +236,20 @@ class TestWinsorizeCovidPeriod:
         assert result.loc['2020-04-01', 'A'] > -600
         assert result.loc['2020-05-01', 'B'] < 400
 
+    def test_integer_dataframe_promotes_before_clip(self):
+        """Integer-valued features should not fail when clipped to float bounds."""
+        dates = pd.date_range('2018-01-01', '2020-06-01', freq='MS')
+        df = pd.DataFrame(
+            {'A': np.arange(len(dates), dtype=np.int64)},
+            index=dates,
+        )
+        df.loc['2020-04-01', 'A'] = 10000
+
+        result = winsorize_covid_period(df)
+
+        assert pd.api.types.is_float_dtype(result['A'])
+        assert result.loc['2020-04-01', 'A'] < 10000
+
     def test_clips_covid_values_series(self, wide_df):
         """COVID-period values should be clipped in a Series."""
         series = wide_df['A'].copy()

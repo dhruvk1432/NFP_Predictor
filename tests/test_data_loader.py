@@ -188,6 +188,62 @@ class TestLaggedTargetFeatures:
             if not np.isnan(expected_lag1):
                 assert np.isclose(features['nfp_mom_lag1'], expected_lag1)
 
+    def test_revised_lag_excludes_same_day_available_value(self):
+        """Revised target lags must respect operational availability, not only ds."""
+        dates = pd.date_range('2020-01-01', '2020-06-01', freq='MS')
+        df = pd.DataFrame({
+            'ds': dates,
+            'y': [100, 110, 125, 140, 160, 190],
+            'y_mom': [np.nan, 10, 15, 15, 20, 30],
+            'operational_available_date': [
+                pd.NaT,
+                pd.Timestamp('2020-03-06'),
+                pd.Timestamp('2020-04-03'),
+                pd.Timestamp('2020-05-08'),
+                pd.Timestamp('2020-06-05'),
+                pd.Timestamp('2020-07-02'),
+            ],
+        })
+
+        features = get_lagged_target_features(
+            df,
+            pd.Timestamp('2020-05-01'),
+            prefix='nfp',
+            cutoff_date=pd.Timestamp('2020-05-08'),
+        )
+
+        assert 'nfp_mom_lag1' not in features
+        assert features['nfp_mom_lag2'] == 15
+
+    def test_batch_revised_lags_respect_cutoff_map(self):
+        """Batch path used by training must match the availability-aware helper."""
+        dates = pd.date_range('2020-01-01', '2020-06-01', freq='MS')
+        df = pd.DataFrame({
+            'ds': dates,
+            'y': [100, 110, 125, 140, 160, 190],
+            'y_mom': [np.nan, 10, 15, 15, 20, 30],
+            'operational_available_date': [
+                pd.NaT,
+                pd.Timestamp('2020-03-06'),
+                pd.Timestamp('2020-04-03'),
+                pd.Timestamp('2020-05-08'),
+                pd.Timestamp('2020-06-05'),
+                pd.Timestamp('2020-07-02'),
+            ],
+        })
+        cutoff_dates = {pd.Timestamp('2020-05-01'): pd.Timestamp('2020-05-08')}
+
+        lookup = batch_lagged_target_features(df, prefix='nfp', cutoff_dates=cutoff_dates)
+        expected = get_lagged_target_features(
+            df,
+            pd.Timestamp('2020-05-01'),
+            prefix='nfp',
+            cutoff_date=pd.Timestamp('2020-05-08'),
+        )
+
+        assert lookup[pd.Timestamp('2020-05-01')] == expected
+        assert 'nfp_mom_lag1' not in lookup[pd.Timestamp('2020-05-01')]
+
     def test_empty_df_returns_empty_features(self):
         """Test that empty DataFrame returns empty features."""
         empty_df = pd.DataFrame(columns=['ds', 'y', 'y_mom'])

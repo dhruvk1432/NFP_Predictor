@@ -43,6 +43,7 @@ from Train.config import (
     ALL_TARGET_CONFIGS,
     DEFAULT_LGBM_PARAMS,
     MASTER_SNAPSHOTS_BASE,
+    lgbm_n_jobs,
 )
 from Train.data_loader import load_target_data, sanitize_feature_name
 from Train.variance_metrics import compute_variance_kpis, composite_objective_score
@@ -75,7 +76,7 @@ BORUTA_LGB_PARAMS = {
     'learning_rate': 0.1,
     'feature_fraction': 0.8,
     'verbose': -1,
-    'n_jobs': -1,
+    'n_jobs': lgbm_n_jobs(),
     'deterministic': True,
     'force_col_wise': True,
     'bagging_seed': 42,

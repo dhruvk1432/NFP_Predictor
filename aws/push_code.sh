@@ -26,6 +26,7 @@ rsync -avz --delete \
   --exclude '*.ipynb' \
   --exclude '.DS_Store' \
   --exclude 'data/' \
+  --exclude '_output*/' \
   --exclude '_output/' \
   --exclude '_output_grid/' \
   --exclude '_output_grid_archive/' \

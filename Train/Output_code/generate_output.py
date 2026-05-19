@@ -7,9 +7,9 @@ Generates output artifacts after training:
   ├── SA_prediction/           (single-branch or combined)
   ├── NSA_plus_adjustment/     (combined only)
   ├── Predictions/             (combined only)
-  ├── consensus_anchor/        (4-way scorecard: baseline_consensus,
-  │                             kalman_fusion, accel_override,
-  │                             kalman_accel_postfilter)
+  ├── consensus_anchor/        (final forecasts: kalman_fusion,
+  │                             panel_kalman_router; diagnostics:
+  │                             baseline_consensus, panel_consensus_mean)
   └── Archive/YYYY-MM-DD_HHMMSS/
 
 Archiving is performed by `archive_outputs()` (defined below), which is
@@ -54,7 +54,7 @@ DEFAULT_ARCHIVE_FOLDERS: List[str] = [
     "SA_prediction",
     "NSA_plus_adjustment",
     "Predictions",
-    # Post-training: consensus anchor (4-way scorecard + comparison artifacts)
+    # Post-training: consensus anchor (final forecasts + comparison artifacts)
     "consensus_anchor",
     # Post-training: sandbox experiments (optional)
     "sandbox/sa_blend_walkforward",
@@ -78,8 +78,8 @@ def archive_outputs(
     Args:
         output_base: Base output dir (typically `settings.OUTPUT_DIR`).
         folders: List of folder paths relative to `output_base`. Defaults
-            to `DEFAULT_ARCHIVE_FOLDERS`, which includes the four model
-            bundles plus the consensus anchor 4-way scorecard.
+            to `DEFAULT_ARCHIVE_FOLDERS`, which includes the model bundles
+            plus the consensus anchor final-forecast scorecard.
         timestamp: Override the archive timestamp (mainly for tests).
 
     Returns:
@@ -475,12 +475,12 @@ def generate_all_output(
     """
     Generate the complete output folder structure.
 
-    The SA LightGBM branch has been retired from the published pipeline — the
-    fusion (consensus + NSA+adjustment + NSA-accel) is the canonical SA-revised
-    output. SA-related arguments are optional: pass them to render an SA
-    diagnostic folder, omit them to skip SA-LightGBM artifacts entirely. The
-    NSA+adjustment folder always runs (it only needs SA actuals, which are
-    expected on ``sa_results['actual']``).
+    The SA LightGBM branch has been retired from the published pipeline.
+    SA-related arguments are optional: pass them to render an SA diagnostic
+    folder, omit them to skip SA-LightGBM artifacts entirely. The final
+    SA-revised outputs are written later by the consensus-anchor layer
+    (Kalman Fusion and Panel/Kalman Router). The NSA+adjustment folder always
+    runs because it feeds that layer.
 
     Args:
         nsa_results: NSA backtest results DataFrame.
@@ -513,7 +513,7 @@ def generate_all_output(
     logger.info("GENERATING OUTPUT")
     logger.info(f"Output directory: {output_base}")
     if not _sa_lgbm_enabled:
-        logger.info("SA LightGBM branch is OFF — fusion is the canonical SA output")
+        logger.info("SA LightGBM branch is OFF — consensus-anchor layer writes final SA outputs")
     logger.info("=" * 60)
 
     # 1) NSA prediction folder

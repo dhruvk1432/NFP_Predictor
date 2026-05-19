@@ -2,7 +2,7 @@
   "objective": "mae",
   "min_history": 24,
   "rule_counts": {
-    "gate:250.00": 35,
+    "gate:200.00": 35,
     "warmup_panel": 24
   },
   "pit_validation": "routing rule selected from prior actual months only"
